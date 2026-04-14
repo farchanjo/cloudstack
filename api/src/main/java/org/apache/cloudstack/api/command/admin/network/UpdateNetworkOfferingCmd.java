@@ -89,6 +89,11 @@ public class UpdateNetworkOfferingCmd extends BaseCmd {
             length = 4096)
     private String zoneIds;
 
+    @Parameter(name = ApiConstants.INTERNET_PROTOCOL,
+            type = CommandType.STRING,
+            description = "The internet protocol of the offering. Options are IPv4 and DualStack. Changing the protocol only affects future NICs; existing VMs/VRs are not automatically reprovisioned.")
+    private String internetProtocol;
+
     /////////////////////////////////////////////////////
     /////////////////// Accessors ///////////////////////
     /////////////////////////////////////////////////////
@@ -187,6 +192,10 @@ public class UpdateNetworkOfferingCmd extends BaseCmd {
             validZoneIds.addAll(_configService.getNetworkOfferingZones(id));
         }
         return validZoneIds;
+    }
+
+    public String getInternetProtocol() {
+        return internetProtocol;
     }
 
     /////////////////////////////////////////////////////
