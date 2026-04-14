@@ -1107,7 +1107,6 @@ public class RoutedIpv4ManagerImplTest {
         when(vpc.getZoneId()).thenReturn(zoneId);
 
         try {
-            when(vpcOffering.getNetworkMode()).thenReturn(NetworkOffering.NetworkMode.ROUTED);
             when(vpcOffering.getRoutingMode()).thenReturn(NetworkOffering.RoutingMode.Static);
             routedIpv4Manager.changeBgpPeersForVpc(cmd);
             Assert.fail("Changing BGP peers for VPC should fail.");
@@ -1120,6 +1119,7 @@ public class RoutedIpv4ManagerImplTest {
         doNothing().when(routedIpv4Manager).validateBgpPeers(account, zoneId, bgpPeerIds);
         doReturn(vpc).when(routedIpv4Manager).changeBgpPeersForVpcInternal(vpc, bgpPeerIds);
 
+        // Dynamic routing is supported independent of network mode (ROUTED or NATTED)
         routedIpv4Manager.changeBgpPeersForVpc(cmd);
 
         verify(routedIpv4Manager).validateBgpPeers(account, zoneId, bgpPeerIds);
