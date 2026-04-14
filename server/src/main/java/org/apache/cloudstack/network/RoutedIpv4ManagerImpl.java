@@ -1030,8 +1030,10 @@ public class RoutedIpv4ManagerImpl extends ComponentLifecycleBase implements Rou
 
     @Override
     public boolean isDynamicRoutedVpc(VpcOffering vpcOffering) {
-        return NetworkOffering.NetworkMode.ROUTED.equals(vpcOffering.getNetworkMode())
-                && NetworkOffering.RoutingMode.Dynamic.equals(vpcOffering.getRoutingMode());
+        // Dynamic routing (BGP peering) applies regardless of the VPC network
+        // mode (NATTED or ROUTED). NATTED VPCs still benefit from advertising
+        // their SourceNAT IP to external BGP peers.
+        return NetworkOffering.RoutingMode.Dynamic.equals(vpcOffering.getRoutingMode());
     }
 
     @Override

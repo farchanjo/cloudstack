@@ -127,12 +127,17 @@ public class OvsVifDriver extends VifDriverBase {
         } else if (nic.getBroadcastType() == Networks.BroadcastDomainType.Pvlan) {
             // TODO consider moving some of this functionality from NetUtils to Networks....
             vlanId = NetUtils.getPrimaryPvlanFromUri(nic.getBroadcastUri());
+        } else {
+            vlanId = getVlanIdFromUri(nic);
         }
         String trafficLabel = nic.getName();
         if (nic.getType() == Networks.TrafficType.Guest) {
             Integer networkRateKBps = getNetworkRateKbps(nic);
-            if ((nic.getBroadcastType() == Networks.BroadcastDomainType.Vlan || nic.getBroadcastType() == Networks.BroadcastDomainType.Pvlan) &&
-                    !vlanId.equalsIgnoreCase("untagged")) {
+            if (vlanId != null && !vlanId.equalsIgnoreCase("untagged") &&
+                    (nic.getBroadcastType() == Networks.BroadcastDomainType.Vlan
+                     || nic.getBroadcastType() == Networks.BroadcastDomainType.Pvlan
+                     || nic.getBroadcastType() == Networks.BroadcastDomainType.Vxlan
+                     || nic.getBroadcastType() == Networks.BroadcastDomainType.Netris)) {
                 if (trafficLabel != null && !trafficLabel.isEmpty()) {
                     if (_libvirtComputingResource.dpdkSupport && nic.isDpdkEnabled()) {
                         plugDPDKInterface(intf, trafficLabel, extraConfig, vlanId, guestOsType, nic, nicAdapter);
@@ -163,7 +168,7 @@ public class OvsVifDriver extends VifDriverBase {
             intf.defBridgeNet(_bridges.get("linklocal"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
         } else if (nic.getType() == Networks.TrafficType.Public) {
             Integer networkRateKBps = getNetworkRateKbps(nic);
-            if (nic.getBroadcastType() == Networks.BroadcastDomainType.Vlan && !vlanId.equalsIgnoreCase("untagged")) {
+            if (vlanId != null && !vlanId.equalsIgnoreCase("untagged")) {
                 if (trafficLabel != null && !trafficLabel.isEmpty()) {
                     logger.debug("creating a vlan dev and bridge for public traffic per traffic label " + trafficLabel);
                     intf.defBridgeNet(_pifs.get(trafficLabel), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
@@ -176,12 +181,35 @@ public class OvsVifDriver extends VifDriverBase {
                 intf.defBridgeNet(_bridges.get("public"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
             }
         } else if (nic.getType() == Networks.TrafficType.Management) {
-            intf.defBridgeNet(_bridges.get("private"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
+            if (vlanId != null) {
+                String brName = (trafficLabel != null && !trafficLabel.isEmpty()) ? _pifs.get(trafficLabel) : _bridges.get("private");
+                intf.defBridgeNet(brName, null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
+                intf.setVlanTag(Integer.parseInt(vlanId));
+            } else {
+                intf.defBridgeNet(_bridges.get("private"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
+            }
         } else if (nic.getType() == Networks.TrafficType.Storage) {
             String storageBrName = nic.getName() == null ? _bridges.get("private") : nic.getName();
             intf.defBridgeNet(storageBrName, null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
+            if (vlanId != null) {
+                intf.setVlanTag(Integer.parseInt(vlanId));
+            }
         }
         return intf;
+    }
+
+    private String getVlanIdFromUri(NicTO nic) {
+        if (nic.getBroadcastUri() == null) {
+            return null;
+        }
+        String scheme = nic.getBroadcastUri().getScheme();
+        if ("vlan".equals(scheme) || "storage".equals(scheme)) {
+            String vlanId = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
+            if (vlanId != null && !vlanId.equalsIgnoreCase("untagged")) {
+                return vlanId;
+            }
+        }
+        return null;
     }
 
     private String getOvsTunnelNetworkName(final String broadcastUri) {

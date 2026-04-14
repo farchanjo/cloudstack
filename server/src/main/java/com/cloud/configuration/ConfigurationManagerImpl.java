@@ -8726,6 +8726,7 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         final String tags = cmd.getTags();
         final List<Long> domainIds = cmd.getDomainIds();
         final List<Long> zoneIds = cmd.getZoneIds();
+        final String internetProtocol = cmd.getInternetProtocol();
 
         // Verify input parameters
         final NetworkOfferingVO offeringToUpdate = _networkOfferingDao.findById(id);
@@ -8741,9 +8742,23 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         List<Long> existingZoneIds = networkOfferingDetailsDao.findZoneIds(id);
         Collections.sort(existingZoneIds);
 
-        // Don't allow to update system network offering
-        if (offeringToUpdate.isSystemOnly()) {
+        // Structural fields cannot be edited on system offerings; detail-only
+        // updates (e.g. internetProtocol on System-Public-Network) are allowed.
+        boolean structuralChangeRequested = name != null || displayText != null || availabilityStr != null
+                || sortKey != null || state != null || tags != null || maxconn != null;
+        if (offeringToUpdate.isSystemOnly() && structuralChangeRequested) {
             throw new InvalidParameterValueException("Can't update system network offerings");
+        }
+
+        // Validate and normalise internetProtocol if provided
+        String normalisedInternetProtocol = null;
+        if (internetProtocol != null) {
+            NetUtils.InternetProtocol protocol = NetUtils.InternetProtocol.fromValue(internetProtocol);
+            if (protocol == null) {
+                throw new InvalidParameterValueException(String.format(
+                        "Invalid internet protocol [%s]. Supported values: IPv4, DualStack.", internetProtocol));
+            }
+            normalisedInternetProtocol = protocol.toString();
         }
 
         // check if valid domain
@@ -8892,6 +8907,16 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         if (!detailsVO.isEmpty()) {
             for (NetworkOfferingDetailsVO detailVO : detailsVO) {
                 networkOfferingDetailsDao.persist(detailVO);
+            }
+        }
+
+        if (normalisedInternetProtocol != null) {
+            NetworkOfferingDetailsVO existing = networkOfferingDetailsDao.findDetail(id, Detail.internetProtocol.toString());
+            if (existing == null) {
+                networkOfferingDetailsDao.persist(new NetworkOfferingDetailsVO(id, Detail.internetProtocol, normalisedInternetProtocol, true));
+            } else if (!normalisedInternetProtocol.equals(existing.getValue())) {
+                existing.setValue(normalisedInternetProtocol);
+                networkOfferingDetailsDao.update(existing.getId(), existing);
             }
         }
 
