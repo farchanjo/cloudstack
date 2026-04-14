@@ -372,8 +372,41 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             List<IPAddressVO> vpcIps = _ipAddressDao.listByAssociatedVpc(router.getVpcId(), true);
             if (CollectionUtils.isNotEmpty(vpcIps)) {
                 buf.append(String.format(" source_nat_ip=%s", vpcIps.get(0).getAddress().toString()));
-                logger.debug("The final Boot Args for " + profile + ": " + buf);
             }
+            appendPublicIpv6ToBootArgs(router, buf);
+            logger.debug("The final Boot Args for " + profile + ": " + buf);
+        }
+    }
+
+    /**
+     * Appends the VR's public-NIC (eth1) IPv6 address, prefix length and
+     * gateway to the kernel boot arguments so the systemvm init scripts can
+     * configure eth1 v6. IPv6 is routed (not NATted), so we pass the NIC's
+     * own v6 address rather than an associated public IP entry.
+     *
+     * Follows the existing cmdline convention used for eth0/eth2:
+     *   eth1ip6=&lt;addr&gt; eth1ip6prelen=&lt;N&gt; ip6gateway=&lt;gw&gt;
+     */
+    private void appendPublicIpv6ToBootArgs(final DomainRouterVO router, final StringBuilder buf) {
+        final List<NicVO> nics = _nicDao.listByVmId(router.getId());
+        for (NicVO nic : nics) {
+            final Network nicNetwork = _networkDao.findById(nic.getNetworkId());
+            if (nicNetwork == null || nicNetwork.getTrafficType() != TrafficType.Public) {
+                continue;
+            }
+            if (nic.getIPv6Address() == null || nic.getIPv6Gateway() == null || nic.getIPv6Cidr() == null) {
+                continue;
+            }
+            final String cidr = nic.getIPv6Cidr();
+            final int slash = cidr.indexOf('/');
+            if (slash < 0) {
+                continue;
+            }
+            final String prelen = cidr.substring(slash + 1);
+            buf.append(" eth1ip6=").append(nic.getIPv6Address());
+            buf.append(" eth1ip6prelen=").append(prelen);
+            buf.append(" ip6gateway=").append(nic.getIPv6Gateway());
+            break;
         }
     }
 
