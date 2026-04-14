@@ -297,6 +297,14 @@ setup_ipv6() {
     rm -rf /etc/radvd.conf
     setup_radvd "0" $GUEST_GW6 $GUEST_CIDR6_SIZE $enableradvd
   fi
+  if [ -n "$ETH1_IP6" ]
+  then
+    # Public eth1 IPv6: routed (no NAT). Set address + default v6 route via $IP6GW.
+    setup_interface_ipv6 "1" $ETH1_IP6 $ETH1_IP6_PRELEN
+    if [ -n "$IP6GW" ]; then
+      ip -6 route replace default via "$IP6GW" dev eth1 || true
+    fi
+  fi
   if [ -n "$ETH2_IP6" ]
   then
     setup_interface_ipv6 "2" $ETH2_IP6 $ETH2_IP6_PRELEN
@@ -304,7 +312,7 @@ setup_ipv6() {
 }
 
 restore_ipv6() {
-  log_it "Restoring IPv6 configurations with ETH0_IP6=$ETH0_IP6 GUEST_GW6=$GUEST_GW6 GUEST_CIDR6_SIZE=$GUEST_CIDR6_SIZE ETH2_IP6=$ETH2_IP6"
+  log_it "Restoring IPv6 configurations with ETH0_IP6=$ETH0_IP6 ETH1_IP6=$ETH1_IP6 GUEST_GW6=$GUEST_GW6 GUEST_CIDR6_SIZE=$GUEST_CIDR6_SIZE ETH2_IP6=$ETH2_IP6"
   if [ -n "$ETH0_IP6" ] || [ -n "$GUEST_GW6"  -a -n "$GUEST_CIDR6_SIZE" ]
     then
     enable_interface_ipv6 "0" true
@@ -312,6 +320,13 @@ restore_ipv6() {
   if [ -n "$ETH0_IP6" ]
   then
     enable_radvd
+  fi
+  if [ -n "$ETH1_IP6" ]
+  then
+    enable_interface_ipv6 "1" true
+    if [ -n "$IP6GW" ]; then
+      ip -6 route replace default via "$IP6GW" dev eth1 || true
+    fi
   fi
   if [ -n "$ETH2_IP6" ]
   then
@@ -773,6 +788,12 @@ parse_cmd_line() {
             ;;
         eth0ip6prelen)
             export ETH0_IP6_PRELEN=$VALUE
+            ;;
+        eth1ip6)
+            export ETH1_IP6=$VALUE
+            ;;
+        eth1ip6prelen)
+            export ETH1_IP6_PRELEN=$VALUE
             ;;
         eth2ip6)
             export ETH2_IP6=$VALUE

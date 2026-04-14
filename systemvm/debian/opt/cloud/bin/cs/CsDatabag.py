@@ -203,6 +203,22 @@ class CsCmdLine(CsDataBag):
             return self.idata()['source_nat_ip']
         return False
 
+    def get_public_ip6_address(self):
+        return self.idata().get("public_ip6_address", False)
+
+    def get_public_ip6_gateway(self):
+        return self.idata().get("public_ip6_gateway", False)
+
+    def get_public_ip6_cidr(self):
+        # passed as full CIDR e.g. 2a13:8740:0:1::/64
+        return self.idata().get("public_ip6_cidr", False)
+
+    def get_public_ip6_prelen(self):
+        cidr = self.get_public_ip6_cidr()
+        if not cidr or "/" not in cidr:
+            return False
+        return cidr.split("/")[1]
+
 
 class CsGuestNetwork(CsDataBag):
     """ Get guestnetwork config parameters """
