@@ -597,7 +597,14 @@ setup_sshd(){
 
 setup_vpc_apache2() {
   log_it "Setting up apache web server for VPC"
-  systemctl disable apache2
+  # Mask (not just disable) so systemd preset cannot re-enable apache2
+  # before CsApache writes a vhost. apache2 will be unmasked + started
+  # by CsApache.setup() when CS pushes the first guest tier IP. Without
+  # this, a redundant VR boots with apache enabled (Debian preset) but
+  # no Listen directive yet, fails with "no listening sockets", and
+  # SetupGuestNetworkCommand reports failure -> tier never implements.
+  systemctl stop apache2 2>/dev/null || true
+  systemctl mask apache2
   clean_ipalias_config
   setup_apache2_common
 }
@@ -640,6 +647,22 @@ setup_apache2_common() {
   [ -f /etc/apache2/mods-available/alias.conf ] && sed -i s/"Options Indexes MultiViews"/"Options -Indexes MultiViews"/ /etc/apache2/mods-available/alias.conf
 
   echo "Options -Indexes" > /var/www/html/.htaccess
+
+  # Always provide at least one bindable Listen so apache2.service can start
+  # successfully even before any vhost is configured. Without this, on a
+  # redundant VR boot apache2 (auto-started by Debian preset) fails with
+  # "no listening sockets available" and the failed state cascades into
+  # SetupGuestNetworkCommand failure -> tier never implements.
+  # CsApache.setup() will write the real per-IP vhost files on demand.
+  cat > /etc/apache2/sites-enabled/000-cs-baseline.conf <<'BASELINE'
+# Baseline listen so apache can start without any vhost configured.
+# Real per-IP vhosts are managed by CsApache.setup() in cs/CsApp.py.
+Listen 127.0.0.1:8082
+<VirtualHost 127.0.0.1:8082>
+    ServerName cs-baseline.local
+    DocumentRoot /var/www/html
+</VirtualHost>
+BASELINE
 }
 
 setup_apache2() {
