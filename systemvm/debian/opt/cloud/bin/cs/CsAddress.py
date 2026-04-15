@@ -781,6 +781,14 @@ class CsIP:
         tableName = "Table_" + self.dev
 
         if method == "add":
+            # Ensure the device is administratively UP before adding routes
+            # via it. On a redundant VR's first SetupGuestNetworkCommand the
+            # public interface (eth1) is initially DOWN (BACKUP holds no
+            # public IP yet), and `ip route add ... dev eth1` fails with
+            # "Network is unreachable". The keepalived/redundant code will
+            # bring eth1 back DOWN later if this VR is the BACKUP.
+            if self.get_type() in ["public"]:
+                CsHelper.execute("ip link set %s up" % self.dev)
             if not self.config.is_vpc():
                 if self.get_type() in ["public"]:
                     route.set_route("table %s throw %s proto static" % (tableName, self.config.address().dbag['eth0'][0]['network']))
