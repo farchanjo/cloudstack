@@ -5,6 +5,8 @@ PACKAGE = $(shell dh_listpackages|head -n 1|cut -d '-' -f 1)
 SYSCONFDIR = "/etc"
 DESTDIR = "debian/tmp"
 
+export NODE_OPTIONS := --openssl-legacy-provider
+
 %:
 	dh $@ --with systemd
 
