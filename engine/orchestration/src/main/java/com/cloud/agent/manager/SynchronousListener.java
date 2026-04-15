@@ -128,7 +128,7 @@ public class SynchronousListener implements Listener {
         profiler.stop();
 
         logger.trace("Synchronized command - sending completed, time: {}, answer: {}", profiler.getDurationInMillis(),
-            (_answers != null ? _answers[0].toString() : "null"));
+            (_answers != null && _answers.length > 0 ? _answers[0].toString() : "null"));
         return _answers;
     }
 
