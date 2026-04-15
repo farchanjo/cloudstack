@@ -83,10 +83,24 @@ class CsRedundant(object):
     def _redundant_on(self):
         guest = self.address.get_guest_if()
 
-        # No redundancy if there is no guest network
+        # No guest network yet (initial redundant VR setup before the
+        # tier has been implemented, or all guest tiers have been
+        # removed). Do NOT call set_backup()/_redundant_off() here:
+        # set_backup() tears down the public interface (eth1 DOWN, stops
+        # dnsmasq, conntrackd, ipsec, xl2tpd, cloud-password-server) which
+        # breaks the initial SetupGuestNetworkCommand flow -- the tier
+        # cannot implement if public state is wiped every configure.py
+        # invocation. Public state belongs to keepalived's VRRP notify
+        # scripts (configure_router.py -p/-b), not to "guest is None"
+        # handling. Just make sure no stale keepalived/conntrackd is
+        # running and defer; when the tier is later added with add:True
+        # in ips.json, configure.py will call _redundant_on again and
+        # this time guest will be non-None, keepalived starts, VRRP
+        # elects PRIMARY, and set_primary() brings eth1 UP with the VIP.
         if guest is None:
-            self.set_backup(restart_conntrackd=False)
-            self._redundant_off()
+            logging.info("Guest tier not yet configured; deferring keepalived setup")
+            CsHelper.service("conntrackd", "stop")
+            CsHelper.service("keepalived", "stop")
             return
 
         interfaces = [interface for interface in self.address.get_interfaces() if interface.is_guest()]
