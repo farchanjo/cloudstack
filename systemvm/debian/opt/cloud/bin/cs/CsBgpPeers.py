@@ -82,12 +82,29 @@ class CsBgpPeers(CsDataBag):
         self.frr_conf.add("ip nht resolve-via-default")
         return
 
+    def _is_backup(self):
+        """Return True only on a redundant VR currently in BACKUP state.
+
+        Used to make this VR's BGP advertisements less preferred than the
+        PRIMARY peer (active/passive HA): both VRs keep BGP sessions up so
+        failover is sub-second, but upstream best-path always elects the
+        PRIMARY because the BACKUP prepends its own ASN N times on outbound.
+        """
+        if not self.cl.is_redundant():
+            return False
+        return not self.cl.is_primary()
+
+    def _prepend_route_map_name(self, as_number):
+        return "BGP-VR-OUT-PREPEND-{}".format(as_number)
+
     def _process_peers(self):
+        is_backup = self._is_backup()
         for as_number in self.peers.keys():
             self.frr_conf.add("router bgp {}".format(as_number))
             self.frr_conf.add(" bgp router-id {}".format(self.public_ip))
             if self.peers[as_number]['ip6_peers']:
                 self.frr_conf.add(" bgp default ipv6-unicast")
+            rmap_name = self._prepend_route_map_name(as_number)
             for ip4_peer in self.peers[as_number]['ip4_peers']:
                 self.frr_conf.add(" neighbor {} remote-as {}".format(ip4_peer['ip4_address'], ip4_peer['peer_as_number']))
                 if 'peer_password' in ip4_peer:
@@ -107,13 +124,24 @@ class CsBgpPeers(CsDataBag):
                 ip4_cidrs = set({ip4_peer['guest_ip4_cidr'] for ip4_peer in self.peers[as_number]['ip4_peers']})
                 for ip4_cidr in ip4_cidrs:
                     self.frr_conf.add("  network {}".format(ip4_cidr))
+                if is_backup:
+                    for ip4_peer in self.peers[as_number]['ip4_peers']:
+                        self.frr_conf.add("  neighbor {} route-map {} out".format(ip4_peer['ip4_address'], rmap_name))
                 self.frr_conf.add(" exit-address-family")
             if self.peers[as_number]['ip6_peers']:
                 self.frr_conf.add(" address-family ipv6 unicast")
                 ip6_cidrs = set({ip6_peer['guest_ip6_cidr'] for ip6_peer in self.peers[as_number]['ip6_peers']})
                 for ip6_cidr in ip6_cidrs:
                     self.frr_conf.add("  network {}".format(ip6_cidr))
+                if is_backup:
+                    for ip6_peer in self.peers[as_number]['ip6_peers']:
+                        self.frr_conf.add("  neighbor {} route-map {} out".format(ip6_peer['ip6_address'], rmap_name))
                 self.frr_conf.add(" exit-address-family")
 
     def _post_set(self):
+        if self._is_backup():
+            for as_number in self.peers.keys():
+                self.frr_conf.add("route-map {} permit 10".format(self._prepend_route_map_name(as_number)))
+                self.frr_conf.add(" set as-path prepend {} {} {}".format(as_number, as_number, as_number))
+                self.frr_conf.add("exit")
         self.frr_conf.add("line vty")

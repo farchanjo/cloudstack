@@ -18,6 +18,7 @@
 # under the License.
 
 from cs.CsRedundant import CsRedundant
+from cs.CsBgpPeers import CsBgpPeers
 from cs.CsDatabag import CsCmdLine
 from cs.CsAddress import CsAddress
 from cs.CsConfig import CsConfig
@@ -57,3 +58,13 @@ if options.backup:
 
 if options.fault:
     red.set_fault()
+
+# After a VRRP transition, regenerate FRR config so the AS-path prepend
+# applied on BACKUP routers is removed when promoted to PRIMARY (and
+# applied when demoted). CsBgpPeers reads is_primary() from the DataBag,
+# which set_primary()/set_backup() updated above.
+if options.primary or options.backup:
+    try:
+        CsBgpPeers("bgppeers", config).process()
+    except Exception as e:
+        logging.error("Failed to refresh BGP peer config after VRRP transition: %s", e)
