@@ -57,6 +57,13 @@ class CsApache(CsApp):
         file.search("ServerName.*", "\tServerName %s.%s" % (self.config.cl.get_type(), self.config.get_domain()))
         if file.is_changed():
             file.commit()
+            # apache2.service may have been masked by setup_vpc_apache2 to
+            # prevent it from auto-starting on boot before any vhost exists
+            # (which would fail with "no listening sockets" and break tier
+            # implement on redundant VRs). Now that we have a real vhost,
+            # unmask + enable + start.
+            CsHelper.execute2("systemctl unmask apache2", False)
+            CsHelper.execute2("systemctl enable apache2", False)
             CsHelper.execute2("systemctl restart apache2", False)
 
 
