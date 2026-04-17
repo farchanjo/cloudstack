@@ -438,6 +438,28 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     private VifDriver defaultVifDriver;
     private VifDriver tungstenVifDriver;
+    private VifDriver vfPassthroughVifDriver;
+    private VifDriver vdpaVifDriver;
+    private SfLifecycleManager sfLifecycleManager;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
+
+    public VifDriver getVfPassthroughVifDriver() {
+        return vfPassthroughVifDriver;
+    }
+
+    public SfLifecycleManager getSfLifecycleManager() {
+        return sfLifecycleManager;
+    }
+
+    public com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler getIntentReconciler() {
+        return intentReconciler;
+    }
+
+    public com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer getTcRuleProgrammer() {
+        return tcRuleProgrammer;
+    }
     private Map<TrafficType, VifDriver> trafficTypeVifDriverMap;
 
     protected static final String DEFAULT_OVS_VIF_DRIVER_CLASS_NAME = "com.cloud.hypervisor.kvm.resource.OvsVifDriver";
@@ -1724,6 +1746,44 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
         defaultVifDriver = getVifDriverClass(defaultVifDriverName, params);
         tungstenVifDriver = getVifDriverClass(DEFAULT_TUNGSTEN_VIF_DRIVER_CLASS_NAME, params);
+        // Always available; only used when NicTO.useHwOffload=true (SR-IOV VF passthrough).
+        // Loading is best-effort: if the class is missing, HW offload requests will fail loudly at plug time.
+        try {
+            vfPassthroughVifDriver = getVifDriverClass(VfPassthroughVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VfPassthroughVifDriver not available; SR-IOV VF passthrough requests will fail", e);
+        }
+        try {
+            vdpaVifDriver = getVifDriverClass(VdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VdpaVifDriver not available; SF vDPA requests will fail", e);
+        }
+        sfLifecycleManager = new SfLifecycleManager();
+        representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
+        tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
+        // HW offload uplink config is read directly from agent.properties because
+        // the params Map passed to configure() only carries command-line args.
+        Properties hwOffloadProps = new Properties();
+        try {
+            File agentPropsFile = PropertiesUtil.findConfigFile("agent.properties");
+            if (agentPropsFile != null) {
+                hwOffloadProps = PropertiesUtil.loadFromFile(agentPropsFile);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("Could not read agent.properties for HW offload config: {}", e.getMessage());
+        }
+        com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind uplinkKind;
+        try {
+            String kindStr = hwOffloadProps.getProperty("hwoffload.uplink.kind", "auto");
+            uplinkKind = com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind.valueOf(kindStr.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            LOGGER.warn("Invalid hwoffload.uplink.kind, falling back to AUTO: {}", e.getMessage());
+            uplinkKind = com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind.AUTO;
+        }
+        boolean uplinkLag = Boolean.parseBoolean(hwOffloadProps.getProperty("hwoffload.uplink.lag", "false"));
+        String uplinkNetdev = hwOffloadProps.getProperty("hwoffload.uplink.netdev");
+        intentReconciler = new com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler(
+                representorMapper, tcRuleProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
 
         // Load any per-traffic-type vif drivers
         for (final Map.Entry<String, Object> entry : params.entrySet()) {
@@ -1774,6 +1834,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
 
         return vifDriver;
+    }
+
+    public VifDriver getVifDriver(final NicTO nic) {
+        if (nic.isUseSfVdpa() && vdpaVifDriver != null) {
+            return vdpaVifDriver;
+        }
+        if (nic.getUseHwOffload() != null && nic.getUseHwOffload() && vfPassthroughVifDriver != null) {
+            return vfPassthroughVifDriver;
+        }
+        return getVifDriver(nic.getType());
     }
 
     public VifDriver getVifDriver(final TrafficType trafficType, final String bridgeName) {
@@ -2558,7 +2628,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             final List<InterfaceDef> pluggedNics = getInterfaces(conn, routerName);
             InterfaceDef routerNic = null;
 
+            LOGGER.info("SetupGuestNetwork: looking for mac={} in VM {} ({} interfaces found)", nic.getMac(), routerName, pluggedNics.size());
             for (final InterfaceDef pluggedNic : pluggedNics) {
+                LOGGER.info("SetupGuestNetwork: found interface type={} mac={} dev={} pciAddr={}",
+                        pluggedNic.getNetType(), pluggedNic.getMacAddress(), pluggedNic.getDevName(), pluggedNic.getPciAddress());
                 if (pluggedNic.getMacAddress().equalsIgnoreCase(nic.getMac())) {
                     routerNic = pluggedNic;
                     break;
@@ -2568,6 +2641,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             if (routerNic == null) {
                 return new ExecutionResult(false, "Can not find nic with mac " + nic.getMac() + " for VM " + routerName);
             }
+
+            // Note: auto-TC programming was previously here, but
+            // SetupGuestNetworkCommand carries only the link-local control IP,
+            // not the real public IP. The trigger now lives in
+            // prepareNetworkElementCommand(SetSourceNatCommand) where
+            // cmd.getIpAddress().getPublicIp() is the actual SNAT IP.
 
             return new ExecutionResult(true, null);
         } catch (final LibvirtException e) {
@@ -2591,6 +2670,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
             for (final InterfaceDef pluggedNic : pluggedNics) {
                 final String pluggedVlanBr = pluggedNic.getBrName();
+                if (pluggedVlanBr == null) {
+                    devNum++;
+                    continue;
+                }
                 final String pluggedVlanId = getBroadcastUriFromBridge(pluggedVlanBr);
                 if (pubVlan.equalsIgnoreCase(Vlan.UNTAGGED) && pluggedVlanBr.equalsIgnoreCase(publicBridgeName)) {
                     break;
@@ -2607,6 +2690,37 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             }
 
             pubIP.setNicDevId(devNum);
+
+            if (pubIP.isAdd() && pubIP.isSourceNat() && intentReconciler != null) {
+                String hostdevVfPci = null;
+                for (final InterfaceDef pluggedNic : pluggedNics) {
+                    if (pluggedNic.getNetType() == LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
+                        hostdevVfPci = pluggedNic.getPciAddress();
+                        break;
+                    }
+                }
+                String publicIp = pubIP.getPublicIp();
+                LOGGER.info("SetSourceNat: hostdevVfPci={} publicIp={} for VR {}", hostdevVfPci, publicIp, routerName);
+                if (hostdevVfPci != null && publicIp != null) {
+                    var spec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+                    spec.vrId = routerName;
+                    spec.version = System.currentTimeMillis();
+                    spec.guestVfPci = hostdevVfPci;
+                    spec.natRules = new java.util.ArrayList<>();
+                    var snat = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                    snat.dir = "SNAT";
+                    snat.translateAddr = publicIp;
+                    snat.ipProto = "tcp";
+                    spec.natRules.add(snat);
+                    var snatUdp = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                    snatUdp.dir = "SNAT";
+                    snatUdp.translateAddr = publicIp;
+                    snatUdp.ipProto = "udp";
+                    spec.natRules.add(snatUdp);
+                    intentReconciler.applyIntent(spec);
+                    LOGGER.info("Programmed TC SNAT rules for VR {} (vfPci={} publicIp={})", routerName, hostdevVfPci, publicIp);
+                }
+            }
 
             return new ExecutionResult(true, "success");
         } catch (final LibvirtException e) {
@@ -3432,13 +3546,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public void createVifs(final VirtualMachineTO vmSpec, final LibvirtVMDef vm) throws InternalErrorException, LibvirtException {
         final NicTO[] nics = vmSpec.getNics();
+        LOGGER.info("createVifs: VM={} total NICs={}", vmSpec.getName(), nics.length);
+        for (final NicTO n : nics) {
+            LOGGER.info("createVifs: NIC devId={} mac={} type={} useHwOffload={} vfPci={} ip={}",
+                    n.getDeviceId(), n.getMac(), n.getType(), n.getUseHwOffload(), n.getVfPciAddress(), n.getIp());
+        }
         final Map <String, String> params = vmSpec.getDetails();
         String nicAdapter = "";
         if (params != null && params.get("nicAdapter") != null && !params.get("nicAdapter").isEmpty()) {
             nicAdapter = params.get("nicAdapter");
         }
         Map<String, String> extraConfig = vmSpec.getExtraConfig();
-        for (int i = 0; i < nics.length; i++) {
+        int maxDevId = 0;
+        for (final NicTO n : nics) {
+            if (n.getDeviceId() > maxDevId) {
+                maxDevId = n.getDeviceId();
+            }
+        }
+        for (int i = 0; i <= maxDevId; i++) {
             for (final NicTO nic : vmSpec.getNics()) {
                 if (nic.getDeviceId() == i) {
                     createVif(vm, vmSpec, nic, nicAdapter, extraConfig);
@@ -3895,11 +4020,36 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             LOGGER.error("LibvirtVMDef object get devices with null result");
             throw new InternalErrorException("LibvirtVMDef object get devices with null result");
         }
-        final InterfaceDef interfaceDef = getVifDriver(nic.getType(), nic.getName()).plug(nic, vm.getPlatformEmulator(), nicAdapter, extraConfig);
+        LOGGER.info("createVif: nic deviceId={} mac={} type={} useHwOffload={} vfPciAddress={} ip={}",
+                nic.getDeviceId(), nic.getMac(), nic.getType(), nic.getUseHwOffload(), nic.getVfPciAddress(), nic.getIp());
+        final VifDriver driver = selectVifDriver(nic);
+        LOGGER.info("createVif: selected VifDriver={} for nic deviceId={} mac={}",
+                driver.getClass().getSimpleName(), nic.getDeviceId(), nic.getMac());
+        final InterfaceDef interfaceDef = driver.plug(nic, vm.getPlatformEmulator(), nicAdapter, extraConfig);
+        LOGGER.info("createVif: plug result netType={} mac={} pciAddr={} for nic deviceId={}",
+                interfaceDef.getNetType(), interfaceDef.getMacAddress(), interfaceDef.getPciAddress(), nic.getDeviceId());
         if (vmSpec.getDetails() != null) {
             setInterfaceDefQueueSettings(vmSpec.getDetails(), vmSpec.getCpus(), interfaceDef);
         }
         vm.getDevices().addDevice(interfaceDef);
+    }
+
+    private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
+        if (nic.isUseSfVdpa()) {
+            if (vdpaVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests SF vDPA (vdpaDevice=" + nic.getVdpaDevice() + ") but VdpaVifDriver is not loaded");
+            }
+            return vdpaVifDriver;
+        }
+        if (nic.isUseHwOffload()) {
+            if (vfPassthroughVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests HW offload (vfPciAddress=" + nic.getVfPciAddress() + ") but VfPassthroughVifDriver is not loaded");
+            }
+            return vfPassthroughVifDriver;
+        }
+        return getVifDriver(nic.getType(), nic.getName());
     }
 
     public boolean cleanupDisk(Map<String, String> volumeToDisconnect) {
@@ -4230,6 +4380,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         if (hostSupportsOvfExport()) {
             cmd.getHostDetails().put(HOST_OVFTOOL_VERSION, getHostOvfToolVersion());
         }
+        // SR-IOV VF discovery: enumerate Mellanox VFs that have a switchdev representor on the PF.
+        // VfPoolManager.registerHostVfs() consumes these on the management server.
+        reportSriovCapabilities(cmd.getHostDetails());
         HealthCheckResult healthCheckResult = getHostHealthCheckResult();
         if (healthCheckResult != HealthCheckResult.IGNORE) {
             cmd.setHostHealthCheckResult(healthCheckResult == HealthCheckResult.SUCCESS);
@@ -5957,6 +6110,113 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     public boolean hostSupportsOvfExport() {
         int exitValue = Script.runSimpleBashScriptForExitValue(OVF_EXPORT_SUPPORTED_CHECK_CMD);
         return exitValue == 0;
+    }
+
+    /**
+     * Inspect /sys/class/net/ for switchdev representors (phys_port_name=pf?vf*) and
+     * advertise their PFs + VF counts + PCI addresses to the management server via
+     * StartupRoutingCommand host_details. Keys:
+     *   sriov.enabled                = "true" if any VF representor exists
+     *   sriov.vfs.&lt;pfname&gt;.count = number of VFs on that PF
+     *   sriov.vfs.&lt;pfname&gt;.pci   = comma-separated PCI addresses
+     */
+    void reportSriovCapabilities(java.util.Map<String, String> details) {
+        try {
+            java.io.File netDir = new java.io.File("/sys/class/net");
+            String[] ifaces = netDir.list();
+            if (ifaces == null) {
+                return;
+            }
+            // pfName -> list of VF PCI addresses (in vfN order)
+            java.util.Map<String, java.util.List<String>> pfToPci = new java.util.TreeMap<>();
+            for (String iface : ifaces) {
+                java.io.File ppnFile = new java.io.File("/sys/class/net/" + iface + "/phys_port_name");
+                if (!ppnFile.isFile()) {
+                    continue;
+                }
+                String ppn = readSysfs(ppnFile).trim();
+                if (!ppn.matches("pf[01]vf\\d+")) {
+                    continue;
+                }
+                String parentDevicePath = new java.io.File("/sys/class/net/" + iface + "/device").getCanonicalPath();
+                String parentPci = new java.io.File(parentDevicePath).getName();
+                String pfName = derivePfName(parentPci, ppn);
+                if (pfName == null) {
+                    continue;
+                }
+                String vfPci = readVfPci(parentPci, ppn);
+                if (vfPci == null) {
+                    continue;
+                }
+                pfToPci.computeIfAbsent(pfName, k -> new java.util.ArrayList<>()).add(vfPci);
+            }
+            if (pfToPci.isEmpty()) {
+                return;
+            }
+            details.put("sriov.enabled", "true");
+            for (java.util.Map.Entry<String, java.util.List<String>> e : pfToPci.entrySet()) {
+                details.put("sriov.vfs." + e.getKey() + ".count", String.valueOf(e.getValue().size()));
+                details.put("sriov.vfs." + e.getKey() + ".pci", String.join(",", e.getValue()));
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Failed to inspect SR-IOV capabilities; HW offload may not be available", e);
+        }
+    }
+
+    /**
+     * Resolve the PF netdev name for a representor: read the PCI parent's net dir
+     * (the PF itself) and pick the first netdev entry.
+     */
+    private String derivePfName(String parentPci, String physPortName) {
+        java.io.File pfNetDir = new java.io.File("/sys/bus/pci/devices/" + parentPci + "/net");
+        if (!pfNetDir.isDirectory()) {
+            return null;
+        }
+        String[] entries = pfNetDir.list();
+        if (entries == null) {
+            return null;
+        }
+        // The PF netdev does NOT have phys_port_name=pfXvfY; it has pX (e.g. p0).
+        for (String n : entries) {
+            String ppn = readSysfs(new java.io.File("/sys/class/net/" + n + "/phys_port_name")).trim();
+            if (ppn.matches("p\\d+")) {
+                return n;
+            }
+        }
+        return entries.length > 0 ? entries[0] : null;
+    }
+
+    /**
+     * Resolve VF PCI address from the PF + phys_port_name (pf0vfN -> virtfnN under PF).
+     */
+    private String readVfPci(String pfPci, String physPortName) {
+        // phys_port_name pf0vfN or pf1vfN -> virtfnN
+        int vfIdx;
+        try {
+            vfIdx = Integer.parseInt(physPortName.substring(physPortName.indexOf("vf") + 2));
+        } catch (Exception e) {
+            return null;
+        }
+        java.io.File virtfn = new java.io.File("/sys/bus/pci/devices/" + pfPci + "/virtfn" + vfIdx);
+        if (!virtfn.exists()) {
+            return null;
+        }
+        try {
+            return new java.io.File(virtfn.getCanonicalPath()).getName();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    private static String readSysfs(java.io.File f) {
+        if (!f.isFile()) {
+            return "";
+        }
+        try {
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            return "";
+        }
     }
 
     public String getHostVirtV2vVersion() {
