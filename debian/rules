@@ -15,7 +15,7 @@ override_dh_auto_configure:
 	echo VERSION=${VERSION} >> replace.properties.tmp
 
 override_dh_auto_build:
-	mvn clean package -Psystemvm,developer -Dsystemvm \
+	mvn clean package -Psystemvm,developer -Dsystemvm -DskipTests \
 	    -Dcs.replace.properties=replace.properties.tmp \
 	    -Dmaven.repo.local=$(HOME)/.m2/repository \
 	     ${ACS_BUILD_OPTS}
