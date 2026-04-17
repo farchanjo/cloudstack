@@ -314,6 +314,11 @@ class CsRedundant(object):
 
         interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
         CsHelper.reconfigure_interfaces(self.cl, interfaces)
+
+        # HW offload: BACKUP submits empty intent so host clears any TC rules
+        # this rep pair was carrying from the previous PRIMARY epoch.
+        self._submit_hw_offload_intent(empty=True)
+
         logging.info("Router switched to backup mode")
 
     def set_primary(self):
@@ -408,7 +413,41 @@ class CsRedundant(object):
                     if interface.get_device() == device:
                         CsHelper.execute("arping -I %s -U %s -c 1" % (device, interface.get_ip()))
 
+        # HW offload: PRIMARY just transitioned UP — re-submit the full intent so
+        # the host agent reinstalls TC rules on this VR's representor pair.
+        # If conntrackd already restored CT entries, the chain-1 +est rule will
+        # match and offload sustained traffic immediately on next packet.
+        self._submit_hw_offload_intent(empty=False)
+
         logging.info("Router switched to primary mode")
+
+    def _is_primary(self):
+        """Best-effort check used by configure.py and HW-offload integration."""
+        try:
+            return bool(self.cl.is_primary())
+        except Exception:
+            try:
+                return bool(self.cl.get_primary_state())
+            except Exception:
+                return True
+
+    def _submit_hw_offload_intent(self, empty=False):
+        """
+        Build and POST an HW offload intent to the host. Idempotent and
+        non-blocking on failure (iptables fallback above remains active).
+        """
+        try:
+            from cs.CsHwOffloadIntent import CsHwOffloadIntent
+            hw = CsHwOffloadIntent(self.config)
+            if not hw.is_enabled():
+                return
+            if empty:
+                hw.submit_empty()
+            else:
+                hw.populate_from_databag(self.config)
+                hw.submit()
+        except Exception as e:
+            logging.warning("HW offload intent submit (empty=%s) failed: %s", empty, e)
 
     def _collect_ignore_ips(self):
         """
