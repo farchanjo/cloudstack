@@ -111,6 +111,24 @@ public class TcRuleProgrammer {
     }
 
     /**
+     * Catch-all rule at the END of chain 1 that simply passes the packet
+     * through (no NAT, no mirred). Required because chain-1 fall-through
+     * (no matching filter) drops the packet, and we need DNAT'd PFW traffic
+     * (which has src=external client and therefore doesn't match the tier-only
+     * SNAT rule at pref 50) to flow back to the kernel's normal forwarding
+     * path so the kernel iptables conntrack can reverse-NAT replies correctly.
+     *
+     * <p>Uses {@code flower} so the rule is HW-offloaded by mlx5. The
+     * {@code action pass} is the cheapest possible HW operation — no NAT,
+     * no commit, no mirred.
+     */
+    public void installCatchAllPass(String repName, int prio) {
+        runTc(String.format(
+            "tc filter add dev %s ingress chain 1 prio %d protocol ip flower action pass",
+            repName, prio));
+    }
+
+    /**
      * Install a NAT rule on the representor (chain 1, +new+trk).
      * On first packet of a flow: commits a CT entry with NAT, then forwards.
      * Subsequent packets are caught by the established-forward rule (cheaper).

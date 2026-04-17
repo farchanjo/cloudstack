@@ -308,6 +308,20 @@ public class IntentReconciler {
             }
         }
 
+        // Catch-all chain 1 rule (prio 200): plain `action pass`. Required because
+        // chain-1 fall-through drops the packet when no rule matches, but DNAT'd
+        // PFW traffic (whose src is the external client, NOT the tier CIDR) doesn't
+        // match the tier-only SNAT rule (pref 50). Without this catch-all, the
+        // kernel-DNATed packet would be dropped before reaching the wire. With
+        // `pass`, mlx5 HW lets the packet continue through OVS forwarding which
+        // then sends it via bond1 to the VM, preserving the original client src IP
+        // so the kernel iptables conntrack on the VR can reverse-NAT replies.
+        // Empirical fix verified 2026-04-17: PFW SSH succeeds end-to-end with this
+        // rule + tier-only SNAT (pref 50, src_ip=guestCidr).
+        if (isGuestSide) {
+            programmer.installCatchAllPass(inRep, 200);
+        }
+
         // ACL rules apply on whichever side they target. For simplicity, install on
         // the guest-side rep (most common for tenant-defined ACLs).
         if (isGuestSide && spec.aclRules != null) {

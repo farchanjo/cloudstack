@@ -2700,7 +2700,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     }
                 }
                 String publicIp = pubIP.getPublicIp();
-                LOGGER.info("SetSourceNat: hostdevVfPci={} publicIp={} for VR {}", hostdevVfPci, publicIp, routerName);
+                // Filter SNAT to tier sources only (src_ip = VPC supernet). Without this
+                // filter, DNAT'd PFW traffic (src=external client) would also get SNATed
+                // to the VR's public IP, which breaks the VR kernel conntrack reversal of
+                // the original DNAT — the reply would arrive with dst=public_ip instead
+                // of the original client IP, and kernel ct can't match it. With the filter,
+                // PFW falls through to the chain-1 catch-all `pass` rule (installed by
+                // IntentReconciler) and continues normally through kernel iptables NAT.
+                String guestCidr = cmd.getAccessDetail(NetworkElementCommand.GUEST_NETWORK_CIDR);
+                LOGGER.info("SetSourceNat: hostdevVfPci={} publicIp={} guestCidr={} for VR {}",
+                        hostdevVfPci, publicIp, guestCidr, routerName);
                 if (hostdevVfPci != null && publicIp != null) {
                     var spec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
                     spec.vrId = routerName;
@@ -2709,16 +2718,19 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     spec.natRules = new java.util.ArrayList<>();
                     var snat = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
                     snat.dir = "SNAT";
+                    snat.matchAddr = guestCidr;
                     snat.translateAddr = publicIp;
                     snat.ipProto = "tcp";
                     spec.natRules.add(snat);
                     var snatUdp = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
                     snatUdp.dir = "SNAT";
+                    snatUdp.matchAddr = guestCidr;
                     snatUdp.translateAddr = publicIp;
                     snatUdp.ipProto = "udp";
                     spec.natRules.add(snatUdp);
                     intentReconciler.applyIntent(spec);
-                    LOGGER.info("Programmed TC SNAT rules for VR {} (vfPci={} publicIp={})", routerName, hostdevVfPci, publicIp);
+                    LOGGER.info("Programmed TC SNAT rules for VR {} (vfPci={} publicIp={} matchCidr={})",
+                            routerName, hostdevVfPci, publicIp, guestCidr);
                 }
             }
 

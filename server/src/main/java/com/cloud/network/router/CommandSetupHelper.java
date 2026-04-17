@@ -929,6 +929,14 @@ public class CommandSetupHelper {
             cmd.setAccessDetail(NetworkElementCommand.ROUTER_NAME, router.getInstanceName());
             final DataCenterVO dcVo = _dcDao.findById(router.getDataCenterId());
             cmd.setAccessDetail(NetworkElementCommand.ZONE_NETWORK_TYPE, dcVo.getNetworkType().toString());
+            // VPC supernet (covers all tier subnets) so the agent's HW offload SNAT rule
+            // can match src_ip = guest CIDR and skip DNAT'd PFW traffic (src=external client).
+            if (router.getVpcId() != null) {
+                final VpcVO vpc = _vpcDao.findById(router.getVpcId());
+                if (vpc != null && vpc.getCidr() != null) {
+                    cmd.setAccessDetail(NetworkElementCommand.GUEST_NETWORK_CIDR, vpc.getCidr());
+                }
+            }
             cmds.addCommand("SetSourceNatCommand", cmd);
         }
     }
