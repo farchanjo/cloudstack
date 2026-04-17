@@ -239,6 +239,12 @@
     <bean id="vpcVirtualNetworkApplianceManagerImpl"
         class="com.cloud.network.router.VpcVirtualNetworkApplianceManagerImpl" />
 
+    <bean id="vfPoolManagerImpl"
+        class="com.cloud.network.router.VfPoolManagerImpl" />
+
+    <bean id="sfPoolManagerImpl"
+        class="com.cloud.network.router.SfPoolManagerImpl" />
+
     <bean id="virtualNetworkApplianceFactory"
         class="com.cloud.network.rules.VirtualNetworkApplianceFactory" />
 
