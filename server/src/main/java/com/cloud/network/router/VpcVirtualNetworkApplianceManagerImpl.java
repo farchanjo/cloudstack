@@ -37,6 +37,7 @@ import org.springframework.stereotype.Component;
 
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.Command;
+import com.cloud.agent.api.to.NicTO;
 import com.cloud.agent.api.Command.OnError;
 import com.cloud.agent.api.NetworkUsageCommand;
 import com.cloud.agent.api.PlugNicCommand;
@@ -105,6 +106,7 @@ import com.cloud.vm.Nic;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.NicVO;
 import com.cloud.vm.ReservationContext;
+import com.cloud.vm.ReservationContextImpl;
 import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.VirtualMachine.State;
 import com.cloud.vm.VirtualMachineProfile;
@@ -135,6 +137,10 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
     private EntityManager _entityMgr;
     @Inject
     protected HypervisorGuruManager _hvGuruMgr;
+    @Inject
+    private VfPoolManager _vfPoolManager;
+    @Inject
+    private com.cloud.offerings.dao.NetworkOfferingDao _networkOfferingDao2;
     @Inject
     protected NetworkDao networkDao;
     @Inject
@@ -333,6 +339,11 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                             defaultIp6Dns1 = nic.getIPv6Dns1();
                             defaultIp6Dns2 = nic.getIPv6Dns2();
                             isDnsConfigured = true;
+                        }
+                        if (nic.getTrafficType() == TrafficType.Guest && isHwOffloadNetwork(nic.getNetworkId())) {
+                            nic.setDeviceId(1);
+                            logger.info("Keeping HW offload guest NIC network={} in boot profile as eth1 (deviceId=1) for VF passthrough", nic.getNetworkId());
+                            continue;
                         }
                         logger.debug("Removing NIC " + nic + " of type " + nic.getTrafficType() + " from the NICs passed on Instance start. " + "The NIC will be plugged later");
                         it.remove();
@@ -547,16 +558,76 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                     }
                 }
 
+                // Pre-allocate guest NICs for HW offload networks before VR boots.
+                // VPC VRs normally get guest NICs via PlugNicCommand (hot-plug) AFTER boot,
+                // but PCI passthrough (hostdev) cannot be hot-plugged — it must be in the
+                // domain XML at boot time. So we allocate the NIC now, before StartCommand.
+                if (guestNics.isEmpty() && domainRouterVO.getVpcId() != null) {
+                    final List<? extends Network> vpcNetworks = _vpcMgr.getVpcNetworks(domainRouterVO.getVpcId());
+                    logger.info("HW offload pre-alloc: vpcId={} vpcNetworks.size={} for VR {}",
+                            domainRouterVO.getVpcId(), vpcNetworks != null ? vpcNetworks.size() : "null",
+                            domainRouterVO.getInstanceName());
+                    for (final Network vpcNetwork : vpcNetworks) {
+                        logger.info("HW offload pre-alloc: checking network={} traffic={} offering={} isPrivGw={}",
+                                vpcNetwork.getName(), vpcNetwork.getTrafficType(),
+                                vpcNetwork.getNetworkOfferingId(),
+                                _networkModel.isPrivateGateway(vpcNetwork.getId()));
+                        if (vpcNetwork.getTrafficType() != TrafficType.Guest) continue;
+                        if (_networkModel.isPrivateGateway(vpcNetwork.getId())) continue;
+                        if (!isHwOffloadNetwork(vpcNetwork.getId())) continue;
+
+                        final Nic existingNic = _nicDao.findByNtwkIdAndInstanceId(vpcNetwork.getId(), domainRouterVO.getId());
+                        if (existingNic != null) continue;
+
+                        logger.info("Pre-allocating guest NIC for HW offload network {} on VR {}",
+                                vpcNetwork.getName(), domainRouterVO.getInstanceName());
+                        final ReservationContext context = new ReservationContextImpl(null, null,
+                                _accountMgr.getSystemUser(), _accountMgr.getSystemAccount());
+                        final VirtualMachineProfileImpl vmProfile =
+                                new VirtualMachineProfileImpl(domainRouterVO, null, null, null, null);
+                        final NicProfile nicProfile = _networkMgr.createNicForVm(vpcNetwork, null, context, vmProfile, true);
+                        if (nicProfile != null) {
+                            _routerDao.addRouterToGuestNetwork(domainRouterVO, vpcNetwork);
+                            final Nic newNic = _nicDao.findByNtwkIdAndInstanceId(vpcNetwork.getId(), domainRouterVO.getId());
+                            if (newNic != null) {
+                                guestNics.add(new Pair<>(newNic, vpcNetwork));
+                                logger.info("Pre-allocated guest NIC id={} ip={} for HW offload network {} on VR {}",
+                                        newNic.getId(), newNic.getIPv4Address(), vpcNetwork.getName(),
+                                        domainRouterVO.getInstanceName());
+                            }
+                        }
+                    }
+                }
+
                 // add VPC router to guest networks
+                logger.info("finalizeCommandsOnStart: guestNics.size={} for VR {}", guestNics.size(), domainRouterVO.getInstanceName());
                 for (final Pair<Nic, Network> nicNtwk : guestNics) {
                     final Nic guestNic = updateNicWithDeviceId(nicNtwk.first().getId(), deviceId);
                     deviceId ++;
-                    // plug guest nic
-                    final PlugNicCommand plugNicCmd = new PlugNicCommand(_nwHelper.getNicTO(domainRouterVO, guestNic.getNetworkId(), null), domainRouterVO.getInstanceName(), domainRouterVO.getType(), details);
-                    cmds.addCommand(plugNicCmd);
-                    // set guest network
+
+                    // Check if this guest NIC's offering has HW offload enabled.
+                    // PCI passthrough (hostdev) cannot be hot-plugged — it must be in the
+                    // boot XML. The StartCommand's VirtualMachineTO already contains this NIC
+                    // (added by NetworkOrchestrator.prepare → vmProfile.getNics()), and
+                    // HypervisorGuruBase.allocateVfIfHwOffload() already enriched it with VF
+                    // info during toVirtualMachineTO(). So we skip the PlugNicCommand and
+                    // only issue SetupGuestNetworkCommand for configuration.
+                    boolean skipPlugNic = isHwOffloadNetwork(guestNic.getNetworkId());
+                    if (!skipPlugNic) {
+                        NicTO guestNicTo = _nwHelper.getNicTO(domainRouterVO, guestNic.getNetworkId(), null);
+                        final PlugNicCommand plugNicCmd = new PlugNicCommand(guestNicTo, domainRouterVO.getInstanceName(), domainRouterVO.getType(), details);
+                        cmds.addCommand(plugNicCmd);
+                    } else {
+                        logger.info("HW offload NIC for network {} already in boot domain XML; skipping PlugNic", guestNic.getNetworkId());
+                    }
+                    // SetupGuestNetworkCommand is always needed (DHCP, ACLs, routing)
                     final VirtualMachine vm = _vmDao.findById(domainRouterVO.getId());
                     final NicProfile nicProfile = _networkModel.getNicProfile(vm, guestNic.getNetworkId(), null);
+                    if (skipPlugNic) {
+                        // HW offload VF is the second boot device (after control eth0) → eth1
+                        nicProfile.setDeviceId(1);
+                        logger.info("Adjusted deviceId to 1 for HW offload guest NIC (eth1 in VR)");
+                    }
                     final SetupGuestNetworkCommand setupCmd = _commandSetupHelper.createSetupGuestNetworkCommand(domainRouterVO, true, nicProfile);
                     cmds.addCommand(setupCmd);
                 }
@@ -992,5 +1063,43 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         nic.setDeviceId(deviceId);
         _nicDao.update(nic.getId(), nic);
         return nic;
+    }
+
+    private boolean isHwOffloadNetwork(long networkId) {
+        try {
+            Network network = _networkDao.findById(networkId);
+            if (network == null) {
+                logger.debug("isHwOffloadNetwork: network {} not found", networkId);
+                return false;
+            }
+            com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
+            boolean result = offering != null && offering.isHwOffloadEnabled();
+            logger.info("isHwOffloadNetwork: network={} offeringId={} offeringName={} hwOffload={}",
+                    networkId, network.getNetworkOfferingId(),
+                    offering != null ? offering.getName() : "null", result);
+            return result;
+        } catch (Exception e) {
+            logger.warn("isHwOffloadNetwork: exception for network {}", networkId, e);
+            return false;
+        }
+    }
+
+    private NicTO enrichWithVfIfHwOffload(NicTO nicTo, long networkId, long hostId, long nicId) {
+        try {
+            Network network = _networkDao.findById(networkId);
+            if (network == null) return nicTo;
+            com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
+            if (offering != null && offering.isHwOffloadEnabled() && _vfPoolManager != null) {
+                SriovVfPoolVO vf = _vfPoolManager.allocate(hostId, nicId);
+                nicTo.setVfPciAddress(vf.getPciAddress());
+                nicTo.setVfPfName(vf.getPfName());
+                nicTo.setUseHwOffload(Boolean.TRUE);
+                logger.info("VPC PlugNic: allocated VF {} (PCI {}) for NIC on network {} host {}",
+                        vf.getUuid(), vf.getPciAddress(), networkId, hostId);
+            }
+        } catch (Exception e) {
+            logger.warn("VPC PlugNic: VF allocation failed for network {} host {} (bridge/TAP fallback)", networkId, hostId, e);
+        }
+        return nicTo;
     }
 }

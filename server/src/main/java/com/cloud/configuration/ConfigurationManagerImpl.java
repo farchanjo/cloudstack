@@ -7081,6 +7081,7 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         final boolean enable = cmd.getEnable();
         boolean specifyAsNumber = cmd.getSpecifyAsNumber();
         String routingModeString = cmd.getRoutingMode();
+        boolean hwOffloadEnabled = cmd.isHwOffloadEnabled();
         // check if valid domain
         if (CollectionUtils.isNotEmpty(domainIds)) {
             for (final Long domainId: domainIds) {
@@ -7392,9 +7393,17 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
 
         final NetworkOfferingVO offering = createNetworkOffering(name, displayText, trafficType, tags, specifyVlan, availability, networkRate, serviceProviderMap, false, guestType, false,
                 serviceOfferingId, conserveMode, serviceCapabilityMap, specifyIpRanges, isPersistent, details, egressDefaultPolicy, maxconn, enableKeepAlive, forVpc, forTungsten, forNsx, forNetris, networkMode, domainIds, zoneIds, enable, internetProtocol, routingMode, specifyAsNumber);
+        boolean needsUpdate = false;
         if (Boolean.TRUE.equals(forNsx) && nsxSupportInternalLbSvc) {
             offering.setInternalLb(true);
             offering.setPublicLb(false);
+            needsUpdate = true;
+        }
+        if (hwOffloadEnabled) {
+            offering.setHwOffloadEnabled(true);
+            needsUpdate = true;
+        }
+        if (needsUpdate) {
             _networkOfferingDao.update(offering.getId(), offering);
         }
         CallContext.current().setEventDetails(" ID: " + offering.getUuid() + " Name: " + name);

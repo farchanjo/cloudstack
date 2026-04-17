@@ -128,6 +128,12 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
     @Inject
     private ResourceManager _resourceMgr;
     @Inject
+    private com.cloud.network.router.VfPoolManager vfPoolManager;
+    @Inject
+    private com.cloud.network.router.SfPoolManager sfPoolManager;
+    @Inject
+    private com.cloud.offerings.dao.NetworkOfferingDao networkOfferingDao;
+    @Inject
     protected ServiceOfferingDetailsDao _serviceOfferingDetailsDao;
     @Inject
     protected VgpuProfileDao vgpuProfileDao;
@@ -240,6 +246,14 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 secIps = _nicSecIpDao.getSecondaryIpAddressesForNic(nicVO.getId());
             }
             to.setNicSecIps(secIps);
+
+            // Propagate SR-IOV VF binding (HW Offload). Null vf_pci_address means traditional bridge/TAP.
+            String vfPci = nicVO.getVfPciAddress();
+            if (vfPci != null && !vfPci.isEmpty()) {
+                to.setVfPciAddress(vfPci);
+                to.setUseHwOffload(Boolean.TRUE);
+                to.setVfPfName(nicVO.getVfPfName());
+            }
         } else {
             logger.warn("Unable to load NicVO for NicProfile {}", profile);
             //Workaround for dynamically created nics
@@ -252,6 +266,80 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         //set nic secondary ip address in NicTO which are used for security group
         // configuration. Use full when vm stop/start
         return to;
+    }
+
+    /**
+     * If the NIC belongs to a network whose offering has hw_offload_enabled=1
+     * and the VfPoolManager has free VFs on the target host, allocate a VF
+     * and set the PCI address on the NicTO so the agent uses VfPassthroughVifDriver.
+     */
+    private void allocateVfIfHwOffload(NicTO nicTo, NicProfile nicProfile, VirtualMachineProfile vmProfile) {
+        if (vfPoolManager == null) {
+            return;
+        }
+        // Only VRs get VF passthrough — user VMs use standard bridge/TAP NICs
+        if (vmProfile.getType() != com.cloud.vm.VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        try {
+            NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
+            if (network == null) {
+                return;
+            }
+            com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
+            if (offering == null || !offering.isHwOffloadEnabled()) {
+                return;
+            }
+            Long hostId = vmProfile.getVirtualMachine().getHostId();
+            if (hostId == null) {
+                return;
+            }
+            com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocate(hostId, nicProfile.getId());
+            nicTo.setVfPciAddress(vf.getPciAddress());
+            nicTo.setVfPfName(vf.getPfName());
+            nicTo.setUseHwOffload(Boolean.TRUE);
+            logger.info("Allocated VF {} (PCI {}) on host {} for NIC {} (HW offload)",
+                    vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId());
+        } catch (com.cloud.exception.InsufficientCapacityException e) {
+            logger.warn("No free VF for HW offload on host {}; NIC {} will use bridge/TAP fallback",
+                    vmProfile.getVirtualMachine().getHostId(), nicProfile.getId());
+        } catch (Exception e) {
+            logger.warn("Failed to allocate VF for HW offload", e);
+        }
+    }
+
+    private void allocateSfIfVdpa(NicTO nicTo, NicProfile nicProfile, VirtualMachineProfile vmProfile) {
+        if (sfPoolManager == null) {
+            return;
+        }
+        if (vmProfile.getType() == com.cloud.vm.VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        try {
+            NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
+            if (network == null) {
+                return;
+            }
+            com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
+            if (offering == null || !offering.isSfVdpaEnabled()) {
+                return;
+            }
+            Long hostId = vmProfile.getVirtualMachine().getHostId();
+            if (hostId == null) {
+                return;
+            }
+            com.cloud.network.router.SriovSfPoolVO sf = sfPoolManager.allocate(hostId, nicProfile.getId());
+            nicTo.setVdpaDevice(sf.getVdpaDevice());
+            nicTo.setSfRepresentorName(sf.getRepresentorName());
+            nicTo.setUseSfVdpa(Boolean.TRUE);
+            logger.info("Allocated SF sfIndex={} vdpa={} on host {} for NIC {} (vDPA)",
+                    sf.getSfIndex(), sf.getVdpaDevice(), hostId, nicProfile.getId());
+        } catch (com.cloud.exception.InsufficientCapacityException e) {
+            logger.warn("No free SF for vDPA on host {}; NIC {} will use standard virtio",
+                    vmProfile.getVirtualMachine().getHostId(), nicProfile.getId());
+        } catch (Exception e) {
+            logger.warn("Failed to allocate SF for vDPA", e);
+        }
     }
 
     private String getNetworkName(long zoneId, long domainId, long accountId, VpcVO vpc, long networkId) {
@@ -336,6 +424,8 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 nicProfile.setBroadcastType(BroadcastDomainType.Native);
             }
             NicTO nicTo = toNicTO(nicProfile);
+            allocateVfIfHwOffload(nicTo, nicProfile, vmProfile);
+            allocateSfIfVdpa(nicTo, nicProfile, vmProfile);
             nics[i++] = nicTo;
         }
 
