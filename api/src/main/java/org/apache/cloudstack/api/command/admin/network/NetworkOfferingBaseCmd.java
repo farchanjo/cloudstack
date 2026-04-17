@@ -128,6 +128,12 @@ public abstract class NetworkOfferingBaseCmd extends BaseCmd {
             description = "True if network offering is meant to be used for VPC, false otherwise.")
     private Boolean forVpc;
 
+    @Parameter(name = "hwoffloadenabled",
+            type = CommandType.BOOLEAN,
+            description = "True if VRs created from this offering should use SR-IOV VF passthrough with TC flower offload (line-rate NAT/ACL/LB on the NIC ASIC). Default: false (SW VR).",
+            since = "4.24.0")
+    private Boolean hwOffloadEnabled;
+
     @Deprecated
     @Parameter(name = ApiConstants.FOR_NSX,
             type = CommandType.BOOLEAN,
@@ -313,6 +319,14 @@ public abstract class NetworkOfferingBaseCmd extends BaseCmd {
 
     public Boolean getForVpc() {
         return forVpc;
+    }
+
+    public Boolean getHwOffloadEnabled() {
+        return hwOffloadEnabled;
+    }
+
+    public boolean isHwOffloadEnabled() {
+        return Boolean.TRUE.equals(hwOffloadEnabled);
     }
 
     public String getNetworkMode() {

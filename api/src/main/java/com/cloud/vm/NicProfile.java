@@ -74,6 +74,11 @@ public class NicProfile implements InternalIdentity, Serializable {
     String requestedIPv6;
     Integer mtu;
 
+    /* SR-IOV VF passthrough (HW Offload). All optional; null/false preserves legacy behavior. */
+    String vfPciAddress;
+    Boolean useHwOffload;
+    String vfPfName;
+
     //
     // CONSTRUCTORS
     //
@@ -406,6 +411,34 @@ public class NicProfile implements InternalIdentity, Serializable {
 
     public void setMtu(Integer mtu) {
         this.mtu = mtu;
+    }
+
+    public String getVfPciAddress() {
+        return vfPciAddress;
+    }
+
+    public void setVfPciAddress(String vfPciAddress) {
+        this.vfPciAddress = vfPciAddress;
+    }
+
+    public Boolean getUseHwOffload() {
+        return useHwOffload;
+    }
+
+    public boolean isUseHwOffload() {
+        return Boolean.TRUE.equals(useHwOffload);
+    }
+
+    public void setUseHwOffload(Boolean useHwOffload) {
+        this.useHwOffload = useHwOffload;
+    }
+
+    public String getVfPfName() {
+        return vfPfName;
+    }
+
+    public void setVfPfName(String vfPfName) {
+        this.vfPfName = vfPfName;
     }
 
     public boolean getIpv4AllocationRaceCheck() {
