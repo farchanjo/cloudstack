@@ -158,6 +158,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
     /**
      * Resolve the PF netdev name for a VF PCI address by reading
      * {@code /sys/bus/pci/devices/<vf>/physfn/net/}.
+     *
+     * In mlx5 switchdev mode this directory can contain the PF netdev alongside its
+     * VF representors (eg. dx6p0, dx6p0vf0, dx6p0vf1). Filter by phys_port_name so
+     * we always return the actual PF (phys_port_name = p&lt;N&gt;) and never a representor
+     * (phys_port_name = pf&lt;N&gt;vf&lt;M&gt;).
      */
     static String lookupPfFromVf(String vfPciAddress) {
         if (StringUtils.isBlank(vfPciAddress)) {
@@ -168,7 +173,34 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             return null;
         }
         String[] entries = pfNetDir.list();
-        return (entries != null && entries.length > 0) ? entries[0] : null;
+        if (entries == null || entries.length == 0) {
+            return null;
+        }
+        for (String name : entries) {
+            String port = readPhysPortName(name);
+            if (port != null && port.matches("p\\d+")) {
+                return name;
+            }
+        }
+        for (String name : entries) {
+            String port = readPhysPortName(name);
+            if (port == null || !port.startsWith("pf")) {
+                return name;
+            }
+        }
+        return entries[0];
+    }
+
+    static String readPhysPortName(String iface) {
+        File f = new File(String.format("/sys/class/net/%s/phys_port_name", iface));
+        if (!f.exists()) {
+            return null;
+        }
+        try {
+            return new String(java.nio.file.Files.readAllBytes(f.toPath())).trim();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -208,7 +240,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     /**
      * Find the representor netdev for a VF by scanning sysfs phys_port_name.
-     * In switchdev mode, each VF has a representor with phys_port_name=pfNvfM.
+     * In switchdev mode, each VF has a representor with phys_port_name=pf&lt;N&gt;vf&lt;M&gt;.
+     * The PF index (N) is read from the PF's own phys_port_name (p&lt;N&gt;) rather than
+     * parsed from the PF netdev name, so renames (eg. enp1s0f0np0) do not break lookup.
      */
     static String lookupRepresentor(String vfPciAddress) {
         Integer vfId = lookupVfIdFromPci(vfPciAddress);
@@ -216,9 +250,17 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         if (vfId == null || pfName == null) {
             return null;
         }
-        int pfIdx = 0;
-        if (pfName.contains("1") || pfName.endsWith("p1")) {
-            pfIdx = 1;
+        Integer pfIdx = null;
+        String pfPhysPort = readPhysPortName(pfName);
+        if (pfPhysPort != null && pfPhysPort.matches("p\\d+")) {
+            try {
+                pfIdx = Integer.parseInt(pfPhysPort.substring(1));
+            } catch (NumberFormatException ignore) {
+                // fall through to name-based fallback
+            }
+        }
+        if (pfIdx == null) {
+            pfIdx = (pfName.endsWith("p1") || pfName.contains("1")) ? 1 : 0;
         }
         String expectedPhysPort = String.format("pf%dvf%d", pfIdx, vfId);
         File netDir = new File("/sys/class/net");
@@ -227,17 +269,8 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             return null;
         }
         for (String iface : ifaces) {
-            File ppn = new File(String.format("/sys/class/net/%s/phys_port_name", iface));
-            if (!ppn.exists()) {
-                continue;
-            }
-            try {
-                String content = new String(java.nio.file.Files.readAllBytes(ppn.toPath())).trim();
-                if (content.equals(expectedPhysPort)) {
-                    return iface;
-                }
-            } catch (Exception e) {
-                // skip
+            if (expectedPhysPort.equals(readPhysPortName(iface))) {
+                return iface;
             }
         }
         return null;
