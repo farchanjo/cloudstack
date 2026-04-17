@@ -104,3 +104,9 @@ waf-*
 #.*
 
 !.gitignore
+
+# Build artifacts (do not commit)
+debian/changelog.20*
+tools/appliance/systemvmtemplate-*-x86_64/
+tools/appliance/systemvmtemplate-*-1/
+tools/appliance/cloud_scripts_shar_archive.sh
