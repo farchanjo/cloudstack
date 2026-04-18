@@ -134,7 +134,20 @@ public class IntentReconciler {
             return;
         }
 
-        int zone = spec.ctZone != null ? spec.ctZone : TcRuleProgrammer.nextZone();
+        // Zone stability: reuse the previous spec's ctZone across re-applies of
+        // the same VR (SetSourceNat → SetNetworkACL → SetPortForwarding all fire
+        // applyIntent and a fresh nextZone() per call would orphan the existing
+        // HW conntrack entries → established connections drop). Spec-supplied
+        // ctZone wins, then previous spec's zone, then a fresh allocation.
+        int zone;
+        if (spec.ctZone != null) {
+            zone = spec.ctZone;
+        } else if (previous != null && previous.ctZone != null) {
+            zone = previous.ctZone;
+        } else {
+            zone = TcRuleProgrammer.nextZone();
+        }
+        spec.ctZone = zone;  // pin so subsequent re-applies see it via currentByVr
 
         // Guest rep: outbound SNAT + +est forward to uplink (bond1/PF).
         applyToRep(guestRep, guestOutDev, zone, spec, true);
