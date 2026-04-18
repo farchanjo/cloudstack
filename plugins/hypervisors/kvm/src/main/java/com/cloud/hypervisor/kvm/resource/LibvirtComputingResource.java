@@ -151,7 +151,9 @@ import com.cloud.agent.api.VmStatsEntry;
 import com.cloud.agent.api.routing.IpAssocCommand;
 import com.cloud.agent.api.routing.IpAssocVpcCommand;
 import com.cloud.agent.api.routing.NetworkElementCommand;
+import com.cloud.agent.api.routing.SetNetworkACLCommand;
 import com.cloud.agent.api.routing.SetSourceNatCommand;
+import com.cloud.agent.api.to.NetworkACLTO;
 import com.cloud.agent.api.to.DataStoreTO;
 import com.cloud.agent.api.to.DataTO;
 import com.cloud.agent.api.to.DiskTO;
@@ -694,6 +696,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             return prepareNetworkElementCommand((SetupGuestNetworkCommand)cmd);
         } else if (cmd instanceof SetSourceNatCommand) {
             return prepareNetworkElementCommand((SetSourceNatCommand)cmd);
+        } else if (cmd instanceof SetNetworkACLCommand) {
+            return prepareNetworkElementCommand((SetNetworkACLCommand)cmd);
         }
         return new ExecutionResult(true, null);
     }
@@ -2765,6 +2769,116 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             LOGGER.error(msg, e);
             return new ExecutionResult(false, msg);
         }
+    }
+
+    /**
+     * Phase B/1: program HW offload for ACL rules.
+     *
+     * <p>SetNetworkACLCommand is sent by CloudStack mgmt whenever the user
+     * adds/removes an ACL rule on a VPC tier. The command is then dispatched
+     * to the VR's configure scripts to update iptables. We hook in BEFORE the
+     * VR script execution: if the VR has an active HW offload spec (i.e. it
+     * was deployed with a HW-offload-enabled offering), program TC flower
+     * rules on the guest representor that match the same conditions and
+     * drop/pass the packet in HW. The kernel iptables in the VR remain as
+     * fallback for traffic that doesn't match TC rules (e.g. ICMP, untracked
+     * conntrack, cross-tier).
+     *
+     * <p>Limitations of the current implementation:
+     * <ul>
+     *   <li>Rules are installed on guest-rep ingress, so they only match
+     *       <b>egress traffic from the VM</b> (Egress ACLs). Inbound ACLs
+     *       (external→VM) would require rules on bond1 or public-rep with
+     *       inverse src/dst — out of scope for this commit.</li>
+     *   <li>Source CIDR list collapses to first entry — multi-CIDR rules
+     *       fall back to kernel iptables on the VR.</li>
+     *   <li>Protocol "all" maps to a single TCP rule for now (UDP fall-back
+     *       to kernel).</li>
+     * </ul>
+     */
+    protected ExecutionResult prepareNetworkElementCommand(final SetNetworkACLCommand cmd) {
+        if (intentReconciler == null) {
+            return new ExecutionResult(true, null);
+        }
+        final String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);
+        com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec current =
+                intentReconciler.currentIntent(routerName);
+        if (current == null) {
+            // VR isn't HW-offload enabled — let VR scripts handle ACL via iptables
+            return new ExecutionResult(true, null);
+        }
+        NetworkACLTO[] rules = cmd.getRules();
+        if (rules == null) {
+            return new ExecutionResult(true, null);
+        }
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.AclRule> aclRules =
+                new java.util.ArrayList<>();
+        int prio = 80;
+        for (NetworkACLTO r : rules) {
+            String proto = r.getProtocol();
+            // Skip wildcard rules: protocol="all" (or null/any) is too broad to
+            // offload safely — it would match every TCP/UDP packet (including
+            // DNAT'd PFW traffic, BGP, etc.), and the ct commit on chain-1
+            // would create HW-zone CT entries that conflict with the VR's
+            // kernel-zone-0 conntrack on replies. Kernel iptables on the VR
+            // already enforces these wildcard ACLs correctly.
+            if (proto == null || "all".equalsIgnoreCase(proto) || "any".equalsIgnoreCase(proto)) {
+                continue;
+            }
+            proto = proto.toLowerCase();
+            if (!"tcp".equals(proto) && !"udp".equals(proto)) {
+                // ICMP and other protos: TC flower in_hw is fragile — skip and let kernel handle
+                continue;
+            }
+            // Determine match details
+            String matchSrcIp = null;
+            java.util.List<String> cidrs = r.getSourceCidrList();
+            if (cidrs != null && !cidrs.isEmpty()) {
+                String first = cidrs.get(0);
+                if (first != null && !"0.0.0.0/0".equals(first) && !"::/0".equals(first)) {
+                    matchSrcIp = first;
+                }
+            }
+            Integer matchPort = null;
+            int[] portRange = r.getSrcPortRange();
+            if (portRange != null && portRange.length > 0 && portRange[0] > 0) {
+                matchPort = portRange[0];
+            }
+            // Defensive: skip rules that match nothing specific. A bare
+            // "tcp +trk+new" rule (no src, no port) would intercept too much
+            // and conflict with NAT/PFW kernel paths. Require at least one of
+            // src CIDR or destination port to scope the rule.
+            if (matchSrcIp == null && matchPort == null) {
+                continue;
+            }
+            var ar = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.AclRule();
+            // CloudStack NetworkACLTO.getAction() returns either "ACCEPT"/"DROP"
+            // (when sourced from VPC ACLs API) or "Allow"/"Deny" (legacy paths).
+            // Map both Allow and ACCEPT to ACCEPT, default everything else to DROP.
+            String aclAction = r.getAction();
+            ar.action = ("Allow".equalsIgnoreCase(aclAction) || "ACCEPT".equalsIgnoreCase(aclAction))
+                    ? "ACCEPT" : "DROP";
+            ar.ipProto = proto;
+            ar.matchSrcIp = matchSrcIp;
+            ar.matchPort = matchPort;
+            ar.stateful = Boolean.TRUE;
+            ar.prio = prio++;
+            aclRules.add(ar);
+        }
+        // Build a new spec carrying over existing NAT/LB state + new ACL rules.
+        var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+        newSpec.vrId = current.vrId;
+        newSpec.version = System.currentTimeMillis();
+        newSpec.guestVfPci = current.guestVfPci;
+        newSpec.publicVfPci = current.publicVfPci;
+        newSpec.ctZone = current.ctZone;
+        newSpec.natRules = current.natRules;
+        newSpec.aclRules = aclRules;
+        newSpec.lbRules = current.lbRules;
+        intentReconciler.applyIntent(newSpec);
+        LOGGER.info("Programmed {} TC ACL rules for VR {} (HW offload, kernel iptables remains as fallback)",
+                aclRules.size(), routerName);
+        return new ExecutionResult(true, null);
     }
 
     protected ExecutionResult prepareNetworkElementCommand(final IpAssocVpcCommand cmd) {
