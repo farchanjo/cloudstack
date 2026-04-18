@@ -495,7 +495,15 @@ public class IntentReconciler {
         // On the guest-side rep we install plain +est (tenant→external is the only
         // expected direction; VR's eth0 doesn't originate non-control traffic).
         boolean replyOnly = !isGuestSide;
-        programmer.installEstablishedForward(inRep, outRep, replyOnly);
+        // On the public-side rep we MUST push the public VLAN tag before
+        // mirreding to bond1 — the VR's Public VF outputs un-tagged packets
+        // (it's hostdev VFIO), and bond1 is a trunk port. Without push_vlan,
+        // the upstream switch (or peer) sees an untagged frame and drops it
+        // (or floods on the wrong VLAN), breaking PFW reverse-path. On the
+        // guest-side rep we don't push (guest tier VLAN often >4094, OVS
+        // handles it via NORMAL switching once packet is back in the kernel).
+        Integer pushVlanId = (!isGuestSide && spec.publicVlanId != null) ? spec.publicVlanId : null;
+        programmer.installEstablishedForward(inRep, outRep, replyOnly, pushVlanId);
 
         // Intra-LAN bypass (chain 1 prio 40-42): MUST be installed BEFORE the
         // SNAT pref 50, otherwise VR-originated traffic destined to other VMs in

@@ -108,16 +108,38 @@ public class TcRuleProgrammer {
      * are forwarded fast-path.
      */
     public void installEstablishedForward(String repName, String outRep, boolean replyOnly) {
+        installEstablishedForward(repName, outRep, replyOnly, null);
+    }
+
+    /**
+     * Install +est forward rule. When {@code pushVlanId} is non-null, the
+     * outgoing packet is tagged with that VLAN before being mirreded to
+     * {@code outRep} (typically bond1). REQUIRED on the public-side rep:
+     * when reverse-NAT happens for a PFW DNAT reply, the packet leaves the
+     * VR's Public VF un-tagged. mirred bond1 without push_vlan sends an
+     * untagged frame onto a trunk port; the upstream switch (or peer
+     * untag-aware code) drops or floods it on the wrong VLAN. With
+     * push_vlan, the reply hits the wire in the correct VLAN and reaches
+     * the original client cleanly.
+     */
+    public void installEstablishedForward(String repName, String outRep, boolean replyOnly, Integer pushVlanId) {
         String state = replyOnly ? "+trk+est+rpl" : "+trk+est";
-        runTc(String.format(
-            "tc filter add dev %s ingress chain 1 prio 100 protocol ip flower ct_state %s " +
-            "action mirred egress redirect dev %s",
-            repName, state, outRep));
+        StringBuilder cmd = new StringBuilder();
+        cmd.append(String.format(
+            "tc filter add dev %s ingress chain 1 prio 100 protocol ip flower ct_state %s ",
+            repName, state));
+        if (pushVlanId != null && pushVlanId > 0 && pushVlanId <= 4094) {
+            cmd.append(String.format(
+                "action vlan push id %d protocol 802.1q pipe ",
+                pushVlanId));
+        }
+        cmd.append(String.format("action mirred egress redirect dev %s", outRep));
+        runTc(cmd.toString());
     }
 
     /** Backwards-compatible: defaults to non-reply (matches all established). */
     public void installEstablishedForward(String repName, String outRep) {
-        installEstablishedForward(repName, outRep, false);
+        installEstablishedForward(repName, outRep, false, null);
     }
 
     /**
