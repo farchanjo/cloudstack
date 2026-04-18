@@ -133,19 +133,19 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         return Transaction.execute(new TransactionCallback<Boolean>() {
             @Override
             public Boolean doInTransaction(TransactionStatus status) {
+                // Bulk UPDATE WHERE allocated_to_nic_id=? — one SQL stmt that
+                // releases every row matching the nic id (across hosts). The
+                // previous lockRows + per-row update loop only updated the
+                // first row reliably because the reused createForUpdate() VO
+                // had its dirty flags cleared after the first update() call,
+                // making subsequent update(id, vo) calls no-op.
                 SearchCriteria<SriovVfPoolVO> sc = nicIdSearch.create();
                 sc.setParameters("allocatedToNicId", nicId);
-                List<SriovVfPoolVO> rows = lockRows(sc, null, false);
-                if (rows == null || rows.isEmpty()) {
-                    return false;
-                }
                 SriovVfPoolVO updateVo = createForUpdate();
                 updateVo.setState(State.FREE.name());
                 updateVo.setAllocatedToNicId(null);
-                for (SriovVfPoolVO vf : rows) {
-                    update(vf.getId(), updateVo);
-                }
-                return true;
+                int affected = update(updateVo, sc);
+                return affected > 0;
             }
         });
     }

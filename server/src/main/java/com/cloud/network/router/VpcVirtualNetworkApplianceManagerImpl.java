@@ -1079,7 +1079,57 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
     public boolean postStateTransitionEvent(final StateMachine2.Transition<State, VirtualMachine.Event> transition, final VirtualMachine vo, final boolean status, final Object opaque) {
         // Without this VirtualNetworkApplianceManagerImpl.postStateTransitionEvent() gets called twice as part of listeners -
         // once from VpcVirtualNetworkApplianceManagerImpl and once from VirtualNetworkApplianceManagerImpl itself
+        releaseHwOffloadVfsOnExpunge(transition, vo);
         return true;
+    }
+
+    /**
+     * Phase B/4 leak fix: VfPoolManager.allocate() is called from
+     * HypervisorGuruBase.allocateVfIfHwOffload() during VR start, but nothing
+     * was releasing entries when the VR was destroyed/expunged. Pool entries
+     * accumulated as state=ALLOCATED with stale allocated_to_nic_id values,
+     * eventually exhausting the pool on a host so future VRs would fall back
+     * to bridge/TAP.
+     *
+     * <p>Hook into the VR state transition: when going to {@code Expunging}
+     * (the canonical end-of-life state for forced destroy), release every VF
+     * that was allocated to any NIC of this VM. We don't release on
+     * {@code Stopped} because the VR may be restarted with the same NIC IDs
+     * and we want VF affinity preserved.
+     */
+    private void releaseHwOffloadVfsOnExpunge(final StateMachine2.Transition<State, VirtualMachine.Event> transition,
+                                              final VirtualMachine vo) {
+        if (_vfPoolManager == null || vo == null || vo.getType() != VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        final State to = transition.getToState();
+        if (to != State.Expunging && to != State.Destroyed) {
+            return;
+        }
+        try {
+            // NicVO.vf_pci_address column is never populated by VfPoolManager.allocate()
+            // (the source of truth is sriov_vf_pool.allocated_to_nic_id), so we can't
+            // gate on nic.getVfPciAddress() != null. Just call releaseByNicId for every
+            // NIC of the VR — it's a no-op if no VF is allocated to that NIC.
+            final java.util.List<NicVO> nics = _nicDao.listByVmId(vo.getId());
+            for (final NicVO nic : nics) {
+                if (nic == null) {
+                    continue;
+                }
+                try {
+                    if (_vfPoolManager.releaseByNicId(nic.getId())) {
+                        logger.info("Released HW offload VF on VR {} expunge (nicId={})",
+                                vo.getInstanceName(), nic.getId());
+                    }
+                } catch (Exception inner) {
+                    logger.warn("Failed to release VF for nicId {} of VR {}: {}",
+                            nic.getId(), vo.getInstanceName(), inner.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to release HW offload VFs for VR {} on transition to {}: {}",
+                    vo.getInstanceName(), to, e.getMessage());
+        }
     }
 
     private Nic updateNicWithDeviceId(final long nicId, int deviceId) {
