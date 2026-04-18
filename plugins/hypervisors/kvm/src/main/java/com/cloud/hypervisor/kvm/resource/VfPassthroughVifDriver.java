@@ -66,19 +66,31 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
 
-        configureVfOnPf(pfName, pciAddress, nic.getMac(), vlanTag);
-
+        // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
+        // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
+        // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
+        // VLAN config via the PF in switchdev fails with "Operation not
+        // supported" and prevents the VR from booting.
+        // Same for the libvirt hostdev <vlan> element — it triggers the same
+        // ip link command on libvirt's side and fails. So we pass vlanTag=0
+        // to defHostdevNet (no <vlan> element) and let the OVS rep tag handle
+        // VLAN push/pop on egress/ingress.
         String repName = lookupRepresentor(pciAddress);
+        boolean switchdev = repName != null;
+        Integer pfVlanTag = switchdev ? null : vlanTag;
+        configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
+
         if (repName != null) {
             addRepresentorToOvs(repName, vlanTag);
         }
 
         LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
-        intf.defHostdevNet(pciAddress, nic.getMac(), vlanTag != null ? vlanTag : 0);
+        int xmlVlanTag = switchdev ? 0 : (vlanTag != null ? vlanTag : 0);
+        intf.defHostdevNet(pciAddress, nic.getMac(), xmlVlanTag);
         intf.setLinkStateUp(nic.isEnabled());
 
-        logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={}",
-                pciAddress, pfName, nic.getMac(), vlanTag, repName);
+        logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={} switchdev={}",
+                pciAddress, pfName, nic.getMac(), vlanTag, repName, switchdev);
         return intf;
     }
 
@@ -148,7 +160,14 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         }
         Script.runSimpleBashScript(String.format("ip link set %s vf %d trust on", pfName, vfId));
         Script.runSimpleBashScript(String.format("ip link set %s vf %d spoofchk off", pfName, vfId));
-        if (vlanTag != null && vlanTag > 0 && vlanTag < 4095) {
+        // Only set legacy PF-side VF VLAN when caller passed a non-null vlanTag
+        // (legacy/non-switchdev path). In switchdev mode the caller passes null
+        // and OVS rep tag handles VLAN — `ip link set vf vlan` returns
+        // "Operation not supported" on the e-switch and would fail the plug.
+        if (vlanTag == null) {
+            return;
+        }
+        if (vlanTag > 0 && vlanTag < 4095) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d vlan %d", pfName, vfId, vlanTag));
         } else {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d vlan 0", pfName, vfId));
