@@ -223,6 +223,25 @@ public class TcRuleProgrammer {
     }
 
     /**
+     * Delete all TC filters in chain 1 (the policy/NAT/ACL chain). Leaves chain 0
+     * dispatch intact. Called by the reconciler at the start of {@code applyToRep}
+     * so re-applying an intent reinstalls a clean rule set instead of accumulating
+     * stale handles across applications. Does NOT touch the OVS-managed clsact
+     * qdisc (which would fail with "Exclusivity flag on" anyway since OVS owns it).
+     */
+    public void clearChain1(String repName) {
+        // `tc filter del dev X ingress chain 1` removes all filters in chain 1 in one shot
+        // when supported; some iproute2 versions require per-pref deletion. Use both for
+        // safety: bulk first, then per-pref for known ranges (50, 60, 80-99, 100, 200).
+        Script.runSimpleBashScript(String.format(
+            "tc filter del dev %s ingress chain 1 2>/dev/null || true", repName));
+        for (int prio : new int[]{50, 60, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 200}) {
+            Script.runSimpleBashScript(String.format(
+                "tc filter del dev %s ingress chain 1 pref %d 2>/dev/null || true", repName, prio));
+        }
+    }
+
+    /**
      * Snapshot the current TC filters on a rep, returning the raw output. Used by
      * the reconciler to compute add/remove diffs.
      */

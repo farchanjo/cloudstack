@@ -111,26 +111,47 @@ public class IntentReconciler {
             return;
         }
 
-        // Public NIC is a TAP (not a VF) — redirect to host's egress uplink for HW offload.
+        // Phase B/4: VR can have its public NIC promoted to a VF (hostdev) too.
+        // When that happens, we install a *full* HW pipeline:
+        //   - guest-rep: SNAT outbound + +est forward to uplink (bond1/PF)
+        //   - public-rep: DNAT inbound + +est+rpl forward back to guest-rep
+        // When publicVfPci is null (legacy: VR's public NIC is a TAP), we fall
+        // back to half-pipeline (guest-rep only); kernel iptables on the VR
+        // handles all public-side processing.
+        String publicRep = spec.publicVfPci != null ? repMapper.getRepresentor(spec.publicVfPci) : null;
+
+        // Egress for the guest-side outbound flow (post-SNAT) → host uplink.
         // Uplink resolution honors agent config (kind/lag/netdev); falls back to
         // auto-discovery from the guest VF's PF parent in sysfs.
-        String outDev = resolveUplink(spec.guestVfPci);
-        if (outDev == null) {
-            outDev = spec.publicVfPci != null ? repMapper.getRepresentor(spec.publicVfPci) : null;
+        String guestOutDev = resolveUplink(spec.guestVfPci);
+        if (guestOutDev == null && publicRep != null) {
+            // No PF uplink resolvable but we have a public rep — use it as the
+            // egress for SNAT'd packets (HW path: guest-rep → public-rep → wire).
+            guestOutDev = publicRep;
         }
-        if (outDev == null) {
-            LOGGER.error("Cannot apply intent for VR {}: no uplink resolved for redirect", spec.vrId);
+        if (guestOutDev == null) {
+            LOGGER.error("Cannot apply intent for VR {}: no uplink resolved for guest-side redirect", spec.vrId);
             return;
         }
 
         int zone = spec.ctZone != null ? spec.ctZone : TcRuleProgrammer.nextZone();
 
-        // Guest rep: outbound SNAT + forward to PF
-        applyToRep(guestRep, outDev, zone, spec, true);
+        // Guest rep: outbound SNAT + +est forward to uplink (bond1/PF).
+        applyToRep(guestRep, guestOutDev, zone, spec, true);
+
+        // Public rep (Phase B/4 only): DNAT inbound + +est+rpl reply forward
+        // back to guest-rep, so DNAT'd PFW packets flow through the e-switch
+        // straight into the VR's guest-VF (eth1), bypassing iptables PREROUTING.
+        if (publicRep != null) {
+            applyToRep(publicRep, guestRep, zone, spec, false);
+            LOGGER.info("Applied intent v{} for VR {} (guestRep={} guestOut={} publicRep={} zone={})",
+                spec.version, spec.vrId, guestRep, guestOutDev, publicRep, zone);
+        } else {
+            LOGGER.info("Applied intent v{} for VR {} (guestRep={} guestOut={} zone={}, no publicRep)",
+                spec.version, spec.vrId, guestRep, guestOutDev, zone);
+        }
 
         currentByVr.put(spec.vrId, spec);
-        LOGGER.info("Applied intent v{} for VR {} (guestRep={} outDev={} zone={})",
-            spec.version, spec.vrId, guestRep, outDev, zone);
     }
 
     /**
@@ -146,7 +167,12 @@ public class IntentReconciler {
         if (guestRep != null) {
             programmer.resetRepresentor(guestRep);
         }
-        LOGGER.info("Removed intent for VR {} (cleared rep {})", vrId, guestRep);
+        String publicRep = prev.publicVfPci != null ? repMapper.getRepresentor(prev.publicVfPci) : null;
+        if (publicRep != null) {
+            programmer.resetRepresentor(publicRep);
+        }
+        LOGGER.info("Removed intent for VR {} (cleared guestRep={} publicRep={})",
+            vrId, guestRep, publicRep);
     }
 
     public synchronized IntentSpec currentIntent(String vrId) {
@@ -266,8 +292,10 @@ public class IntentReconciler {
     }
 
     private void applyToRep(String inRep, String outRep, int zone, IntentSpec spec, boolean isGuestSide) {
-        // Wipe and re-init.
+        // Try a full clsact reset (works on raw reps); fails silently if OVS
+        // owns the qdisc, in which case clearChain1 below scrubs stale rules.
         programmer.initRepresentor(inRep);
+        programmer.clearChain1(inRep);
 
         // Chain 0 dispatch: ct lookup for tcp+udp.
         programmer.installChain0Dispatch(inRep, zone);
@@ -309,18 +337,22 @@ public class IntentReconciler {
         }
 
         // Catch-all chain 1 rule (prio 200): plain `action pass`. Required because
-        // chain-1 fall-through drops the packet when no rule matches, but DNAT'd
-        // PFW traffic (whose src is the external client, NOT the tier CIDR) doesn't
-        // match the tier-only SNAT rule (pref 50). Without this catch-all, the
-        // kernel-DNATed packet would be dropped before reaching the wire. With
-        // `pass`, mlx5 HW lets the packet continue through OVS forwarding which
-        // then sends it via bond1 to the VM, preserving the original client src IP
-        // so the kernel iptables conntrack on the VR can reverse-NAT replies.
-        // Empirical fix verified 2026-04-17: PFW SSH succeeds end-to-end with this
-        // rule + tier-only SNAT (pref 50, src_ip=guestCidr).
-        if (isGuestSide) {
-            programmer.installCatchAllPass(inRep, 200);
-        }
+        // chain-1 fall-through drops the packet when no rule matches.
+        //
+        // Guest-side rationale: DNAT'd PFW traffic (src=external client, not tier
+        // CIDR) doesn't match the tier-only SNAT rule (pref 50). Without this
+        // catch-all, kernel-DNAT'd packets would be dropped before reaching the
+        // wire. With `pass`, mlx5 HW lets the packet continue through OVS
+        // forwarding which sends it via bond1 to the VM, preserving the original
+        // client src IP so the VR's kernel ct can reverse-NAT replies.
+        //
+        // Public-side rationale (Phase B/4): VR-originated +new traffic on the
+        // public VF (BGP TCP 179, FRR keepalives, conntrackd UDP, outbound SSH
+        // for cmk push, etc.) doesn't match any chain-1 rule and would otherwise
+        // be silently dropped on the rep ingress, breaking the control plane.
+        // Empirical fix verified 2026-04-17: PFW SSH succeeds end-to-end with
+        // this rule + tier-only SNAT (pref 50, src_ip=guestCidr).
+        programmer.installCatchAllPass(inRep, 200);
 
         // ACL rules apply on whichever side they target. For simplicity, install on
         // the guest-side rep (most common for tenant-defined ACLs).
