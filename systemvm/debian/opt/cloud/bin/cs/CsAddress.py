@@ -383,9 +383,10 @@ class CsIP:
                     gateway = interface.get_gateway()
                     route.add_or_change_defaultroute(gateway)
                     CsDevice(self.dev, self.config).configure_rp(False)
-            elif self.get_type() in ["public"] and address["device"] == CsHelper.PUBLIC_INTERFACES[self.cl.get_type()]:
+            elif self.get_type() in ["public"] and address.get("source_nat", False):
                 gateway = str(address["gateway"])
-                route.add_defaultroute(gateway)
+                if gateway:
+                    route.add_defaultroute(gateway)
         else:
             # once we start processing public ip's we need to verify there
             # is a default route and add if needed
