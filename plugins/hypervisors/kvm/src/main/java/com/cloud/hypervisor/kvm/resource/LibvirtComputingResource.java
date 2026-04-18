@@ -153,7 +153,9 @@ import com.cloud.agent.api.routing.IpAssocVpcCommand;
 import com.cloud.agent.api.routing.NetworkElementCommand;
 import com.cloud.agent.api.routing.SetNetworkACLCommand;
 import com.cloud.agent.api.routing.SetSourceNatCommand;
+import com.cloud.agent.api.routing.SetStaticNatRulesCommand;
 import com.cloud.agent.api.to.NetworkACLTO;
+import com.cloud.agent.api.to.StaticNatRuleTO;
 import com.cloud.agent.api.to.DataStoreTO;
 import com.cloud.agent.api.to.DataTO;
 import com.cloud.agent.api.to.DiskTO;
@@ -698,6 +700,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             return prepareNetworkElementCommand((SetSourceNatCommand)cmd);
         } else if (cmd instanceof SetNetworkACLCommand) {
             return prepareNetworkElementCommand((SetNetworkACLCommand)cmd);
+        } else if (cmd instanceof SetStaticNatRulesCommand) {
+            return prepareNetworkElementCommand((SetStaticNatRulesCommand)cmd);
         }
         return new ExecutionResult(true, null);
     }
@@ -2815,6 +2819,28 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 new java.util.ArrayList<>();
         int prio = 80;
         for (NetworkACLTO r : rules) {
+            // Skip rules that are being revoked. CloudStack sends the FULL
+            // rule set on every SetNetworkACL invocation — both currently-
+            // active and just-deleted rules — and the agent script is
+            // expected to GC the revoked ones. Since applyToRep does
+            // clearChain1 + reinstall from scratch, simply omitting the
+            // revoked entries from the new IntentSpec is sufficient.
+            if (r.revoked()) {
+                continue;
+            }
+            // Only Egress rules apply on the guest-rep ingress (which sees
+            // VM-egress traffic). Ingress ACLs need to match inbound traffic
+            // from the wire — that direction isn't exposed via TC ingress on
+            // a VF rep in switchdev (would require rules on bond1 or
+            // public-rep egress, out of scope here). Kernel iptables in the
+            // VR (ACL_INBOUND_eth1) handles Ingress ACLs.
+            //
+            // NOTE: NetworkACLTO.getTrafficType() returns
+            // com.cloud.network.vpc.NetworkACLItem.TrafficType (Ingress/Egress),
+            // NOT com.cloud.network.Networks.TrafficType (Guest/Public/...).
+            if (r.getTrafficType() != com.cloud.network.vpc.NetworkACLItem.TrafficType.Egress) {
+                continue;
+            }
             String proto = r.getProtocol();
             // Skip wildcard rules: protocol="all" (or null/any) is too broad to
             // offload safely — it would match every TCP/UDP packet (including
@@ -2878,6 +2904,90 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         intentReconciler.applyIntent(newSpec);
         LOGGER.info("Programmed {} TC ACL rules for VR {} (HW offload, kernel iptables remains as fallback)",
                 aclRules.size(), routerName);
+        return new ExecutionResult(true, null);
+    }
+
+    /**
+     * Phase B/3: program HW offload SNAT for Static NAT rules (1:1 mapping
+     * between a public IP and a VM private IP).
+     *
+     * <p>Static NAT in CloudStack VPC: the user calls {@code enableStaticNat}
+     * to bind a public IP to a guest VM IP. CloudStack mgmt then sends
+     * {@link SetStaticNatRulesCommand} to the host with a list of
+     * {@link StaticNatRuleTO} (srcIp = public, dstIp = VM private). The agent
+     * normally pushes those into the VR's iptables.
+     *
+     * <p>HW path (this method): for each non-revoked rule, install a TC
+     * stateful flower rule on the guest representor matching VM-egress
+     * traffic (src_ip = dstIp, the VM IP) — both TCP and UDP — and mirredd
+     * to bond1 with {@code ct commit zone N nat src addr <publicIp>}. Higher
+     * precedence (pref 30) than the broader source NAT (pref 50), so static
+     * NAT'd VMs SNAT to their dedicated public IP instead of the VPC source
+     * NAT IP.
+     *
+     * <p>Inbound DNAT (external → public IP → VM) is NOT in HW yet — that
+     * requires TC on bond1/uplink which mlx5 switchdev handles differently.
+     * For now the kernel iptables in the VR (static_nat_PREROUTING) handles
+     * the DNAT direction; HW only accelerates the outbound SNAT.
+     */
+    protected ExecutionResult prepareNetworkElementCommand(final SetStaticNatRulesCommand cmd) {
+        if (intentReconciler == null) {
+            return new ExecutionResult(true, null);
+        }
+        final String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);
+        com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec current =
+                intentReconciler.currentIntent(routerName);
+        if (current == null) {
+            return new ExecutionResult(true, null);
+        }
+        StaticNatRuleTO[] rules = cmd.getRules();
+        if (rules == null) {
+            return new ExecutionResult(true, null);
+        }
+        // Carry over existing NAT (source NAT, port forwards, etc.) and add
+        // static NAT entries on top. Source NAT's matchAddr is the VPC
+        // supernet so it doesn't conflict with static NAT's per-VM src match
+        // (which always sits at a higher precedence).
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natRules =
+                new java.util.ArrayList<>();
+        if (current.natRules != null) {
+            natRules.addAll(current.natRules);
+        }
+        int prio = 30; // strictly less than source NAT (pref 50) → matches first
+        int added = 0;
+        for (StaticNatRuleTO r : rules) {
+            if (r.revoked()) {
+                continue;
+            }
+            if (r.getDstIp() == null || r.getSrcIp() == null) {
+                continue;
+            }
+            for (String proto : new String[]{"tcp", "udp"}) {
+                var sn = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                sn.dir = "SNAT";
+                sn.matchAddr = r.getDstIp();        // VM private IP — narrow match
+                sn.translateAddr = r.getSrcIp();    // dedicated public IP for this VM
+                sn.ipProto = proto;
+                sn.prio = prio++;
+                natRules.add(sn);
+            }
+            added++;
+        }
+        if (added == 0) {
+            return new ExecutionResult(true, null);
+        }
+        var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+        newSpec.vrId = current.vrId;
+        newSpec.version = System.currentTimeMillis();
+        newSpec.guestVfPci = current.guestVfPci;
+        newSpec.publicVfPci = current.publicVfPci;
+        newSpec.ctZone = current.ctZone;
+        newSpec.natRules = natRules;
+        newSpec.aclRules = current.aclRules;
+        newSpec.lbRules = current.lbRules;
+        intentReconciler.applyIntent(newSpec);
+        LOGGER.info("Programmed {} static NAT rule(s) ({} TC entries) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
+                added, added * 2, routerName);
         return new ExecutionResult(true, null);
     }
 
