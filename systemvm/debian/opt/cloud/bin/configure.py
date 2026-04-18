@@ -1702,6 +1702,32 @@ def main(argv):
 
     red = CsRedundant(config)
     red.set()
+
+    # HW offload intent: if this VR has SR-IOV VFs (eth0/eth1 are mlx5 VFs),
+    # serialize NAT/ACL/LB rules and POST to the host agent so it can program
+    # the corresponding switchdev representors with TC flower offload.
+    # iptables/nftables fallback above stays in place either way.
+    try:
+        from cs.CsHwOffloadIntent import CsHwOffloadIntent
+        hw_intent = CsHwOffloadIntent(config)
+        if hw_intent.is_enabled():
+            # BACKUP VR submits empty intent so host clears any rules from a
+            # previous PRIMARY epoch on this rep pair.
+            from cs.CsRedundant import CsRedundant as _R
+            is_primary = True
+            try:
+                # Best-effort detect: CsRedundant exposes an _is_primary helper
+                is_primary = bool(getattr(red, "_is_primary", lambda: True)())
+            except Exception:
+                pass
+            if is_primary:
+                hw_intent.populate_from_databag(config)
+                hw_intent.submit()
+            else:
+                hw_intent.submit_empty()
+    except Exception as _e:
+        logging.warning("HW offload intent step failed (continuing with iptables): %s", _e)
+
     return 0
 
 

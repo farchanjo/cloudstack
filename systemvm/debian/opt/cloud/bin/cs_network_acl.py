@@ -15,9 +15,33 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 from netaddr import *
 
 
+def macdevice_map():
+    device_map = {}
+    for eth in os.listdir('/sys/class/net'):
+        if not eth.startswith('eth'):
+            continue
+        try:
+            with open('/sys/class/net/%s/address' % eth) as f:
+                mac_address = f.read().replace('\n', '')
+                device_map[mac_address] = eth
+        except (IOError, OSError):
+            continue
+    return device_map
+
+
 def merge(dbag, data):
+    # The 'device' field comes from NicTO.deviceId on management side, which
+    # may not match VR's actual interface ordering when a HW offload guest
+    # NIC (hostdev) is present (it shifts subsequent interfaces by one).
+    # When mac_address is provided, resolve the actual eth name by MAC.
+    mac = data.get('mac_address')
+    if mac:
+        device_map = macdevice_map()
+        if mac in device_map:
+            data['device'] = device_map[mac]
     dbag[data['device']] = data
     return dbag

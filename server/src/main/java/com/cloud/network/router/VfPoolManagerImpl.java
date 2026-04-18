@@ -1,0 +1,127 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.network.router;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import javax.inject.Inject;
+import javax.naming.ConfigurationException;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.stereotype.Component;
+
+import com.cloud.exception.InsufficientCapacityException;
+import com.cloud.exception.InsufficientServerCapacityException;
+import com.cloud.host.Host;
+import com.cloud.network.router.SriovVfPoolVO.State;
+import com.cloud.network.router.dao.SriovVfPoolDao;
+import com.cloud.utils.component.ManagerBase;
+
+@Component
+public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
+
+    private static final Logger LOGGER = LogManager.getLogger(VfPoolManagerImpl.class);
+
+    @Inject
+    private SriovVfPoolDao vfPoolDao;
+
+    @Override
+    public boolean configure(String name, java.util.Map<String, Object> params) throws ConfigurationException {
+        super.configure(name, params);
+        return true;
+    }
+
+    @Override
+    public void registerHostVfs(long hostId, String pfName, int totalVfs, List<String> pciAddresses) {
+        if (pciAddresses == null || pciAddresses.isEmpty()) {
+            LOGGER.warn(String.format("registerHostVfs called for host %d pf=%s with no PCI addresses", hostId, pfName));
+            return;
+        }
+
+        // Build a set of currently-known PCI addresses on this host (for any PF).
+        Set<String> known = new HashSet<>();
+        for (SriovVfPoolVO vf : vfPoolDao.listByHost(hostId)) {
+            known.add(vf.getPciAddress());
+        }
+
+        int added = 0;
+        for (String pci : pciAddresses) {
+            if (known.contains(pci)) {
+                continue;
+            }
+            String repName = derivePortRepresentor(pfName, pciAddresses.indexOf(pci));
+            SriovVfPoolVO vf = new SriovVfPoolVO(hostId, pci, pfName, repName);
+            vfPoolDao.persist(vf);
+            added++;
+        }
+        if (added > 0) {
+            LOGGER.info(String.format("Registered %d new VFs on host %d for PF %s (total reported: %d)",
+                    added, hostId, pfName, totalVfs));
+        }
+    }
+
+    @Override
+    public SriovVfPoolVO allocate(long hostId, long nicId) throws InsufficientCapacityException {
+        SriovVfPoolVO vf = vfPoolDao.allocate(hostId, nicId);
+        if (vf == null) {
+            throw new InsufficientServerCapacityException(
+                "No FREE SR-IOV VF available on host " + hostId, Host.class, hostId);
+        }
+        LOGGER.debug(String.format("Allocated VF %s (PCI %s, rep %s) on host %d for NIC %d",
+                vf.getUuid(), vf.getPciAddress(), vf.getRepresentorName(), hostId, nicId));
+        return vf;
+    }
+
+    @Override
+    public boolean release(long vfPoolId) {
+        boolean ok = vfPoolDao.release(vfPoolId);
+        if (ok) {
+            LOGGER.debug(String.format("Released VF pool id=%d", vfPoolId));
+        }
+        return ok;
+    }
+
+    @Override
+    public boolean releaseByNicId(long nicId) {
+        boolean ok = vfPoolDao.releaseByNicId(nicId);
+        if (ok) {
+            LOGGER.debug(String.format("Released VF(s) bound to NIC %d", nicId));
+        }
+        return ok;
+    }
+
+    @Override
+    public int countFree(long hostId) {
+        return vfPoolDao.countByHostAndState(hostId, State.FREE);
+    }
+
+    /**
+     * Derive the representor netdev name for a VF index on a given PF.
+     * Mirrors the udev/script naming applied in {@code mlx-switchdev.sh}:
+     *   pf=dx6p0 vfIndex=0 → dx6p0r0
+     *   pf=dx6p1 vfIndex=15 → dx6p1r15
+     */
+    static String derivePortRepresentor(String pfName, int vfIndex) {
+        if (pfName == null || pfName.isEmpty()) {
+            return null;
+        }
+        return pfName + "r" + vfIndex;
+    }
+}

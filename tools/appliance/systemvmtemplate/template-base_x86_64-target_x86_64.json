@@ -34,11 +34,11 @@
       "qemuargs": [
         [
           "-m",
-          "500M"
+          "2048M"
         ],
         [
           "-smp",
-          "1"
+          "4"
         ]
       ],
       "shutdown_command": "sudo halt -p",

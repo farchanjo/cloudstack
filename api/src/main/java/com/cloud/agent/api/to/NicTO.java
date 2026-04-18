@@ -37,6 +37,16 @@ public class NicTO extends NetworkTO {
 
     String networkSegmentName;
 
+    /* SR-IOV VF passthrough (HW Offload). All optional; null/false means traditional bridge/TAP. */
+    String vfPciAddress;       // VF PCI bus address, e.g. "0000:01:00.2"
+    Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
+    String vfPfName;           // Physical Function netdev name (e.g. "dx6p0")
+
+    /* SR-IOV Sub-Function with vDPA. All optional; null/false means no SF/vDPA. */
+    String vdpaDevice;         // vDPA device path, e.g. "/dev/vhost-vdpa-0"
+    Boolean useSfVdpa;         // wrapper Boolean → null preserves wire compat with older agents
+    String sfRepresentorName;  // SF representor name, e.g. "dx6p0sf0"
+
     public NicTO() {
         super();
     }
@@ -162,5 +172,61 @@ public class NicTO extends NetworkTO {
 
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
+    }
+
+    public String getVfPciAddress() {
+        return vfPciAddress;
+    }
+
+    public void setVfPciAddress(String vfPciAddress) {
+        this.vfPciAddress = vfPciAddress;
+    }
+
+    public Boolean getUseHwOffload() {
+        return useHwOffload;
+    }
+
+    public boolean isUseHwOffload() {
+        return Boolean.TRUE.equals(useHwOffload);
+    }
+
+    public void setUseHwOffload(Boolean useHwOffload) {
+        this.useHwOffload = useHwOffload;
+    }
+
+    public String getVfPfName() {
+        return vfPfName;
+    }
+
+    public void setVfPfName(String vfPfName) {
+        this.vfPfName = vfPfName;
+    }
+
+    public String getVdpaDevice() {
+        return vdpaDevice;
+    }
+
+    public void setVdpaDevice(String vdpaDevice) {
+        this.vdpaDevice = vdpaDevice;
+    }
+
+    public Boolean getUseSfVdpa() {
+        return useSfVdpa;
+    }
+
+    public boolean isUseSfVdpa() {
+        return Boolean.TRUE.equals(useSfVdpa);
+    }
+
+    public void setUseSfVdpa(Boolean useSfVdpa) {
+        this.useSfVdpa = useSfVdpa;
+    }
+
+    public String getSfRepresentorName() {
+        return sfRepresentorName;
+    }
+
+    public void setSfRepresentorName(String sfRepresentorName) {
+        this.sfRepresentorName = sfRepresentorName;
     }
 }

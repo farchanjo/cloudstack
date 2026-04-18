@@ -83,6 +83,34 @@ function install_packages() {
 
   apt_clean
 
+    # Regenerate GRUB2 config so the backports kernel appears in grub.cfg
+    # (configure_grub.sh runs before this script, so grub.cfg only has the old kernel)
+    grub-mkconfig -o /boot/grub/grub.cfg
+
+    # Fix grub-legacy menu.lst kopt to include console params for serial output
+    if [[ -f /boot/grub/menu.lst ]]; then
+      sed -i 's|^# kopt=\(root=UUID=[^ ]* ro\)$|# kopt=\1 console=tty0 console=ttyS0,115200n8 console=hvc0 earlyprintk=xen net.ifnames=0 biosdevname=0 nomodeset|' /boot/grub/menu.lst
+      update-grub
+    fi
+
+  # Backports kernel (6.11+) for better mlx5 switchdev + TC ct/nat offload support
+  if [[ "${arch}" == "amd64" ]]; then
+    echo "deb http://deb.debian.org/debian bookworm-backports main non-free-firmware" > /etc/apt/sources.list.d/backports.list
+    apt-get update
+    ${apt_get} -t bookworm-backports install linux-image-amd64 firmware-misc-nonfree
+    apt_clean
+
+    # Regenerate GRUB2 config so the backports kernel appears in grub.cfg
+    # (configure_grub.sh runs before this script, so grub.cfg only has the old kernel)
+    grub-mkconfig -o /boot/grub/grub.cfg
+
+    # Fix grub-legacy menu.lst kopt to include console params for serial output
+    if [[ -f /boot/grub/menu.lst ]]; then
+      sed -i 's|^# kopt=\(root=UUID=[^ ]* ro\)$|# kopt=\1 console=tty0 console=ttyS0,115200n8 console=hvc0 earlyprintk=xen net.ifnames=0 biosdevname=0 nomodeset|' /boot/grub/menu.lst
+      update-grub
+    fi
+  fi
+
   # 32 bit architecture support for vhd-util
   if [[ "${arch}" != "i386" && "${arch}" == "amd64" ]]; then
     dpkg --add-architecture i386
@@ -106,6 +134,16 @@ function install_packages() {
   ${apt_get} install containerd.io
 
   apt_clean
+
+    # Regenerate GRUB2 config so the backports kernel appears in grub.cfg
+    # (configure_grub.sh runs before this script, so grub.cfg only has the old kernel)
+    grub-mkconfig -o /boot/grub/grub.cfg
+
+    # Fix grub-legacy menu.lst kopt to include console params for serial output
+    if [[ -f /boot/grub/menu.lst ]]; then
+      sed -i 's|^# kopt=\(root=UUID=[^ ]* ro\)$|# kopt=\1 console=tty0 console=ttyS0,115200n8 console=hvc0 earlyprintk=xen net.ifnames=0 biosdevname=0 nomodeset|' /boot/grub/menu.lst
+      update-grub
+    fi
 
   if [ "${arch}" == "amd64" ]; then
     install_vhd_util

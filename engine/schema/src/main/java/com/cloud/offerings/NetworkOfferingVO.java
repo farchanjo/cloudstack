@@ -155,6 +155,12 @@ public class NetworkOfferingVO implements NetworkOffering {
     @Column(name = "supports_vm_autoscaling")
     boolean supportsVmAutoScaling = false;
 
+    @Column(name = "hw_offload_enabled")
+    boolean hwOffloadEnabled = false;
+
+    @Column(name = "sf_vdpa_enabled")
+    boolean sfVdpaEnabled = false;
+
     @Override
     public String getDisplayText() {
         return displayText;
@@ -565,6 +571,22 @@ public class NetworkOfferingVO implements NetworkOffering {
     @Override
     public boolean isSupportsVmAutoScaling() {
         return supportsVmAutoScaling;
+    }
+
+    public boolean isHwOffloadEnabled() {
+        return hwOffloadEnabled;
+    }
+
+    public void setHwOffloadEnabled(boolean hwOffloadEnabled) {
+        this.hwOffloadEnabled = hwOffloadEnabled;
+    }
+
+    public boolean isSfVdpaEnabled() {
+        return sfVdpaEnabled;
+    }
+
+    public void setSfVdpaEnabled(boolean sfVdpaEnabled) {
+        this.sfVdpaEnabled = sfVdpaEnabled;
     }
 
     @Override

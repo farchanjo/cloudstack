@@ -1540,7 +1540,7 @@ public class LibvirtVMDef {
 
     public static class InterfaceDef {
         public enum GuestNetType {
-            BRIDGE("bridge"), DIRECT("direct"), NETWORK("network"), USER("user"), ETHERNET("ethernet"), INTERNAL("internal"), VHOSTUSER("vhostuser");
+            BRIDGE("bridge"), DIRECT("direct"), NETWORK("network"), USER("user"), ETHERNET("ethernet"), INTERNAL("internal"), VHOSTUSER("vhostuser"), HOSTDEV("hostdev"), VDPA("vdpa");
             String _type;
 
             GuestNetType(String type) {
@@ -1600,6 +1600,9 @@ public class LibvirtVMDef {
         private Integer _userIp4Prefix;
         private Integer _multiQueueNumber;
         private Boolean _packedVirtQueues;
+        private String _pciAddress; /* For HOSTDEV interface type (SR-IOV VF passthrough). Format: dddd:bb:ss.f */
+        private boolean _hostdevManaged = true; /* libvirt 'managed' attr; true => libvirt detaches/reattaches the device */
+        private String _vdpaDevPath; /* For VDPA interface type (SF vDPA passthrough). Path: /dev/vhost-vdpa-N */
 
         public void defBridgeNet(String brName, String targetBrName, String macAddr, NicModel model) {
             defBridgeNet(brName, targetBrName, macAddr, model, 0);
@@ -1626,6 +1629,54 @@ public class LibvirtVMDef {
             _macAddr = macAddr;
             _model = model;
             _networkRateKBps = networkRateKBps;
+        }
+
+        /**
+         * SR-IOV VF passthrough as a guest interface. Generates libvirt XML of the form:
+         *   {@code <interface type='hostdev' managed='yes'>
+         *            <source><address type='pci' domain='...' bus='...' slot='...' function='...'/></source>
+         *            <mac address='...'/>
+         *            <vlan><tag id='N'/></vlan>
+         *          </interface>}
+         *
+         * @param pciAddress VF PCI bus address. Accepts "dddd:bb:ss.f" or "bb:ss.f" (domain defaults to 0000).
+         * @param macAddr    MAC to assign to the guest-visible NIC.
+         * @param vlanTag    802.1Q VLAN tag (1-4094); pass 0 or negative to omit.
+         */
+        public void defHostdevNet(String pciAddress, String macAddr, int vlanTag) {
+            _netType = GuestNetType.HOSTDEV;
+            _pciAddress = pciAddress;
+            _macAddr = macAddr;
+            _vlanTag = vlanTag;
+        }
+
+        public String getPciAddress() {
+            return _pciAddress;
+        }
+
+        public boolean isHostdevManaged() {
+            return _hostdevManaged;
+        }
+
+        public void setHostdevManaged(boolean managed) {
+            this._hostdevManaged = managed;
+        }
+
+        /**
+         * Define a vDPA network interface backed by a Mellanox SF.
+         * Generates: {@code <interface type='vdpa'><source dev='/dev/vhost-vdpa-N'/><mac address='...'/></interface>}
+         *
+         * @param vdpaDevPath vDPA character device path, e.g. "/dev/vhost-vdpa-0".
+         * @param macAddr     MAC address to assign to the guest-visible NIC.
+         */
+        public void defVdpaNet(String vdpaDevPath, String macAddr) {
+            _netType = GuestNetType.VDPA;
+            _vdpaDevPath = vdpaDevPath;
+            _macAddr = macAddr;
+        }
+
+        public String getVdpaDevPath() {
+            return _vdpaDevPath;
         }
 
         public void defDpdkNet(String dpdkSourcePath, String dpdkPort, String macAddress, NicModel model,
@@ -1807,6 +1858,23 @@ public class LibvirtVMDef {
             } else if (_netType == GuestNetType.VHOSTUSER) {
                 netBuilder.append("<source type='unix' path='"+ _dpdkSourcePath + _dpdkSourcePort +
                         "' mode='" + _interfaceMode + "'/>\n");
+            } else if (_netType == GuestNetType.HOSTDEV) {
+                netBuilder.append("<source>\n");
+                netBuilder.append(formatPciAddressXml(_pciAddress));
+                netBuilder.append("</source>\n");
+                if (_macAddr != null) {
+                    netBuilder.append("<mac address='" + _macAddr + "'/>\n");
+                }
+                if (_vlanTag > 0 && _vlanTag < 4095) {
+                    netBuilder.append("<vlan>\n<tag id='" + _vlanTag + "'/>\n</vlan>\n");
+                }
+                return netBuilder.toString();
+            } else if (_netType == GuestNetType.VDPA) {
+                netBuilder.append("<source dev='" + _vdpaDevPath + "'/>\n");
+                if (_macAddr != null) {
+                    netBuilder.append("<mac address='" + _macAddr + "'/>\n");
+                }
+                return netBuilder.toString();
             }
 
             if (_networkName != null) {
@@ -1878,10 +1946,45 @@ public class LibvirtVMDef {
         @Override
         public String toString() {
             StringBuilder netBuilder = new StringBuilder();
-            netBuilder.append("<interface type='" + _netType + "'>\n");
+            if (_netType == GuestNetType.HOSTDEV) {
+                netBuilder.append("<interface type='hostdev' managed='" + (_hostdevManaged ? "yes" : "no") + "'>\n");
+            } else {
+                netBuilder.append("<interface type='" + _netType + "'>\n");
+            }
             netBuilder.append(getContent());
             netBuilder.append("</interface>\n");
             return netBuilder.toString();
+        }
+
+        /**
+         * Convert a PCI bus address into the canonical libvirt {@code <address type='pci' .../>} XML element.
+         * Accepts "dddd:bb:ss.f" or "bb:ss.f" (domain defaults to 0000). Each segment is parsed as hex.
+         * Mirrors the parsing logic in {@link LibvirtGpuDef} for consistency.
+         */
+        static String formatPciAddressXml(String pciAddress) {
+            int domainVal = 0, busVal = 0, slotVal = 0, funcVal = 0;
+            if (pciAddress != null && !pciAddress.isEmpty()) {
+                String[] parts = pciAddress.split(":");
+                String slotFunction;
+                if (parts.length == 3) {
+                    domainVal = Integer.parseInt(parts[0], 16);
+                    busVal = Integer.parseInt(parts[1], 16);
+                    slotFunction = parts[2];
+                } else if (parts.length == 2) {
+                    slotFunction = parts[1];
+                    busVal = Integer.parseInt(parts[0], 16);
+                } else {
+                    throw new IllegalArgumentException("Invalid PCI bus address format: '" + pciAddress + "'");
+                }
+                String[] sf = slotFunction.split("\\.");
+                if (sf.length != 2) {
+                    throw new IllegalArgumentException("Invalid PCI bus address format: '" + pciAddress + "'");
+                }
+                slotVal = Integer.parseInt(sf[0], 16);
+                funcVal = Integer.parseInt(sf[1].trim(), 16);
+            }
+            return String.format("<address type='pci' domain='0x%04x' bus='0x%02x' slot='0x%02x' function='0x%x'/>%n",
+                    domainVal, busVal, slotVal, funcVal);
         }
     }
 

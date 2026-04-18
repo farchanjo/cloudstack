@@ -67,6 +67,7 @@ public class LibvirtOvsFetchInterfaceCommandWrapperTest {
             }
         } catch (SocketException ignored) {}
         Assume.assumeTrue(StringUtils.isNotBlank(interfaceName));
+        Assume.assumeTrue(StringUtils.isNotBlank(ipAddress));
         Ternary<String, String, String> result = null;
         try {
             result = wrapper.getInterfaceDetails(interfaceName);

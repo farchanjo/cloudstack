@@ -258,6 +258,20 @@ public class LibvirtDomainXMLParser {
                     def.setDpdkSourcePort(port);
                     def.setDpdkOvsPath(ovsPath);
                     def.setInterfaceMode(mode);
+                } else if (type.equalsIgnoreCase("hostdev")) {
+                    String hDomain = getAttrValue("address", "domain", nic);
+                    String hBus = getAttrValue("address", "bus", nic);
+                    String hSlot = getAttrValue("address", "slot", nic);
+                    String hFunc = getAttrValue("address", "function", nic);
+                    String pciAddr = String.format("%s:%s:%s.%s",
+                            hDomain != null ? hDomain.replace("0x", "") : "0000",
+                            hBus != null ? hBus.replace("0x", "") : "00",
+                            hSlot != null ? hSlot.replace("0x", "") : "00",
+                            hFunc != null ? hFunc.replace("0x", "") : "0");
+                    def.defHostdevNet(pciAddr, mac, 0);
+                } else if (type.equalsIgnoreCase("vdpa")) {
+                    String sourceDev = getAttrValue("source", "dev", nic);
+                    def.defVdpaNet(sourceDev, mac);
                 }
                 String multiQueueNumber = getAttrValue("driver", "queues", nic);
                 if (StringUtils.isNotBlank(multiQueueNumber)) {

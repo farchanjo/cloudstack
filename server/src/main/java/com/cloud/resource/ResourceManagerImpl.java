@@ -247,6 +247,8 @@ public class ResourceManagerImpl extends ManagerBase implements ResourceManager,
     @Inject
     private AgentManager _agentMgr;
     @Inject
+    private com.cloud.network.router.VfPoolManager _vfPoolManager;
+    @Inject
     private StorageManager _storageMgr;
     @Inject
     private DataCenterDao _dcDao;
@@ -3633,6 +3635,36 @@ public class ResourceManagerImpl extends ManagerBase implements ResourceManager,
         return createHostVO(cmds, null, null, null, null, ResourceStateAdapter.Event.CREATE_HOST_VO_FOR_CONNECTED);
     }
 
+    private void registerSriovVfsFromHostDetails(long hostId, Map<String, String> details) {
+        try {
+            for (Map.Entry<String, String> entry : details.entrySet()) {
+                String key = entry.getKey();
+                // Keys: sriov.vfs.<pfname>.pci = "0000:01:00.2,0000:01:00.3,..."
+                if (key.startsWith("sriov.vfs.") && key.endsWith(".pci")) {
+                    String pfName = key.substring("sriov.vfs.".length(), key.length() - ".pci".length());
+                    String countKey = "sriov.vfs." + pfName + ".count";
+                    int count = 0;
+                    try {
+                        count = Integer.parseInt(details.getOrDefault(countKey, "0"));
+                    } catch (NumberFormatException ignored) {}
+                    String[] pciAddresses = entry.getValue().split(",");
+                    java.util.List<String> pciList = new java.util.ArrayList<>();
+                    for (String pci : pciAddresses) {
+                        String trimmed = pci.trim();
+                        if (!trimmed.isEmpty()) {
+                            pciList.add(trimmed);
+                        }
+                    }
+                    if (_vfPoolManager != null) {
+                        _vfPoolManager.registerHostVfs(hostId, pfName, count, pciList);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to register SR-IOV VFs from host_details for host " + hostId, e);
+        }
+    }
+
     private void checkIPConflicts(final HostPodVO pod, final DataCenterVO dc, final String serverPrivateIP, final String serverPublicIP) {
         // If the server's private IP is the same as is public IP, this host has
         // a host-only private network. Don't check for conflicts with the
@@ -3695,6 +3727,11 @@ public class ResourceManagerImpl extends ManagerBase implements ResourceManager,
             } else {
                 details = hostDetails;
             }
+        }
+
+        // SR-IOV VF pool registration from host_details reported by agent
+        if (details != null && "true".equals(details.get("sriov.enabled"))) {
+            registerSriovVfsFromHostDetails(host.getId(), details);
         }
 
         final HostPodVO pod = _podDao.findById(host.getPodId());

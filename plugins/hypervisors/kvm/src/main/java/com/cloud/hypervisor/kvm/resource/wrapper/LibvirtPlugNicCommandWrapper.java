@@ -60,6 +60,9 @@ public final class LibvirtPlugNicCommandWrapper extends CommandWrapper<PlugNicCo
                 }
                 nicnum++;
             }
+            // Note: VF passthrough (hostdev) cannot be hot-plugged via attachDevice.
+            // For VPC VRs, guest NICs with HW offload must be included in the initial
+            // StartCommand boot XML. This is a TODO for the next phase.
             final VifDriver vifDriver = libvirtComputingResource.getVifDriver(nic.getType(), nic.getName());
             final InterfaceDef interfaceDef = vifDriver.plug(nic, "Other PV", "", null);
             if (command.getDetails() != null) {

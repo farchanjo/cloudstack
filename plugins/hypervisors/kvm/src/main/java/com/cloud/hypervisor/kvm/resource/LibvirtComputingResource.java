@@ -151,7 +151,11 @@ import com.cloud.agent.api.VmStatsEntry;
 import com.cloud.agent.api.routing.IpAssocCommand;
 import com.cloud.agent.api.routing.IpAssocVpcCommand;
 import com.cloud.agent.api.routing.NetworkElementCommand;
+import com.cloud.agent.api.routing.SetNetworkACLCommand;
 import com.cloud.agent.api.routing.SetSourceNatCommand;
+import com.cloud.agent.api.routing.SetStaticNatRulesCommand;
+import com.cloud.agent.api.to.NetworkACLTO;
+import com.cloud.agent.api.to.StaticNatRuleTO;
 import com.cloud.agent.api.to.DataStoreTO;
 import com.cloud.agent.api.to.DataTO;
 import com.cloud.agent.api.to.DiskTO;
@@ -438,6 +442,28 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     private VifDriver defaultVifDriver;
     private VifDriver tungstenVifDriver;
+    private VifDriver vfPassthroughVifDriver;
+    private VifDriver vdpaVifDriver;
+    private SfLifecycleManager sfLifecycleManager;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
+    private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
+
+    public VifDriver getVfPassthroughVifDriver() {
+        return vfPassthroughVifDriver;
+    }
+
+    public SfLifecycleManager getSfLifecycleManager() {
+        return sfLifecycleManager;
+    }
+
+    public com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler getIntentReconciler() {
+        return intentReconciler;
+    }
+
+    public com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer getTcRuleProgrammer() {
+        return tcRuleProgrammer;
+    }
     private Map<TrafficType, VifDriver> trafficTypeVifDriverMap;
 
     protected static final String DEFAULT_OVS_VIF_DRIVER_CLASS_NAME = "com.cloud.hypervisor.kvm.resource.OvsVifDriver";
@@ -672,6 +698,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             return prepareNetworkElementCommand((SetupGuestNetworkCommand)cmd);
         } else if (cmd instanceof SetSourceNatCommand) {
             return prepareNetworkElementCommand((SetSourceNatCommand)cmd);
+        } else if (cmd instanceof SetNetworkACLCommand) {
+            return prepareNetworkElementCommand((SetNetworkACLCommand)cmd);
+        } else if (cmd instanceof SetStaticNatRulesCommand) {
+            return prepareNetworkElementCommand((SetStaticNatRulesCommand)cmd);
         }
         return new ExecutionResult(true, null);
     }
@@ -1724,6 +1754,44 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
         defaultVifDriver = getVifDriverClass(defaultVifDriverName, params);
         tungstenVifDriver = getVifDriverClass(DEFAULT_TUNGSTEN_VIF_DRIVER_CLASS_NAME, params);
+        // Always available; only used when NicTO.useHwOffload=true (SR-IOV VF passthrough).
+        // Loading is best-effort: if the class is missing, HW offload requests will fail loudly at plug time.
+        try {
+            vfPassthroughVifDriver = getVifDriverClass(VfPassthroughVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VfPassthroughVifDriver not available; SR-IOV VF passthrough requests will fail", e);
+        }
+        try {
+            vdpaVifDriver = getVifDriverClass(VdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VdpaVifDriver not available; SF vDPA requests will fail", e);
+        }
+        sfLifecycleManager = new SfLifecycleManager();
+        representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
+        tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
+        // HW offload uplink config is read directly from agent.properties because
+        // the params Map passed to configure() only carries command-line args.
+        Properties hwOffloadProps = new Properties();
+        try {
+            File agentPropsFile = PropertiesUtil.findConfigFile("agent.properties");
+            if (agentPropsFile != null) {
+                hwOffloadProps = PropertiesUtil.loadFromFile(agentPropsFile);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("Could not read agent.properties for HW offload config: {}", e.getMessage());
+        }
+        com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind uplinkKind;
+        try {
+            String kindStr = hwOffloadProps.getProperty("hwoffload.uplink.kind", "auto");
+            uplinkKind = com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind.valueOf(kindStr.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            LOGGER.warn("Invalid hwoffload.uplink.kind, falling back to AUTO: {}", e.getMessage());
+            uplinkKind = com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind.AUTO;
+        }
+        boolean uplinkLag = Boolean.parseBoolean(hwOffloadProps.getProperty("hwoffload.uplink.lag", "false"));
+        String uplinkNetdev = hwOffloadProps.getProperty("hwoffload.uplink.netdev");
+        intentReconciler = new com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler(
+                representorMapper, tcRuleProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
 
         // Load any per-traffic-type vif drivers
         for (final Map.Entry<String, Object> entry : params.entrySet()) {
@@ -1774,6 +1842,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
 
         return vifDriver;
+    }
+
+    public VifDriver getVifDriver(final NicTO nic) {
+        if (nic.isUseSfVdpa() && vdpaVifDriver != null) {
+            return vdpaVifDriver;
+        }
+        if (nic.getUseHwOffload() != null && nic.getUseHwOffload() && vfPassthroughVifDriver != null) {
+            return vfPassthroughVifDriver;
+        }
+        return getVifDriver(nic.getType());
     }
 
     public VifDriver getVifDriver(final TrafficType trafficType, final String bridgeName) {
@@ -2558,7 +2636,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             final List<InterfaceDef> pluggedNics = getInterfaces(conn, routerName);
             InterfaceDef routerNic = null;
 
+            LOGGER.info("SetupGuestNetwork: looking for mac={} in VM {} ({} interfaces found)", nic.getMac(), routerName, pluggedNics.size());
             for (final InterfaceDef pluggedNic : pluggedNics) {
+                LOGGER.info("SetupGuestNetwork: found interface type={} mac={} dev={} pciAddr={}",
+                        pluggedNic.getNetType(), pluggedNic.getMacAddress(), pluggedNic.getDevName(), pluggedNic.getPciAddress());
                 if (pluggedNic.getMacAddress().equalsIgnoreCase(nic.getMac())) {
                     routerNic = pluggedNic;
                     break;
@@ -2568,6 +2649,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             if (routerNic == null) {
                 return new ExecutionResult(false, "Can not find nic with mac " + nic.getMac() + " for VM " + routerName);
             }
+
+            // Note: auto-TC programming was previously here, but
+            // SetupGuestNetworkCommand carries only the link-local control IP,
+            // not the real public IP. The trigger now lives in
+            // prepareNetworkElementCommand(SetSourceNatCommand) where
+            // cmd.getIpAddress().getPublicIp() is the actual SNAT IP.
 
             return new ExecutionResult(true, null);
         } catch (final LibvirtException e) {
@@ -2586,13 +2673,26 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         try {
             conn = LibvirtConnection.getConnectionByVmName(routerName);
             Integer devNum = 0;
+            int publicIdx = -1;
             final String pubVlan = pubIP.getBroadcastUri();
+            final String pubMac = pubIP.getVifMacAddress();
             final List<InterfaceDef> pluggedNics = getInterfaces(conn, routerName);
 
             for (final InterfaceDef pluggedNic : pluggedNics) {
                 final String pluggedVlanBr = pluggedNic.getBrName();
+                // Phase B/4: HOSTDEV NICs have no bridge — must correlate by MAC instead.
+                // Falls through to bridge-based matching for legacy bridge/TAP NICs.
+                if (pubMac != null && pubMac.equalsIgnoreCase(pluggedNic.getMacAddress())) {
+                    publicIdx = devNum;
+                    break;
+                }
+                if (pluggedVlanBr == null) {
+                    devNum++;
+                    continue;
+                }
                 final String pluggedVlanId = getBroadcastUriFromBridge(pluggedVlanBr);
                 if (pubVlan.equalsIgnoreCase(Vlan.UNTAGGED) && pluggedVlanBr.equalsIgnoreCase(publicBridgeName)) {
+                    publicIdx = devNum;
                     break;
                 } else if (pluggedVlanBr.equalsIgnoreCase(linkLocalBridgeName)) {
                     /*skip over, no physical bridge device exists*/
@@ -2601,12 +2701,71 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     return new ExecutionResult(false, "unable to find the vlan id for bridge " + pluggedVlanBr + " when attempting to set up" + pubVlan +
                             " on router " + routerName);
                 } else if (pluggedVlanId.equals(pubVlan)) {
+                    publicIdx = devNum;
                     break;
                 }
                 devNum++;
             }
 
-            pubIP.setNicDevId(devNum);
+            // Fall back to last attempted index when no explicit match found
+            // (preserves legacy behavior for non-MAC, non-bridge edge cases).
+            if (publicIdx == -1) {
+                publicIdx = devNum;
+            }
+            pubIP.setNicDevId(publicIdx);
+
+            if (pubIP.isAdd() && pubIP.isSourceNat() && intentReconciler != null) {
+                // Phase B/4: when the public NIC is itself a HOSTDEV (VF), capture
+                // its PCI separately. Guest VF is any *other* HOSTDEV in pluggedNics
+                // (in a single-tier VPC, that's eth1; multi-tier is out of scope here).
+                String guestVfPci = null;
+                String publicVfPci = null;
+                for (int i = 0; i < pluggedNics.size(); i++) {
+                    InterfaceDef nic = pluggedNics.get(i);
+                    if (nic.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
+                        continue;
+                    }
+                    if (i == publicIdx) {
+                        publicVfPci = nic.getPciAddress();
+                    } else if (guestVfPci == null) {
+                        guestVfPci = nic.getPciAddress();
+                    }
+                }
+                String publicIp = pubIP.getPublicIp();
+                // Filter SNAT to tier sources only (src_ip = VPC supernet). Without this
+                // filter, DNAT'd PFW traffic (src=external client) would also get SNATed
+                // to the VR's public IP, which breaks the VR kernel conntrack reversal of
+                // the original DNAT — the reply would arrive with dst=public_ip instead
+                // of the original client IP, and kernel ct can't match it. With the filter,
+                // PFW falls through to the chain-1 catch-all `pass` rule (installed by
+                // IntentReconciler) and continues normally through kernel iptables NAT.
+                String guestCidr = cmd.getAccessDetail(NetworkElementCommand.GUEST_NETWORK_CIDR);
+                LOGGER.info("SetSourceNat: guestVfPci={} publicVfPci={} publicIp={} guestCidr={} for VR {}",
+                        guestVfPci, publicVfPci, publicIp, guestCidr, routerName);
+                if (guestVfPci != null && publicIp != null) {
+                    var spec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+                    spec.vrId = routerName;
+                    spec.version = System.currentTimeMillis();
+                    spec.guestVfPci = guestVfPci;
+                    spec.publicVfPci = publicVfPci;
+                    spec.natRules = new java.util.ArrayList<>();
+                    var snat = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                    snat.dir = "SNAT";
+                    snat.matchAddr = guestCidr;
+                    snat.translateAddr = publicIp;
+                    snat.ipProto = "tcp";
+                    spec.natRules.add(snat);
+                    var snatUdp = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                    snatUdp.dir = "SNAT";
+                    snatUdp.matchAddr = guestCidr;
+                    snatUdp.translateAddr = publicIp;
+                    snatUdp.ipProto = "udp";
+                    spec.natRules.add(snatUdp);
+                    intentReconciler.applyIntent(spec);
+                    LOGGER.info("Programmed TC SNAT rules for VR {} (guestVf={} publicVf={} publicIp={} matchCidr={})",
+                            routerName, guestVfPci, publicVfPci, publicIp, guestCidr);
+                }
+            }
 
             return new ExecutionResult(true, "success");
         } catch (final LibvirtException e) {
@@ -2614,6 +2773,222 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             LOGGER.error(msg, e);
             return new ExecutionResult(false, msg);
         }
+    }
+
+    /**
+     * Phase B/1: program HW offload for ACL rules.
+     *
+     * <p>SetNetworkACLCommand is sent by CloudStack mgmt whenever the user
+     * adds/removes an ACL rule on a VPC tier. The command is then dispatched
+     * to the VR's configure scripts to update iptables. We hook in BEFORE the
+     * VR script execution: if the VR has an active HW offload spec (i.e. it
+     * was deployed with a HW-offload-enabled offering), program TC flower
+     * rules on the guest representor that match the same conditions and
+     * drop/pass the packet in HW. The kernel iptables in the VR remain as
+     * fallback for traffic that doesn't match TC rules (e.g. ICMP, untracked
+     * conntrack, cross-tier).
+     *
+     * <p>Limitations of the current implementation:
+     * <ul>
+     *   <li>Rules are installed on guest-rep ingress, so they only match
+     *       <b>egress traffic from the VM</b> (Egress ACLs). Inbound ACLs
+     *       (external→VM) would require rules on bond1 or public-rep with
+     *       inverse src/dst — out of scope for this commit.</li>
+     *   <li>Source CIDR list collapses to first entry — multi-CIDR rules
+     *       fall back to kernel iptables on the VR.</li>
+     *   <li>Protocol "all" maps to a single TCP rule for now (UDP fall-back
+     *       to kernel).</li>
+     * </ul>
+     */
+    protected ExecutionResult prepareNetworkElementCommand(final SetNetworkACLCommand cmd) {
+        if (intentReconciler == null) {
+            return new ExecutionResult(true, null);
+        }
+        final String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);
+        com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec current =
+                intentReconciler.currentIntent(routerName);
+        if (current == null) {
+            // VR isn't HW-offload enabled — let VR scripts handle ACL via iptables
+            return new ExecutionResult(true, null);
+        }
+        NetworkACLTO[] rules = cmd.getRules();
+        if (rules == null) {
+            return new ExecutionResult(true, null);
+        }
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.AclRule> aclRules =
+                new java.util.ArrayList<>();
+        int prio = 80;
+        for (NetworkACLTO r : rules) {
+            // Skip rules that are being revoked. CloudStack sends the FULL
+            // rule set on every SetNetworkACL invocation — both currently-
+            // active and just-deleted rules — and the agent script is
+            // expected to GC the revoked ones. Since applyToRep does
+            // clearChain1 + reinstall from scratch, simply omitting the
+            // revoked entries from the new IntentSpec is sufficient.
+            if (r.revoked()) {
+                continue;
+            }
+            // Only Egress rules apply on the guest-rep ingress (which sees
+            // VM-egress traffic). Ingress ACLs need to match inbound traffic
+            // from the wire — that direction isn't exposed via TC ingress on
+            // a VF rep in switchdev (would require rules on bond1 or
+            // public-rep egress, out of scope here). Kernel iptables in the
+            // VR (ACL_INBOUND_eth1) handles Ingress ACLs.
+            //
+            // NOTE: NetworkACLTO.getTrafficType() returns
+            // com.cloud.network.vpc.NetworkACLItem.TrafficType (Ingress/Egress),
+            // NOT com.cloud.network.Networks.TrafficType (Guest/Public/...).
+            if (r.getTrafficType() != com.cloud.network.vpc.NetworkACLItem.TrafficType.Egress) {
+                continue;
+            }
+            String proto = r.getProtocol();
+            // Skip wildcard rules: protocol="all" (or null/any) is too broad to
+            // offload safely — it would match every TCP/UDP packet (including
+            // DNAT'd PFW traffic, BGP, etc.), and the ct commit on chain-1
+            // would create HW-zone CT entries that conflict with the VR's
+            // kernel-zone-0 conntrack on replies. Kernel iptables on the VR
+            // already enforces these wildcard ACLs correctly.
+            if (proto == null || "all".equalsIgnoreCase(proto) || "any".equalsIgnoreCase(proto)) {
+                continue;
+            }
+            proto = proto.toLowerCase();
+            if (!"tcp".equals(proto) && !"udp".equals(proto)) {
+                // ICMP and other protos: TC flower in_hw is fragile — skip and let kernel handle
+                continue;
+            }
+            // Determine match details
+            String matchSrcIp = null;
+            java.util.List<String> cidrs = r.getSourceCidrList();
+            if (cidrs != null && !cidrs.isEmpty()) {
+                String first = cidrs.get(0);
+                if (first != null && !"0.0.0.0/0".equals(first) && !"::/0".equals(first)) {
+                    matchSrcIp = first;
+                }
+            }
+            Integer matchPort = null;
+            int[] portRange = r.getSrcPortRange();
+            if (portRange != null && portRange.length > 0 && portRange[0] > 0) {
+                matchPort = portRange[0];
+            }
+            // Defensive: skip rules that match nothing specific. A bare
+            // "tcp +trk+new" rule (no src, no port) would intercept too much
+            // and conflict with NAT/PFW kernel paths. Require at least one of
+            // src CIDR or destination port to scope the rule.
+            if (matchSrcIp == null && matchPort == null) {
+                continue;
+            }
+            var ar = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.AclRule();
+            // CloudStack NetworkACLTO.getAction() returns either "ACCEPT"/"DROP"
+            // (when sourced from VPC ACLs API) or "Allow"/"Deny" (legacy paths).
+            // Map both Allow and ACCEPT to ACCEPT, default everything else to DROP.
+            String aclAction = r.getAction();
+            ar.action = ("Allow".equalsIgnoreCase(aclAction) || "ACCEPT".equalsIgnoreCase(aclAction))
+                    ? "ACCEPT" : "DROP";
+            ar.ipProto = proto;
+            ar.matchSrcIp = matchSrcIp;
+            ar.matchPort = matchPort;
+            ar.stateful = Boolean.TRUE;
+            ar.prio = prio++;
+            aclRules.add(ar);
+        }
+        // Build a new spec carrying over existing NAT/LB state + new ACL rules.
+        var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+        newSpec.vrId = current.vrId;
+        newSpec.version = System.currentTimeMillis();
+        newSpec.guestVfPci = current.guestVfPci;
+        newSpec.publicVfPci = current.publicVfPci;
+        newSpec.ctZone = current.ctZone;
+        newSpec.natRules = current.natRules;
+        newSpec.aclRules = aclRules;
+        newSpec.lbRules = current.lbRules;
+        intentReconciler.applyIntent(newSpec);
+        LOGGER.info("Programmed {} TC ACL rules for VR {} (HW offload, kernel iptables remains as fallback)",
+                aclRules.size(), routerName);
+        return new ExecutionResult(true, null);
+    }
+
+    /**
+     * Phase B/3: program HW offload SNAT for Static NAT rules (1:1 mapping
+     * between a public IP and a VM private IP).
+     *
+     * <p>Static NAT in CloudStack VPC: the user calls {@code enableStaticNat}
+     * to bind a public IP to a guest VM IP. CloudStack mgmt then sends
+     * {@link SetStaticNatRulesCommand} to the host with a list of
+     * {@link StaticNatRuleTO} (srcIp = public, dstIp = VM private). The agent
+     * normally pushes those into the VR's iptables.
+     *
+     * <p>HW path (this method): for each non-revoked rule, install a TC
+     * stateful flower rule on the guest representor matching VM-egress
+     * traffic (src_ip = dstIp, the VM IP) — both TCP and UDP — and mirredd
+     * to bond1 with {@code ct commit zone N nat src addr <publicIp>}. Higher
+     * precedence (pref 30) than the broader source NAT (pref 50), so static
+     * NAT'd VMs SNAT to their dedicated public IP instead of the VPC source
+     * NAT IP.
+     *
+     * <p>Inbound DNAT (external → public IP → VM) is NOT in HW yet — that
+     * requires TC on bond1/uplink which mlx5 switchdev handles differently.
+     * For now the kernel iptables in the VR (static_nat_PREROUTING) handles
+     * the DNAT direction; HW only accelerates the outbound SNAT.
+     */
+    protected ExecutionResult prepareNetworkElementCommand(final SetStaticNatRulesCommand cmd) {
+        if (intentReconciler == null) {
+            return new ExecutionResult(true, null);
+        }
+        final String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);
+        com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec current =
+                intentReconciler.currentIntent(routerName);
+        if (current == null) {
+            return new ExecutionResult(true, null);
+        }
+        StaticNatRuleTO[] rules = cmd.getRules();
+        if (rules == null) {
+            return new ExecutionResult(true, null);
+        }
+        // Carry over existing NAT (source NAT, port forwards, etc.) and add
+        // static NAT entries on top. Source NAT's matchAddr is the VPC
+        // supernet so it doesn't conflict with static NAT's per-VM src match
+        // (which always sits at a higher precedence).
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natRules =
+                new java.util.ArrayList<>();
+        if (current.natRules != null) {
+            natRules.addAll(current.natRules);
+        }
+        int prio = 30; // strictly less than source NAT (pref 50) → matches first
+        int added = 0;
+        for (StaticNatRuleTO r : rules) {
+            if (r.revoked()) {
+                continue;
+            }
+            if (r.getDstIp() == null || r.getSrcIp() == null) {
+                continue;
+            }
+            for (String proto : new String[]{"tcp", "udp"}) {
+                var sn = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                sn.dir = "SNAT";
+                sn.matchAddr = r.getDstIp();        // VM private IP — narrow match
+                sn.translateAddr = r.getSrcIp();    // dedicated public IP for this VM
+                sn.ipProto = proto;
+                sn.prio = prio++;
+                natRules.add(sn);
+            }
+            added++;
+        }
+        if (added == 0) {
+            return new ExecutionResult(true, null);
+        }
+        var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+        newSpec.vrId = current.vrId;
+        newSpec.version = System.currentTimeMillis();
+        newSpec.guestVfPci = current.guestVfPci;
+        newSpec.publicVfPci = current.publicVfPci;
+        newSpec.ctZone = current.ctZone;
+        newSpec.natRules = natRules;
+        newSpec.aclRules = current.aclRules;
+        newSpec.lbRules = current.lbRules;
+        intentReconciler.applyIntent(newSpec);
+        LOGGER.info("Programmed {} static NAT rule(s) ({} TC entries) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
+                added, added * 2, routerName);
+        return new ExecutionResult(true, null);
     }
 
     protected ExecutionResult prepareNetworkElementCommand(final IpAssocVpcCommand cmd) {
@@ -3432,13 +3807,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public void createVifs(final VirtualMachineTO vmSpec, final LibvirtVMDef vm) throws InternalErrorException, LibvirtException {
         final NicTO[] nics = vmSpec.getNics();
+        LOGGER.info("createVifs: VM={} total NICs={}", vmSpec.getName(), nics.length);
+        for (final NicTO n : nics) {
+            LOGGER.info("createVifs: NIC devId={} mac={} type={} useHwOffload={} vfPci={} ip={}",
+                    n.getDeviceId(), n.getMac(), n.getType(), n.getUseHwOffload(), n.getVfPciAddress(), n.getIp());
+        }
         final Map <String, String> params = vmSpec.getDetails();
         String nicAdapter = "";
         if (params != null && params.get("nicAdapter") != null && !params.get("nicAdapter").isEmpty()) {
             nicAdapter = params.get("nicAdapter");
         }
         Map<String, String> extraConfig = vmSpec.getExtraConfig();
-        for (int i = 0; i < nics.length; i++) {
+        int maxDevId = 0;
+        for (final NicTO n : nics) {
+            if (n.getDeviceId() > maxDevId) {
+                maxDevId = n.getDeviceId();
+            }
+        }
+        for (int i = 0; i <= maxDevId; i++) {
             for (final NicTO nic : vmSpec.getNics()) {
                 if (nic.getDeviceId() == i) {
                     createVif(vm, vmSpec, nic, nicAdapter, extraConfig);
@@ -3895,11 +4281,36 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             LOGGER.error("LibvirtVMDef object get devices with null result");
             throw new InternalErrorException("LibvirtVMDef object get devices with null result");
         }
-        final InterfaceDef interfaceDef = getVifDriver(nic.getType(), nic.getName()).plug(nic, vm.getPlatformEmulator(), nicAdapter, extraConfig);
+        LOGGER.info("createVif: nic deviceId={} mac={} type={} useHwOffload={} vfPciAddress={} ip={}",
+                nic.getDeviceId(), nic.getMac(), nic.getType(), nic.getUseHwOffload(), nic.getVfPciAddress(), nic.getIp());
+        final VifDriver driver = selectVifDriver(nic);
+        LOGGER.info("createVif: selected VifDriver={} for nic deviceId={} mac={}",
+                driver.getClass().getSimpleName(), nic.getDeviceId(), nic.getMac());
+        final InterfaceDef interfaceDef = driver.plug(nic, vm.getPlatformEmulator(), nicAdapter, extraConfig);
+        LOGGER.info("createVif: plug result netType={} mac={} pciAddr={} for nic deviceId={}",
+                interfaceDef.getNetType(), interfaceDef.getMacAddress(), interfaceDef.getPciAddress(), nic.getDeviceId());
         if (vmSpec.getDetails() != null) {
             setInterfaceDefQueueSettings(vmSpec.getDetails(), vmSpec.getCpus(), interfaceDef);
         }
         vm.getDevices().addDevice(interfaceDef);
+    }
+
+    private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
+        if (nic.isUseSfVdpa()) {
+            if (vdpaVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests SF vDPA (vdpaDevice=" + nic.getVdpaDevice() + ") but VdpaVifDriver is not loaded");
+            }
+            return vdpaVifDriver;
+        }
+        if (nic.isUseHwOffload()) {
+            if (vfPassthroughVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests HW offload (vfPciAddress=" + nic.getVfPciAddress() + ") but VfPassthroughVifDriver is not loaded");
+            }
+            return vfPassthroughVifDriver;
+        }
+        return getVifDriver(nic.getType(), nic.getName());
     }
 
     public boolean cleanupDisk(Map<String, String> volumeToDisconnect) {
@@ -4230,6 +4641,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         if (hostSupportsOvfExport()) {
             cmd.getHostDetails().put(HOST_OVFTOOL_VERSION, getHostOvfToolVersion());
         }
+        // SR-IOV VF discovery: enumerate Mellanox VFs that have a switchdev representor on the PF.
+        // VfPoolManager.registerHostVfs() consumes these on the management server.
+        reportSriovCapabilities(cmd.getHostDetails());
         HealthCheckResult healthCheckResult = getHostHealthCheckResult();
         if (healthCheckResult != HealthCheckResult.IGNORE) {
             cmd.setHostHealthCheckResult(healthCheckResult == HealthCheckResult.SUCCESS);
@@ -5957,6 +6371,113 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     public boolean hostSupportsOvfExport() {
         int exitValue = Script.runSimpleBashScriptForExitValue(OVF_EXPORT_SUPPORTED_CHECK_CMD);
         return exitValue == 0;
+    }
+
+    /**
+     * Inspect /sys/class/net/ for switchdev representors (phys_port_name=pf?vf*) and
+     * advertise their PFs + VF counts + PCI addresses to the management server via
+     * StartupRoutingCommand host_details. Keys:
+     *   sriov.enabled                = "true" if any VF representor exists
+     *   sriov.vfs.&lt;pfname&gt;.count = number of VFs on that PF
+     *   sriov.vfs.&lt;pfname&gt;.pci   = comma-separated PCI addresses
+     */
+    void reportSriovCapabilities(java.util.Map<String, String> details) {
+        try {
+            java.io.File netDir = new java.io.File("/sys/class/net");
+            String[] ifaces = netDir.list();
+            if (ifaces == null) {
+                return;
+            }
+            // pfName -> list of VF PCI addresses (in vfN order)
+            java.util.Map<String, java.util.List<String>> pfToPci = new java.util.TreeMap<>();
+            for (String iface : ifaces) {
+                java.io.File ppnFile = new java.io.File("/sys/class/net/" + iface + "/phys_port_name");
+                if (!ppnFile.isFile()) {
+                    continue;
+                }
+                String ppn = readSysfs(ppnFile).trim();
+                if (!ppn.matches("pf[01]vf\\d+")) {
+                    continue;
+                }
+                String parentDevicePath = new java.io.File("/sys/class/net/" + iface + "/device").getCanonicalPath();
+                String parentPci = new java.io.File(parentDevicePath).getName();
+                String pfName = derivePfName(parentPci, ppn);
+                if (pfName == null) {
+                    continue;
+                }
+                String vfPci = readVfPci(parentPci, ppn);
+                if (vfPci == null) {
+                    continue;
+                }
+                pfToPci.computeIfAbsent(pfName, k -> new java.util.ArrayList<>()).add(vfPci);
+            }
+            if (pfToPci.isEmpty()) {
+                return;
+            }
+            details.put("sriov.enabled", "true");
+            for (java.util.Map.Entry<String, java.util.List<String>> e : pfToPci.entrySet()) {
+                details.put("sriov.vfs." + e.getKey() + ".count", String.valueOf(e.getValue().size()));
+                details.put("sriov.vfs." + e.getKey() + ".pci", String.join(",", e.getValue()));
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Failed to inspect SR-IOV capabilities; HW offload may not be available", e);
+        }
+    }
+
+    /**
+     * Resolve the PF netdev name for a representor: read the PCI parent's net dir
+     * (the PF itself) and pick the first netdev entry.
+     */
+    private String derivePfName(String parentPci, String physPortName) {
+        java.io.File pfNetDir = new java.io.File("/sys/bus/pci/devices/" + parentPci + "/net");
+        if (!pfNetDir.isDirectory()) {
+            return null;
+        }
+        String[] entries = pfNetDir.list();
+        if (entries == null) {
+            return null;
+        }
+        // The PF netdev does NOT have phys_port_name=pfXvfY; it has pX (e.g. p0).
+        for (String n : entries) {
+            String ppn = readSysfs(new java.io.File("/sys/class/net/" + n + "/phys_port_name")).trim();
+            if (ppn.matches("p\\d+")) {
+                return n;
+            }
+        }
+        return entries.length > 0 ? entries[0] : null;
+    }
+
+    /**
+     * Resolve VF PCI address from the PF + phys_port_name (pf0vfN -> virtfnN under PF).
+     */
+    private String readVfPci(String pfPci, String physPortName) {
+        // phys_port_name pf0vfN or pf1vfN -> virtfnN
+        int vfIdx;
+        try {
+            vfIdx = Integer.parseInt(physPortName.substring(physPortName.indexOf("vf") + 2));
+        } catch (Exception e) {
+            return null;
+        }
+        java.io.File virtfn = new java.io.File("/sys/bus/pci/devices/" + pfPci + "/virtfn" + vfIdx);
+        if (!virtfn.exists()) {
+            return null;
+        }
+        try {
+            return new java.io.File(virtfn.getCanonicalPath()).getName();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    private static String readSysfs(java.io.File f) {
+        if (!f.isFile()) {
+            return "";
+        }
+        try {
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            return "";
+        }
     }
 
     public String getHostVirtV2vVersion() {

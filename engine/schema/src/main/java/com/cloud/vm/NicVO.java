@@ -134,6 +134,16 @@ public class NicVO implements Nic {
     @Column(name = "enabled")
     boolean enabled;
 
+    /* SR-IOV VF passthrough (HW Offload). Null = traditional bridge/TAP NIC. */
+    @Column(name = "vf_pci_address")
+    String vfPciAddress;
+
+    @Column(name = "vf_pool_id")
+    Long vfPoolId;
+
+    @Transient
+    transient String vfPfName;
+
     @Transient
     transient String nsxLogicalSwitchUuid;
 
@@ -425,5 +435,29 @@ public class NicVO implements Nic {
 
     public void setMtu(Integer mtu) {
         this.mtu = mtu;
+    }
+
+    public String getVfPciAddress() {
+        return vfPciAddress;
+    }
+
+    public void setVfPciAddress(String vfPciAddress) {
+        this.vfPciAddress = vfPciAddress;
+    }
+
+    public Long getVfPoolId() {
+        return vfPoolId;
+    }
+
+    public void setVfPoolId(Long vfPoolId) {
+        this.vfPoolId = vfPoolId;
+    }
+
+    public String getVfPfName() {
+        return vfPfName;
+    }
+
+    public void setVfPfName(String vfPfName) {
+        this.vfPfName = vfPfName;
     }
 }

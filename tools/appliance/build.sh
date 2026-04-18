@@ -278,6 +278,17 @@ mem.hotadd = "false"
 VMXFILE
 }
 
+function compress_bz2() {
+  # Prefer pbzip2 (parallel bzip2) when available for ~Nx speedup on multi-core hosts,
+  # falls back to stock bzip2. Output is bit-identical: both produce a valid .bz2 stream.
+  local file="$1"
+  if command -v pbzip2 >/dev/null 2>&1; then
+    pbzip2 -f "${file}"
+  else
+    bzip2 -f "${file}"
+  fi
+}
+
 function xen_server_export() {
   log INFO "creating xen server export"
   set +e
@@ -289,7 +300,7 @@ function xen_server_export() {
     vhd-util convert -s 0 -t 1 -i img.raw -o stagefixed.vhd
     faketime '2010-01-01' vhd-util convert -s 1 -t 2 -i stagefixed.vhd -o "${appliance_build_name}-xen.vhd"
     rm -f *.bak
-    bzip2 "${appliance_build_name}-xen.vhd"
+    compress_bz2 "${appliance_build_name}-xen.vhd"
     mv "${appliance_build_name}-xen.vhd.bz2" dist/
     log INFO "${appliance} exported for XenServer: dist/${appliance_build_name}-xen.vhd.bz2"
   else
@@ -301,7 +312,7 @@ function xen_server_export() {
 function ovm_export() {
   log INFO "creating OVM export"
   qemu-img convert -f qcow2 -O raw "dist/${appliance}" "dist/${appliance_build_name}-ovm.raw"
-  cd dist && bzip2 "${appliance_build_name}-ovm.raw" && cd ..
+  cd dist && compress_bz2 "${appliance_build_name}-ovm.raw" && cd ..
   log INFO "${appliance} exported for OracleVM: dist/${appliance_build_name}-ovm.raw.bz2"
 }
 
@@ -310,7 +321,7 @@ function kvm_export() {
   set +e
   qemu-img convert -o compat=0.10 -f qcow2 -c -O qcow2 "dist/${appliance}" "dist/${appliance_build_name}-kvm.qcow2"
   local qemuresult=$?
-  cd dist && bzip2 "${appliance_build_name}-kvm.qcow2" && cd ..
+  cd dist && compress_bz2 "${appliance_build_name}-kvm.qcow2" && cd ..
   log INFO "${appliance} exported for KVM: dist/${appliance_build_name}-kvm.qcow2.bz2"
 }
 

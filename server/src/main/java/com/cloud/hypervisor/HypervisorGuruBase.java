@@ -128,6 +128,10 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
     @Inject
     private ResourceManager _resourceMgr;
     @Inject
+    private com.cloud.network.router.VfPoolManager vfPoolManager;
+    @Inject
+    private com.cloud.offerings.dao.NetworkOfferingDao networkOfferingDao;
+    @Inject
     protected ServiceOfferingDetailsDao _serviceOfferingDetailsDao;
     @Inject
     protected VgpuProfileDao vgpuProfileDao;
@@ -240,6 +244,14 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 secIps = _nicSecIpDao.getSecondaryIpAddressesForNic(nicVO.getId());
             }
             to.setNicSecIps(secIps);
+
+            // Propagate SR-IOV VF binding (HW Offload). Null vf_pci_address means traditional bridge/TAP.
+            String vfPci = nicVO.getVfPciAddress();
+            if (vfPci != null && !vfPci.isEmpty()) {
+                to.setVfPciAddress(vfPci);
+                to.setUseHwOffload(Boolean.TRUE);
+                to.setVfPfName(nicVO.getVfPfName());
+            }
         } else {
             logger.warn("Unable to load NicVO for NicProfile {}", profile);
             //Workaround for dynamically created nics
@@ -252,6 +264,104 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         //set nic secondary ip address in NicTO which are used for security group
         // configuration. Use full when vm stop/start
         return to;
+    }
+
+    /**
+     * Allocate an SR-IOV VF for this NIC when the VR needs HW offload.
+     *
+     * <p>Two trigger paths:
+     * <ul>
+     *   <li><b>Guest-tier NIC</b>: when this NIC's network offering has
+     *       {@code hw_offload_enabled=1} (the explicit per-tier opt-in).</li>
+     *   <li><b>Public NIC</b> (Phase B/4): when the same VR also has at least
+     *       one Guest NIC on a HW-offload network. We propagate HW offload to
+     *       the public NIC so the agent can install DNAT rules in HW on its
+     *       representor (full HW pipeline: DNAT on public-rep, SNAT on
+     *       guest-rep). Without this, kernel iptables PREROUTING DNAT runs
+     *       on the soft-path and the chain-1 catch-all has to absorb the flow.</li>
+     * </ul>
+     *
+     * <p>Control NICs (link-local 169.254/16) are NEVER promoted — they're a
+     * per-host bridge (cloud0) used by the agent for VR config push and have
+     * no presence on the hardware NIC.
+     */
+    private void allocateVfIfHwOffload(NicTO nicTo, NicProfile nicProfile, VirtualMachineProfile vmProfile) {
+        if (vfPoolManager == null) {
+            return;
+        }
+        // Only VRs get VF passthrough — user VMs use standard bridge/TAP NICs
+        if (vmProfile.getType() != com.cloud.vm.VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        try {
+            NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
+            if (network == null) {
+                return;
+            }
+            // Skip control NIC (link-local cloud0) — never gets a VF.
+            if (network.getTrafficType() == com.cloud.network.Networks.TrafficType.Control ||
+                network.getTrafficType() == com.cloud.network.Networks.TrafficType.Management) {
+                return;
+            }
+            boolean shouldOffload = false;
+            com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
+            if (offering != null && offering.isHwOffloadEnabled()) {
+                shouldOffload = true;
+            } else if (network.getTrafficType() == com.cloud.network.Networks.TrafficType.Public &&
+                       vrHasAnyHwOffloadGuestNic(vmProfile)) {
+                // Phase B/4: public NIC inherits HW offload when at least one guest tier has it.
+                shouldOffload = true;
+                logger.debug("Public NIC for VR {} promoted to HW offload (sibling guest tier is HW-offload)",
+                        vmProfile.getVirtualMachine().getInstanceName());
+            }
+            if (!shouldOffload) {
+                return;
+            }
+            Long hostId = vmProfile.getVirtualMachine().getHostId();
+            if (hostId == null) {
+                return;
+            }
+            com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocate(hostId, nicProfile.getId());
+            nicTo.setVfPciAddress(vf.getPciAddress());
+            nicTo.setVfPfName(vf.getPfName());
+            nicTo.setUseHwOffload(Boolean.TRUE);
+            logger.info("Allocated VF {} (PCI {}) on host {} for NIC {} ({} traffic, HW offload)",
+                    vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
+        } catch (com.cloud.exception.InsufficientCapacityException e) {
+            logger.warn("No free VF for HW offload on host {}; NIC {} will use bridge/TAP fallback",
+                    vmProfile.getVirtualMachine().getHostId(), nicProfile.getId());
+        } catch (Exception e) {
+            logger.warn("Failed to allocate VF for HW offload", e);
+        }
+    }
+
+    /**
+     * True if the VR (DomainRouter) has any Guest-traffic NIC on a network whose
+     * offering has {@code hw_offload_enabled=1}. Used to decide whether the
+     * Public NIC of the same VR should also be promoted to a hostdev VF
+     * (Phase B/4 — full HW NAT pipeline).
+     */
+    private boolean vrHasAnyHwOffloadGuestNic(VirtualMachineProfile vmProfile) {
+        if (vmProfile.getNics() == null) {
+            return false;
+        }
+        for (com.cloud.vm.NicProfile other : vmProfile.getNics()) {
+            if (other == null || other.getNetworkId() == 0) {
+                continue;
+            }
+            NetworkVO net = networkDao.findById(other.getNetworkId());
+            if (net == null) {
+                continue;
+            }
+            if (net.getTrafficType() != com.cloud.network.Networks.TrafficType.Guest) {
+                continue;
+            }
+            com.cloud.offerings.NetworkOfferingVO off = networkOfferingDao.findById(net.getNetworkOfferingId());
+            if (off != null && off.isHwOffloadEnabled()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String getNetworkName(long zoneId, long domainId, long accountId, VpcVO vpc, long networkId) {
@@ -336,6 +446,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 nicProfile.setBroadcastType(BroadcastDomainType.Native);
             }
             NicTO nicTo = toNicTO(nicProfile);
+            allocateVfIfHwOffload(nicTo, nicProfile, vmProfile);
             nics[i++] = nicTo;
         }
 
