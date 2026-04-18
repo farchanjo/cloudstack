@@ -154,6 +154,8 @@ import com.cloud.agent.api.routing.NetworkElementCommand;
 import com.cloud.agent.api.routing.SetNetworkACLCommand;
 import com.cloud.agent.api.routing.SetSourceNatCommand;
 import com.cloud.agent.api.routing.SetStaticNatRulesCommand;
+import com.cloud.agent.api.routing.SetPortForwardingRulesVpcCommand;
+import com.cloud.agent.api.to.PortForwardingRuleTO;
 import com.cloud.agent.api.to.NetworkACLTO;
 import com.cloud.agent.api.to.StaticNatRuleTO;
 import com.cloud.agent.api.to.DataStoreTO;
@@ -702,6 +704,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             return prepareNetworkElementCommand((SetNetworkACLCommand)cmd);
         } else if (cmd instanceof SetStaticNatRulesCommand) {
             return prepareNetworkElementCommand((SetStaticNatRulesCommand)cmd);
+        } else if (cmd instanceof SetPortForwardingRulesVpcCommand) {
+            return prepareNetworkElementCommand((SetPortForwardingRulesVpcCommand)cmd);
         }
         return new ExecutionResult(true, null);
     }
@@ -2748,6 +2752,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     spec.version = System.currentTimeMillis();
                     spec.guestVfPci = guestVfPci;
                     spec.publicVfPci = publicVfPci;
+                    spec.publicVlanId = parseVlanIdFromUri(pubVlan);
                     spec.natRules = new java.util.ArrayList<>();
                     var snat = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
                     snat.dir = "SNAT";
@@ -2897,10 +2902,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.version = System.currentTimeMillis();
         newSpec.guestVfPci = current.guestVfPci;
         newSpec.publicVfPci = current.publicVfPci;
+        newSpec.publicVlanId = current.publicVlanId;
         newSpec.ctZone = current.ctZone;
         newSpec.natRules = current.natRules;
         newSpec.aclRules = aclRules;
         newSpec.lbRules = current.lbRules;
+        newSpec.pfwRules = current.pfwRules;
         intentReconciler.applyIntent(newSpec);
         LOGGER.info("Programmed {} TC ACL rules for VR {} (HW offload, kernel iptables remains as fallback)",
                 aclRules.size(), routerName);
@@ -2981,14 +2988,138 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.version = System.currentTimeMillis();
         newSpec.guestVfPci = current.guestVfPci;
         newSpec.publicVfPci = current.publicVfPci;
+        newSpec.publicVlanId = current.publicVlanId;
         newSpec.ctZone = current.ctZone;
         newSpec.natRules = natRules;
         newSpec.aclRules = current.aclRules;
         newSpec.lbRules = current.lbRules;
+        newSpec.pfwRules = current.pfwRules;
         intentReconciler.applyIntent(newSpec);
         LOGGER.info("Programmed {} static NAT rule(s) ({} TC entries) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
                 added, added * 2, routerName);
         return new ExecutionResult(true, null);
+    }
+
+    /**
+     * Phase B/2: program HW offload PFW DNAT inbound for VPC port forwarding rules.
+     *
+     * <p>PortForwardingRuleTO uses {@code srcIp/srcPortRange} for the PUBLIC side
+     * (external client target) and {@code dstIp/dstPortRange} for the INTERNAL
+     * tenant VM. Mapped into {@link com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule}
+     * fields {@code publicIp/publicPort} and {@code internalIp/internalPort}
+     * (saner names for the TC pipeline).
+     *
+     * <p>Reverse path is NOT in HW yet — the tenant VM's reply travels VM →
+     * guest VF → kernel-routing inside VR → public VF → OVS userspace → bond1
+     * → wire (kernel iptables ct in zone 0 reverses NAT). Future work: add
+     * reverse-direction TC rule on the public VF rep ingress that matches
+     * +est+rpl on a separate zone and short-circuits to OVS internal port.
+     */
+    protected ExecutionResult prepareNetworkElementCommand(final SetPortForwardingRulesVpcCommand cmd) {
+        if (intentReconciler == null) {
+            return new ExecutionResult(true, null);
+        }
+        final String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);
+        com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec current =
+                intentReconciler.currentIntent(routerName);
+        if (current == null) {
+            return new ExecutionResult(true, null);
+        }
+        PortForwardingRuleTO[] rules = cmd.getRules();
+        if (rules == null) {
+            return new ExecutionResult(true, null);
+        }
+
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule> pfw =
+                new java.util.ArrayList<>();
+        int added = 0;
+        for (PortForwardingRuleTO r : rules) {
+            if (r == null || r.revoked()) {
+                continue;
+            }
+            String pubIp = r.getSrcIp();
+            String intIp = r.getDstIp();
+            String proto = r.getProtocol();
+            int[] pubPorts = r.getSrcPortRange();
+            int[] intPorts = r.getDstPortRange();
+            if (pubIp == null || intIp == null || proto == null || pubPorts == null || pubPorts.length == 0) {
+                continue;
+            }
+            // tc flower flat dst_port works for single-port DNAT only; port ranges
+            // would require N rules. Since CloudStack PFW commonly maps single
+            // public→single internal, skip ranges (kernel iptables fallback).
+            int pubStart = pubPorts[0];
+            int pubEnd = pubPorts.length > 1 ? pubPorts[1] : pubStart;
+            int intStart = (intPorts != null && intPorts.length > 0) ? intPorts[0] : pubStart;
+            if (pubStart != pubEnd) {
+                LOGGER.warn("PFW rule for VR {} has port range {}-{} — HW offload supports single-port only, skipping (kernel fallback)",
+                        routerName, pubStart, pubEnd);
+                continue;
+            }
+            String p = proto.toLowerCase();
+            if (!"tcp".equals(p) && !"udp".equals(p)) {
+                continue;
+            }
+            var pr = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule();
+            pr.publicIp = pubIp;
+            pr.publicPort = pubStart;
+            pr.internalIp = intIp;
+            pr.internalPort = intStart;
+            pr.ipProto = p;
+            pfw.add(pr);
+            added++;
+        }
+        // Build a new spec carrying over everything + new pfwRules. Note: even
+        // when pfw is empty (all revoked), still apply so the reconciler clears
+        // the PFW pref window on the block.
+        var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
+        newSpec.vrId = current.vrId;
+        newSpec.version = System.currentTimeMillis();
+        newSpec.guestVfPci = current.guestVfPci;
+        newSpec.publicVfPci = current.publicVfPci;
+        newSpec.publicVlanId = current.publicVlanId;
+        newSpec.ctZone = current.ctZone;
+        newSpec.natRules = current.natRules;
+        newSpec.aclRules = current.aclRules;
+        newSpec.lbRules = current.lbRules;
+        newSpec.pfwRules = pfw;
+        intentReconciler.applyIntent(newSpec);
+        LOGGER.info("Programmed {} PFW HW DNAT rule(s) for VR {} (kernel iptables remains as fallback for ranges/non-tcp-udp)",
+                added, routerName);
+        return new ExecutionResult(true, null);
+    }
+
+    /**
+     * Parse {@code "vlan://2988"} into integer 2988. Returns {@code null} for
+     * untagged or unparseable URIs (e.g. {@code "untagged"}, {@code "vxlan://..."}).
+     */
+    private static Integer parseVlanIdFromUri(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        String s = uri.trim();
+        if (s.isEmpty() || s.equalsIgnoreCase("untagged")) {
+            return null;
+        }
+        // Strip scheme if present.
+        int idx = s.indexOf("://");
+        if (idx >= 0) {
+            String scheme = s.substring(0, idx).toLowerCase();
+            if (!"vlan".equals(scheme)) {
+                return null; // vxlan / lswitch / etc — not applicable to TC vlan_id match
+            }
+            s = s.substring(idx + 3);
+        }
+        // Strip trailing slashes/queries (defensive).
+        int slash = s.indexOf('/');
+        if (slash >= 0) {
+            s = s.substring(0, slash);
+        }
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     protected ExecutionResult prepareNetworkElementCommand(final IpAssocVpcCommand cmd) {

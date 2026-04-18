@@ -207,10 +207,12 @@ public class HwOffloadIntentApi {
         public long version;
         public String guestVfPci;
         public String publicVfPci;
+        public Integer publicVlanId;   // VLAN tag of the public VF rep (e.g. 2988); needed for B/2 PFW DNAT
         public Integer ctZone;
         public java.util.List<NatRule> natRules;
         public java.util.List<AclRule> aclRules;
         public java.util.List<LbRule> lbRules;
+        public java.util.List<PfwRule> pfwRules;
     }
 
     public static class NatRule {
@@ -237,6 +239,27 @@ public class HwOffloadIntentApi {
         public Integer port;
         public java.util.List<String> backends;
         public String method;       // "hash" / "round_robin"
+        public Integer prio;
+    }
+
+    /**
+     * Port-Forwarding rule (Phase B/2). Inbound DNAT in HW: external client
+     * targets {@code publicIp:publicPort} on the wire (VLAN-tagged on the
+     * public uplink); HW translates dst to {@code internalIp:internalPort}
+     * and mirrors to the VR's public VF rep, where the kernel routing inside
+     * the VR forwards via the guest VF to the destination tenant VM.
+     *
+     * <p>Reverse path is currently NOT offloaded: the tenant VM's reply goes
+     * VM → guest VF → kernel-routing inside VR → public VF → OVS userspace
+     * → bond1 → wire (kernel iptables ct in zone 0 reverses NAT). The HW
+     * pipeline only saves PREROUTING DNAT cycles per inbound flow.
+     */
+    public static class PfwRule {
+        public String publicIp;
+        public Integer publicPort;
+        public String internalIp;
+        public Integer internalPort;
+        public String ipProto;      // "tcp" / "udp"
         public Integer prio;
     }
 }

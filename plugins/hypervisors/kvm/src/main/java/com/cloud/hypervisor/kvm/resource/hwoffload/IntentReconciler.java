@@ -86,6 +86,13 @@ public class IntentReconciler {
     private final TcRuleProgrammer programmer;
     private final Map<String, IntentSpec> currentByVr = new HashMap<>();
 
+    /**
+     * Cached ingress block id of the host uplink (e.g. 37 for bond1 on aragog).
+     * Populated lazily on first PFW apply; reused for both add and remove.
+     * -1 means "unknown / no block"; 0+ is a valid block id.
+     */
+    private int cachedUplinkBlockId = -1;
+
     private final UplinkKind uplinkKind;
     private final boolean uplinkLag;
     private final String uplinkNetdev;
@@ -248,6 +255,9 @@ public class IntentReconciler {
                 spec.version, spec.vrId, guestRep, guestOutDev, zone);
         }
 
+        // Phase B/2: apply PFW DNAT rules to the host uplink ingress block.
+        applyPfwRules(spec, publicRep, guestOutDev, zone);
+
         currentByVr.put(spec.vrId, spec);
         persistSpec(spec);
     }
@@ -269,6 +279,10 @@ public class IntentReconciler {
         String publicRep = prev.publicVfPci != null ? repMapper.getRepresentor(prev.publicVfPci) : null;
         if (publicRep != null) {
             programmer.resetRepresentor(publicRep);
+        }
+        if (cachedUplinkBlockId >= 0 && prev.pfwRules != null && !prev.pfwRules.isEmpty()) {
+            programmer.clearPfwBlock(cachedUplinkBlockId);
+            LOGGER.info("Cleared PFW HW DNAT rules from block {} for removed VR {}", cachedUplinkBlockId, vrId);
         }
         LOGGER.info("Removed intent for VR {} (cleared guestRep={} publicRep={})",
             vrId, guestRep, publicRep);
@@ -317,6 +331,65 @@ public class IntentReconciler {
             if (snap != null && !snap.trim().isEmpty()) {
                 LOGGER.warn("GC: clearing orphan TC rules on {} (no current intent owns it)", iface);
                 programmer.resetRepresentor(iface);
+            }
+        }
+    }
+
+
+    /**
+     * Apply Phase B/2 PFW DNAT rules in HW. Inbound external→public IP
+     * traffic on the uplink VLAN is matched on the shared ingress block,
+     * then HW does pop_vlan + ct nat dst + mirred to the VR's public VF rep.
+     *
+     * <p>Idempotent: clears the PFW pref window (60-79) on the block before
+     * re-installing every rule. Cheap because at most ~10 PFW rules per VR
+     * and the block is per-host (shared across all VRs but pref windows are
+     * sliced per-VR — currently all VRs share 60-79 because we only use this
+     * for the single VR's PFW set per applyIntent invocation).
+     */
+    private void applyPfwRules(IntentSpec spec, String publicRep, String guestOutDev, int zone) {
+        if (spec.pfwRules == null || spec.pfwRules.isEmpty()) {
+            // Still clear the block in case we're going from "had rules" to "no rules"
+            if (cachedUplinkBlockId >= 0) {
+                programmer.clearPfwBlock(cachedUplinkBlockId);
+            }
+            return;
+        }
+        if (publicRep == null) {
+            LOGGER.warn("PFW rules requested for VR {} but no publicRep — skipping HW DNAT (kernel iptables fallback)", spec.vrId);
+            return;
+        }
+        if (spec.publicVlanId == null || spec.publicVlanId <= 0) {
+            LOGGER.warn("PFW rules requested for VR {} but spec.publicVlanId is unset — skipping HW DNAT", spec.vrId);
+            return;
+        }
+        // Resolve and cache block id from the uplink netdev (e.g. bond1).
+        if (cachedUplinkBlockId < 0) {
+            cachedUplinkBlockId = programmer.resolveIngressBlock(guestOutDev);
+            if (cachedUplinkBlockId < 0) {
+                LOGGER.warn("Cannot resolve ingress block on uplink {} — PFW HW DNAT disabled for VR {}",
+                        guestOutDev, spec.vrId);
+                return;
+            }
+            LOGGER.info("Resolved ingress block {} on uplink {} for PFW HW DNAT", cachedUplinkBlockId, guestOutDev);
+        }
+        programmer.clearPfwBlock(cachedUplinkBlockId);
+        int autoPrio = 60;
+        for (com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule r : spec.pfwRules) {
+            if (r == null || r.publicIp == null || r.publicPort == null
+                    || r.internalIp == null || r.internalPort == null) {
+                continue;
+            }
+            String proto = (r.ipProto != null && !r.ipProto.isBlank()) ? r.ipProto.toLowerCase() : "tcp";
+            int prio = (r.prio != null && r.prio >= 60 && r.prio <= 79) ? r.prio : autoPrio++;
+            programmer.installPfwInboundDnat(cachedUplinkBlockId, spec.publicVlanId, proto,
+                    r.publicIp, r.publicPort, zone, r.internalIp, r.internalPort, publicRep, prio);
+            LOGGER.info("Installed PFW HW DNAT for VR {}: {}:{} -> {}:{} ({}) on block {} pref {}",
+                    spec.vrId, r.publicIp, r.publicPort, r.internalIp, r.internalPort,
+                    proto, cachedUplinkBlockId, prio);
+            if (autoPrio > 79) {
+                LOGGER.warn("PFW pref window 60-79 exhausted for VR {}; remaining rules skipped", spec.vrId);
+                break;
             }
         }
     }

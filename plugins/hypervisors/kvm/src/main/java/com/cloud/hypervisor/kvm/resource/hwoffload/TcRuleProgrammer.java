@@ -249,6 +249,101 @@ public class TcRuleProgrammer {
         return Script.runSimpleBashScript(String.format("tc filter show dev %s ingress", repName));
     }
 
+    /**
+     * Phase B/2: install one PFW DNAT rule on the shared ingress block.
+     *
+     * <p>The block (typically {@code 37}) covers the kernel bond device
+     * ({@code bond1}) AND the underlying mlx5 PFs ({@code dx6p0/dx6p1}).
+     * bond1 itself does NOT support {@code hw-tc-offload}, but the PFs do —
+     * so a flower rule installed via the shared block lands in HW via the
+     * PFs while still matching wire-side traffic that arrived through the
+     * bond. Empirically validated 2026-04-18 with {@code in_hw in_hw_count 2}.
+     *
+     * <p>Match: VLAN-tagged inbound (the public VLAN, e.g. 2988) + L4 dst.
+     * <p>Action: pop_vlan → ct commit nat dst → mirred to the VR's public VF rep.
+     *
+     * @param blockId      ingress block ID (resolved from the uplink, e.g. 37)
+     * @param vlanId       VLAN tag of the public network (e.g. 2988)
+     * @param ipProto      "tcp" / "udp"
+     * @param publicIp     external-facing public IP (the wire dst)
+     * @param publicPort   external-facing port (the wire dst port)
+     * @param ctZone       conntrack zone (must match the VR's zone for reverse-NAT to work via VR kernel ct)
+     * @param internalIp   tenant VM IP to translate to
+     * @param internalPort tenant VM port to translate to
+     * @param publicVfRep  representor of the VR's public VF (e.g. dx6p0vf0)
+     * @param prio         pref window; recommended 60-79 (between source NAT 50 and ACL 80)
+     */
+    public void installPfwInboundDnat(int blockId, int vlanId, String ipProto,
+                                      String publicIp, int publicPort,
+                                      int ctZone, String internalIp, int internalPort,
+                                      String publicVfRep, int prio) {
+        String cmd = String.format(
+            "tc filter add block %d ingress pref %d protocol 802.1Q flower " +
+                "vlan_id %d vlan_ethtype 0x0800 ip_proto %s dst_ip %s dst_port %d ct_state -trk " +
+                "action vlan pop pipe " +
+                "action ct commit zone %d nat dst addr %s port %d pipe " +
+                "action mirred egress redirect dev %s",
+            blockId, prio, vlanId, ipProto, publicIp, publicPort,
+            ctZone, internalIp, internalPort, publicVfRep);
+        runTc(cmd);
+    }
+
+    /**
+     * Idempotent: clear all PFW pref slots on the shared block before re-installing.
+     * Pref window is 60-79 (20 slots — generous for the typical 1-5 PFW rules per VR).
+     */
+    public void clearPfwBlock(int blockId) {
+        for (int prio = 60; prio <= 79; prio++) {
+            Script.runSimpleBashScript(String.format(
+                "tc filter del block %d ingress pref %d 2>/dev/null || true", blockId, prio));
+        }
+    }
+
+    /**
+     * Resolve the ingress block id of a given netdev (typically the uplink, e.g. bond1).
+     * Returns {@code -1} if the netdev has no ingress qdisc with a block.
+     *
+     * <p>Parses output of {@code tc qdisc show dev <netdev>}:
+     * <pre>
+     *   qdisc ingress ffff: parent ffff:fff1 ingress_block 37 ----------------
+     * </pre>
+     */
+    public int resolveIngressBlock(String netdev) {
+        // Use JSON output (single-line) — Script.runSimpleBashScript truncates
+        // multi-line tc output (likely a stdout buffering race when reading
+        // from a non-TTY child process), so the second qdisc line was lost.
+        // tc -j emits everything in one write.
+        String out = Script.runSimpleBashScript(String.format("tc -j qdisc show dev %s", netdev));
+        if (out == null || out.isBlank()) {
+            LOGGER.warn("resolveIngressBlock: tc -j qdisc returned null/empty for dev {}", netdev);
+            return -1;
+        }
+        // Look for {"...","ingress_block":<N>,"..."} via simple substring match.
+        int idx = out.indexOf("\"ingress_block\":");
+        if (idx < 0) {
+            LOGGER.warn("resolveIngressBlock: no ingress_block in tc -j output for dev {}: {}", netdev, out);
+            return -1;
+        }
+        String tail = out.substring(idx + "\"ingress_block\":".length());
+        // Number is followed by `,` or `}`.
+        int end = 0;
+        while (end < tail.length() && (Character.isDigit(tail.charAt(end)) || tail.charAt(end) == '-')) {
+            end++;
+        }
+        if (end == 0) {
+            LOGGER.warn("resolveIngressBlock: failed to parse number for dev {}: {}", netdev, tail);
+            return -1;
+        }
+        try {
+            int b = Integer.parseInt(tail.substring(0, end));
+            LOGGER.debug("resolveIngressBlock({}) = {}", netdev, b);
+            return b;
+        } catch (NumberFormatException e) {
+            LOGGER.warn("resolveIngressBlock: parse failed for dev {}: {}", netdev, tail.substring(0, end));
+            return -1;
+        }
+    }
+
     /** Allocate a fresh conntrack zone id for a new VR. Zones isolate flow state per-VR. */
     public static int nextZone() {
         return ZONE_SEQ.incrementAndGet();
