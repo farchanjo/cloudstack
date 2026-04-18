@@ -2665,17 +2665,26 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         try {
             conn = LibvirtConnection.getConnectionByVmName(routerName);
             Integer devNum = 0;
+            int publicIdx = -1;
             final String pubVlan = pubIP.getBroadcastUri();
+            final String pubMac = pubIP.getVifMacAddress();
             final List<InterfaceDef> pluggedNics = getInterfaces(conn, routerName);
 
             for (final InterfaceDef pluggedNic : pluggedNics) {
                 final String pluggedVlanBr = pluggedNic.getBrName();
+                // Phase B/4: HOSTDEV NICs have no bridge — must correlate by MAC instead.
+                // Falls through to bridge-based matching for legacy bridge/TAP NICs.
+                if (pubMac != null && pubMac.equalsIgnoreCase(pluggedNic.getMacAddress())) {
+                    publicIdx = devNum;
+                    break;
+                }
                 if (pluggedVlanBr == null) {
                     devNum++;
                     continue;
                 }
                 final String pluggedVlanId = getBroadcastUriFromBridge(pluggedVlanBr);
                 if (pubVlan.equalsIgnoreCase(Vlan.UNTAGGED) && pluggedVlanBr.equalsIgnoreCase(publicBridgeName)) {
+                    publicIdx = devNum;
                     break;
                 } else if (pluggedVlanBr.equalsIgnoreCase(linkLocalBridgeName)) {
                     /*skip over, no physical bridge device exists*/
@@ -2684,19 +2693,34 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     return new ExecutionResult(false, "unable to find the vlan id for bridge " + pluggedVlanBr + " when attempting to set up" + pubVlan +
                             " on router " + routerName);
                 } else if (pluggedVlanId.equals(pubVlan)) {
+                    publicIdx = devNum;
                     break;
                 }
                 devNum++;
             }
 
-            pubIP.setNicDevId(devNum);
+            // Fall back to last attempted index when no explicit match found
+            // (preserves legacy behavior for non-MAC, non-bridge edge cases).
+            if (publicIdx == -1) {
+                publicIdx = devNum;
+            }
+            pubIP.setNicDevId(publicIdx);
 
             if (pubIP.isAdd() && pubIP.isSourceNat() && intentReconciler != null) {
-                String hostdevVfPci = null;
-                for (final InterfaceDef pluggedNic : pluggedNics) {
-                    if (pluggedNic.getNetType() == LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
-                        hostdevVfPci = pluggedNic.getPciAddress();
-                        break;
+                // Phase B/4: when the public NIC is itself a HOSTDEV (VF), capture
+                // its PCI separately. Guest VF is any *other* HOSTDEV in pluggedNics
+                // (in a single-tier VPC, that's eth1; multi-tier is out of scope here).
+                String guestVfPci = null;
+                String publicVfPci = null;
+                for (int i = 0; i < pluggedNics.size(); i++) {
+                    InterfaceDef nic = pluggedNics.get(i);
+                    if (nic.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
+                        continue;
+                    }
+                    if (i == publicIdx) {
+                        publicVfPci = nic.getPciAddress();
+                    } else if (guestVfPci == null) {
+                        guestVfPci = nic.getPciAddress();
                     }
                 }
                 String publicIp = pubIP.getPublicIp();
@@ -2708,13 +2732,14 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 // PFW falls through to the chain-1 catch-all `pass` rule (installed by
                 // IntentReconciler) and continues normally through kernel iptables NAT.
                 String guestCidr = cmd.getAccessDetail(NetworkElementCommand.GUEST_NETWORK_CIDR);
-                LOGGER.info("SetSourceNat: hostdevVfPci={} publicIp={} guestCidr={} for VR {}",
-                        hostdevVfPci, publicIp, guestCidr, routerName);
-                if (hostdevVfPci != null && publicIp != null) {
+                LOGGER.info("SetSourceNat: guestVfPci={} publicVfPci={} publicIp={} guestCidr={} for VR {}",
+                        guestVfPci, publicVfPci, publicIp, guestCidr, routerName);
+                if (guestVfPci != null && publicIp != null) {
                     var spec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
                     spec.vrId = routerName;
                     spec.version = System.currentTimeMillis();
-                    spec.guestVfPci = hostdevVfPci;
+                    spec.guestVfPci = guestVfPci;
+                    spec.publicVfPci = publicVfPci;
                     spec.natRules = new java.util.ArrayList<>();
                     var snat = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
                     snat.dir = "SNAT";
@@ -2729,8 +2754,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     snatUdp.ipProto = "udp";
                     spec.natRules.add(snatUdp);
                     intentReconciler.applyIntent(spec);
-                    LOGGER.info("Programmed TC SNAT rules for VR {} (vfPci={} publicIp={} matchCidr={})",
-                            routerName, hostdevVfPci, publicIp, guestCidr);
+                    LOGGER.info("Programmed TC SNAT rules for VR {} (guestVf={} publicVf={} publicIp={} matchCidr={})",
+                            routerName, guestVfPci, publicVfPci, publicIp, guestCidr);
                 }
             }
 

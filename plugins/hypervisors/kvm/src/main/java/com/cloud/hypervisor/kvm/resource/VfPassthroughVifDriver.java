@@ -70,7 +70,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
-            addRepresentorToOvs(repName);
+            addRepresentorToOvs(repName, vlanTag);
         }
 
         LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
@@ -276,17 +276,38 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         return null;
     }
 
-    private void addRepresentorToOvs(String repName) {
-        Script.runSimpleBashScript(String.format("ovs-vsctl --may-exist add-port br-bond %s", repName));
+    private void addRepresentorToOvs(String repName, Integer vlanTag) {
+        // Ensure the rep is in br-bond. The boot-time mlx-switchdev.sh script may
+        // already have added it (untagged trunk); we need to (re)apply the VLAN tag.
+        Script.runSimpleBashScript(String.format(
+            "ovs-vsctl --may-exist add-port br-bond %s", repName));
+        // For VLAN-tagged networks (e.g. public VLAN 2988), set tag=N so OVS pops
+        // VLAN on egress to the VF and pushes VLAN on ingress from the VF — same
+        // semantics as a virtio tap on a VLAN access port. Without this tag, the
+        // rep is treated as a trunk port and packets reach the VF still tagged,
+        // which the guest doesn't strip → silent drops.
+        // NOTE: --may-exist add-port doesn't update tag of existing ports, so we
+        // run a separate set/clear to enforce the desired state on every plug.
+        if (vlanTag != null && vlanTag > 0) {
+            Script.runSimpleBashScript(String.format(
+                "ovs-vsctl set port %s tag=%d", repName, vlanTag));
+        } else {
+            Script.runSimpleBashScript(String.format(
+                "ovs-vsctl clear port %s tag", repName));
+        }
         Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
-        logger.info("Added VF representor {} to OVS br-bond with clsact qdisc", repName);
+        logger.info("Added VF representor {} to OVS br-bond (tag={}) with clsact qdisc", repName, vlanTag);
     }
 
     private Integer extractVlanTag(NicTO nic) {
         if (nic.getBroadcastUri() == null) {
             return null;
         }
-        if (nic.getBroadcastType() != Networks.BroadcastDomainType.Vlan) {
+        // Don't trust nic.getBroadcastType() — VPC public NICs can come through
+        // with broadcastType=Vxlan even though their broadcastUri is "vlan://N"
+        // (CloudStack inconsistency). Check the URI scheme directly instead.
+        String scheme = nic.getBroadcastUri().getScheme();
+        if (scheme == null || !"vlan".equalsIgnoreCase(scheme)) {
             return null;
         }
         String value = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
