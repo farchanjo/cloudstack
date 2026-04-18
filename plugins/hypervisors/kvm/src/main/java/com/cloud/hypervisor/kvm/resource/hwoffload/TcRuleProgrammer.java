@@ -223,6 +223,41 @@ public class TcRuleProgrammer {
     }
 
     /**
+     * Install intra-LAN bypass rules in chain 1 ABOVE the SNAT pref 50.
+     * Without these, the SNAT rule (which matches src_ip=tier_cidr) erroneously
+     * captures VR-originated traffic destined to other VMs in the SAME tier
+     * (e.g. dnsmasq DHCPOFFER, internal DNS responses, intra-tier ssh from VR
+     * to a tenant VM) and SNATs them to the public IP + mirreds to bond1 — the
+     * intended dst VM never receives them.
+     *
+     * <p>Three pref slots:
+     * <ul>
+     *   <li>{@code pref 40}: {@code dst_ip <tier_cidr> action pass} — intra-tier unicast
+     *   <li>{@code pref 41}: {@code udp src_port 67 dst_port 68 action pass} —
+     *       DHCPOFFER from VR's dnsmasq (server→client; client may not yet have
+     *       its assigned IP so dst_ip filter alone wouldn't match the broadcast form)
+     *   <li>{@code pref 42}: {@code dst_ip 255.255.255.255 action pass} — generic broadcast
+     * </ul>
+     *
+     * <p>All match BEFORE the SNAT pref 50, so SNAT is only applied to traffic
+     * actually destined to external networks. Empirically validated 2026-04-18:
+     * vm-fr received DHCP lease only after these rules were installed.
+     */
+    public void installIntraLanBypass(String repName, String tierCidr) {
+        if (tierCidr != null && !tierCidr.isBlank()) {
+            runTc(String.format(
+                "tc filter add dev %s ingress chain 1 prio 40 protocol ip flower " +
+                "dst_ip %s action pass", repName, tierCidr));
+        }
+        runTc(String.format(
+            "tc filter add dev %s ingress chain 1 prio 41 protocol ip flower " +
+            "ip_proto udp src_port 67 dst_port 68 action pass", repName));
+        runTc(String.format(
+            "tc filter add dev %s ingress chain 1 prio 42 protocol ip flower " +
+            "dst_ip 255.255.255.255 action pass", repName));
+    }
+
+    /**
      * Delete all TC filters in chain 1 (the policy/NAT/ACL chain). Leaves chain 0
      * dispatch intact. Called by the reconciler at the start of {@code applyToRep}
      * so re-applying an intent reinstalls a clean rule set instead of accumulating
@@ -235,7 +270,7 @@ public class TcRuleProgrammer {
         // safety: bulk first, then per-pref for known ranges (50, 60, 80-99, 100, 200).
         Script.runSimpleBashScript(String.format(
             "tc filter del dev %s ingress chain 1 2>/dev/null || true", repName));
-        for (int prio : new int[]{50, 60, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 200}) {
+        for (int prio : new int[]{40, 41, 42, 50, 60, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 200}) {
             Script.runSimpleBashScript(String.format(
                 "tc filter del dev %s ingress chain 1 pref %d 2>/dev/null || true", repName, prio));
         }

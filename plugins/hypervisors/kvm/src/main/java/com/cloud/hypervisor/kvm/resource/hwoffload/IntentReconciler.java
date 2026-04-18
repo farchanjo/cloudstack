@@ -497,6 +497,26 @@ public class IntentReconciler {
         boolean replyOnly = !isGuestSide;
         programmer.installEstablishedForward(inRep, outRep, replyOnly);
 
+        // Intra-LAN bypass (chain 1 prio 40-42): MUST be installed BEFORE the
+        // SNAT pref 50, otherwise VR-originated traffic destined to other VMs in
+        // the SAME tier (e.g. dnsmasq DHCPOFFER, intra-tier ssh from VR) gets
+        // wrongly SNATed and mirreded to bond1, never reaching the dst VM. Only
+        // applies on the guest-side rep — public-side never has this issue
+        // because the SNAT rule there is direction-asymmetric (public-rep is the
+        // egress side of SNAT, not the ingress).
+        if (isGuestSide) {
+            String tierCidr = null;
+            if (spec.natRules != null) {
+                for (NatRule r : spec.natRules) {
+                    if (r != null && "SNAT".equalsIgnoreCase(r.dir) && r.matchAddr != null && !r.matchAddr.isBlank()) {
+                        tierCidr = r.matchAddr;
+                        break;
+                    }
+                }
+            }
+            programmer.installIntraLanBypass(inRep, tierCidr);
+        }
+
         // NAT rules (chain 1, prio 10-99): only on the guest-side rep for SNAT,
         // public-side for DNAT. (Could be configured per-rule via direction matching.)
         if (spec.natRules != null) {
