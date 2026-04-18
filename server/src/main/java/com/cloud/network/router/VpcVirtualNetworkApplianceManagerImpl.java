@@ -327,6 +327,16 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                 String defaultIp6Dns1 = null;
                 String defaultIp6Dns2 = null;
                 boolean isDnsConfigured = false;
+                // Phase B/4: first pass — detect if VR has any HW-offload guest tier.
+                // If so, the public NIC is also promoted to a hostdev VF (must stay in
+                // boot XML — VfPassthroughVifDriver doesn't support hot-attach).
+                boolean hasHwOffloadGuest = false;
+                for (final NicProfile probeNic : profile.getNics()) {
+                    if (probeNic.getTrafficType() == TrafficType.Guest && isHwOffloadNetwork(probeNic.getNetworkId())) {
+                        hasHwOffloadGuest = true;
+                        break;
+                    }
+                }
                 // remove public and guest nics as we will plug them later
                 final Iterator<NicProfile> it = profile.getNics().iterator();
                 while (it.hasNext()) {
@@ -343,6 +353,11 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                         if (nic.getTrafficType() == TrafficType.Guest && isHwOffloadNetwork(nic.getNetworkId())) {
                             nic.setDeviceId(1);
                             logger.info("Keeping HW offload guest NIC network={} in boot profile as eth1 (deviceId=1) for VF passthrough", nic.getNetworkId());
+                            continue;
+                        }
+                        if (nic.getTrafficType() == TrafficType.Public && hasHwOffloadGuest) {
+                            nic.setDeviceId(2);
+                            logger.info("Keeping public NIC network={} in boot profile as eth2 (deviceId=2) for VF passthrough (Phase B/4 — sibling guest is HW-offload)", nic.getNetworkId());
                             continue;
                         }
                         logger.debug("Removing NIC " + nic + " of type " + nic.getTrafficType() + " from the NICs passed on Instance start. " + "The NIC will be plugged later");
@@ -505,9 +520,18 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                         }
                     }
                     String broadcastURI = publicNic.getBroadcastUri() != null ? publicNic.getBroadcastUri().toString() : null;
-                    final PlugNicCommand plugNicCmd = new PlugNicCommand(_nwHelper.getNicTO(domainRouterVO, publicNic.getNetworkId(), broadcastURI),
-                            domainRouterVO.getInstanceName(), domainRouterVO.getType(), details);
-                    cmds.addCommand(plugNicCmd);
+                    // Phase B/4: when the VR has any HW-offload guest tier, the public NIC
+                    // is also promoted to a hostdev VF (VfPassthroughVifDriver — no hot-plug).
+                    // It's already in the boot domain XML via finalizeVirtualMachineProfile,
+                    // so we skip the post-start PlugNicCommand to avoid double-attach.
+                    boolean publicHwOffload = vrHasAnyHwOffloadGuestTier(domainRouterVO);
+                    if (publicHwOffload) {
+                        logger.info("HW offload public NIC for VR {} already in boot domain XML; skipping PlugNic", domainRouterVO.getInstanceName());
+                    } else {
+                        final PlugNicCommand plugNicCmd = new PlugNicCommand(_nwHelper.getNicTO(domainRouterVO, publicNic.getNetworkId(), broadcastURI),
+                                domainRouterVO.getInstanceName(), domainRouterVO.getType(), details);
+                        cmds.addCommand(plugNicCmd);
+                    }
                     final VpcVO vpc = _vpcDao.findById(domainRouterVO.getVpcId());
                     if (routedIpv4Manager.isRoutedVpc(vpc)) {
                         continue;
@@ -1063,6 +1087,31 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         nic.setDeviceId(deviceId);
         _nicDao.update(nic.getId(), nic);
         return nic;
+    }
+
+    /**
+     * Phase B/4: returns true if the VR has any guest tier whose offering has
+     * {@code hw_offload_enabled=1}. Used to decide whether the VR's public NIC
+     * should also be promoted to a hostdev VF (so the full HW NAT pipeline can
+     * span both guest-rep and public-rep on the e-switch).
+     */
+    private boolean vrHasAnyHwOffloadGuestTier(final DomainRouterVO vr) {
+        try {
+            final java.util.List<? extends Network> vpcNetworks = _vpcMgr.getVpcNetworks(vr.getVpcId());
+            if (vpcNetworks == null) {
+                return false;
+            }
+            for (final Network n : vpcNetworks) {
+                if (n.getTrafficType() != TrafficType.Guest) continue;
+                if (_networkModel.isPrivateGateway(n.getId())) continue;
+                if (isHwOffloadNetwork(n.getId())) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("vrHasAnyHwOffloadGuestTier: failed for VR {}", vr.getInstanceName(), e);
+        }
+        return false;
     }
 
     private boolean isHwOffloadNetwork(long networkId) {
