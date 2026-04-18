@@ -92,6 +92,19 @@ public final class LibvirtStopCommandWrapper extends CommandWrapper<StopCommand,
 
             performAgentStopHook(vmName, libvirtComputingResource);
 
+            // Phase B HW offload: if this was a VR (r-*), purge its IntentSpec
+            // and the TC rules / state JSON associated with it. Without this,
+            // re-creating a VR with the same id (or any VR landing on the same
+            // VFs) inherits stale chain-1 rules + a ghost spec on disk.
+            if (vmName != null && vmName.startsWith("r-") && libvirtComputingResource.getIntentReconciler() != null) {
+                try {
+                    libvirtComputingResource.getIntentReconciler().removeIntent(vmName);
+                    logger.info("HwOffload: removed intent state for stopped VR {}", vmName);
+                } catch (Exception e) {
+                    logger.warn("HwOffload: failed to remove intent for VR " + vmName + ": " + e.getMessage());
+                }
+            }
+
             if (result == null) {
                 if (disks != null && disks.size() > 0) {
                     for (final DiskDef disk : disks) {

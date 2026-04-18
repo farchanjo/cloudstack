@@ -272,13 +272,29 @@ public class IntentReconciler {
         if (prev == null) {
             return;
         }
+        // Use clearChain1 (per-pref del) on each rep instead of resetRepresentor
+        // (which does `tc qdisc del clsact` and fails silently when OVS owns
+        // the clsact qdisc — leaving stale chain-1 filters behind). clearChain1
+        // works regardless of OVS ownership because it deletes filters by
+        // chain+pref, which don't conflict with OVS's own chain-0 redirects.
         String guestRep = repMapper.getRepresentor(prev.guestVfPci);
         if (guestRep != null) {
-            programmer.resetRepresentor(guestRep);
+            programmer.clearChain1(guestRep);
+            // Also drop chain-0 dispatch rules (ct lookup) we installed —
+            // OVS owns the qdisc but its chain-0 entries live at different prefs.
+            // Best-effort delete by the specific prios we used (1, 2 for tcp/udp).
+            for (int p : new int[]{1, 2}) {
+                com.cloud.utils.script.Script.runSimpleBashScript(String.format(
+                    "tc filter del dev %s ingress chain 0 pref %d 2>/dev/null || true", guestRep, p));
+            }
         }
         String publicRep = prev.publicVfPci != null ? repMapper.getRepresentor(prev.publicVfPci) : null;
         if (publicRep != null) {
-            programmer.resetRepresentor(publicRep);
+            programmer.clearChain1(publicRep);
+            for (int p : new int[]{1, 2}) {
+                com.cloud.utils.script.Script.runSimpleBashScript(String.format(
+                    "tc filter del dev %s ingress chain 0 pref %d 2>/dev/null || true", publicRep, p));
+            }
         }
         if (cachedUplinkBlockId >= 0 && prev.pfwRules != null && !prev.pfwRules.isEmpty()) {
             programmer.clearPfwBlock(cachedUplinkBlockId);
