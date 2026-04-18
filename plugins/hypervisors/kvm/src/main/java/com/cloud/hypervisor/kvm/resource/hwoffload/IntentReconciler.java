@@ -70,6 +70,18 @@ public class IntentReconciler {
         SF
     }
 
+    /**
+     * Disk-backed state for the per-VR IntentSpec map. Without persistence the
+     * map is empty after every agent restart; subsequent SetNetworkACLCommand
+     * etc. find currentIntent==null and silently skip HW programming until the
+     * next SetSourceNatCommand re-establishes the spec. With persistence the
+     * agent rehydrates currentByVr from disk on startup, so HW programming
+     * stays consistent with TC rules already installed on representors.
+     */
+    private static final java.nio.file.Path STATE_DIR =
+            java.nio.file.Paths.get("/var/lib/cloudstack-agent/hwoffload");
+    private static final com.google.gson.Gson GSON = new com.google.gson.Gson();
+
     private final RepresentorMapper repMapper;
     private final TcRuleProgrammer programmer;
     private final Map<String, IntentSpec> currentByVr = new HashMap<>();
@@ -91,6 +103,74 @@ public class IntentReconciler {
         this.uplinkNetdev = (uplinkNetdev != null && !uplinkNetdev.isBlank()) ? uplinkNetdev.trim() : null;
         LOGGER.info("HwOffload uplink config: kind={} lag={} netdev={}",
                 this.uplinkKind, this.uplinkLag, this.uplinkNetdev != null ? this.uplinkNetdev : "<auto>");
+        loadPersistedSpecs();
+    }
+
+    /**
+     * Load all per-VR IntentSpec JSON files from STATE_DIR into currentByVr.
+     * Called once from the constructor (i.e. on agent startup). Best-effort:
+     * malformed files are logged and skipped, the directory is created if
+     * missing.
+     */
+    private synchronized void loadPersistedSpecs() {
+        try {
+            java.nio.file.Files.createDirectories(STATE_DIR);
+        } catch (java.io.IOException e) {
+            LOGGER.warn("Cannot create HwOffload state dir {}: {}", STATE_DIR, e.getMessage());
+            return;
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> stream = java.nio.file.Files.list(STATE_DIR)) {
+            stream.filter(p -> p.toString().endsWith(".json")).forEach(p -> {
+                try {
+                    String json = new String(java.nio.file.Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8);
+                    IntentSpec spec = GSON.fromJson(json, IntentSpec.class);
+                    if (spec != null && spec.vrId != null) {
+                        currentByVr.put(spec.vrId, spec);
+                        LOGGER.info("Rehydrated HwOffload IntentSpec for VR {} from {} (version={})",
+                                spec.vrId, p.getFileName(), spec.version);
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("Skipping malformed HwOffload state file {}: {}", p.getFileName(), e.getMessage());
+                }
+            });
+        } catch (java.io.IOException e) {
+            LOGGER.warn("Cannot enumerate HwOffload state dir {}: {}", STATE_DIR, e.getMessage());
+        }
+    }
+
+    /** Atomically write spec to STATE_DIR/&lt;vrId&gt;.json. Best-effort. */
+    private void persistSpec(IntentSpec spec) {
+        if (spec == null || spec.vrId == null) {
+            return;
+        }
+        try {
+            java.nio.file.Files.createDirectories(STATE_DIR);
+            java.nio.file.Path target = STATE_DIR.resolve(sanitizeFilename(spec.vrId) + ".json");
+            java.nio.file.Path tmp = STATE_DIR.resolve(sanitizeFilename(spec.vrId) + ".json.tmp");
+            java.nio.file.Files.write(tmp, GSON.toJson(spec).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            java.nio.file.Files.move(tmp, target,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.io.IOException e) {
+            LOGGER.warn("Failed to persist HwOffload state for VR {}: {}", spec.vrId, e.getMessage());
+        }
+    }
+
+    /** Delete STATE_DIR/&lt;vrId&gt;.json. Idempotent. */
+    private void deletePersistedSpec(String vrId) {
+        if (vrId == null) {
+            return;
+        }
+        try {
+            java.nio.file.Files.deleteIfExists(STATE_DIR.resolve(sanitizeFilename(vrId) + ".json"));
+        } catch (java.io.IOException e) {
+            LOGGER.warn("Failed to delete HwOffload state file for VR {}: {}", vrId, e.getMessage());
+        }
+    }
+
+    /** Strip path separators / dots so a VR id can't escape the state dir. */
+    private static String sanitizeFilename(String s) {
+        return s.replaceAll("[^A-Za-z0-9_-]", "_");
     }
 
     public synchronized void applyIntent(IntentSpec spec) {
@@ -152,11 +232,15 @@ public class IntentReconciler {
         // Guest rep: outbound SNAT + +est forward to uplink (bond1/PF).
         applyToRep(guestRep, guestOutDev, zone, spec, true);
 
-        // Public rep (Phase B/4 only): DNAT inbound + +est+rpl reply forward
-        // back to guest-rep, so DNAT'd PFW packets flow through the e-switch
-        // straight into the VR's guest-VF (eth1), bypassing iptables PREROUTING.
+        // Public rep (Phase B/4 only): TC ingress on the public-rep matches
+        // packets going FROM the VR's public VF OUT TO THE WIRE — that is
+        // the *reply* path on the public side (e.g. SYN-ACK from VR back to
+        // an external client after kernel-iptables PFW, or BGP/FRR replies).
+        // outRep MUST be the uplink (bond1), not the guest-rep — the reply
+        // goes to the wire, not back into the VR via guest-VF (which would
+        // create a forwarding loop and break PFW SSH).
         if (publicRep != null) {
-            applyToRep(publicRep, guestRep, zone, spec, false);
+            applyToRep(publicRep, guestOutDev, zone, spec, false);
             LOGGER.info("Applied intent v{} for VR {} (guestRep={} guestOut={} publicRep={} zone={})",
                 spec.version, spec.vrId, guestRep, guestOutDev, publicRep, zone);
         } else {
@@ -165,6 +249,7 @@ public class IntentReconciler {
         }
 
         currentByVr.put(spec.vrId, spec);
+        persistSpec(spec);
     }
 
     /**
@@ -173,6 +258,7 @@ public class IntentReconciler {
      */
     public synchronized void removeIntent(String vrId) {
         IntentSpec prev = currentByVr.remove(vrId);
+        deletePersistedSpec(vrId);
         if (prev == null) {
             return;
         }
