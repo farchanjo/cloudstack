@@ -37,6 +37,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
     private final SearchBuilder<SriovVfPoolVO> hostStateSearch;
     private final SearchBuilder<SriovVfPoolVO> hostPciSearch;
     private final SearchBuilder<SriovVfPoolVO> nicIdSearch;
+    private final SearchBuilder<SriovVfPoolVO> hostNicIdSearch;
 
     public SriovVfPoolDaoImpl() {
         hostStateSearch = createSearchBuilder();
@@ -52,6 +53,11 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         nicIdSearch = createSearchBuilder();
         nicIdSearch.and("allocatedToNicId", nicIdSearch.entity().getAllocatedToNicId(), SearchCriteria.Op.EQ);
         nicIdSearch.done();
+
+        hostNicIdSearch = createSearchBuilder();
+        hostNicIdSearch.and("hostId", hostNicIdSearch.entity().getHostId(), SearchCriteria.Op.EQ);
+        hostNicIdSearch.and("allocatedToNicId", hostNicIdSearch.entity().getAllocatedToNicId(), SearchCriteria.Op.EQ);
+        hostNicIdSearch.done();
     }
 
     @Override
@@ -90,6 +96,19 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         return Transaction.execute(new TransactionCallback<SriovVfPoolVO>() {
             @Override
             public SriovVfPoolVO doInTransaction(TransactionStatus status) {
+                // Idempotency: if this (hostId, nicId) already has an ALLOCATED entry,
+                // reuse it instead of taking another FREE VF. Multiple StartCommand
+                // re-fires (HA, mgmt-cluster races) will each call allocate(), and
+                // without this check we'd burn a fresh VF every time, exhausting the
+                // host pool after a few retries.
+                SearchCriteria<SriovVfPoolVO> existSc = hostNicIdSearch.create();
+                existSc.setParameters("hostId", hostId);
+                existSc.setParameters("allocatedToNicId", nicId);
+                List<SriovVfPoolVO> existing = listBy(existSc);
+                if (existing != null && !existing.isEmpty()) {
+                    return existing.get(0);
+                }
+
                 SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
                 sc.setParameters("hostId", hostId);
                 sc.setParameters("state", State.FREE.name());
@@ -105,6 +124,8 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 updateVo.setState(State.ALLOCATED.name());
                 updateVo.setAllocatedToNicId(nicId);
                 update(vf.getId(), updateVo);
+                vf.setState(State.ALLOCATED.name());
+                vf.setAllocatedToNicId(nicId);
                 return vf;
             }
         });
