@@ -325,8 +325,19 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         // Don't trust nic.getBroadcastType() — VPC public NICs can come through
         // with broadcastType=Vxlan even though their broadcastUri is "vlan://N"
         // (CloudStack inconsistency). Check the URI scheme directly instead.
+        //
+        // Accept BOTH "vlan://N" AND "vxlan://N":
+        //   - vlan://N is used for Public NICs (CloudStack Public network type)
+        //   - vxlan://N is used for VPC Guest tiers when broadcastType=Vxlan
+        // On our data nodes (no actual VXLAN encap — segmentation is plain
+        // VLAN trunking on bond1) both schemes carry the segmentation ID that
+        // OVS should program as access tag on the representor port.
         String scheme = nic.getBroadcastUri().getScheme();
-        if (scheme == null || !"vlan".equalsIgnoreCase(scheme)) {
+        if (scheme == null) {
+            return null;
+        }
+        scheme = scheme.toLowerCase();
+        if (!"vlan".equals(scheme) && !"vxlan".equals(scheme) && !"lswitch".equals(scheme)) {
             return null;
         }
         String value = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
