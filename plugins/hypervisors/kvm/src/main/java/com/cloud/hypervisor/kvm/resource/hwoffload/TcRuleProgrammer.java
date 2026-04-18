@@ -71,13 +71,23 @@ public class TcRuleProgrammer {
      * Called once per representor when it's first used.
      */
     public void installChain0Dispatch(String repName, int zone) {
+        // ct + nat in chain 0 dispatch:
+        // - For INBOUND (DNAT'd by HW elsewhere, e.g. PFW HW DNAT in block 37):
+        //   `nat` here is a no-op on the request — the packet already has dst translated.
+        //   But the ct entry is created with NAT info, so reply traffic gets reverse-NAT.
+        // - For OUTBOUND (SNAT in chain 1 prio 50): `nat` here applies reverse-NAT
+        //   on reply traffic too, so server-to-client return packets restore the
+        //   original tier IP→public IP rewrite.
+        // Without `nat` in chain 0, ct lookup happens but no NAT info is attached
+        // to the metadata, so chain-1 mirred sends the packet out un-NATed —
+        // breaking reverse-path of all HW NAT (PFW DNAT and SNAT).
         runTc(String.format(
             "tc filter add dev %s ingress chain 0 prio 1 protocol ip flower ip_proto tcp " +
-            "action ct zone %d pipe action goto chain 1",
+            "action ct zone %d nat pipe action goto chain 1",
             repName, zone));
         runTc(String.format(
             "tc filter add dev %s ingress chain 0 prio 2 protocol ip flower ip_proto udp " +
-            "action ct zone %d pipe action goto chain 1",
+            "action ct zone %d nat pipe action goto chain 1",
             repName, zone));
     }
 
