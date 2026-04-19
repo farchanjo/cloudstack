@@ -3180,30 +3180,49 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             int pubStart = pubPorts[0];
             int pubEnd = pubPorts.length > 1 ? pubPorts[1] : pubStart;
             int intStart = (intPorts != null && intPorts.length > 0) ? intPorts[0] : pubStart;
-            if (pubStart != pubEnd) {
-                LOGGER.warn("PFW rule for VR {} has port range {}-{} — HW offload supports single-port only, skipping (kernel fallback)",
-                        routerName, pubStart, pubEnd);
-                continue;
-            }
+            int intEnd = (intPorts != null && intPorts.length > 1) ? intPorts[1] : intStart;
             String p = proto.toLowerCase();
             if (!"tcp".equals(p) && !"udp".equals(p)) {
                 continue;
             }
-            var pr = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule();
-            pr.publicIp = pubIp;
-            pr.publicPort = pubStart;
-            pr.internalIp = intIp;
-            pr.internalPort = intStart;
-            pr.ipProto = p;
-            String key = pubIp + ":" + pubStart + ":" + p;
-            if (r.revoked()) {
-                if (pfwMap.remove(key) != null) {
-                    added++;
-                }
-                continue;
+            // Expand ranges into N single-port rules. tc flower matches
+            // single dst_port — no port-range syntax. Map pub[i] -> int[i+offset].
+            // If internal range length differs from public, assume 1:1 starting
+            // at intStart (CloudStack UI enforces equal-length ranges but DB
+            // may have drift — defensive fallback).
+            int pubLen = pubEnd - pubStart + 1;
+            int intLen = intEnd - intStart + 1;
+            if (pubLen != intLen) {
+                LOGGER.warn("PFW rule for VR {} public {}-{} vs internal {}-{} length mismatch; using 1:1 offset mapping from intStart",
+                        routerName, pubStart, pubEnd, intStart, intEnd);
             }
-            pfwMap.put(key, pr);
-            added++;
+            // Cap expansion at 256 ports to avoid TC rule flood on malformed
+            // giant ranges (e.g. 1-65535). Realistic tenant ranges are <=256.
+            final int MAX_EXPAND = 256;
+            int expand = Math.min(pubLen, MAX_EXPAND);
+            if (pubLen > MAX_EXPAND) {
+                LOGGER.warn("PFW rule for VR {} range {}-{} exceeds {} ports; capping HW offload to first {} entries (rest fall back to kernel)",
+                        routerName, pubStart, pubEnd, MAX_EXPAND, MAX_EXPAND);
+            }
+            for (int off = 0; off < expand; off++) {
+                int pPort = pubStart + off;
+                int iPort = intStart + off;
+                var pr = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule();
+                pr.publicIp = pubIp;
+                pr.publicPort = pPort;
+                pr.internalIp = intIp;
+                pr.internalPort = iPort;
+                pr.ipProto = p;
+                String key = pubIp + ":" + pPort + ":" + p;
+                if (r.revoked()) {
+                    if (pfwMap.remove(key) != null) {
+                        added++;
+                    }
+                    continue;
+                }
+                pfwMap.put(key, pr);
+                added++;
+            }
         }
         java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule> pfw =
                 new java.util.ArrayList<>(pfwMap.values());
@@ -3223,7 +3242,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.lbRules = current.lbRules;
         newSpec.pfwRules = pfw;
         intentReconciler.applyIntent(newSpec);
-        LOGGER.info("Programmed {} PFW HW DNAT rule(s) for VR {} (kernel iptables remains as fallback for ranges/non-tcp-udp)",
+        LOGGER.info("Programmed {} PFW HW DNAT entries for VR {} (kernel iptables fallback for non-tcp-udp only; ranges expanded inline)",
                 added, routerName);
         return new ExecutionResult(true, null);
     }
