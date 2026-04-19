@@ -3107,11 +3107,20 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             return new ExecutionResult(true, null);
         }
 
-        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule> pfw =
-                new java.util.ArrayList<>();
+        // Merge-by-key: CS mgmt may send single-rule delta commands on
+        // updatePortForwardingRule. A full replace would drop the other rules
+        // that were not part of this particular push. Use (publicIp, port,
+        // proto) as identity key; revoked rules remove from the set.
+        java.util.Map<String, com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule> pfwMap =
+                new java.util.LinkedHashMap<>();
+        if (current.pfwRules != null) {
+            for (var existing : current.pfwRules) {
+                pfwMap.put(existing.publicIp + ":" + existing.publicPort + ":" + existing.ipProto, existing);
+            }
+        }
         int added = 0;
         for (PortForwardingRuleTO r : rules) {
-            if (r == null || r.revoked()) {
+            if (r == null) {
                 continue;
             }
             String pubIp = r.getSrcIp();
@@ -3119,7 +3128,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             String proto = r.getProtocol();
             int[] pubPorts = r.getSrcPortRange();
             int[] intPorts = r.getDstPortRange();
-            if (pubIp == null || intIp == null || proto == null || pubPorts == null || pubPorts.length == 0) {
+            if (pubIp == null || proto == null || pubPorts == null || pubPorts.length == 0) {
                 continue;
             }
             // tc flower flat dst_port works for single-port DNAT only; port ranges
@@ -3143,9 +3152,18 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             pr.internalIp = intIp;
             pr.internalPort = intStart;
             pr.ipProto = p;
-            pfw.add(pr);
+            String key = pubIp + ":" + pubStart + ":" + p;
+            if (r.revoked()) {
+                if (pfwMap.remove(key) != null) {
+                    added++;
+                }
+                continue;
+            }
+            pfwMap.put(key, pr);
             added++;
         }
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.PfwRule> pfw =
+                new java.util.ArrayList<>(pfwMap.values());
         // Build a new spec carrying over everything + new pfwRules. Note: even
         // when pfw is empty (all revoked), still apply so the reconciler clears
         // the PFW pref window on the block.
@@ -3153,6 +3171,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.vrId = current.vrId;
         newSpec.version = System.currentTimeMillis();
         newSpec.guestVfPci = current.guestVfPci;
+        newSpec.additionalGuestVfPcis = current.additionalGuestVfPcis;
         newSpec.publicVfPci = current.publicVfPci;
         newSpec.publicVlanId = current.publicVlanId;
         newSpec.ctZone = current.ctZone;
