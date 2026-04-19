@@ -46,6 +46,24 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     /** Release VF by NIC id (used when NIC is being removed). */
     boolean releaseByNicId(long nicId);
 
+    /**
+     * Release every VF whose {@code allocated_to_nic_id} refers to any NIC of
+     * the given VM. Uses a JOIN into {@code nics} so removed NIC rows
+     * ({@code nics.removed IS NOT NULL}) are still matched — covers the case
+     * where a listener has already removed NICs before our hook ran.
+     *
+     * @return number of rows updated.
+     */
+    int releaseByVmId(long vmId);
+
+    /**
+     * Sweep ALLOCATED VFs whose {@code allocated_to_nic_id} points at a NIC
+     * that has {@code nics.removed IS NOT NULL} or whose VM has been removed.
+     * Returns the number of rows swept back to FREE. Used by the periodic
+     * orphan GC.
+     */
+    int sweepOrphans();
+
     /** Counts of FREE/ALLOCATED/RESERVED/UNAVAILABLE per host (for capacity reporting). */
     int countByHostAndState(long hostId, State state);
 }

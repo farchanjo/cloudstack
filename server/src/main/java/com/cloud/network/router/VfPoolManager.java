@@ -53,6 +53,27 @@ public interface VfPoolManager extends Manager {
     /** Release any VF currently bound to the NIC. Used when the NIC is being removed. */
     boolean releaseByNicId(long nicId);
 
+    /**
+     * Release every VF whose {@code allocated_to_nic_id} belongs to any NIC of the given VM.
+     *
+     * <p>Complements {@link #releaseByNicId(long)} for the VR-expunge path where the
+     * caller only has the VM id and wants to guarantee no VF remains bound — even
+     * if individual NIC rows are in a transient state or the listener missed some.
+     *
+     * @return number of VFs released (0 if none were bound).
+     */
+    int releaseByVmId(long vmId);
+
+    /**
+     * Garbage-collect stuck ALLOCATED VFs whose {@code allocated_to_nic_id} points at
+     * a NIC that has been removed (or whose VM has been removed). Safety net for
+     * cases where the postStateTransition listener missed its window (race, crash,
+     * mgmt restart between DestroyRequested and ExpungeOperation).
+     *
+     * @return number of VFs swept back to FREE.
+     */
+    int sweepOrphans();
+
     /** Count of FREE VFs on a host (used for capacity scheduling). */
     int countFree(long hostId);
 }

@@ -327,9 +327,21 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                 String defaultIp6Dns1 = null;
                 String defaultIp6Dns2 = null;
                 boolean isDnsConfigured = false;
-                // Phase B/4: first pass — detect if VR has any HW-offload guest tier.
-                // If so, the public NIC is also promoted to a hostdev VF (must stay in
-                // boot XML — VfPassthroughVifDriver doesn't support hot-attach).
+                // Phase B/4 (multi-tier safe): HW-offload guest NICs and Public
+                // are hostdev VFs and must stay in boot XML (VfPassthroughVifDriver
+                // doesn't support hot-attach). Non-HW guests are removed and
+                // hot-plugged later as before.
+                //
+                // Layout (Layout A — preserves DB device_id ordering, matches
+                // legacy systemvm assumptions like PUBLIC_INTERFACES=eth1):
+                //   eth0        -> Control (DB device_id=0)
+                //   eth1        -> Public  (DB device_id=1, allocated 2nd)
+                //   eth2..ethN  -> Guest tiers (DB device_id=2..N, allocated in tier creation order)
+                //
+                // We do NOT reassign deviceIds. The DB device_id is the
+                // authoritative position used everywhere — boot cmdline
+                // generator, libvirt slot order, SetupGuestNetworkCommand,
+                // CsAddress, dnsmasq listen-address, iptables INPUT rules.
                 boolean hasHwOffloadGuest = false;
                 for (final NicProfile probeNic : profile.getNics()) {
                     if (probeNic.getTrafficType() == TrafficType.Guest && isHwOffloadNetwork(probeNic.getNetworkId())) {
@@ -337,7 +349,8 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                         break;
                     }
                 }
-                // remove public and guest nics as we will plug them later
+
+                // remove non-HW-offload public and guest nics as we will plug them later
                 final Iterator<NicProfile> it = profile.getNics().iterator();
                 while (it.hasNext()) {
                     final NicProfile nic = it.next();
@@ -351,14 +364,14 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                             isDnsConfigured = true;
                         }
                         if (nic.getTrafficType() == TrafficType.Guest && isHwOffloadNetwork(nic.getNetworkId())) {
-                            nic.setDeviceId(1);
-                            logger.info("Keeping HW offload guest NIC network={} in boot profile as eth1 (deviceId=1) for VF passthrough", nic.getNetworkId());
-                            continue;
+                            logger.info("Keeping HW offload guest NIC network={} in boot profile as eth{} (deviceId={}) for VF passthrough",
+                                    nic.getNetworkId(), nic.getDeviceId(), nic.getDeviceId());
+                            continue; // kept, DB device_id flows through
                         }
                         if (nic.getTrafficType() == TrafficType.Public && hasHwOffloadGuest) {
-                            nic.setDeviceId(2);
-                            logger.info("Keeping public NIC network={} in boot profile as eth2 (deviceId=2) for VF passthrough (Phase B/4 — sibling guest is HW-offload)", nic.getNetworkId());
-                            continue;
+                            logger.info("Keeping public NIC network={} in boot profile as eth{} (deviceId={}) for VF passthrough (Phase B/4 — sibling guest is HW-offload)",
+                                    nic.getNetworkId(), nic.getDeviceId(), nic.getDeviceId());
+                            continue; // kept, DB device_id flows through
                         }
                         logger.debug("Removing NIC " + nic + " of type " + nic.getTrafficType() + " from the NICs passed on Instance start. " + "The NIC will be plugged later");
                         it.remove();
@@ -405,13 +418,15 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
     }
 
     /**
-     * Appends the VR's public-NIC (eth1) IPv6 address, prefix length and
-     * gateway to the kernel boot arguments so the systemvm init scripts can
-     * configure eth1 v6. IPv6 is routed (not NATted), so we pass the NIC's
-     * own v6 address rather than an associated public IP entry.
+     * Appends the VR's public-NIC IPv6 address, prefix length and gateway to
+     * the kernel boot arguments. IPv6 is routed (not NATted), so we pass the
+     * NIC's own v6 address rather than an associated public IP entry.
      *
-     * Follows the existing cmdline convention used for eth0/eth2:
-     *   eth1ip6=&lt;addr&gt; eth1ip6prelen=&lt;N&gt; ip6gateway=&lt;gw&gt;
+     * Uses the actual NIC device_id from the DB (not hardcoded eth1). This is
+     * a fallback for legacy (non-HW-offload) VPC VRs where Public is plugged
+     * post-boot; for HW-offload VRs the main finalize loop in the parent class
+     * already emits eth&lt;deviceId&gt;ip6= from NicProfile and we skip here
+     * to avoid duplicate entries.
      */
     private void appendPublicIpv6ToBootArgs(final DomainRouterVO router, final StringBuilder buf) {
         final List<NicVO> nics = _nicDao.listByVmId(router.getId());
@@ -428,9 +443,15 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             if (slash < 0) {
                 continue;
             }
+            // Skip if the main finalize loop already emitted eth<N>ip6= for this
+            // Public NIC (HW-offload layout keeps Public in profile.getNics()).
+            final String alreadyEmitted = " eth" + nic.getDeviceId() + "ip6=";
+            if (buf.indexOf(alreadyEmitted) >= 0) {
+                break;
+            }
             final String prelen = cidr.substring(slash + 1);
-            buf.append(" eth1ip6=").append(nic.getIPv6Address());
-            buf.append(" eth1ip6prelen=").append(prelen);
+            buf.append(" eth").append(nic.getDeviceId()).append("ip6=").append(nic.getIPv6Address());
+            buf.append(" eth").append(nic.getDeviceId()).append("ip6prelen=").append(prelen);
             buf.append(" ip6gateway=").append(nic.getIPv6Gateway());
             break;
         }
@@ -1125,6 +1146,32 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                     logger.warn("Failed to release VF for nicId {} of VR {}: {}",
                             nic.getId(), vo.getInstanceName(), inner.getMessage());
                 }
+            }
+            // Safety net: the loop above only covers NICs with removed IS NULL. If
+            // any NIC of this VR was already soft-removed by NetworkOrchestrator
+            // (cleanupNics) before our transition hook fired, listByVmId misses it
+            // and its VF stays ALLOCATED. releaseByVmId joins sriov_vf_pool against
+            // nics.instance_id without the removed filter, catching the leak.
+            try {
+                int swept = _vfPoolManager.releaseByVmId(vo.getId());
+                if (swept > 0) {
+                    logger.info("Released {} HW offload VF(s) on VR {} expunge via VM-id sweep", swept, vo.getInstanceName());
+                }
+            } catch (Exception vmSweepEx) {
+                logger.warn("Failed VM-id VF sweep for VR {}: {}", vo.getInstanceName(), vmSweepEx.getMessage());
+            }
+            // Every VR expunge also runs a global orphan sweep so any VFs pinned to
+            // long-removed NICs from earlier bugs/races get reclaimed. Piggy-backing
+            // on the VR-destroy hook avoids adding a dedicated scheduled executor
+            // while still providing periodic convergence in practice (any non-empty
+            // DC has VR churn).
+            try {
+                int orphans = _vfPoolManager.sweepOrphans();
+                if (orphans > 0) {
+                    logger.info("Swept {} orphan VF(s) back to FREE during VR {} expunge", orphans, vo.getInstanceName());
+                }
+            } catch (Exception orphanEx) {
+                logger.warn("Orphan sweep failed during VR {} expunge: {}", vo.getInstanceName(), orphanEx.getMessage());
             }
         } catch (Exception e) {
             logger.warn("Failed to release HW offload VFs for VR {} on transition to {}: {}",

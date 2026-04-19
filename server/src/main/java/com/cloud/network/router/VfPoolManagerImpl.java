@@ -108,6 +108,24 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
     }
 
     @Override
+    public int releaseByVmId(long vmId) {
+        int affected = vfPoolDao.releaseByVmId(vmId);
+        if (affected > 0) {
+            LOGGER.info(String.format("Released %d VF(s) bound to VM %d via releaseByVmId", affected, vmId));
+        }
+        return affected;
+    }
+
+    @Override
+    public int sweepOrphans() {
+        int affected = vfPoolDao.sweepOrphans();
+        if (affected > 0) {
+            LOGGER.info(String.format("Swept %d orphan VF(s) back to FREE", affected));
+        }
+        return affected;
+    }
+
+    @Override
     public int countFree(long hostId) {
         return vfPoolDao.countByHostAndState(hostId, State.FREE);
     }
