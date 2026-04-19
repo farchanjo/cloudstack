@@ -274,6 +274,12 @@ public class IntentReconciler {
         // Phase B/2: apply PFW DNAT rules to the host uplink ingress block.
         applyPfwRules(spec, publicRep, guestOutDev, zone);
 
+        // Phase B/3+: apply StaticNat inbound DNAT rules to the host uplink
+        // ingress block. Mirrors PFW but without ip_proto/port match (1:1 for
+        // all protocols). Separate pref window (20-29) so the two features
+        // don't clobber each other and can coexist on the same block.
+        applyStaticNatDnatRules(spec, publicRep, guestOutDev, zone);
+
         currentByVr.put(spec.vrId, spec);
         persistSpec(spec);
     }
@@ -324,6 +330,10 @@ public class IntentReconciler {
         if (cachedUplinkBlockId >= 0 && prev.pfwRules != null && !prev.pfwRules.isEmpty()) {
             programmer.clearPfwBlock(cachedUplinkBlockId);
             LOGGER.info("Cleared PFW HW DNAT rules from block {} for removed VR {}", cachedUplinkBlockId, vrId);
+        }
+        if (cachedUplinkBlockId >= 0 && hasStaticNatDnat(prev)) {
+            programmer.clearStaticNatBlock(cachedUplinkBlockId);
+            LOGGER.info("Cleared StaticNat HW DNAT rules from block {} for removed VR {}", cachedUplinkBlockId, vrId);
         }
         // VR-destroy leak fix: strip VF representor ports from OVS br-bond.
         // Background: VfPassthroughVifDriver.unplug() does `ovs-vsctl --if-exists del-port`
@@ -471,6 +481,99 @@ public class IntentReconciler {
     }
 
     /**
+     * Return {@code true} iff the spec carries at least one DNAT NatRule
+     * (i.e. an inbound StaticNat entry that {@link #applyStaticNatDnatRules}
+     * would have programmed into the block's 20-29 pref window).
+     */
+    private static boolean hasStaticNatDnat(IntentSpec spec) {
+        if (spec == null || spec.natRules == null) {
+            return false;
+        }
+        for (NatRule r : spec.natRules) {
+            if (r != null && "DNAT".equalsIgnoreCase(r.dir)
+                    && r.matchAddr != null && r.translateAddr != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Phase B/3+: apply StaticNat inbound DNAT rules in HW. Mirrors
+     * {@link #applyPfwRules} but uses a distinct pref window (20-29) and
+     * OMITS ip_proto/port (StaticNat is 1:1, all protocols).
+     *
+     * <p>Rule pattern (empirically offloads on mlx5 CX6-Dx, validated 2026-04-19):
+     * <pre>
+     *   tc filter add block &lt;N&gt; ingress pref 20+i protocol 802.1Q flower \
+     *     vlan_id &lt;publicVlanId&gt; vlan_ethtype 0x0800 \
+     *     dst_ip &lt;publicIp&gt; ct_state -trk \
+     *     action vlan pop pipe \
+     *     action ct commit zone &lt;Z&gt; nat dst addr &lt;vmIp&gt; pipe \
+     *     action mirred egress redirect dev &lt;publicVfRep&gt;
+     * </pre>
+     *
+     * <p>The DNAT entries are stored in the same {@code spec.natRules} list
+     * as the existing SNAT entries but with {@code dir = "DNAT"} and
+     * {@code ipProto = null/""} (distinguishes from PFW-style DNAT which
+     * always has a proto+port and goes via {@code applyToRep} on the public
+     * rep). StaticNat DNAT is rejected inside {@code applyToRep} because it
+     * targets the BLOCK, not per-rep. Keeping it in {@code natRules} lets
+     * the merge-by-key in the mgmt-side handler operate uniformly.
+     */
+    private void applyStaticNatDnatRules(IntentSpec spec, String publicRep, String guestOutDev, int zone) {
+        if (!hasStaticNatDnat(spec)) {
+            // Still clear the block in case we're going from "had rules" to "no rules".
+            if (cachedUplinkBlockId >= 0) {
+                programmer.clearStaticNatBlock(cachedUplinkBlockId);
+            }
+            return;
+        }
+        if (publicRep == null) {
+            LOGGER.warn("StaticNat DNAT rules requested for VR {} but no publicRep — skipping HW DNAT (kernel iptables fallback)", spec.vrId);
+            return;
+        }
+        if (spec.publicVlanId == null || spec.publicVlanId <= 0) {
+            LOGGER.warn("StaticNat DNAT rules requested for VR {} but spec.publicVlanId is unset — skipping HW DNAT", spec.vrId);
+            return;
+        }
+        if (cachedUplinkBlockId < 0) {
+            cachedUplinkBlockId = programmer.resolveIngressBlock(guestOutDev);
+            if (cachedUplinkBlockId < 0) {
+                LOGGER.warn("Cannot resolve ingress block on uplink {} — StaticNat HW DNAT disabled for VR {}",
+                        guestOutDev, spec.vrId);
+                return;
+            }
+            LOGGER.info("Resolved ingress block {} on uplink {} for StaticNat HW DNAT", cachedUplinkBlockId, guestOutDev);
+        }
+        // Dedup by publicIp: multiple NatRule DNAT entries can land here (the
+        // mgmt handler may emit per-protocol variants for future extensions).
+        // A single HW rule per public IP is both necessary (mlx5 rejects
+        // duplicates on the same match) and sufficient (StaticNat is 1:1).
+        java.util.LinkedHashMap<String, NatRule> byPub = new java.util.LinkedHashMap<>();
+        for (NatRule r : spec.natRules) {
+            if (r == null || !"DNAT".equalsIgnoreCase(r.dir)
+                    || r.matchAddr == null || r.translateAddr == null) {
+                continue;
+            }
+            byPub.putIfAbsent(r.matchAddr, r);
+        }
+        programmer.clearStaticNatBlock(cachedUplinkBlockId);
+        int autoPrio = 20;
+        for (NatRule r : byPub.values()) {
+            int prio = (r.prio != null && r.prio >= 20 && r.prio <= 29) ? r.prio : autoPrio++;
+            programmer.installStaticNatInboundDnat(cachedUplinkBlockId, spec.publicVlanId,
+                    r.matchAddr, zone, r.translateAddr, publicRep, prio);
+            LOGGER.info("Installed StaticNat HW DNAT for VR {}: {} -> {} on block {} pref {}",
+                    spec.vrId, r.matchAddr, r.translateAddr, cachedUplinkBlockId, prio);
+            if (autoPrio > 29) {
+                LOGGER.warn("StaticNat pref window 20-29 exhausted for VR {}; remaining rules skipped", spec.vrId);
+                break;
+            }
+        }
+    }
+
+    /**
      * Resolve the PF uplink netdev for a VF PCI address.
      * VF at 0000:01:00.2 → parent PF at 0000:01:00.0 → netdev "dx6p0".
      */
@@ -587,6 +690,11 @@ public class IntentReconciler {
 
         // NAT rules (chain 1, prio 10-99): only on the guest-side rep for SNAT,
         // public-side for DNAT. (Could be configured per-rule via direction matching.)
+        // Note: StaticNat inbound DNAT (dir=DNAT, ipProto empty/null) is a
+        // 1:1 all-proto rule programmed in {@link #applyStaticNatDnatRules}
+        // on the shared uplink block (20-29), NOT per-rep here. It's filtered
+        // out explicitly below so the per-rep installNatRule (which requires
+        // ip_proto+port) is never called with incomplete inputs.
         if (spec.natRules != null) {
             for (NatRule r : spec.natRules) {
                 if (r == null || r.dir == null || r.translateAddr == null) {
@@ -602,6 +710,14 @@ public class IntentReconciler {
                 boolean appliesHere = (dir == NatDirection.SNAT && isGuestSide)
                                    || (dir == NatDirection.DNAT && !isGuestSide);
                 if (!appliesHere) {
+                    continue;
+                }
+                // Skip StaticNat DNAT entries — they target the shared uplink
+                // block (20-29), not the per-rep chain-1. Convention: StaticNat
+                // DNAT rules have ipProto null/blank; PFW-style DNAT (if ever
+                // routed through natRules instead of pfwRules) would carry
+                // an explicit proto+port and land here.
+                if (dir == NatDirection.DNAT && (r.ipProto == null || r.ipProto.isBlank())) {
                     continue;
                 }
                 int prio = r.prio != null ? r.prio : 50;

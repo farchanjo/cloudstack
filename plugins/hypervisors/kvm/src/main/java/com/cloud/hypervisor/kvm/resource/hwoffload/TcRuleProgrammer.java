@@ -367,6 +367,58 @@ public class TcRuleProgrammer {
     }
 
     /**
+     * Phase B/3+: install one Static NAT inbound DNAT rule on the shared
+     * ingress block (mirrors {@link #installPfwInboundDnat} but WITHOUT
+     * ip_proto / dst_port matching — StaticNat is 1:1 for ALL protocols
+     * and ports on the public IP).
+     *
+     * <p>Empirically validated 2026-04-19 on aragog block 44:
+     * {@code vlan_ethtype 0x0800} + {@code dst_ip} + {@code ct_state -trk}
+     * (no ip_proto, no dst_port) → {@code in_hw in_hw_count 2} (bond1 + 2
+     * mlx5 PFs). Single-rule per StaticNat entry; no need to split into
+     * tcp/udp/icmp.
+     *
+     * <p>Pref window 20-29 (BELOW PFW 60-79 and source NAT 30-50 to satisfy
+     * ordering: StaticNat is more specific than source NAT for the same
+     * public IP, and any overlap with PFW on the same public IP must resolve
+     * to PFW for defined (protocol, port) tuples).
+     *
+     * @param blockId     ingress block ID (resolved from the uplink, e.g. 44)
+     * @param vlanId      VLAN tag of the public network (e.g. 2988)
+     * @param publicIp    external-facing public IP (the wire dst) dedicated to one VM
+     * @param ctZone      conntrack zone (shared with VR zone for reverse-NAT via kernel ct)
+     * @param internalIp  tenant VM IP to translate the packet dst to
+     * @param publicVfRep representor of the VR's public VF (e.g. dx6p0vf0)
+     * @param prio        pref window; recommended 20-29 (below source NAT pref 30)
+     */
+    public void installStaticNatInboundDnat(int blockId, int vlanId,
+                                            String publicIp, int ctZone,
+                                            String internalIp,
+                                            String publicVfRep, int prio) {
+        String cmd = String.format(
+            "tc filter add block %d ingress pref %d protocol 802.1Q flower " +
+                "vlan_id %d vlan_ethtype 0x0800 dst_ip %s ct_state -trk " +
+                "action vlan pop pipe " +
+                "action ct commit zone %d nat dst addr %s pipe " +
+                "action mirred egress redirect dev %s",
+            blockId, prio, vlanId, publicIp,
+            ctZone, internalIp, publicVfRep);
+        runTc(cmd);
+    }
+
+    /**
+     * Idempotent: clear all Static NAT pref slots on the shared block before
+     * re-installing. Pref window 20-29 (10 slots — generous for the typical
+     * 1-3 StaticNat per VR; legal range is 8 per-tenant VPC IP quota anyway).
+     */
+    public void clearStaticNatBlock(int blockId) {
+        for (int prio = 20; prio <= 29; prio++) {
+            Script.runSimpleBashScript(String.format(
+                "tc filter del block %d ingress pref %d 2>/dev/null || true", blockId, prio));
+        }
+    }
+
+    /**
      * Resolve the ingress block id of a given netdev (typically the uplink, e.g. bond1).
      * Returns {@code -1} if the netdev has no ingress qdisc with a block.
      *

@@ -3008,10 +3008,13 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
      * NAT'd VMs SNAT to their dedicated public IP instead of the VPC source
      * NAT IP.
      *
-     * <p>Inbound DNAT (external → public IP → VM) is NOT in HW yet — that
-     * requires TC on bond1/uplink which mlx5 switchdev handles differently.
-     * For now the kernel iptables in the VR (static_nat_PREROUTING) handles
-     * the DNAT direction; HW only accelerates the outbound SNAT.
+     * <p>Inbound DNAT is ALSO programmed in HW via the shared uplink ingress
+     * block (pref window 20-29) using a single flower rule per StaticNat
+     * entry matching {@code vlan_id + dst_ip} (no ip_proto, no dst_port —
+     * StaticNat is 1:1 for ALL protocols). mlx5 CX6-Dx offloads this pattern
+     * natively (verified 2026-04-19 on aragog block 44: {@code in_hw_count 2}).
+     * The kernel iptables in the VR remains as a fallback for non-offloaded
+     * hosts.
      */
     protected ExecutionResult prepareNetworkElementCommand(final SetStaticNatRulesCommand cmd) {
         if (intentReconciler == null) {
@@ -3030,9 +3033,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         // Merge-by-key: CS may resend the same rule (update) and may send
         // delta commands with revoked=true for removals. A naive accumulate
         // would duplicate on update and leak stale entries on revoke. Key
-        // static-NAT entries by (matchAddr, translateAddr, ipProto); source
-        // NAT entries (carried over verbatim) use matchAddr = VPC supernet
-        // so they cannot collide with static-NAT per-VM matches.
+        // static-NAT entries by (dir, matchAddr, translateAddr, ipProto);
+        // source NAT entries (carried over verbatim) use matchAddr = VPC
+        // supernet so they cannot collide with static-NAT per-VM matches.
         java.util.Map<String, com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natMap =
                 new java.util.LinkedHashMap<>();
         if (current.natRules != null) {
@@ -3040,13 +3043,18 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 natMap.put(existing.dir + ":" + existing.matchAddr + ":" + existing.translateAddr + ":" + existing.ipProto, existing);
             }
         }
-        int prio = 30; // strictly less than source NAT (pref 50) → matches first
+        int snatPrio = 30; // strictly less than source NAT (pref 50) → matches first
+        int dnatPrio = 20; // shared uplink block pref window 20-29 (applyStaticNatDnatRules)
         int added = 0;
         int removed = 0;
         for (StaticNatRuleTO r : rules) {
             if (r.getDstIp() == null || r.getSrcIp() == null) {
                 continue;
             }
+            // Outbound SNAT: VM → wire. Installed per-rep in chain-1 pref 30
+            // (above source NAT pref 50). Per-proto (tcp/udp) since
+            // installNatRule takes an explicit ip_proto. icmp SNAT stays on
+            // kernel iptables (low-volume, not worth the HW slots).
             for (String proto : new String[]{"tcp", "udp"}) {
                 String key = "SNAT:" + r.getDstIp() + ":" + r.getSrcIp() + ":" + proto;
                 if (r.revoked()) {
@@ -3060,8 +3068,32 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 sn.matchAddr = r.getDstIp();
                 sn.translateAddr = r.getSrcIp();
                 sn.ipProto = proto;
-                sn.prio = prio++;
+                sn.prio = snatPrio++;
                 natMap.put(key, sn);
+                added++;
+            }
+            // Inbound DNAT: wire → public IP → VM. One rule per StaticNat
+            // (all protos, all ports). Goes to the shared uplink block
+            // (pref 20-29) via applyStaticNatDnatRules — NOT per-rep.
+            // ipProto left null/blank so the reconciler can distinguish
+            // StaticNat DNAT from PFW-style DNAT (which carries proto+port).
+            String dnatKey = "DNAT:" + r.getSrcIp() + ":" + r.getDstIp() + ":";
+            if (r.revoked()) {
+                if (natMap.remove(dnatKey) != null) {
+                    removed++;
+                }
+            } else {
+                var dn = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
+                dn.dir = "DNAT";
+                dn.matchAddr = r.getSrcIp();       // public IP (the dst on the wire)
+                dn.translateAddr = r.getDstIp();   // VM IP (what dst is rewritten to)
+                dn.ipProto = null;                 // all protocols/ports
+                dn.prio = dnatPrio++;
+                if (dnatPrio > 29) {
+                    LOGGER.warn("StaticNat DNAT pref window 20-29 exhausted on VR {}; remaining entries fall back to kernel iptables", routerName);
+                    continue;
+                }
+                natMap.put(dnatKey, dn);
                 added++;
             }
         }
@@ -3083,7 +3115,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.lbRules = current.lbRules;
         newSpec.pfwRules = current.pfwRules;
         intentReconciler.applyIntent(newSpec);
-        LOGGER.info("Programmed static NAT: {} added, {} removed (TC entries reconciled) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
+        LOGGER.info("Programmed static NAT: {} added, {} removed (TC entries reconciled) for VR {} (HW outbound SNAT + HW inbound DNAT)",
                 added, removed, routerName);
         return new ExecutionResult(true, null);
     }
