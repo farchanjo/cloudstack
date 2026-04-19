@@ -239,6 +239,22 @@ public class IntentReconciler {
         // Guest rep: outbound SNAT + +est forward to uplink (bond1/PF).
         applyToRep(guestRep, guestOutDev, zone, spec, true);
 
+        // Multi-tier: mirror chain-0 ct + chain-1 bypass/SNAT to each additional guest VF rep.
+        // Same SNAT rule (src_cidr = VPC supernet) applies to all tiers since they share /16.
+        if (spec.additionalGuestVfPcis != null && !spec.additionalGuestVfPcis.isEmpty()) {
+            for (String extraVfPci : spec.additionalGuestVfPcis) {
+                String extraRep = repMapper.getRepresentor(extraVfPci);
+                if (extraRep == null) {
+                    LOGGER.warn("Multi-tier: no rep for additional guest VF {} — skipping TC mirror", extraVfPci);
+                    continue;
+                }
+                String extraOut = resolveUplink(extraVfPci);
+                if (extraOut == null) { extraOut = guestOutDev; }
+                applyToRep(extraRep, extraOut, zone, spec, true);
+                LOGGER.info("Multi-tier: applied TC mirror on extra guest rep {} (VF {})", extraRep, extraVfPci);
+            }
+        }
+
         // Public rep (Phase B/4 only): TC ingress on the public-rep matches
         // packets going FROM the VR's public VF OUT TO THE WIRE — that is
         // the *reply* path on the public side (e.g. SYN-ACK from VR back to
@@ -278,6 +294,15 @@ public class IntentReconciler {
         // works regardless of OVS ownership because it deletes filters by
         // chain+pref, which don't conflict with OVS's own chain-0 redirects.
         String guestRep = repMapper.getRepresentor(prev.guestVfPci);
+        // Multi-tier: also clean extra guest reps
+        if (prev.additionalGuestVfPcis != null) {
+            for (String extraPci : prev.additionalGuestVfPcis) {
+                String extraRep = repMapper.getRepresentor(extraPci);
+                if (extraRep != null) {
+                    try { programmer.clearChain1(extraRep); } catch (Exception e) { LOGGER.warn("clearChain1 failed on {}: {}", extraRep, e.toString()); }
+                }
+            }
+        }
         if (guestRep != null) {
             programmer.clearChain1(guestRep);
             // Also drop chain-0 dispatch rules (ct lookup) we installed —
@@ -300,8 +325,43 @@ public class IntentReconciler {
             programmer.clearPfwBlock(cachedUplinkBlockId);
             LOGGER.info("Cleared PFW HW DNAT rules from block {} for removed VR {}", cachedUplinkBlockId, vrId);
         }
+        // VR-destroy leak fix: strip VF representor ports from OVS br-bond.
+        // Background: VfPassthroughVifDriver.unplug() does `ovs-vsctl --if-exists del-port`
+        // for each hostdev iface libvirt reports at StopCommand time. But when the VR is
+        // already stopped before expunge (e.g. advanceStop followed by ExpungeOperation
+        // issued while domain is gone), getInterfaces() returns an empty list and the
+        // driver-side cleanup is skipped. The reps stay on br-bond tagged with the old
+        // VLAN of the destroyed tier, and later VRs landing on the same VFs inherit
+        // stale tag state. Since removeIntent has authoritative knowledge of every VF
+        // PCI this VR ever used (persisted in the intent JSON), mirror the del-port
+        // here so cleanup is tied to VR lifecycle rather than libvirt domain state.
+        detachRepresentorFromBridge(guestRep);
+        if (prev.additionalGuestVfPcis != null) {
+            for (String extraPci : prev.additionalGuestVfPcis) {
+                detachRepresentorFromBridge(repMapper.getRepresentor(extraPci));
+            }
+        }
+        detachRepresentorFromBridge(publicRep);
         LOGGER.info("Removed intent for VR {} (cleared guestRep={} publicRep={})",
             vrId, guestRep, publicRep);
+    }
+
+    /**
+     * Remove a VF representor from OVS br-bond. Idempotent and best-effort:
+     * if the rep isn't on the bridge (already removed by VifDriver.unplug or
+     * never added), ovs-vsctl returns 0 and we move on.
+     */
+    private void detachRepresentorFromBridge(String repName) {
+        if (repName == null || repName.isEmpty()) {
+            return;
+        }
+        try {
+            com.cloud.utils.script.Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists del-port br-bond %s", repName));
+            LOGGER.debug("Detached VF representor {} from br-bond", repName);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Failed to detach rep {} from br-bond: {}", repName, e.getMessage());
+        }
     }
 
     public synchronized IntentSpec currentIntent(String vrId) {
