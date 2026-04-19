@@ -206,6 +206,7 @@ public class HwOffloadIntentApi {
         public String vrId;
         public long version;
         public String guestVfPci;
+        public java.util.List<String> additionalGuestVfPcis;
         public String publicVfPci;
         public Integer publicVlanId;   // VLAN tag of the public VF rep (e.g. 2988); needed for B/2 PFW DNAT
         public Integer ctZone;
