@@ -3027,36 +3027,47 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         if (rules == null) {
             return new ExecutionResult(true, null);
         }
-        // Carry over existing NAT (source NAT, port forwards, etc.) and add
-        // static NAT entries on top. Source NAT's matchAddr is the VPC
-        // supernet so it doesn't conflict with static NAT's per-VM src match
-        // (which always sits at a higher precedence).
-        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natRules =
-                new java.util.ArrayList<>();
+        // Merge-by-key: CS may resend the same rule (update) and may send
+        // delta commands with revoked=true for removals. A naive accumulate
+        // would duplicate on update and leak stale entries on revoke. Key
+        // static-NAT entries by (matchAddr, translateAddr, ipProto); source
+        // NAT entries (carried over verbatim) use matchAddr = VPC supernet
+        // so they cannot collide with static-NAT per-VM matches.
+        java.util.Map<String, com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natMap =
+                new java.util.LinkedHashMap<>();
         if (current.natRules != null) {
-            natRules.addAll(current.natRules);
+            for (var existing : current.natRules) {
+                natMap.put(existing.dir + ":" + existing.matchAddr + ":" + existing.translateAddr + ":" + existing.ipProto, existing);
+            }
         }
         int prio = 30; // strictly less than source NAT (pref 50) → matches first
         int added = 0;
+        int removed = 0;
         for (StaticNatRuleTO r : rules) {
-            if (r.revoked()) {
-                continue;
-            }
             if (r.getDstIp() == null || r.getSrcIp() == null) {
                 continue;
             }
             for (String proto : new String[]{"tcp", "udp"}) {
+                String key = "SNAT:" + r.getDstIp() + ":" + r.getSrcIp() + ":" + proto;
+                if (r.revoked()) {
+                    if (natMap.remove(key) != null) {
+                        removed++;
+                    }
+                    continue;
+                }
                 var sn = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule();
                 sn.dir = "SNAT";
-                sn.matchAddr = r.getDstIp();        // VM private IP — narrow match
-                sn.translateAddr = r.getSrcIp();    // dedicated public IP for this VM
+                sn.matchAddr = r.getDstIp();
+                sn.translateAddr = r.getSrcIp();
                 sn.ipProto = proto;
                 sn.prio = prio++;
-                natRules.add(sn);
+                natMap.put(key, sn);
+                added++;
             }
-            added++;
         }
-        if (added == 0) {
+        java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.NatRule> natRules =
+                new java.util.ArrayList<>(natMap.values());
+        if (added == 0 && removed == 0) {
             return new ExecutionResult(true, null);
         }
         var newSpec = new com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.IntentSpec();
@@ -3072,8 +3083,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.lbRules = current.lbRules;
         newSpec.pfwRules = current.pfwRules;
         intentReconciler.applyIntent(newSpec);
-        LOGGER.info("Programmed {} static NAT rule(s) ({} TC entries) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
-                added, added * 2, routerName);
+        LOGGER.info("Programmed static NAT: {} added, {} removed (TC entries reconciled) for VR {} (HW outbound SNAT; inbound DNAT remains kernel)",
+                added, removed, routerName);
         return new ExecutionResult(true, null);
     }
 
