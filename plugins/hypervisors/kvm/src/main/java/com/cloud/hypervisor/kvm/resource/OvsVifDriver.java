@@ -127,6 +127,10 @@ public class OvsVifDriver extends VifDriverBase {
         } else if (nic.getBroadcastType() == Networks.BroadcastDomainType.Pvlan) {
             // TODO consider moving some of this functionality from NetUtils to Networks....
             vlanId = NetUtils.getPrimaryPvlanFromUri(nic.getBroadcastUri());
+        } else if (nic.getBroadcastType() == Networks.BroadcastDomainType.Vxlan) {
+            // VNI (possibly > 4094). toOvsAccessTag() folds to 12-bit OVS tag.
+            vlanId = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
+            ensureVxlanMesh(nic, vlanId);
         } else {
             vlanId = getVlanIdFromUri(nic);
         }
@@ -144,11 +148,11 @@ public class OvsVifDriver extends VifDriverBase {
                     } else {
                         logger.debug("creating a vlan dev and bridge for guest traffic per traffic label " + trafficLabel);
                         intf.defBridgeNet(_pifs.get(trafficLabel), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
-                        intf.setVlanTag(Integer.parseInt(vlanId));
+                        intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
                     }
                 } else {
                     intf.defBridgeNet(_pifs.get("private"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
-                    intf.setVlanTag(Integer.parseInt(vlanId));
+                    intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
                 }
             } else if (nic.getBroadcastType() == Networks.BroadcastDomainType.Lswitch || nic.getBroadcastType() == Networks.BroadcastDomainType.OpenDaylight) {
                 logger.debug("nic " + nic + " needs to be connected to LogicalSwitch " + logicalSwitchUuid);
@@ -172,10 +176,10 @@ public class OvsVifDriver extends VifDriverBase {
                 if (trafficLabel != null && !trafficLabel.isEmpty()) {
                     logger.debug("creating a vlan dev and bridge for public traffic per traffic label " + trafficLabel);
                     intf.defBridgeNet(_pifs.get(trafficLabel), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
-                    intf.setVlanTag(Integer.parseInt(vlanId));
+                    intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
                 } else {
                     intf.defBridgeNet(_pifs.get("public"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
-                    intf.setVlanTag(Integer.parseInt(vlanId));
+                    intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
                 }
             } else {
                 intf.defBridgeNet(_bridges.get("public"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter), networkRateKBps);
@@ -184,7 +188,7 @@ public class OvsVifDriver extends VifDriverBase {
             if (vlanId != null) {
                 String brName = (trafficLabel != null && !trafficLabel.isEmpty()) ? _pifs.get(trafficLabel) : _bridges.get("private");
                 intf.defBridgeNet(brName, null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
-                intf.setVlanTag(Integer.parseInt(vlanId));
+                intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
             } else {
                 intf.defBridgeNet(_bridges.get("private"), null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
             }
@@ -192,7 +196,7 @@ public class OvsVifDriver extends VifDriverBase {
             String storageBrName = nic.getName() == null ? _bridges.get("private") : nic.getName();
             intf.defBridgeNet(storageBrName, null, nic.getMac(), getGuestNicModel(guestOsType, nicAdapter));
             if (vlanId != null) {
-                intf.setVlanTag(Integer.parseInt(vlanId));
+                intf.setVlanTag(toOvsAccessTag(Integer.parseInt(vlanId)));
             }
         }
         return intf;
@@ -210,6 +214,75 @@ public class OvsVifDriver extends VifDriverBase {
             }
         }
         return null;
+    }
+
+    /**
+     * Map a (potentially >4094) broadcast segment id (e.g. VXLAN VNI) to a
+     * valid OVS/IEEE 802.1Q access VLAN tag (1..4094). Segment ids in range
+     * are returned as-is. Out-of-range ids are folded back into 1..4094 using
+     * modulo so two different VNIs don't silently collide on the same host.
+     *
+     * Without this mapping libvirt emits {@code <vlan><tag id='10197'/></vlan>},
+     * OVS rejects the out-of-range tag and the port ends up untagged — which
+     * breaks VM connectivity for that tier. Mirrors VfPassthroughVifDriver.
+     */
+    public static int toOvsAccessTag(int segmentId) {
+        if (segmentId >= 1 && segmentId <= 4094) {
+            return segmentId;
+        }
+        return ((segmentId - 1) % 4094) + 1;
+    }
+
+    /**
+     * Ensure OVS VXLAN tunnel mesh exists for the given VNI before libvirt
+     * attaches the tap to the bridge. Peer list and owning VM name are read
+     * from dynamic NIC details populated by the management server; falls
+     * back to {@code agent.properties} ({@code vxlan.peers}) when the
+     * details are absent (e.g. old mgmt talking to new agent).
+     *
+     * <p>Safe no-op when the manager is not configured or the string is
+     * unparseable — plug must not fail on a recoverable data-plane issue.
+     */
+    private void ensureVxlanMesh(NicTO nic, String vlanId) {
+        if (StringUtils.isBlank(vlanId)) {
+            return;
+        }
+        if (_libvirtComputingResource == null || _libvirtComputingResource.vxlanTunnelManager == null) {
+            return;
+        }
+        try {
+            int vni = Integer.parseInt(vlanId.trim());
+            java.util.Collection<String> peers = parseCsvDetail(nic, "vxlan.peers");
+            String vmName = nic != null ? nic.getNicDetail("vxlan.vm.name") : null;
+            _libvirtComputingResource.vxlanTunnelManager.ensureMeshForVni(vmName, vni, peers);
+        } catch (NumberFormatException e) {
+            logger.warn("ensureVxlanMesh: could not parse VNI '{}': {}", vlanId, e.getMessage());
+        } catch (RuntimeException e) {
+            logger.warn("ensureVxlanMesh: failed for vni='{}': {}", vlanId, e.getMessage());
+        }
+    }
+
+    /**
+     * Parse a comma-separated NIC detail into a list. Returns {@code null}
+     * when the detail is absent, which signals {@code VxlanTunnelManager}
+     * to consult its {@code agent.properties} fallback.
+     */
+    private static java.util.List<String> parseCsvDetail(NicTO nic, String key) {
+        if (nic == null) {
+            return null;
+        }
+        String raw = nic.getNicDetail(key);
+        if (StringUtils.isBlank(raw)) {
+            return null;
+        }
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String t : raw.split(",")) {
+            String v = t.trim();
+            if (!v.isEmpty()) {
+                out.add(v);
+            }
+        }
+        return out;
     }
 
     private String getOvsTunnelNetworkName(final String broadcastUri) {

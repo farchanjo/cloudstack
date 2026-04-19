@@ -18,6 +18,7 @@ package com.cloud.agent.api.to;
 
 import com.cloud.offering.NetworkOffering;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -46,6 +47,20 @@ public class NicTO extends NetworkTO {
     String vdpaDevice;         // vDPA device path, e.g. "/dev/vhost-vdpa-0"
     Boolean useSfVdpa;         // wrapper Boolean → null preserves wire compat with older agents
     String sfRepresentorName;  // SF representor name, e.g. "dx6p0sf0"
+
+    /**
+     * Free-form String-keyed detail map propagated from the management server
+     * to the agent. Distinct from {@link #details} (which is typed by
+     * {@link NetworkOffering.Detail}) because some agent-side features need
+     * to carry values that don't fit an enum — e.g. dynamic VXLAN peer lists
+     * ({@code vxlan.peers}), the local host mgmt IP ({@code vxlan.local.ip}),
+     * or the owning VM instance name ({@code vxlan.vm.name}) used for
+     * ref-counted tunnel cleanup.
+     *
+     * <p>Null-preserving wire compat: older agents that don't know about this
+     * field simply ignore it.
+     */
+    Map<String, String> nicDetails;
 
     public NicTO() {
         super();
@@ -228,5 +243,47 @@ public class NicTO extends NetworkTO {
 
     public void setSfRepresentorName(String sfRepresentorName) {
         this.sfRepresentorName = sfRepresentorName;
+    }
+
+    /**
+     * Return the raw custom detail map, or {@code null} if none was set.
+     */
+    public Map<String, String> getNicDetails() {
+        return nicDetails;
+    }
+
+    /**
+     * Replace the full custom detail map. Prefer {@link #setNicDetail(String, String)}
+     * for adding individual keys from the enrichment path.
+     */
+    public void setNicDetails(final Map<String, String> nicDetails) {
+        this.nicDetails = nicDetails;
+    }
+
+    /**
+     * Set a single custom detail key/value — allocates the backing map lazily.
+     *
+     * @param key   detail key, never {@code null}
+     * @param value detail value; {@code null} is accepted but stored verbatim
+     */
+    public void setNicDetail(final String key, final String value) {
+        if (key == null) {
+            return;
+        }
+        if (nicDetails == null) {
+            nicDetails = new HashMap<>();
+        }
+        nicDetails.put(key, value);
+    }
+
+    /**
+     * Lookup a single custom detail value; returns {@code null} if the map is
+     * absent or the key is missing.
+     */
+    public String getNicDetail(final String key) {
+        if (nicDetails == null || key == null) {
+            return null;
+        }
+        return nicDetails.get(key);
     }
 }

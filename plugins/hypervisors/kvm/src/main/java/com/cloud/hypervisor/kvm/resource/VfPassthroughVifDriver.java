@@ -81,6 +81,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
 
         if (repName != null) {
+            // Auto-plumb OVS VXLAN tunnels to peer data nodes before we drop
+            // the rep into the bridge; safe no-op for legacy VLAN segments.
+            ensureVxlanMeshIfNeeded(nic, vlanTag);
             addRepresentorToOvs(repName, vlanTag);
         }
 
@@ -308,14 +311,90 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         // NOTE: --may-exist add-port doesn't update tag of existing ports, so we
         // run a separate set/clear to enforce the desired state on every plug.
         if (vlanTag != null && vlanTag > 0) {
+            int ovsTag = toOvsAccessTag(vlanTag);
             Script.runSimpleBashScript(String.format(
-                "ovs-vsctl set port %s tag=%d", repName, vlanTag));
+                "ovs-vsctl set port %s tag=%d", repName, ovsTag));
+            if (ovsTag != vlanTag) {
+                logger.info("Mapped network segment {} → internal OVS tag {} (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)",
+                    vlanTag, ovsTag);
+            }
         } else {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl clear port %s tag", repName));
         }
         Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
-        logger.info("Added VF representor {} to OVS br-bond (tag={}) with clsact qdisc", repName, vlanTag);
+        logger.info("Added VF representor {} to OVS br-bond (segment={}) with clsact qdisc", repName, vlanTag);
+    }
+
+    /**
+     * Map a network segment ID (VLAN tag or VXLAN VNI) to a 12-bit OVS access tag (1..4094).
+     *
+     * For VLAN-isolated networks the segment is already in range and is used as-is.
+     * For VXLAN-isolated networks (VNI may be up to 16M) we collapse into the 12-bit
+     * VLAN-tag range using ((vni - 1) % 4094) + 1. This keeps the mapping deterministic
+     * (every host derives the same internal tag for the same VNI), so VFs of the same
+     * tenant network land on the same OVS broadcast domain on every host where they're
+     * placed. Cross-tenant collisions are mathematically possible but unlikely with the
+     * VNI ranges CloudStack actually allocates (low thousands), and downstream HW offload
+     * TC rules use the real VNI for upstream encap when needed.
+     */
+    public static int toOvsAccessTag(int segmentId) {
+        if (segmentId >= 1 && segmentId <= 4094) {
+            return segmentId;
+        }
+        return ((segmentId - 1) % 4094) + 1;
+    }
+
+    /**
+     * Ensure the OVS VXLAN tunnel mesh exists for the given segment before
+     * we attach the representor port to the bridge. This is a no-op when
+     * segmentId is in the legacy VLAN range (1..4094) or when the scheme is
+     * not {@code vxlan://}, and safely swallows errors so plug is not
+     * blocked by data-plane issues.
+     */
+    private void ensureVxlanMeshIfNeeded(NicTO nic, Integer segmentId) {
+        if (segmentId == null || segmentId <= 4094) {
+            return;
+        }
+        if (nic == null || nic.getBroadcastUri() == null) {
+            return;
+        }
+        String scheme = nic.getBroadcastUri().getScheme();
+        if (scheme == null || !"vxlan".equalsIgnoreCase(scheme)) {
+            return;
+        }
+        if (_libvirtComputingResource == null || _libvirtComputingResource.vxlanTunnelManager == null) {
+            return;
+        }
+        try {
+            java.util.List<String> peers = parseCsvDetail(nic, "vxlan.peers");
+            String vmName = nic.getNicDetail("vxlan.vm.name");
+            _libvirtComputingResource.vxlanTunnelManager.ensureMeshForVni(vmName, segmentId, peers);
+        } catch (RuntimeException e) {
+            logger.warn("ensureVxlanMeshIfNeeded: failed for segment={}: {}", segmentId, e.getMessage());
+        }
+    }
+
+    /**
+     * Parse a comma-separated NIC detail into a list. Null means "detail
+     * absent" — the tunnel manager falls back to agent.properties.
+     */
+    private static java.util.List<String> parseCsvDetail(NicTO nic, String key) {
+        if (nic == null) {
+            return null;
+        }
+        String raw = nic.getNicDetail(key);
+        if (StringUtils.isBlank(raw)) {
+            return null;
+        }
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String t : raw.split(",")) {
+            String v = t.trim();
+            if (!v.isEmpty()) {
+                out.add(v);
+            }
+        }
+        return out;
     }
 
     private Integer extractVlanTag(NicTO nic) {

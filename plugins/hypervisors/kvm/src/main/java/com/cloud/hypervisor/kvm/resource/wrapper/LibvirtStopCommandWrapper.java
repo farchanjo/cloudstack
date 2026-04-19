@@ -105,6 +105,19 @@ public final class LibvirtStopCommandWrapper extends CommandWrapper<StopCommand,
                 }
             }
 
+            // Phase A/B VXLAN: release this VM's VXLAN tunnel refs. When this
+            // is the last VM on the host referencing a given VNI, the
+            // corresponding vxlan_<vni>_<peer> ports are removed from the
+            // OVS bridge — kills zombie tunnels and prevents unbounded port
+            // growth on long-lived hosts.
+            if (vmName != null && libvirtComputingResource.vxlanTunnelManager != null) {
+                try {
+                    libvirtComputingResource.vxlanTunnelManager.releaseVmTunnels(vmName);
+                } catch (Exception e) {
+                    logger.warn("Vxlan: failed to release tunnels for " + vmName + ": " + e.getMessage());
+                }
+            }
+
             if (result == null) {
                 if (disks != null && disks.size() > 0) {
                     for (final DiskDef disk : disks) {

@@ -450,6 +450,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
+    public com.cloud.hypervisor.kvm.resource.ovs.VxlanTunnelManager vxlanTunnelManager;
 
     public VifDriver getVfPassthroughVifDriver() {
         return vfPassthroughVifDriver;
@@ -744,6 +745,58 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public LibvirtUtilitiesHelper getLibvirtUtilitiesHelper() {
         return libvirtUtilitiesHelper;
+    }
+
+    /**
+     * Probe whether a libvirt domain with the given VM instance name is
+     * currently {@code VIR_DOMAIN_RUNNING}. Best-effort: returns {@code true}
+     * when any doubt remains (e.g. libvirt unreachable) so callers that use
+     * this as a liveness predicate err on the side of preserving state
+     * rather than deleting valid plumbing.
+     *
+     * <p>Used by {@link com.cloud.hypervisor.kvm.resource.ovs.VxlanTunnelManager#bootstrapFromState}
+     * on agent startup to decide which persisted (vm, vni) entries should
+     * be re-plumbed vs. purged.
+     *
+     * @param vmName libvirt instance name (e.g. {@code i-2-414-VM})
+     * @return {@code true} if the domain exists and is running, or if the
+     *         probe itself failed (fail-open); {@code false} when the
+     *         domain is definitively absent or stopped.
+     */
+    public boolean isLibvirtDomainRunning(String vmName) {
+        if (vmName == null || vmName.isEmpty()) {
+            return false;
+        }
+        try {
+            final org.libvirt.Connect conn = LibvirtConnection.getConnectionByVmName(vmName);
+            final org.libvirt.Domain domain = conn.domainLookupByName(vmName);
+            if (domain == null) {
+                return false;
+            }
+            try {
+                org.libvirt.DomainInfo info = domain.getInfo();
+                return info != null && info.state == org.libvirt.DomainInfo.DomainState.VIR_DOMAIN_RUNNING;
+            } finally {
+                try {
+                    domain.free();
+                } catch (org.libvirt.LibvirtException ignored) {
+                    // domain.free() throws only on unusual libvirt errors; we
+                    // already have the liveness answer we need, leak once.
+                }
+            }
+        } catch (org.libvirt.LibvirtException e) {
+            // VIR_ERR_NO_DOMAIN is the canonical "not there" signal; anything
+            // else is ambiguous (daemon down, transient) — keep state.
+            String msg = e.getMessage() != null ? e.getMessage() : "";
+            if (msg.contains("Domain not found") || msg.contains("VIR_ERR_NO_DOMAIN")) {
+                return false;
+            }
+            LOGGER.debug("isLibvirtDomainRunning({}): uncertain, keeping state ({})", vmName, msg);
+            return true;
+        } catch (RuntimeException e) {
+            LOGGER.debug("isLibvirtDomainRunning({}): unexpected error, keeping state ({})", vmName, e.getMessage());
+            return true;
+        }
     }
 
     public String getClusterId() {
@@ -1796,6 +1849,23 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         String uplinkNetdev = hwOffloadProps.getProperty("hwoffload.uplink.netdev");
         intentReconciler = new com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler(
                 representorMapper, tcRuleProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
+        // Auto-plumb VXLAN tunnel mesh between data nodes when a guest NIC
+        // carries a VXLAN VNI. agent.properties legacy keys (vxlan.peers /
+        // vxlan.local.ip) are kept only as a fallback — the management
+        // server now enriches each VXLAN NicTO with the current dynamic
+        // peer list; the fallback is a no-op when both keys are absent, so
+        // zones that don't use VXLAN isolation pay zero cost.
+        vxlanTunnelManager = new com.cloud.hypervisor.kvm.resource.ovs.VxlanTunnelManager(hwOffloadProps);
+        // Startup re-plumb: read /var/lib/cloudstack-agent/vxlan/state.json,
+        // prune state for domains that are no longer libvirt:RUNNING, and
+        // re-issue ovs-vsctl add-port for each surviving (vm, vni) pair.
+        // Without this, an agent restart would leave tenant tiers black-holed
+        // until every VM on the host is re-plugged.
+        try {
+            vxlanTunnelManager.bootstrapFromState(this::isLibvirtDomainRunning);
+        } catch (RuntimeException e) {
+            LOGGER.warn("VxlanTunnelManager.bootstrapFromState failed: {}", e.getMessage());
+        }
 
         // Load any per-traffic-type vif drivers
         for (final Map.Entry<String, Object> entry : params.entrySet()) {
@@ -2724,6 +2794,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 // (in a single-tier VPC, that's eth1; multi-tier is out of scope here).
                 String guestVfPci = null;
                 String publicVfPci = null;
+                java.util.List<String> additionalGuestVfPcis = new java.util.ArrayList<>();
                 for (int i = 0; i < pluggedNics.size(); i++) {
                     InterfaceDef nic = pluggedNics.get(i);
                     if (nic.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
@@ -2733,6 +2804,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                         publicVfPci = nic.getPciAddress();
                     } else if (guestVfPci == null) {
                         guestVfPci = nic.getPciAddress();
+                    } else {
+                        // Multi-tier: extra guest VFs (t2, t3, ...) — TC mirrored by IntentReconciler
+                        additionalGuestVfPcis.add(nic.getPciAddress());
                     }
                 }
                 String publicIp = pubIP.getPublicIp();
@@ -2751,6 +2825,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     spec.vrId = routerName;
                     spec.version = System.currentTimeMillis();
                     spec.guestVfPci = guestVfPci;
+                    spec.additionalGuestVfPcis = additionalGuestVfPcis.isEmpty() ? null : additionalGuestVfPcis;
                     spec.publicVfPci = publicVfPci;
                     spec.publicVlanId = parseVlanIdFromUri(pubVlan);
                     spec.natRules = new java.util.ArrayList<>();
@@ -2901,6 +2976,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.vrId = current.vrId;
         newSpec.version = System.currentTimeMillis();
         newSpec.guestVfPci = current.guestVfPci;
+        newSpec.additionalGuestVfPcis = current.additionalGuestVfPcis;
         newSpec.publicVfPci = current.publicVfPci;
         newSpec.publicVlanId = current.publicVlanId;
         newSpec.ctZone = current.ctZone;
@@ -2987,6 +3063,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         newSpec.vrId = current.vrId;
         newSpec.version = System.currentTimeMillis();
         newSpec.guestVfPci = current.guestVfPci;
+        newSpec.additionalGuestVfPcis = current.additionalGuestVfPcis;
         newSpec.publicVfPci = current.publicVfPci;
         newSpec.publicVlanId = current.publicVlanId;
         newSpec.ctZone = current.ctZone;

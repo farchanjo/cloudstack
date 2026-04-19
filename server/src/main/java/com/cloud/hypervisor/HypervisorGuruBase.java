@@ -404,6 +404,84 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         }
     }
 
+    /**
+     * Enrich a VXLAN-isolated {@link NicTO} with the current dynamic peer list
+     * so the KVM agent can plumb a full OVS VXLAN mesh without relying on a
+     * static {@code vxlan.peers} / {@code vxlan.local.ip} pair in
+     * {@code agent.properties}.
+     *
+     * <p>Populated detail keys (see {@code VxlanTunnelManager}):
+     * <ul>
+     *   <li>{@code vxlan.peers}: comma-separated management IPs of all
+     *       {@code KVM} hosts in the same zone that are currently
+     *       {@link com.cloud.host.Status#Up}. Filtering by zone (instead of
+     *       cluster) matches the BGP/OVS fabric model: every data node in
+     *       Slytherin is a valid tunnel endpoint.</li>
+     *   <li>{@code vxlan.vm.name}: the VM instance name this NIC belongs to
+     *       ({@code i-2-414-VM}, {@code r-417-VM} …). The agent uses this as
+     *       the reference-count key so tunnel cleanup on VM stop/expunge is
+     *       safe when multiple VMs share a VNI on the same host.</li>
+     * </ul>
+     *
+     * <p>When the NIC is not VXLAN-broadcast, or the zone lookup yields zero
+     * Up peers, this method is a no-op and the agent falls back to its own
+     * {@code agent.properties} defaults.
+     *
+     * <p>Guarded: any exception here must never fail the TO assembly — the
+     * worst case is the agent falls back to static config or empty peers.
+     */
+    private void enrichVxlanPeerDetails(NicTO nicTo, VirtualMachine vm) {
+        if (nicTo == null || vm == null) {
+            return;
+        }
+        try {
+            if (nicTo.getBroadcastUri() == null) {
+                return;
+            }
+            String scheme = nicTo.getBroadcastUri().getScheme();
+            if (scheme == null || !"vxlan".equalsIgnoreCase(scheme)) {
+                return;
+            }
+            // vm.getInstanceName() is stable across VM lifecycle (i-2-414-VM,
+            // r-417-VM) — exactly what the agent needs as ref-count key.
+            String instanceName = vm.getInstanceName();
+            if (StringUtils.isNotBlank(instanceName)) {
+                nicTo.setNicDetail("vxlan.vm.name", instanceName);
+            }
+            Long zoneId = vm.getDataCenterId();
+            if (zoneId == null) {
+                return;
+            }
+            List<HostVO> hosts = hostDao.listAllHostsUpByZoneAndHypervisor(zoneId, Hypervisor.HypervisorType.KVM);
+            if (CollectionUtils.isEmpty(hosts)) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (HostVO host : hosts) {
+                if (host == null) {
+                    continue;
+                }
+                String ip = host.getPrivateIpAddress();
+                if (StringUtils.isBlank(ip)) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(ip.trim());
+            }
+            if (sb.length() > 0) {
+                nicTo.setNicDetail("vxlan.peers", sb.toString());
+            }
+            // "vxlan.local.ip" is the target host's own mgmt IP. It is known
+            // only at execution time (the Command dispatcher picks the host
+            // at the very end), so we cannot fill it here — the agent detects
+            // it at runtime from its uplink device as a fallback.
+        } catch (RuntimeException e) {
+            logger.debug("enrichVxlanPeerDetails: skipped for nic={} due to {}", nicTo, e.getMessage());
+        }
+    }
+
     protected VirtualMachineTO toVirtualMachineTO(VirtualMachineProfile vmProfile) {
         ServiceOffering offering = serviceOfferingDao.findById(vmProfile.getId(), vmProfile.getServiceOfferingId());
         VirtualMachine vm = vmProfile.getVirtualMachine();
@@ -447,6 +525,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             }
             NicTO nicTo = toNicTO(nicProfile);
             allocateVfIfHwOffload(nicTo, nicProfile, vmProfile);
+            enrichVxlanPeerDetails(nicTo, vm);
             nics[i++] = nicTo;
         }
 
