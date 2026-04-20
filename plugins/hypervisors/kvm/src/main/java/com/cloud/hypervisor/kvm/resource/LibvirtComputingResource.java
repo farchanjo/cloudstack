@@ -451,6 +451,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
     public com.cloud.hypervisor.kvm.resource.ovs.VxlanTunnelManager vxlanTunnelManager;
+    public com.cloud.hypervisor.kvm.resource.ovs.DvrManager dvrManager;
 
     public VifDriver getVfPassthroughVifDriver() {
         return vfPassthroughVifDriver;
@@ -1865,6 +1866,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             vxlanTunnelManager.bootstrapFromState(this::isLibvirtDomainRunning);
         } catch (RuntimeException e) {
             LOGGER.warn("VxlanTunnelManager.bootstrapFromState failed: {}", e.getMessage());
+        }
+
+        // Distributed Virtual Router (MVP). Installs intra-host cross-tier
+        // OVS flows so VMs in different tiers of the same VPC on the SAME
+        // host route directly via the bridge, skipping the VR kernel.
+        dvrManager = new com.cloud.hypervisor.kvm.resource.ovs.DvrManager(hwOffloadProps);
+        try {
+            dvrManager.bootstrapFromState();
+        } catch (RuntimeException e) {
+            LOGGER.warn("DvrManager.bootstrapFromState failed: {}", e.getMessage());
         }
 
         // Load any per-traffic-type vif drivers

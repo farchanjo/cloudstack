@@ -131,6 +131,7 @@ public class OvsVifDriver extends VifDriverBase {
             // VNI (possibly > 4094). toOvsAccessTag() folds to 12-bit OVS tag.
             vlanId = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
             ensureVxlanMesh(nic, vlanId);
+            registerDvrIntent(nic, vlanId);
         } else {
             vlanId = getVlanIdFromUri(nic);
         }
@@ -259,6 +260,91 @@ public class OvsVifDriver extends VifDriverBase {
             logger.warn("ensureVxlanMesh: could not parse VNI '{}': {}", vlanId, e.getMessage());
         } catch (RuntimeException e) {
             logger.warn("ensureVxlanMesh: failed for vni='{}': {}", vlanId, e.getMessage());
+        }
+    }
+
+    /**
+     * Register the NIC with the Distributed Virtual Router manager so
+     * intra-host cross-tier routing can bypass the VR kernel.
+     *
+     * <p>MVP: IPv4 only, Guest traffic only, silent no-op when required
+     * bits are missing (absent vpc id / gateway / ip / mac). The DVR
+     * never fails a plug; the VR path remains the safe fallback.
+     */
+    private void registerDvrIntent(NicTO nic, String vlanId) {
+        if (nic == null || _libvirtComputingResource == null) {
+            return;
+        }
+        if (_libvirtComputingResource.dvrManager == null) {
+            return;
+        }
+        if (nic.getType() != Networks.TrafficType.Guest) {
+            return;
+        }
+        if (StringUtils.isBlank(vlanId)) {
+            return;
+        }
+        String vmIp = nic.getIp();
+        String vmMac = nic.getMac();
+        String gateway = nic.getGateway();
+        if (StringUtils.isBlank(vmIp) || StringUtils.isBlank(vmMac) || StringUtils.isBlank(gateway)) {
+            return;
+        }
+        try {
+            int vni = Integer.parseInt(vlanId.trim());
+            String cidr = buildCidrFromIpNetmask(vmIp, nic.getNetmask());
+            String vpcId = nic.getNicDetail("dvr.vpc.id");
+            if (StringUtils.isBlank(vpcId)) {
+                vpcId = nic.getNicDetail("vpc.id");
+            }
+            // When mgmt doesn't supply a vpc id yet (older mgmt), fold all
+            // local tiers into a single synthetic VPC bucket ("*"). Fine
+            // for the single-VPC MVP; multi-VPC requires the NIC detail.
+            String vmName = nic.getNicDetail("vxlan.vm.name");
+            if (StringUtils.isBlank(vmName)) {
+                vmName = nic.getUuid();
+            }
+            _libvirtComputingResource.dvrManager.registerTier(vpcId, vni,
+                    cidr != null ? cidr : (gateway + "/24"), gateway);
+            _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, vni, vmIp, vmMac);
+        } catch (NumberFormatException e) {
+            logger.warn("registerDvrIntent: non-numeric vlanId '{}': {}", vlanId, e.getMessage());
+        } catch (RuntimeException e) {
+            logger.warn("registerDvrIntent: failed for vlanId='{}' ip={}: {}", vlanId, nic.getIp(), e.getMessage());
+        }
+    }
+
+    /**
+     * Build a simple {@code ip/prefix} CIDR from a dotted netmask. Falls
+     * back to {@code null} when the netmask is missing or unparseable;
+     * DVR uses the gateway-derived network only as a diagnostic string,
+     * so null is tolerated.
+     */
+    private static String buildCidrFromIpNetmask(String ip, String netmask) {
+        if (StringUtils.isBlank(ip) || StringUtils.isBlank(netmask)) {
+            return null;
+        }
+        try {
+            String[] nm = netmask.trim().split("\\.");
+            if (nm.length != 4) {
+                return null;
+            }
+            long mask = 0;
+            for (String p : nm) {
+                mask = (mask << 8) | (Integer.parseInt(p) & 0xff);
+            }
+            int prefix = Long.bitCount(mask);
+            // Network = ip bit-AND mask
+            String[] ipParts = ip.trim().split("\\.");
+            long ipL = 0;
+            for (String p : ipParts) {
+                ipL = (ipL << 8) | (Integer.parseInt(p) & 0xff);
+            }
+            long net = ipL & mask;
+            return String.format("%d.%d.%d.%d/%d",
+                    (net >> 24) & 0xff, (net >> 16) & 0xff, (net >> 8) & 0xff, net & 0xff, prefix);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

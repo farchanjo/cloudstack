@@ -118,6 +118,18 @@ public final class LibvirtStopCommandWrapper extends CommandWrapper<StopCommand,
                 }
             }
 
+            // DVR MVP: release this VM's distributed-routing flows (ARP
+            // responder + per-VM L3 routes). When the last local VM of a
+            // tier is released, the tier's ARP responder is removed too;
+            // cross-tier routing transparently falls back to the VR.
+            if (vmName != null && libvirtComputingResource.dvrManager != null) {
+                try {
+                    libvirtComputingResource.dvrManager.unregisterVm(vmName);
+                } catch (Exception e) {
+                    logger.warn("DVR: failed to unregister VM " + vmName + ": " + e.getMessage());
+                }
+            }
+
             if (result == null) {
                 if (disks != null && disks.size() > 0) {
                     for (final DiskDef disk : disks) {
