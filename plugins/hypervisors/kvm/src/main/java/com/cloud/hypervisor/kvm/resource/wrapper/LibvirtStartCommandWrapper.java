@@ -92,6 +92,19 @@ public final class LibvirtStartCommandWrapper extends CommandWrapper<StartComman
             libvirtComputingResource.startVM(conn, vmName, vmFinalSpecification);
             performAgentStartHook(vmName, libvirtComputingResource);
 
+            // Once libvirt has attached every tap to the OVS bridge, the
+            // local-port set for every VXLAN tag is stable. Refresh the
+            // per-tag split-horizon groups so BUM from tunnels is delivered
+            // to this VM's tap (the manager treats missing-mesh tags as
+            // no-ops). Safe and idempotent.
+            if (libvirtComputingResource.vxlanTunnelManager != null) {
+                try {
+                    libvirtComputingResource.vxlanTunnelManager.refreshAllLocalFlood();
+                } catch (RuntimeException e) {
+                    logger.warn("refreshAllLocalFlood failed after startVM {}: {}", vmName, e.getMessage());
+                }
+            }
+
             libvirtComputingResource.applyDefaultNetworkRules(conn, vmSpec, false);
 
             if (vmSpec.getType() == VirtualMachine.Type.User) {

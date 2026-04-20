@@ -98,6 +98,35 @@ public class VxlanTunnelManager {
     private static final int VXLAN_UDP_PORT = 4789;
     private static final int OVS_TIMEOUT_MS = 15_000;
 
+    /**
+     * OpenFlow priority used for VXLAN split-horizon BUM-redirect rules. Must
+     * be higher than the default {@code priority=0 actions=NORMAL} installed by
+     * the agent so that broadcast/multicast packets arriving via a tunnel port
+     * short-circuit the NORMAL flood (which would otherwise re-emit them to
+     * every other tunnel port — the classic VXLAN mesh loop).
+     */
+    private static final int OF_SPLIT_HORIZON_PRIORITY = 200;
+    /**
+     * Base of the OpenFlow group-id range used for per-tag local-flood groups.
+     * Group id is {@code SPLIT_HORIZON_GROUP_BASE + foldedTag}. Keeps well clear
+     * of anything CloudStack/Neutron might otherwise install.
+     */
+    private static final int SPLIT_HORIZON_GROUP_BASE = 0x10000; // 65536
+    /** IPv4 multicast MAC prefix: {@code 01:00:5e:00:00:00/ff:ff:ff:80:00:00}. */
+    private static final String IPV4_MCAST_MAC_MATCH = "01:00:5e:00:00:00/ff:ff:ff:80:00:00";
+    /** IPv6 multicast MAC prefix: {@code 33:33:00:00:00:00/ff:ff:00:00:00:00}. */
+    private static final String IPV6_MCAST_MAC_MATCH = "33:33:00:00:00:00/ff:ff:00:00:00:00";
+    /** Broadcast MAC used in split-horizon match. */
+    private static final String BROADCAST_MAC = "ff:ff:ff:ff:ff:ff";
+    /**
+     * OpenFlow protocol used for split-horizon rules. {@code OpenFlow13} is the
+     * first version with groups and is universally supported on any ovs-vswitchd
+     * shipped with Ubuntu 22.04+ / 24.04.
+     */
+    private static final String OF_PROTOCOL = "OpenFlow13";
+    /** Cookie stamped on every split-horizon flow so cleanup is unambiguous. */
+    private static final String SPLIT_HORIZON_COOKIE = "0x5ec4517e000"; // "sec-split" magic
+
     private static final Path STATE_DIR = Paths.get("/var/lib/cloudstack-agent/vxlan");
     private static final Path STATE_FILE = STATE_DIR.resolve("state.json");
 
@@ -264,11 +293,15 @@ public class VxlanTunnelManager {
             if (peers == null) {
                 continue;
             }
+            int folded = toOvsAccessTag(vni);
             for (String peer : peers) {
                 if (removePeerPort(vni, peer)) {
                     removed++;
                 }
             }
+            // Last reference to this VNI on this host: drop the split-horizon
+            // group too. Flows were already removed per-port above.
+            removeSplitHorizonGroup(folded);
         }
         persistState();
         LOGGER.info("releaseVmTunnels: vmName={} released={} vnis, removed {} port(s) from {}",
@@ -419,6 +452,7 @@ public class VxlanTunnelManager {
             }
             LOGGER.info("Ensured VXLAN tunnel: bridge={} port={} peer={} vni={} tag={}",
                     bridgeName, portName, peerIp, vni, folded);
+            applySplitHorizonForVxlanPort(folded, portName);
             return true;
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to plumb VXLAN tunnel port={} peer={} vni={}: {}",
@@ -429,6 +463,10 @@ public class VxlanTunnelManager {
 
     private boolean removePeerPort(int vni, String peerIp) {
         String portName = buildPortName(vni, peerIp);
+        // Remove split-horizon flows for this port BEFORE deleting the port: once the
+        // port is gone its ofport is freed and a matcher like "in_port=<N>" silently
+        // matches nothing, so an orphan flow lingers until next bridge reset.
+        removeSplitHorizonFlowsForVxlanPort(portName);
         String command = String.format("ovs-vsctl --if-exists del-port %s %s", bridgeName, portName);
         try {
             Script.runSimpleBashScript(command, OVS_TIMEOUT_MS);
@@ -440,6 +478,244 @@ public class VxlanTunnelManager {
                     portName, peerIp, vni, e.getMessage());
             return false;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Split-horizon OpenFlow plumbing
+    // ------------------------------------------------------------------
+    //
+    // Full-mesh OVS VXLAN has no built-in split-horizon: the default
+    // {@code actions=NORMAL} will happily re-flood BUM traffic arriving on one
+    // tunnel port to every other tunnel port, producing wrong FDB entries on
+    // remote hosts and (at scale) a loop.
+    //
+    // Fix: for each VXLAN ingress port, install priority=200 flows that match
+    // BUM (broadcast + IPv4 mcast + IPv6 mcast) and redirect to a per-tag
+    // {@code type=all} OpenFlow group whose buckets are the LOCAL (non-vxlan)
+    // ports of that same tag — vnet*, VF representors, etc. Local-to-tunnel
+    // egress, unicast learning, and the default {@code NORMAL} path are all
+    // untouched.
+
+    /**
+     * Program the split-horizon BUM redirect for a freshly-added VXLAN port.
+     * Idempotent: safe to call repeatedly for the same port.
+     */
+    private void applySplitHorizonForVxlanPort(int foldedTag, String vxlanPortName) {
+        try {
+            String ofportStr = readOfport(vxlanPortName);
+            if (StringUtils.isBlank(ofportStr) || "-1".equals(ofportStr.trim())) {
+                LOGGER.warn("applySplitHorizonForVxlanPort: ofport for {} not yet assigned, will retry on next reconcile",
+                        vxlanPortName);
+                return;
+            }
+            int ofport = Integer.parseInt(ofportStr.trim());
+            ensureSplitHorizonGroup(foldedTag);
+            installSplitHorizonFlows(foldedTag, ofport);
+        } catch (RuntimeException e) {
+            LOGGER.warn("applySplitHorizonForVxlanPort: failed for port={} tag={}: {}",
+                    vxlanPortName, foldedTag, e.getMessage());
+        }
+    }
+
+    /**
+     * Rebuild the {@code type=all} group for a folded tag with the current
+     * local (non-vxlan) port set. Called on any event that may change the
+     * bucket list: VXLAN port add (first member of the tag), local VM plug,
+     * local VM unplug.
+     */
+    private void ensureSplitHorizonGroup(int foldedTag) {
+        Set<Integer> localOfports = queryLocalOfportsForTag(foldedTag);
+        int groupId = SPLIT_HORIZON_GROUP_BASE + foldedTag;
+        String buckets;
+        if (localOfports.isEmpty()) {
+            // OVS rejects a group with zero buckets. Use a drop-bucket so the
+            // group-exists invariant holds; the flow is still correct because
+            // there is nothing to deliver locally on this host for this tag.
+            buckets = "bucket=actions=drop";
+        } else {
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (Integer port : localOfports) {
+                if (!first) {
+                    sb.append(',');
+                }
+                sb.append("bucket=output:").append(port);
+                first = false;
+            }
+            buckets = sb.toString();
+        }
+        String groupSpec = String.format("group_id=%d,type=all,%s", groupId, buckets);
+        // mod-group replaces the buckets when the group exists, and errors out
+        // when it does not — so we try mod first, then add as fallback. Net
+        // effect: idempotent create-or-replace.
+        String modCmd = String.format("ovs-ofctl -O %s mod-group %s \"%s\" 2>/dev/null || "
+                        + "ovs-ofctl -O %s add-group %s \"%s\"",
+                OF_PROTOCOL, bridgeName, groupSpec, OF_PROTOCOL, bridgeName, groupSpec);
+        try {
+            Script.runSimpleBashScript(modCmd, OVS_TIMEOUT_MS);
+            LOGGER.debug("ensureSplitHorizonGroup: tag={} group_id={} buckets={}",
+                    foldedTag, groupId, buckets);
+        } catch (RuntimeException e) {
+            LOGGER.warn("ensureSplitHorizonGroup: tag={} group_id={} failed: {}",
+                    foldedTag, groupId, e.getMessage());
+        }
+    }
+
+    private void installSplitHorizonFlows(int foldedTag, int vxlanOfport) {
+        int groupId = SPLIT_HORIZON_GROUP_BASE + foldedTag;
+        String[] matches = new String[] {
+                "dl_dst=" + BROADCAST_MAC,
+                "dl_dst=" + IPV4_MCAST_MAC_MATCH,
+                "dl_dst=" + IPV6_MCAST_MAC_MATCH,
+        };
+        for (String match : matches) {
+            String flow = String.format(
+                    "cookie=%s,table=0,priority=%d,in_port=%d,%s,actions=group:%d",
+                    SPLIT_HORIZON_COOKIE, OF_SPLIT_HORIZON_PRIORITY, vxlanOfport, match, groupId);
+            String cmd = String.format("ovs-ofctl -O %s add-flow %s \"%s\"",
+                    OF_PROTOCOL, bridgeName, flow);
+            try {
+                Script.runSimpleBashScript(cmd, OVS_TIMEOUT_MS);
+            } catch (RuntimeException e) {
+                LOGGER.warn("installSplitHorizonFlows: tag={} in_port={} match={}: {}",
+                        foldedTag, vxlanOfport, match, e.getMessage());
+            }
+        }
+        LOGGER.info("Split-horizon installed: bridge={} tag={} vxlan_ofport={} -> group:{}",
+                bridgeName, foldedTag, vxlanOfport, groupId);
+    }
+
+    private void removeSplitHorizonFlowsForVxlanPort(String vxlanPortName) {
+        String ofportStr = readOfport(vxlanPortName);
+        if (StringUtils.isBlank(ofportStr) || "-1".equals(ofportStr.trim())) {
+            return;
+        }
+        int ofport;
+        try {
+            ofport = Integer.parseInt(ofportStr.trim());
+        } catch (NumberFormatException nfe) {
+            return;
+        }
+        String cmd = String.format(
+                "ovs-ofctl -O %s del-flows %s \"cookie=%s/-1,in_port=%d\"",
+                OF_PROTOCOL, bridgeName, SPLIT_HORIZON_COOKIE, ofport);
+        try {
+            Script.runSimpleBashScript(cmd, OVS_TIMEOUT_MS);
+            LOGGER.debug("Removed split-horizon flows: port={} ofport={}", vxlanPortName, ofport);
+        } catch (RuntimeException e) {
+            LOGGER.warn("removeSplitHorizonFlowsForVxlanPort: port={}: {}", vxlanPortName, e.getMessage());
+        }
+    }
+
+    private void removeSplitHorizonGroup(int foldedTag) {
+        int groupId = SPLIT_HORIZON_GROUP_BASE + foldedTag;
+        String cmd = String.format("ovs-ofctl -O %s --strict del-groups %s group_id=%d",
+                OF_PROTOCOL, bridgeName, groupId);
+        try {
+            Script.runSimpleBashScript(cmd, OVS_TIMEOUT_MS);
+            LOGGER.debug("Removed split-horizon group: tag={} group_id={}", foldedTag, groupId);
+        } catch (RuntimeException e) {
+            LOGGER.warn("removeSplitHorizonGroup: tag={}: {}", foldedTag, e.getMessage());
+        }
+    }
+
+    /**
+     * Enumerate local (non-vxlan) OVS ports on {@link #bridgeName} whose access
+     * tag equals {@code foldedTag}. These are the buckets of the per-tag
+     * split-horizon group (vnet* taps, VF representors, anything attached by a
+     * vif driver for this guest network).
+     */
+    Set<Integer> queryLocalOfportsForTag(int foldedTag) {
+        // Single bash invocation over every port on the bridge. Shelling out
+        // once is cheaper than N ovs-vsctl calls and trivially race-safe: if a
+        // port is added mid-scan we'll just pick it up on the next reconcile.
+        String script = ""
+                + "for p in $(ovs-vsctl list-ports " + bridgeName + "); do "
+                + "  t=$(ovs-vsctl --bare --if-exists get port $p tag 2>/dev/null); "
+                + "  ty=$(ovs-vsctl --bare --if-exists get interface $p type 2>/dev/null); "
+                + "  op=$(ovs-vsctl --bare --if-exists get interface $p ofport 2>/dev/null); "
+                + "  if [ \"$t\" = \"" + foldedTag + "\" ] && [ \"$ty\" != \"vxlan\" ] && "
+                + "     [ -n \"$op\" ] && [ \"$op\" != \"-1\" ] && [ \"$op\" != \"[]\" ]; then "
+                + "    echo $op; "
+                + "  fi; "
+                + "done";
+        Set<Integer> out = new LinkedHashSet<>();
+        try {
+            String result = Script.runSimpleBashScript(script, OVS_TIMEOUT_MS);
+            if (StringUtils.isNotBlank(result)) {
+                for (String line : result.split("\\s+")) {
+                    String s = line.trim();
+                    if (s.isEmpty()) {
+                        continue;
+                    }
+                    try {
+                        out.add(Integer.parseInt(s));
+                    } catch (NumberFormatException ignore) {
+                        // skip
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            LOGGER.warn("queryLocalOfportsForTag({}): {}", foldedTag, e.getMessage());
+        }
+        return out;
+    }
+
+    private String readOfport(String portName) {
+        try {
+            String cmd = String.format("ovs-vsctl --bare --if-exists get interface %s ofport", portName);
+            String out = Script.runSimpleBashScript(cmd, OVS_TIMEOUT_MS);
+            return out == null ? "" : out.trim();
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    /**
+     * Refresh the split-horizon group for a given folded tag. Invoked by the
+     * vif drivers on local VM plug / unplug so the group's buckets track the
+     * live local port set for that tag. Safe no-op when the tag has no
+     * associated VXLAN mesh on this host.
+     */
+    public synchronized void refreshLocalFloodForTag(int foldedTag) {
+        if (!tagHasVxlanMesh(foldedTag)) {
+            return;
+        }
+        ensureSplitHorizonGroup(foldedTag);
+    }
+
+    /**
+     * Refresh every split-horizon group currently tracked by the manager.
+     * Invoked by {@code LibvirtStartCommandWrapper} after {@code startVM}
+     * returns — at that point libvirt has attached every tap to the bridge,
+     * so the per-tag bucket scan picks up the newly-plugged local ports and
+     * the group's bucket list converges with reality.
+     */
+    public synchronized void refreshAllLocalFlood() {
+        Set<Integer> tags = new LinkedHashSet<>();
+        for (Integer vni : lastPeersByVni.keySet()) {
+            tags.add(toOvsAccessTag(vni));
+        }
+        for (Integer tag : tags) {
+            ensureSplitHorizonGroup(tag);
+        }
+        if (!tags.isEmpty()) {
+            LOGGER.debug("refreshAllLocalFlood: refreshed {} tag(s): {}", tags.size(), tags);
+        }
+    }
+
+    /**
+     * Test whether any VNI currently tracked on this host folds to
+     * {@code foldedTag}. Only then is it worth programming a split-horizon
+     * group.
+     */
+    private boolean tagHasVxlanMesh(int foldedTag) {
+        for (Integer vni : lastPeersByVni.keySet()) {
+            if (toOvsAccessTag(vni) == foldedTag) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

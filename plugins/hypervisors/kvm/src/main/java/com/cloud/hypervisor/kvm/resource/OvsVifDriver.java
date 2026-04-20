@@ -308,6 +308,17 @@ public class OvsVifDriver extends VifDriverBase {
             logger.debug("Removing DPDK port: " + dpdkPort);
             Script.runSimpleBashScript(cmd);
         }
+        // Local tap is going away: rebuild every split-horizon group on this
+        // host so its bucket list drops the now-stale ofport. Tag-level refresh
+        // would require us to know which tag the iface had; full-refresh is
+        // cheap and idempotent for any number of tags.
+        if (_libvirtComputingResource != null && _libvirtComputingResource.vxlanTunnelManager != null) {
+            try {
+                _libvirtComputingResource.vxlanTunnelManager.refreshAllLocalFlood();
+            } catch (RuntimeException e) {
+                logger.warn("refreshAllLocalFlood on unplug failed: {}", e.getMessage());
+            }
+        }
     }
 
 

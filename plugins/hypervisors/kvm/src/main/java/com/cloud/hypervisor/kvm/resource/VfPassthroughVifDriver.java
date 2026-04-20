@@ -114,6 +114,16 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         if (pfName != null && vfId != null) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
         }
+        // VF representor has been detached from br-bond; the split-horizon
+        // group for its tag still contains the now-freed ofport. Rebuild all
+        // tracked groups so their buckets match the live port set.
+        if (_libvirtComputingResource != null && _libvirtComputingResource.vxlanTunnelManager != null) {
+            try {
+                _libvirtComputingResource.vxlanTunnelManager.refreshAllLocalFlood();
+            } catch (RuntimeException e) {
+                logger.warn("refreshAllLocalFlood on VF unplug failed: {}", e.getMessage());
+            }
+        }
     }
 
     @Override
