@@ -210,11 +210,6 @@ public class DvrManager {
             tier.gatewayIp = gatewayIp.trim();
             tier.foldedTag = folded;
         }
-        if (!tier.arpInstalled) {
-            if (installArpResponder(folded, tier.gatewayIp)) {
-                tier.arpInstalled = true;
-            }
-        }
         // Fix asymmetric registration: when this tier is brand-new but the
         // VPC already has VMs in OTHER tiers, install inbound L3 route
         // flows so traffic originating from this new tier can reach those
@@ -232,6 +227,7 @@ public class DvrManager {
             }
             installL3Route(folded, peerVm.ip, peerVm.mac, dstTier.foldedTag);
         }
+        reconcileArpResponders(vpc);
         persistState();
     }
 
@@ -279,6 +275,7 @@ public class DvrManager {
                 installed++;
             }
         }
+        reconcileArpResponders(vpc);
         persistState();
         LOGGER.info("DVR registerVmInTier: vpc={} vm={} vni={} ip={} mac={} routeFlowsInstalled={}",
                 vKey, vmName, vni, entry.ip, entry.mac, installed);
@@ -303,8 +300,11 @@ public class DvrManager {
             }
             // Remove all L3 routes pointing to this VM, across every src tier.
             removeL3RoutesForDstIp(e.ip);
-            // If no more local VMs are on tier e.vni, tear down the ARP
-            // responder too — keeps the flow-table tidy.
+            // Rerun the cross-tier gate: if this was the last VM on its
+            // tier OR the last in the only-peer tier, the gate may fall,
+            // so every ARP responder becomes a liability and has to be
+            // torn down. reconcileArpResponders handles both directions
+            // (install / remove) based on current local cross-tier state.
             boolean stillHasLocal = false;
             for (VmEntry other : vpc.vms.values()) {
                 if (other.vni == e.vni) {
@@ -312,15 +312,11 @@ public class DvrManager {
                     break;
                 }
             }
-            if (!stillHasLocal) {
-                TierState tier = vpc.tiers.get(e.vni);
-                if (tier != null && tier.arpInstalled) {
-                    removeArpResponder(tier.foldedTag, tier.gatewayIp);
-                    tier.arpInstalled = false;
-                }
-            }
             LOGGER.info("DVR unregisterVm: vpc={} vm={} ip={} (remaining tier={} localVms={})",
                     ve.getKey(), key, e.ip, e.vni, stillHasLocal);
+        }
+        for (VpcState vpc : vpcs.values()) {
+            reconcileArpResponders(vpc);
         }
         persistState();
     }
@@ -344,14 +340,60 @@ public class DvrManager {
      * request for the gateway IP hits the bridge on the tier's access tag,
      * craft a reply in-place and send back {@code in_port}.
      */
+    /**
+     * Walk every registered tier in this VPC and install the ARP responder
+     * only when this host has at least two tiers with at least one local VM
+     * each — i.e., cross-tier traffic is actually possible locally and the
+     * L3-route flows will consume frames stamped with the DVR gateway MAC.
+     *
+     * <p>When the gate is open we install; when it is closed we tear down
+     * any existing responder so that gateway ARP resolves back to the VR's
+     * real MAC. Skipping this gate makes VMs address the DVR gateway MAC
+     * for all north-south traffic, which has no route here and gets
+     * flooded into oblivion — that was the production break observed on
+     * single-tier-per-host layouts (VM ↔ centralized VR could not talk).
+     */
+    private void reconcileArpResponders(VpcState vpc) {
+        if (vpc == null) {
+            return;
+        }
+        Set<Integer> tiersWithLocalVms = new LinkedHashSet<>();
+        for (VmEntry vm : vpc.vms.values()) {
+            tiersWithLocalVms.add(vm.vni);
+        }
+        boolean gateOpen = tiersWithLocalVms.size() >= 2;
+        for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
+            TierState tier = te.getValue();
+            boolean shouldInstall = gateOpen && tiersWithLocalVms.contains(te.getKey());
+            if (shouldInstall && !tier.arpInstalled) {
+                if (installArpResponder(tier.foldedTag, tier.gatewayIp)) {
+                    tier.arpInstalled = true;
+                    LOGGER.info("DVR reconcile: installed ARP responder vni={} tag={} gw={}",
+                            te.getKey(), tier.foldedTag, tier.gatewayIp);
+                }
+            } else if (!shouldInstall && tier.arpInstalled) {
+                removeArpResponder(tier.foldedTag, tier.gatewayIp);
+                tier.arpInstalled = false;
+                LOGGER.info("DVR reconcile: removed ARP responder vni={} tag={} gw={}"
+                        + " (no cross-tier peer)", te.getKey(), tier.foldedTag, tier.gatewayIp);
+            }
+        }
+    }
+
     private boolean installArpResponder(int foldedTag, String gatewayIp) {
         long gwInt = ipv4ToLong(gatewayIp);
         if (gwInt < 0) {
             LOGGER.warn("DVR installArpResponder: bad gw IP '{}'", gatewayIp);
             return false;
         }
+        // Intentionally match vlan_tci=0x0000 instead of dl_vlan=%d: access
+        // ports (the VM-facing vnetN side) strip the VLAN before table-0
+        // classification, so the frame arrives with vlan_tci=0 even though
+        // the port has an access tag configured. Historical dl_vlan match
+        // never fired. Scope stays unambiguous because arp_tpa (tier gw IP)
+        // is unique per tier within a VPC (each tier has its own CIDR).
         String flow = String.format(
-                "cookie=%s,table=0,priority=%d,arp,dl_vlan=%d,arp_tpa=%s,arp_op=1,"
+                "cookie=%s,table=0,priority=%d,arp,vlan_tci=0x0000,arp_tpa=%s,arp_op=1,"
                         + "actions=move:NXM_OF_ETH_SRC[]->NXM_OF_ETH_DST[],"
                         + "mod_dl_src:%s,"
                         + "load:0x2->NXM_OF_ARP_OP[],"
@@ -360,16 +402,32 @@ public class DvrManager {
                         + "load:0x%s->NXM_NX_ARP_SHA[],"
                         + "load:0x%x->NXM_OF_ARP_SPA[],"
                         + "in_port",
-                DVR_COOKIE_ARP, PRIORITY_ARP_RESPONDER, foldedTag, gatewayIp,
+                DVR_COOKIE_ARP, PRIORITY_ARP_RESPONDER, gatewayIp,
                 DVR_GATEWAY_MAC,
                 macToHex(DVR_GATEWAY_MAC),
                 gwInt);
+        // NOTE: priority=500 alone is sufficient to win the ARP race.
+        // OVS is a single-pipeline matcher — only the highest-priority
+        // match executes, never in parallel with priority=0 NORMAL. The
+        // VM's ARP request for the tier gateway hits this flow and the
+        // response goes out IN_PORT before any VXLAN flood can occur.
+        // Consequence: the centralized VR on a remote host never sees
+        // the request (it's consumed locally), so there is no race at
+        // all. A previous iteration added a priority=600 drop fence for
+        // ARP replies with arp_spa=<gw>; that turned out to be harmful
+        // because it also blocked legitimate VR↔VM ARP replies used for
+        // traffic that still needs to transit the central VR (default
+        // route to internet, inter-VPC, etc. — the VR has the full L3
+        // table; DVR only handles intra-VPC peer VMs).
         return addFlow(flow, "arp-responder tag=" + foldedTag + " gw=" + gatewayIp);
     }
 
     private void removeArpResponder(int foldedTag, String gatewayIp) {
-        String spec = String.format("cookie=%s/-1,table=0,arp,dl_vlan=%d,arp_tpa=%s",
-                DVR_COOKIE_ARP, foldedTag, gatewayIp);
+        // Remove responder (new vlan_tci=0x0000 match). Old dl_vlan flows
+        // from previous agent versions are swept by the cookie-mask clear
+        // at bootstrap (bootstrapFromState issues a del-flows on the mask).
+        String spec = String.format("cookie=%s/-1,table=0,arp,vlan_tci=0x0000,arp_tpa=%s",
+                DVR_COOKIE_ARP, gatewayIp);
         delFlows(spec, "arp-responder tag=" + foldedTag);
     }
 
@@ -595,14 +653,20 @@ public class DvrManager {
             for (VmEntry vm : vpc.vms.values()) {
                 tiersWithLocalVms.add(vm.vni);
             }
+            // Same gate as reconcileArpResponders: only reinstall when
+            // the host has >=2 tiers with local VMs. Single-tier hosts
+            // must leave the centralized VR as the gateway.
+            boolean gateOpen = tiersWithLocalVms.size() >= 2;
             for (Integer vni : tiersWithLocalVms) {
                 TierState t = vpc.tiers.get(vni);
                 if (t == null) {
                     continue;
                 }
-                if (installArpResponder(t.foldedTag, t.gatewayIp)) {
+                if (gateOpen && installArpResponder(t.foldedTag, t.gatewayIp)) {
                     t.arpInstalled = true;
                     reArp++;
+                } else if (!gateOpen) {
+                    t.arpInstalled = false;
                 }
             }
             // Re-install L3 routes for each local VM against every OTHER tier.
