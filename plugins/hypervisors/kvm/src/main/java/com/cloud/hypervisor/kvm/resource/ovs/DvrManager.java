@@ -215,6 +215,23 @@ public class DvrManager {
                 tier.arpInstalled = true;
             }
         }
+        // Fix asymmetric registration: when this tier is brand-new but the
+        // VPC already has VMs in OTHER tiers, install inbound L3 route
+        // flows so traffic originating from this new tier can reach those
+        // VMs via OVS. registerVmInTier only walks other tiers when a VM
+        // registers; without this back-fill the reverse direction stays
+        // on the VR fallback path.
+        for (Map.Entry<String, VmEntry> ve : vpc.vms.entrySet()) {
+            VmEntry peerVm = ve.getValue();
+            if (peerVm == null || peerVm.vni == vni) {
+                continue;
+            }
+            TierState dstTier = vpc.tiers.get(peerVm.vni);
+            if (dstTier == null) {
+                continue;
+            }
+            installL3Route(folded, peerVm.ip, peerVm.mac, dstTier.foldedTag);
+        }
         persistState();
     }
 
