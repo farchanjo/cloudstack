@@ -20,6 +20,8 @@ from cs.CsDatabag import CsDataBag
 from .CsFile import CsFile
 from . import CsHelper
 
+# Legacy fallback for when cmdline doesn't carry source_nat_ip= hint.
+# Prefer CsHelper.get_public_interface(cmdline) for multi-tier layouts.
 VPC_PUBLIC_INTERFACE = "eth1"
 
 RADVD_CONF = "/etc/radvd.conf"
@@ -31,6 +33,9 @@ class CsVpcGuestNetwork(CsDataBag):
 
     def process(self):
         logging.debug("Processing CsVpcGuestNetwork")
+        # Resolve Public interface once per run. Multi-tier safe (uses
+        # source_nat_ip= cmdline arg); falls back to legacy eth1 for old VRs.
+        self._public_if = CsHelper.get_public_interface(self.config.cmdline()) or VPC_PUBLIC_INTERFACE
         self.conf = CsFile(RADVD_CONF_NEW)
         self.conf.empty()
         for item in self.dbag:
@@ -63,10 +68,10 @@ class CsVpcGuestNetwork(CsDataBag):
             if not CsHelper.execute("ip -6 addr show dev %s | grep -w %s" % (entry['device'], full_addr)):
                 CsHelper.execute("ip -6 addr add %s dev %s" % (full_addr, entry['device']))
             if 'router_ip6' in list(entry.keys()) and entry['router_ip6']:
-                self.__disable_dad(VPC_PUBLIC_INTERFACE)
+                self.__disable_dad(self._public_if)
                 full_public_addr = entry['router_ip6'] + "/" + cidr_size
-                if not CsHelper.execute("ip -6 addr show dev %s | grep -w %s" % (VPC_PUBLIC_INTERFACE, full_public_addr)):
-                    CsHelper.execute("ip -6 addr add %s dev %s" % (full_public_addr, VPC_PUBLIC_INTERFACE))
+                if not CsHelper.execute("ip -6 addr show dev %s | grep -w %s" % (self._public_if, full_public_addr)):
+                    CsHelper.execute("ip -6 addr add %s dev %s" % (full_public_addr, self._public_if))
                 if not CsHelper.execute("ip -6 route list default via %s" % entry['router_ip6_gateway']):
                     CsHelper.execute("ip -6 route add default via %s" % entry['router_ip6_gateway'])
         else:
@@ -81,7 +86,7 @@ class CsVpcGuestNetwork(CsDataBag):
             CsHelper.execute("ip -6 addr del %s dev %s" % (full_addr, entry['device']))
             if 'router_ip6' in list(entry.keys()) and entry['router_ip6']:
                 full_public_addr = entry['router_ip6'] + "/" + cidr_size
-                CsHelper.execute("ip -6 addr del %s dev %s" % (full_public_addr, VPC_PUBLIC_INTERFACE))
+                CsHelper.execute("ip -6 addr del %s dev %s" % (full_public_addr, self._public_if))
         else:
             return
 

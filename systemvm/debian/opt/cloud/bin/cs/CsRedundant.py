@@ -346,11 +346,11 @@ class CsRedundant(object):
                 try:
                     gateway = interface.get_gateway()
                     logging.info("Adding gateway ==> %s to device ==> %s" % (gateway, dev))
-                    if dev == CsHelper.PUBLIC_INTERFACES[self.cl.get_type()]:
+                    if dev == CsHelper.get_public_interface(self.cl):
                         route.add_defaultroute(gateway)
                 except Exception:
                     logging.error("ERROR getting gateway from device %s" % dev)
-                if dev == CsHelper.PUBLIC_INTERFACES[self.cl.get_type()]:
+                if dev == CsHelper.get_public_interface(self.cl):
                     try:
                         self._add_ipv6_to_interface(interface, interface.get_ip6())
                         if interface.get_gateway6():

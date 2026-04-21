@@ -27,7 +27,23 @@ import re
 import shutil
 from netaddr import *
 
-PUBLIC_INTERFACES = {"router": "eth2", "vpcrouter": "eth1"}
+PUBLIC_INTERFACES = {"router": "eth2", "vpcrouter": "eth1"}  # legacy fallback; prefer get_public_interface()
+
+
+def get_public_interface(router_config):
+    """
+    Return the eth<N> that carries the Public IP for this router.
+    Multi-tier safe: uses cmdline source_nat_ip= to locate it; falls back
+    to legacy PUBLIC_INTERFACES map when cmdline lacks the hint.
+    """
+    try:
+        dev = router_config.get_public_device()
+        if dev:
+            return dev
+    except Exception:
+        pass
+    return PUBLIC_INTERFACES.get(router_config.get_type(), "eth1")
+
 
 STATE_COMMANDS = {"router": "ip addr show dev eth0 | grep inet | wc -l | xargs bash -c  'if [ $0 == 2 ]; then echo \"PRIMARY\"; else echo \"BACKUP\"; fi'",
                   "vpcrouter": "ip addr show dev eth1 | grep state | awk '{print $9;}' | xargs bash -c 'if [ $0 == \"UP\" ]; then echo \"PRIMARY\"; else echo \"BACKUP\"; fi'"}
@@ -39,16 +55,15 @@ def reconfigure_interfaces(router_config, interfaces):
         for device in execute(cmd):
             if " DOWN " in device:
                 cmd = "ip link set %s up" % interface.get_device()
-                # If redundant only bring up public interfaces that are not eth1.
-                # Reason: private gateways are public interfaces.
-                # configure_router.py and keepalived will deal with eth1 public interface.
+                # If redundant only bring up public interfaces that are not the
+                # primary public (handled by configure_router.py/keepalived).
 
                 if router_config.is_redundant() and interface.is_public():
                     state_cmd = STATE_COMMANDS[router_config.get_type()]
                     logging.info("Check state command => %s" % state_cmd)
                     state = execute(state_cmd)[0]
                     logging.info("Route state => %s" % state)
-                    if interface.get_device() != PUBLIC_INTERFACES[router_config.get_type()] and state == "PRIMARY":
+                    if interface.get_device() != get_public_interface(router_config) and state == "PRIMARY":
                         execute(cmd)
                 else:
                     execute(cmd)

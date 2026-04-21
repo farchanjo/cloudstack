@@ -492,7 +492,7 @@ class CsIP:
             self.fw.append(
                 ["", "", "-A NETWORK_STATS_%s -i %s ! -o eth0 -p tcp" % (self.dev, self.dev)])
             self.fw.append(
-                ["nat", "", "-A POSTROUTING -o %s -j SNAT --to-source %s" % (self.dev, self.cl.get_eth2_ip())])
+                ["nat", "", "-A POSTROUTING -o %s -j SNAT --to-source %s" % (self.dev, self.cl.get_public_ip())])
             self.fw.append(["mangle", "",
                             "-A PREROUTING -i %s -m state --state NEW " % self.dev +
                             "-j CONNMARK --set-xmark %s/0xffffffff" % self.dnum])

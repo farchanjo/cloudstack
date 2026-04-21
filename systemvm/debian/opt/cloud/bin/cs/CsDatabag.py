@@ -125,6 +125,35 @@ class CsCmdLine(CsDataBag):
         else:
             return "unknown"
 
+    def get_public_ip(self):
+        """
+        Return the VPC VR's Public IP regardless of which eth<N> it is on.
+        Uses `source_nat_ip=<ip>` cmdline arg (authoritative from mgmt).
+        Falls back to legacy eth2ip= for non-VPC routers.
+        """
+        data = self.idata()
+        if "source_nat_ip" in data:
+            return data['source_nat_ip']
+        if "eth2ip" in data:
+            return data['eth2ip']
+        return "unknown"
+
+    def get_public_device(self):
+        """
+        Return the eth<N> name that carries the Public IP.
+        Scans eth<N>ip= entries for one matching source_nat_ip.
+        Falls back to eth2 for legacy router, eth1 for legacy vpcrouter.
+        """
+        data = self.idata()
+        pub_ip = data.get('source_nat_ip')
+        if pub_ip:
+            for key, val in data.items():
+                if isinstance(key, str) and key.endswith('ip') and key.startswith('eth') and val == pub_ip:
+                    return key[:-2]
+        if self.get_type() == 'vpcrouter':
+            return "eth1"
+        return "eth2"
+
     def is_primary(self):
         if not self.is_redundant():
             return False

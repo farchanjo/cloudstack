@@ -286,6 +286,7 @@ enable_rpsrfs() {
 
 setup_ipv6() {
   local enableradvd=false
+  # eth0 (Control) IPv6 — keep legacy radvd hook on eth0
   if [ -n "$ETH0_IP6" ]
   then
     enableradvd=true
@@ -297,22 +298,23 @@ setup_ipv6() {
     rm -rf /etc/radvd.conf
     setup_radvd "0" $GUEST_GW6 $GUEST_CIDR6_SIZE $enableradvd
   fi
-  if [ -n "$ETH1_IP6" ]
-  then
-    # Public eth1 IPv6: routed (no NAT). Set address + default v6 route via $IP6GW.
-    setup_interface_ipv6 "1" $ETH1_IP6 $ETH1_IP6_PRELEN
-    if [ -n "$IP6GW" ]; then
-      ip -6 route replace default via "$IP6GW" dev eth1 || true
+  # Any eth<N> with v6 (N>=1) — Public default route added on whichever
+  # eth has IP6GW reachability (systemvm doesn't pre-know which is Public).
+  for _n in $(compgen -A variable | grep -E '^ETH[0-9]+_IP6$' | sed 's/^ETH\([0-9]*\)_IP6$/\1/' | sort -n); do
+    if [ "$_n" = "0" ]; then continue; fi
+    _ip6="ETH${_n}_IP6"
+    _pre="ETH${_n}_IP6_PRELEN"
+    if [ -n "${!_ip6}" ]; then
+      setup_interface_ipv6 "$_n" "${!_ip6}" "${!_pre}"
+      if [ -n "$IP6GW" ]; then
+        ip -6 route replace default via "$IP6GW" dev "eth$_n" || true
+      fi
     fi
-  fi
-  if [ -n "$ETH2_IP6" ]
-  then
-    setup_interface_ipv6 "2" $ETH2_IP6 $ETH2_IP6_PRELEN
-  fi
+  done
 }
 
 restore_ipv6() {
-  log_it "Restoring IPv6 configurations with ETH0_IP6=$ETH0_IP6 ETH1_IP6=$ETH1_IP6 GUEST_GW6=$GUEST_GW6 GUEST_CIDR6_SIZE=$GUEST_CIDR6_SIZE ETH2_IP6=$ETH2_IP6"
+  log_it "Restoring IPv6 configurations (multi-tier aware: all ETH<N>_IP6)"
   if [ -n "$ETH0_IP6" ] || [ -n "$GUEST_GW6"  -a -n "$GUEST_CIDR6_SIZE" ]
     then
     enable_interface_ipv6 "0" true
@@ -321,34 +323,30 @@ restore_ipv6() {
   then
     enable_radvd
   fi
-  if [ -n "$ETH1_IP6" ]
-  then
-    enable_interface_ipv6 "1" true
-    if [ -n "$IP6GW" ]; then
-      ip -6 route replace default via "$IP6GW" dev eth1 || true
+  for _n in $(compgen -A variable | grep -E '^ETH[0-9]+_IP6$' | sed 's/^ETH\([0-9]*\)_IP6$/\1/' | sort -n); do
+    if [ "$_n" = "0" ]; then continue; fi
+    _ip6="ETH${_n}_IP6"
+    if [ -n "${!_ip6}" ]; then
+      enable_interface_ipv6 "$_n" true
+      if [ -n "$IP6GW" ]; then
+        ip -6 route replace default via "$IP6GW" dev "eth$_n" || true
+      fi
     fi
-  fi
-  if [ -n "$ETH2_IP6" ]
-  then
-    enable_interface_ipv6 "2" true
-  fi
+  done
 }
 
 
 setup_common() {
   init_interfaces $1 $2 $3
-  if [ -n "$ETH0_IP" ]
-  then
-    setup_interface "0" $ETH0_IP $ETH0_MASK $GW
-  fi
-  if [ -n "$ETH1_IP" ]
-  then
-    setup_interface "1" $ETH1_IP $ETH1_MASK $GW
-  fi
-  if [ -n "$ETH2_IP" ]
-  then
-    setup_interface "2" $ETH2_IP $ETH2_MASK $GW
-  fi
+  # Multi-tier aware: iterate all ETH<N>_IP exported by parse_cmd_line
+  # (supports VPC with N guest tiers + public at ethN+1).
+  for _n in $(compgen -A variable | grep -E '^ETH[0-9]+_IP$' | sed 's/^ETH\([0-9]*\)_IP$/\1/' | sort -n); do
+    _ip="ETH${_n}_IP"
+    _mask="ETH${_n}_MASK"
+    if [ -n "${!_ip}" ]; then
+      setup_interface "$_n" "${!_ip}" "${!_mask}" "$GW"
+    fi
+  done
   setup_ipv6
 
   echo $NAME > /etc/hostname
@@ -775,18 +773,22 @@ parse_cmd_line() {
       # Two lines so values do not accidentally interpretted as escapes!!
       echo -n \"${KEY}\"': '\"${VALUE}\" >> ${CHEF_TMP_FILE}
       COMMA=",\n\t"
+      # Multi-tier aware: eth<N>ip / eth<N>mask / eth<N>ip6 / eth<N>ip6prelen
+      # are exported dynamically as ETH<N>_IP / ETH<N>_MASK / ETH<N>_IP6 /
+      # ETH<N>_IP6_PRELEN for any N (no longer hardcoded to 0/1/2).
+      if [[ "$KEY" =~ ^eth([0-9]+)(ip|mask|ip6|ip6prelen)$ ]]; then
+          _idx=${BASH_REMATCH[1]}
+          _field=${BASH_REMATCH[2]}
+          case "$_field" in
+              ip)         export "ETH${_idx}_IP=$VALUE" ;;
+              mask)       export "ETH${_idx}_MASK=$VALUE" ;;
+              ip6)        export "ETH${_idx}_IP6=$VALUE" ;;
+              ip6prelen)  export "ETH${_idx}_IP6_PRELEN=$VALUE" ;;
+          esac
+      fi
       case $KEY in
         disable_rp_filter)
             export DISABLE_RP_FILTER=$VALUE
-            ;;
-        eth0ip)
-            export ETH0_IP=$VALUE
-            ;;
-        eth1ip)
-            export ETH1_IP=$VALUE
-            ;;
-        eth2ip)
-            export ETH2_IP=$VALUE
             ;;
         host)
             export MGMT_HOST=$VALUE
@@ -796,33 +798,6 @@ parse_cmd_line() {
             ;;
         ip6gateway)
             export IP6GW=$VALUE
-            ;;
-        eth0mask)
-            export ETH0_MASK=$VALUE
-            ;;
-        eth1mask)
-            export ETH1_MASK=$VALUE
-            ;;
-        eth2mask)
-            export ETH2_MASK=$VALUE
-            ;;
-        eth0ip6)
-            export ETH0_IP6=$VALUE
-            ;;
-        eth0ip6prelen)
-            export ETH0_IP6_PRELEN=$VALUE
-            ;;
-        eth1ip6)
-            export ETH1_IP6=$VALUE
-            ;;
-        eth1ip6prelen)
-            export ETH1_IP6_PRELEN=$VALUE
-            ;;
-        eth2ip6)
-            export ETH2_IP6=$VALUE
-            ;;
-        eth2ip6prelen)
-            export ETH2_IP6_PRELEN=$VALUE
             ;;
         internaldns1)
             export internalNS1=$VALUE

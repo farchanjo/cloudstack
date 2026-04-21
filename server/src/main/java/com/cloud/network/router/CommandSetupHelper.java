@@ -1231,9 +1231,10 @@ public class CommandSetupHelper {
         final String dhcpRange = getGuestDhcpRange(guestNic, network, _entityMgr.findById(DataCenter.class, network.getDataCenterId()));
 
         final NicProfile nicProfile = _networkModel.getNicProfile(router, nic.getNetworkId(), null);
-        if (guestNic.getDeviceId() != null) {
-            nicProfile.setDeviceId(guestNic.getDeviceId());
-        }
+        // Multi-tier safe: trust DB device_id from getNicProfile; do NOT override
+        // with caller-supplied guestNic.deviceId, which can be a stale value
+        // assigned during the initial NIC allocation (collides with Public on
+        // VPC VR with multiple guest tiers).
         final SetupGuestNetworkCommand setupCmd = new SetupGuestNetworkCommand(dhcpRange, networkDomain, router.getIsRedundantRouter(), defaultDns1, defaultDns2, add, _itMgr.toNicTO(nicProfile,
                 router.getHypervisorType()));
 
