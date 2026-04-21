@@ -82,8 +82,26 @@ public class VfVdpaLifecycleManager {
 
         try {
             removeStaleVdpaDevice(vdpaName);
+
+            // Program VF MAC BEFORE creating the vDPA device so the vdpa
+            // configuration space captures the correct MAC.  Also pass the MAC
+            // explicitly to `vdpa dev add` so the config MAC matches what the
+            // guest virtio-net driver will read.  Without this ordering the
+            // vdpa device inherits whatever MAC was previously on the VF
+            // (often a stale MAC from a prior allocation), and the guest sees
+            // the wrong address — breaking ARP end-to-end.
+            final int vfIndex = resolveVfIndex(pfName, vfPciAddress);
+            if (vfIndex < 0) {
+                return new CreateVdpaAnswer(cmd, false,
+                        "Failed to resolve VF index for " + vfPciAddress + " on PF " + pfName);
+            }
+            final String realPfName = resolvePfNetdevFromVfPci(vfPciAddress, pfName);
             Script.runSimpleBashScript(String.format(
-                    "vdpa dev add name %s mgmtdev pci/%s", vdpaName, vfPciAddress));
+                    "ip link set dev %s vf %d mac %s", realPfName, vfIndex, mac));
+
+            Script.runSimpleBashScript(String.format(
+                    "vdpa dev add name %s mgmtdev pci/%s mac %s",
+                    vdpaName, vfPciAddress, mac));
             Script.runSimpleBashScript("modprobe vhost_vdpa");
 
             final String vdpaDevice = waitForVhostVdpaDevice(vdpaName);
@@ -92,17 +110,6 @@ public class VfVdpaLifecycleManager {
                 return new CreateVdpaAnswer(cmd, false,
                         "Timed out waiting for /dev/vhost-vdpa-* to appear for " + vdpaName);
             }
-
-            final int vfIndex = resolveVfIndex(pfName, vfPciAddress);
-            if (vfIndex < 0) {
-                rollbackVdpa(vdpaName);
-                return new CreateVdpaAnswer(cmd, false,
-                        "Failed to resolve VF index for " + vfPciAddress + " on PF " + pfName);
-            }
-
-            final String realPfName = resolvePfNetdevFromVfPci(vfPciAddress, pfName);
-            Script.runSimpleBashScript(String.format(
-                    "ip link set dev %s vf %d mac %s", realPfName, vfIndex, mac));
 
             LOGGER.info("VF+vDPA created: pfHint={} realPf={} vf={} pci={} vdpaName={} vdpaDev={} mac={}",
                     pfName, realPfName, vfIndex, vfPciAddress, vdpaName, vdpaDevice, mac);

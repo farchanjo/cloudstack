@@ -78,6 +78,7 @@ public class VdpaVifDriver extends VifDriverBase {
         }
         if (StringUtils.isNotBlank(repName)) {
             ensureRepresentorOnOvs(repName);
+            attachVfRepToNetwork(nic, repName);
         } else {
             logger.warn("VF representor name not set on NicTO for vDPA device {}; " +
                     "OVS port and TC qdisc will not be configured", vdpaDevice);
@@ -209,5 +210,53 @@ public class VdpaVifDriver extends VifDriverBase {
         Script.runSimpleBashScript(String.format("ovs-vsctl --may-exist add-port %s %s", OVS_BRIDGE, repName));
         Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
         logger.info("Ensured VF representor {} on OVS {} with clsact qdisc", repName, OVS_BRIDGE);
+    }
+
+    /**
+     * Set the OVS access tag on a VF representor port so packets from the VM
+     * exit OVS with the correct VLAN/VXLAN-folded tag. For {@code vlan://N}
+     * (Public NIC) we apply the VLAN ID directly; for {@code vxlan://N} we
+     * fold the VNI through {@link OvsVifDriver#toOvsAccessTag(int)} and also
+     * trigger {@link com.cloud.hypervisor.kvm.resource.ovs.VxlanTunnelManager}
+     * to build the inter-host tunnel mesh for this VNI.
+     */
+    private void attachVfRepToNetwork(final NicTO nic, final String repName) {
+        final String uri = nic.getBroadcastUri() != null ? nic.getBroadcastUri().toString() : null;
+        if (StringUtils.isBlank(uri)) {
+            return;
+        }
+        int tag = -1;
+        try {
+            if (uri.startsWith("vlan://")) {
+                tag = Integer.parseInt(uri.substring("vlan://".length()));
+            } else if (uri.startsWith("vxlan://")) {
+                final int vni = Integer.parseInt(uri.substring("vxlan://".length()));
+                tag = OvsVifDriver.toOvsAccessTag(vni);
+                ensureVxlanMesh(nic, vni);
+            }
+        } catch (NumberFormatException e) {
+            logger.warn("attachVfRepToNetwork: unparseable broadcastUri '{}' for rep {}", uri, repName);
+            return;
+        }
+        if (tag > 0) {
+            Script.runSimpleBashScript(String.format("ovs-vsctl set port %s tag=%d", repName, tag));
+            logger.info("Set OVS tag={} on VF rep {} (from broadcastUri={})", tag, repName, uri);
+        }
+    }
+
+    private void ensureVxlanMesh(final NicTO nic, final int vni) {
+        if (_libvirtComputingResource == null || _libvirtComputingResource.vxlanTunnelManager == null) {
+            return;
+        }
+        try {
+            final String raw = nic.getNicDetail("vxlan.peers");
+            final java.util.Collection<String> peers = (raw == null || raw.isEmpty())
+                    ? null
+                    : java.util.Arrays.asList(raw.split("\\s*,\\s*"));
+            final String vmName = nic.getNicDetail("vxlan.vm.name");
+            _libvirtComputingResource.vxlanTunnelManager.ensureMeshForVni(vmName, vni, peers);
+        } catch (RuntimeException e) {
+            logger.warn("ensureVxlanMesh failed for vni={}: {}", vni, e.getMessage());
+        }
     }
 }
