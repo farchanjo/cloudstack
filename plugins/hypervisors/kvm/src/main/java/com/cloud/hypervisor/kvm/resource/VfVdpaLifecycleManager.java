@@ -210,13 +210,65 @@ public class VfVdpaLifecycleManager {
         return null;
     }
 
-    static String lookupVhostVdpaDevice(final String vdpaName) {
-        final File sysClass = new File("/sys/class/vdpa/" + vdpaName);
-        if (!sysClass.isDirectory()) {
+    /**
+     * Reverse map {@code /dev/vhost-vdpa-N} back to the underlying SR-IOV VF
+     * PCI BDF by walking sysfs:
+     * <ul>
+     *   <li>{@code /sys/bus/vdpa/devices/<name>/vhost-vdpa-N/} identifies
+     *       which vDPA netlink device owns the chardev.</li>
+     *   <li>{@code /sys/bus/vdpa/drivers/vhost_vdpa/<name>} is a symlink whose
+     *       target contains the parent VF PCI (e.g.
+     *       {@code .../devices/pci0000:00/.../0000:01:00.2/<name>}).</li>
+     * </ul>
+     *
+     * <p>Returns {@code null} if the path cannot be resolved (caller falls back
+     * to hostdev detection or skip).
+     */
+    public static String resolveVfPciFromVdpaDev(final String vdpaDevPath) {
+        if (StringUtils.isBlank(vdpaDevPath)) {
             return null;
         }
-        // /sys/class/vdpa/<name>/vhost-vdpa-K/dev -> "major:minor"
-        final File[] entries = sysClass.listFiles((dir, name) -> name.startsWith("vhost-vdpa-"));
+        final String fileName = Paths.get(vdpaDevPath).getFileName().toString(); // vhost-vdpa-0
+        final File devicesDir = new File("/sys/bus/vdpa/devices");
+        final File[] vdpaDevs = devicesDir.listFiles();
+        if (vdpaDevs == null) {
+            return null;
+        }
+        String vdpaName = null;
+        for (File d : vdpaDevs) {
+            if (new File(d, fileName).exists()) {
+                vdpaName = d.getName();
+                break;
+            }
+        }
+        if (vdpaName == null) {
+            return null;
+        }
+        final Path symlink = Paths.get("/sys/bus/vdpa/drivers/vhost_vdpa/" + vdpaName);
+        try {
+            final String target = Files.readSymbolicLink(symlink).toString();
+            // target like: ../../../../devices/pci0000:00/.../0000:01:00.2/<vdpaName>
+            final java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(\\d{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f])").matcher(target);
+            String last = null;
+            while (m.find()) {
+                last = m.group(1);
+            }
+            return last;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    static String lookupVhostVdpaDevice(final String vdpaName) {
+        // On current kernels the vdpa class symlink lives under
+        // /sys/bus/vdpa/devices/<name>/, not /sys/class/vdpa/. The child
+        // directory 'vhost-vdpa-K/' maps 1:1 to the /dev/vhost-vdpa-K chardev.
+        final File sysDev = new File("/sys/bus/vdpa/devices/" + vdpaName);
+        if (!sysDev.isDirectory()) {
+            return null;
+        }
+        final File[] entries = sysDev.listFiles((dir, name) -> name.startsWith("vhost-vdpa-"));
         if (entries == null || entries.length == 0) {
             return null;
         }
@@ -225,8 +277,8 @@ public class VfVdpaLifecycleManager {
     }
 
     private void removeStaleVdpaDevice(final String vdpaName) {
-        final File sysClass = new File("/sys/class/vdpa/" + vdpaName);
-        if (sysClass.exists()) {
+        final File sysDev = new File("/sys/bus/vdpa/devices/" + vdpaName);
+        if (sysDev.exists()) {
             LOGGER.warn("Removing stale vDPA device {} before re-create", vdpaName);
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
         }

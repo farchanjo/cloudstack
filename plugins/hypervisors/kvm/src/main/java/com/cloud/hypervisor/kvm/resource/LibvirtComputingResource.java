@@ -2816,6 +2816,13 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                         continue;
                     }
                     String pci = nic.getPciAddress();
+                    // VDPA InterfaceDefs re-parsed from libvirt XML don't carry the
+                    // underlying VF PCI (only /dev/vhost-vdpa-N is in the XML). Walk
+                    // sysfs to resolve it back.
+                    if (pci == null && type == LibvirtVMDef.InterfaceDef.GuestNetType.VDPA) {
+                        pci = com.cloud.hypervisor.kvm.resource.VfVdpaLifecycleManager
+                                .resolveVfPciFromVdpaDev(nic.getVdpaDevPath());
+                    }
                     if (pci == null) {
                         continue;
                     }
