@@ -192,6 +192,9 @@ public class NetworkOfferingJoinVO extends BaseViewVO implements NetworkOffering
     @Column(name = "specify_as_number")
     private Boolean specifyAsNumber;
 
+    @Column(name = "hw_offload_enabled")
+    private boolean hwOffloadEnabled = false;
+
     public NetworkOfferingJoinVO() {
     }
 
@@ -451,5 +454,14 @@ public class NetworkOfferingJoinVO extends BaseViewVO implements NetworkOffering
 
     public void setSpecifyAsNumber(Boolean specifyAsNumber) {
         this.specifyAsNumber = specifyAsNumber;
+    }
+
+    @Override
+    public boolean isHwOffloadEnabled() {
+        return hwOffloadEnabled;
+    }
+
+    public void setHwOffloadEnabled(boolean v) {
+        this.hwOffloadEnabled = v;
     }
 }

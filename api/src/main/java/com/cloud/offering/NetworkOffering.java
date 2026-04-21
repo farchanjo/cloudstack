@@ -171,4 +171,8 @@ public interface NetworkOffering extends InfrastructureEntity, InternalIdentity,
     RoutingMode getRoutingMode();
 
     Boolean isSpecifyAsNumber();
+
+    default boolean isHwOffloadEnabled() {
+        return false;
+    }
 }

@@ -557,15 +557,19 @@ public class RoutedIpv4ManagerImpl extends ComponentLifecycleBase implements Rou
         Long zoneId = null;
         if (subnet.getNetworkId() != null) {
             Network network = ApiDBUtils.findNetworkById(subnet.getNetworkId());
-            response.setNetworkId(network.getUuid());
-            response.setNetworkName(network.getName());
-            zoneId = network.getDataCenterId();
+            if (network != null) {
+                response.setNetworkId(network.getUuid());
+                response.setNetworkName(network.getName());
+                zoneId = network.getDataCenterId();
+            }
         }
         if (subnet.getVpcId() != null) {
             Vpc vpc = ApiDBUtils.findVpcById(subnet.getVpcId());
-            response.setVpcId(vpc.getUuid());
-            response.setVpcName(vpc.getName());
-            zoneId = vpc.getZoneId();
+            if (vpc != null) {
+                response.setVpcId(vpc.getUuid());
+                response.setVpcName(vpc.getName());
+                zoneId = vpc.getZoneId();
+            }
         }
         if (subnet.getParentId() != null) {
             DataCenterIpv4GuestSubnet parent = dataCenterIpv4GuestSubnetDao.findById(subnet.getParentId());

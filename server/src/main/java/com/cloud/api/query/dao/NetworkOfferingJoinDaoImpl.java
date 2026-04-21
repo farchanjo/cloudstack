@@ -130,6 +130,7 @@ public class NetworkOfferingJoinDaoImpl extends GenericDaoBase<NetworkOfferingJo
         if (offering.isSpecifyAsNumber() != null) {
             networkOfferingResponse.setSpecifyAsNumber(offering.isSpecifyAsNumber());
         }
+        networkOfferingResponse.setHwOffloadEnabled(offering.isHwOffloadEnabled());
         networkOfferingResponse.setObjectName("networkoffering");
 
         return networkOfferingResponse;

@@ -99,6 +99,10 @@ public class NetworkOfferingResponse extends BaseResponseWithAnnotations {
     @Param(description = "True if Network offering can be used by VPC Networks only")
     private Boolean forVpc;
 
+    @SerializedName("hwoffloadenabled")
+    @Param(description = "True if VRs from this offering use SR-IOV VF passthrough + TC flower HW offload (line-rate NAT/ACL/LB in NIC ASIC).", since = "4.24.0")
+    private Boolean hwOffloadEnabled;
+
     @SerializedName(ApiConstants.FOR_NSX)
     @Param(description = "true if network offering can be used by NSX networks only")
     private Boolean forNsx;
@@ -329,5 +333,13 @@ public class NetworkOfferingResponse extends BaseResponseWithAnnotations {
 
     public void setRoutingMode(String routingMode) {
         this.routingMode = routingMode;
+    }
+
+    public Boolean getHwOffloadEnabled() {
+        return hwOffloadEnabled;
+    }
+
+    public void setHwOffloadEnabled(Boolean hwOffloadEnabled) {
+        this.hwOffloadEnabled = hwOffloadEnabled;
     }
 }
