@@ -209,3 +209,22 @@ FROM
     `cloud`.`network_offering_details` AS `offering_details` ON `offering_details`.`network_offering_id` = `network_offerings`.`id` AND `offering_details`.`name`='internetProtocol'
 GROUP BY
     `network_offerings`.`id`;
+
+
+
+-- ============================================================
+
+-- Expand host_details.value to TEXT
+
+-- ============================================================
+
+-- With sriov_numvfs >= 8 per PF the sriov.vfs.dx*.pci detail string
+
+-- exceeds the upstream VARCHAR(255) limit, causing MysqlDataTruncation
+
+-- during agent StartupCommand handling and an infinite sig.kill loop.
+
+
+
+ALTER TABLE `cloud`.`host_details` MODIFY COLUMN `value` TEXT NOT NULL;
+
