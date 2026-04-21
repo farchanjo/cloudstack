@@ -43,10 +43,8 @@ public class NicTO extends NetworkTO {
     Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
     String vfPfName;           // Physical Function netdev name (e.g. "dx6p0")
 
-    /* SR-IOV Sub-Function with vDPA. All optional; null/false means no SF/vDPA. */
-    String vdpaDevice;         // vDPA device path, e.g. "/dev/vhost-vdpa-0"
-    Boolean useSfVdpa;         // wrapper Boolean → null preserves wire compat with older agents
-    String sfRepresentorName;  // SF representor name, e.g. "dx6p0sf0"
+    /* vDPA device path (reused across future VF+vDPA path). Null when NIC does not use vDPA. */
+    String vdpaDevice;         // e.g. "/dev/vhost-vdpa-0"
 
     /**
      * Free-form String-keyed detail map propagated from the management server
@@ -223,26 +221,6 @@ public class NicTO extends NetworkTO {
 
     public void setVdpaDevice(String vdpaDevice) {
         this.vdpaDevice = vdpaDevice;
-    }
-
-    public Boolean getUseSfVdpa() {
-        return useSfVdpa;
-    }
-
-    public boolean isUseSfVdpa() {
-        return Boolean.TRUE.equals(useSfVdpa);
-    }
-
-    public void setUseSfVdpa(Boolean useSfVdpa) {
-        this.useSfVdpa = useSfVdpa;
-    }
-
-    public String getSfRepresentorName() {
-        return sfRepresentorName;
-    }
-
-    public void setSfRepresentorName(String sfRepresentorName) {
-        this.sfRepresentorName = sfRepresentorName;
     }
 
     /**

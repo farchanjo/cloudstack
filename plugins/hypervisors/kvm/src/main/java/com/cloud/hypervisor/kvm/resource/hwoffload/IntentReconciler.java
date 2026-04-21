@@ -65,9 +65,7 @@ public class IntentReconciler {
         /** Physical Function netdev (e.g. dx6p0). */
         PF,
         /** Virtual Function netdev (e.g. dx6p0vf3). */
-        VF,
-        /** Sub-Function netdev (e.g. en3f0pf0sf42). */
-        SF
+        VF
     }
 
     /**
