@@ -38,13 +38,17 @@ public class NicTO extends NetworkTO {
 
     String networkSegmentName;
 
-    /* SR-IOV VF passthrough (HW Offload). All optional; null/false means traditional bridge/TAP. */
+    /* SR-IOV VF binding. All optional; null/false means traditional bridge/TAP. */
     String vfPciAddress;       // VF PCI bus address, e.g. "0000:01:00.2"
-    Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
     String vfPfName;           // Physical Function netdev name (e.g. "dx6p0")
+    String vfRepName;          // VF representor netdev name on the host, e.g. "dx6p0vf20"
 
-    /* vDPA device path (reused across future VF+vDPA path). Null when NIC does not use vDPA. */
-    String vdpaDevice;         // e.g. "/dev/vhost-vdpa-0"
+    /* HW-offload via VF passthrough (hostdev). Mutually exclusive with useVdpa. */
+    Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
+
+    /* HW-offload via VF+vDPA (vhost-vdpa chardev). Mutually exclusive with useHwOffload. */
+    String vdpaDevice;         // vhost-vdpa chardev path, e.g. "/dev/vhost-vdpa-0"
+    Boolean useVdpa;           // wrapper Boolean → null preserves wire compat with older agents
 
     /**
      * Free-form String-keyed detail map propagated from the management server
@@ -215,12 +219,32 @@ public class NicTO extends NetworkTO {
         this.vfPfName = vfPfName;
     }
 
+    public String getVfRepName() {
+        return vfRepName;
+    }
+
+    public void setVfRepName(String vfRepName) {
+        this.vfRepName = vfRepName;
+    }
+
     public String getVdpaDevice() {
         return vdpaDevice;
     }
 
     public void setVdpaDevice(String vdpaDevice) {
         this.vdpaDevice = vdpaDevice;
+    }
+
+    public Boolean getUseVdpa() {
+        return useVdpa;
+    }
+
+    public boolean isUseVdpa() {
+        return Boolean.TRUE.equals(useVdpa);
+    }
+
+    public void setUseVdpa(Boolean useVdpa) {
+        this.useVdpa = useVdpa;
     }
 
     /**

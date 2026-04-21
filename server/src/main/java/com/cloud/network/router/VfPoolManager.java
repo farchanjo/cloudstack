@@ -30,6 +30,11 @@ import com.cloud.utils.component.Manager;
  * a FREE VF on the chosen host and binds it to the NIC. Failure to allocate raises
  * {@link InsufficientCapacityException} so the orchestrator can retry on another host
  * or fall back to SW VR (depending on offering settings).
+ *
+ * <p>When the allocated VF is additionally promoted to VF+vDPA (offering.vdpa_enabled=1)
+ * the caller issues {@code CreateVdpaCommand} to the agent and records the returned
+ * {@code /dev/vhost-vdpa-*} chardev and vDPA netlink name via {@link #bindVdpa}; the
+ * release path then issues the matching {@code DestroyVdpaCommand}.
  */
 public interface VfPoolManager extends Manager {
 
@@ -46,6 +51,15 @@ public interface VfPoolManager extends Manager {
      * @throws InsufficientCapacityException when no FREE VF is available on the host.
      */
     SriovVfPoolVO allocate(long hostId, long nicId) throws InsufficientCapacityException;
+
+    /**
+     * Persist the vDPA chardev/name returned by a successful
+     * {@code CreateVdpaCommand} on the allocated VF row.
+     *
+     * <p>Called by the allocator after promoting a freshly allocated VF to
+     * VF+vDPA mode. Idempotent: repeated calls overwrite the columns.
+     */
+    void bindVdpa(long vfPoolId, String vdpaDevice, String vdpaName);
 
     /** Release a VF back to FREE. Idempotent. */
     boolean release(long vfPoolId);

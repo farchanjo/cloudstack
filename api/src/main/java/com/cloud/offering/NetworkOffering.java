@@ -175,4 +175,8 @@ public interface NetworkOffering extends InfrastructureEntity, InternalIdentity,
     default boolean isHwOffloadEnabled() {
         return false;
     }
+
+    default boolean isVdpaEnabled() {
+        return false;
+    }
 }

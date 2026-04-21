@@ -445,6 +445,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     private VifDriver defaultVifDriver;
     private VifDriver tungstenVifDriver;
     private VifDriver vfPassthroughVifDriver;
+    private VifDriver vdpaVifDriver;
+    private VfVdpaLifecycleManager vfVdpaLifecycleManager;
     private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
@@ -453,6 +455,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public VifDriver getVfPassthroughVifDriver() {
         return vfPassthroughVifDriver;
+    }
+
+    public VfVdpaLifecycleManager getVfVdpaLifecycleManager() {
+        return vfVdpaLifecycleManager;
     }
 
     public com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler getIntentReconciler() {
@@ -1813,6 +1819,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         } catch (ConfigurationException e) {
             LOGGER.warn("VfPassthroughVifDriver not available; SR-IOV VF passthrough requests will fail", e);
         }
+        try {
+            vdpaVifDriver = getVifDriverClass(VdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VdpaVifDriver not available; VF+vDPA requests will fail", e);
+        }
+        vfVdpaLifecycleManager = new VfVdpaLifecycleManager();
         representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
         tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
         // HW offload uplink config is read directly from agent.properties because
@@ -1918,6 +1930,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     public VifDriver getVifDriver(final NicTO nic) {
+        if (nic.isUseVdpa() && vdpaVifDriver != null) {
+            return vdpaVifDriver;
+        }
         if (nic.getUseHwOffload() != null && nic.getUseHwOffload() && vfPassthroughVifDriver != null) {
             return vfPassthroughVifDriver;
         }
@@ -4581,6 +4596,13 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
+        if (nic.isUseVdpa()) {
+            if (vdpaVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests VF+vDPA (vdpaDevice=" + nic.getVdpaDevice() + ") but VdpaVifDriver is not loaded");
+            }
+            return vdpaVifDriver;
+        }
         if (nic.isUseHwOffload()) {
             if (vfPassthroughVifDriver == null) {
                 throw new InternalErrorException(

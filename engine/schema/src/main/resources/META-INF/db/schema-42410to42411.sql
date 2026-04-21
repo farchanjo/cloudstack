@@ -69,6 +69,20 @@ ALTER TABLE `cloud`.`network_offerings`
     COMMENT 'Enable VF+vDPA on the VR guest NIC (hot-plug + future live-migration). 0=disabled, 1=enabled.';
 
 -- ============================================================
+-- Extend sriov_vf_pool with vDPA binding bookkeeping (idempotent)
+-- ============================================================
+-- When a VF is promoted to vDPA we remember the vhost-vdpa chardev and
+-- the vDPA device name so release can issue the matching DestroyVdpa.
+
+ALTER TABLE `cloud`.`sriov_vf_pool`
+    ADD COLUMN IF NOT EXISTS `vdpa_device` varchar(64) NULL
+    COMMENT 'vhost-vdpa chardev path bound to this VF, e.g. /dev/vhost-vdpa-0. NULL when VF is hostdev-only.';
+
+ALTER TABLE `cloud`.`sriov_vf_pool`
+    ADD COLUMN IF NOT EXISTS `vdpa_name` varchar(64) NULL
+    COMMENT 'vDPA netlink device name (vdpa dev add name ...). NULL when VF is hostdev-only.';
+
+-- ============================================================
 -- Retire SF global config, introduce VF+vDPA config
 -- ============================================================
 
