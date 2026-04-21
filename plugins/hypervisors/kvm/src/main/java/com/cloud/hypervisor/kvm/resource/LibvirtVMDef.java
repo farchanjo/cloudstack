@@ -1602,7 +1602,7 @@ public class LibvirtVMDef {
         private Boolean _packedVirtQueues;
         private String _pciAddress; /* For HOSTDEV interface type (SR-IOV VF passthrough). Format: dddd:bb:ss.f */
         private boolean _hostdevManaged = true; /* libvirt 'managed' attr; true => libvirt detaches/reattaches the device */
-        private String _vdpaDevPath; /* For VDPA interface type (SF vDPA passthrough). Path: /dev/vhost-vdpa-N */
+        private String _vdpaDevPath; /* For VDPA interface type (VF+vDPA passthrough). Path: /dev/vhost-vdpa-N */
 
         public void defBridgeNet(String brName, String targetBrName, String macAddr, NicModel model) {
             defBridgeNet(brName, targetBrName, macAddr, model, 0);
