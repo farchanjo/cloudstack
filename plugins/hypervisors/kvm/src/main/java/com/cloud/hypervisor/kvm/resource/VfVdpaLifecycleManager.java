@@ -167,7 +167,17 @@ public class VfVdpaLifecycleManager {
             final Path pfNetDir = Paths.get("/sys/bus/pci/devices", pfPci, "net");
             if (Files.isDirectory(pfNetDir)) {
                 try (Stream<Path> s = Files.list(pfNetDir)) {
-                    return s.findFirst().map(p -> p.getFileName().toString()).orElse(pfNameHint);
+                    for (Path nd : (Iterable<Path>) s::iterator) {
+                        final String name = nd.getFileName().toString();
+                        String ppn = "";
+                        try {
+                            ppn = new String(Files.readAllBytes(
+                                    Paths.get("/sys/class/net", name, "phys_port_name"))).trim();
+                        } catch (Exception ignored) {}
+                        if (ppn.isEmpty() || !ppn.contains("vf")) {
+                            return name;
+                        }
+                    }
                 }
             }
         } catch (Exception ignored) {

@@ -16,7 +16,11 @@
 // under the License.
 package com.cloud.hypervisor.kvm.resource;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import javax.naming.ConfigurationException;
 
@@ -60,7 +64,18 @@ public class VdpaVifDriver extends VifDriverBase {
                     "VdpaVifDriver invoked without vdpaDevice on NicTO; check VfPoolManager allocation");
         }
 
-        final String repName = nic.getVfRepName();
+        // sriov_vf_pool.representor_name is unreliable (observed to point at
+        // the wrong rep for a given VF PCI). Derive the real rep from sysfs
+        // using the VF PCI address (which is authoritative). Fall back to the
+        // hint from NicTO only if sysfs resolution fails.
+        String repName = resolveRepNameFromVfPci(nic.getVfPciAddress());
+        final String repHint = nic.getVfRepName();
+        if (StringUtils.isBlank(repName)) {
+            repName = repHint;
+        } else if (!repName.equals(repHint)) {
+            logger.info("VF rep resolved via sysfs: {} (pool hint was {}) for VF {}",
+                    repName, repHint, nic.getVfPciAddress());
+        }
         if (StringUtils.isNotBlank(repName)) {
             ensureRepresentorOnOvs(repName);
         } else {
@@ -111,6 +126,79 @@ public class VdpaVifDriver extends VifDriverBase {
     @Override
     public boolean isExistingBridge(final String bridgeName) {
         return false;
+    }
+
+    /**
+     * Given a VF PCI (e.g. {@code 0000:01:00.2}) resolve the real host-side
+     * representor netdev name. Sysfs mapping:
+     * <ul>
+     *   <li>{@code /sys/bus/pci/devices/<vf>/physfn} -> PF PCI</li>
+     *   <li>{@code /sys/bus/pci/devices/<pfPci>/net/<pfName>} -> PF netdev</li>
+     *   <li>{@code /sys/bus/pci/devices/<pfPci>/virtfnN} (matching the VF PCI)
+     *       -> VF index N</li>
+     *   <li>Representor convention on these hosts: {@code <pfName>vf<N>}
+     *       (renamed by udev; see project_a2_sriov_rolling_complete).</li>
+     * </ul>
+     * Returns {@code null} if anything along the way is unreadable.
+     */
+    static String resolveRepNameFromVfPci(final String vfPciAddress) {
+        if (StringUtils.isBlank(vfPciAddress)) {
+            return null;
+        }
+        try {
+            final Path vfPhysfn = Paths.get("/sys/bus/pci/devices", vfPciAddress, "physfn");
+            final String pfPci = Files.readSymbolicLink(vfPhysfn).getFileName().toString();
+            // In switchdev mode /sys/bus/pci/devices/<pfPci>/net/ contains BOTH
+            // the PF netdev AND every VF representor (they share the same PCI
+            // parent). Filter to the real PF netdev — identified by an empty
+            // or "pfN"-only phys_port_name (representors carry "pfNvfM").
+            final Path pfNetDir = Paths.get("/sys/bus/pci/devices", pfPci, "net");
+            String pfName = null;
+            try (Stream<Path> s = Files.list(pfNetDir)) {
+                for (Path nd : (Iterable<Path>) s::iterator) {
+                    final String name = nd.getFileName().toString();
+                    String ppn = "";
+                    try {
+                        ppn = new String(Files.readAllBytes(
+                                Paths.get("/sys/class/net", name, "phys_port_name"))).trim();
+                    } catch (Exception ignored) {}
+                    if (ppn.isEmpty() || !ppn.contains("vf")) {
+                        pfName = name;
+                        break;
+                    }
+                }
+            }
+            if (pfName == null) {
+                return null;
+            }
+            final Path pfDevice = Paths.get("/sys/bus/pci/devices", pfPci);
+            try (Stream<Path> s = Files.list(pfDevice)) {
+                final Integer idx = s
+                        .filter(p -> p.getFileName().toString().startsWith("virtfn"))
+                        .filter(p -> {
+                            try {
+                                return vfPciAddress.equals(Files.readSymbolicLink(p).getFileName().toString());
+                            } catch (Exception ignored) {
+                                return false;
+                            }
+                        })
+                        .findFirst()
+                        .map(p -> {
+                            try {
+                                return Integer.parseInt(p.getFileName().toString().substring("virtfn".length()));
+                            } catch (NumberFormatException ex) {
+                                return null;
+                            }
+                        })
+                        .orElse(null);
+                if (idx == null) {
+                    return null;
+                }
+                return pfName + "vf" + idx;
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /**

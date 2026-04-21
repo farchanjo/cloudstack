@@ -291,10 +291,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         if (vfPoolManager == null) {
             return;
         }
-        // Only VRs get VF passthrough — user VMs use standard bridge/TAP NICs
-        if (vmProfile.getType() != com.cloud.vm.VirtualMachine.Type.DomainRouter) {
-            return;
-        }
+        final boolean isVr = vmProfile.getType() == com.cloud.vm.VirtualMachine.Type.DomainRouter;
         try {
             NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
             if (network == null) {
@@ -304,6 +301,16 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             if (network.getTrafficType() == com.cloud.network.Networks.TrafficType.Control ||
                 network.getTrafficType() == com.cloud.network.Networks.TrafficType.Management) {
                 return;
+            }
+            // Non-VRs (user VMs) only receive a VF when the offering has
+            // vdpa_enabled=1. hwOffloadEnabled alone targets VRs (hostdev),
+            // so without this check user VMs would try to grab a VF too.
+            if (!isVr) {
+                com.cloud.offerings.NetworkOfferingVO off =
+                        networkOfferingDao.findById(network.getNetworkOfferingId());
+                if (off == null || !off.isVdpaEnabled()) {
+                    return;
+                }
             }
             boolean shouldOffload = false;
             com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
