@@ -52,24 +52,23 @@ CREATE TABLE IF NOT EXISTS `cloud`.`sriov_vf_pool` (
 
 -- NIC: optional binding to a VF. NULL preserves legacy bridge/TAP behavior.
 ALTER TABLE `cloud`.`nics`
-  ADD COLUMN `vf_pci_address` varchar(17) NULL
+    ADD COLUMN IF NOT EXISTS `vf_pci_address` varchar(17) NULL
     COMMENT 'SR-IOV VF PCI address. NULL = NIC uses traditional TAP/bridge.';
 
 ALTER TABLE `cloud`.`nics`
-  ADD COLUMN `vf_pool_id` bigint unsigned NULL
+    ADD COLUMN IF NOT EXISTS `vf_pool_id` bigint unsigned NULL
     COMMENT 'Soft reference to sriov_vf_pool.id. NULL when vf_pci_address is NULL.';
 
 -- Network offering: opt-in flag for HW offload.
 ALTER TABLE `cloud`.`network_offerings`
-  ADD COLUMN `hw_offload_enabled` tinyint(1) NOT NULL DEFAULT 0
+    ADD COLUMN IF NOT EXISTS `hw_offload_enabled` tinyint(1) NOT NULL DEFAULT 0
     COMMENT 'Enable hardware TC flower offload via SR-IOV VF passthrough. 0=disabled (SW VR), 1=enabled (HW VR).';
 
-ALTER TABLE `cloud`.`network_offerings`
-  ADD INDEX `idx_network_offerings__hw_offload_enabled` (`hw_offload_enabled`);
+CREATE INDEX IF NOT EXISTS `idx_network_offerings__hw_offload_enabled` ON `cloud`.`network_offerings` (`hw_offload_enabled`);
 
 -- Domain router: tracking flag (provisioning was HW or SW). Read-only, for ops/troubleshoot.
 ALTER TABLE `cloud`.`domain_router`
-  ADD COLUMN `hw_offload_active` tinyint(1) NOT NULL DEFAULT 0
+    ADD COLUMN IF NOT EXISTS `hw_offload_active` tinyint(1) NOT NULL DEFAULT 0
     COMMENT 'Tracks if this VR was provisioned with HW offload (VFs).';
 
 -- HW offload intent cache: last intent (NAT/ACL/LB rules JSON) received per VR.
@@ -142,16 +141,16 @@ CREATE TABLE IF NOT EXISTS `cloud`.`sriov_sf_pool` (
 
 -- NIC: optional binding to an SF pool entry and vDPA device.
 ALTER TABLE `cloud`.`nics`
-  ADD COLUMN `sf_pool_id` bigint unsigned NULL
+    ADD COLUMN IF NOT EXISTS `sf_pool_id` bigint unsigned NULL
     COMMENT 'Soft reference to sriov_sf_pool.id. NULL when NIC does not use SF.';
 
 ALTER TABLE `cloud`.`nics`
-  ADD COLUMN `vdpa_device` varchar(64) NULL
+    ADD COLUMN IF NOT EXISTS `vdpa_device` varchar(64) NULL
     COMMENT 'vDPA device path assigned to this NIC. NULL when NIC does not use vDPA.';
 
 -- Network offering: opt-in flag for SF+vDPA.
 ALTER TABLE `cloud`.`network_offerings`
-  ADD COLUMN `sf_vdpa_enabled` tinyint(1) NOT NULL DEFAULT 0
+    ADD COLUMN IF NOT EXISTS `sf_vdpa_enabled` tinyint(1) NOT NULL DEFAULT 0
     COMMENT 'Enable SR-IOV Sub-Function with vDPA for live-migratable HW datapath. 0=disabled, 1=enabled.';
 
 -- Configuration entries for SF pool management.
