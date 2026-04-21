@@ -1603,6 +1603,7 @@ public class LibvirtVMDef {
         private String _pciAddress; /* For HOSTDEV interface type (SR-IOV VF passthrough). Format: dddd:bb:ss.f */
         private boolean _hostdevManaged = true; /* libvirt 'managed' attr; true => libvirt detaches/reattaches the device */
         private String _vdpaDevPath; /* For VDPA interface type (VF+vDPA passthrough). Path: /dev/vhost-vdpa-N */
+        private String _vdpaVfPciAddress; /* Underlying VF PCI for VDPA NIC — used by the HW-offload pipeline to resolve the representor. */
 
         public void defBridgeNet(String brName, String targetBrName, String macAddr, NicModel model) {
             defBridgeNet(brName, targetBrName, macAddr, model, 0);
@@ -1651,6 +1652,9 @@ public class LibvirtVMDef {
         }
 
         public String getPciAddress() {
+            if (_netType == GuestNetType.VDPA && _vdpaVfPciAddress != null) {
+                return _vdpaVfPciAddress;
+            }
             return _pciAddress;
         }
 
@@ -1670,13 +1674,28 @@ public class LibvirtVMDef {
          * @param macAddr     MAC address to assign to the guest-visible NIC.
          */
         public void defVdpaNet(String vdpaDevPath, String macAddr) {
+            defVdpaNet(vdpaDevPath, macAddr, null);
+        }
+
+        /**
+         * Variant of {@link #defVdpaNet(String, String)} that also records
+         * the underlying SR-IOV VF PCI bus address so the HW-offload pipeline
+         * can look up the representor and install TC flower rules (same path
+         * the HOSTDEV flow uses via {@link #getPciAddress()}).
+         */
+        public void defVdpaNet(String vdpaDevPath, String macAddr, String vfPciAddress) {
             _netType = GuestNetType.VDPA;
             _vdpaDevPath = vdpaDevPath;
             _macAddr = macAddr;
+            _vdpaVfPciAddress = vfPciAddress;
         }
 
         public String getVdpaDevPath() {
             return _vdpaDevPath;
+        }
+
+        public String getVdpaVfPciAddress() {
+            return _vdpaVfPciAddress;
         }
 
         public void defDpdkNet(String dpdkSourcePath, String dpdkPort, String macAddress, NicModel model,

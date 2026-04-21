@@ -2808,16 +2808,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 java.util.List<String> additionalGuestVfPcis = new java.util.ArrayList<>();
                 for (int i = 0; i < pluggedNics.size(); i++) {
                     InterfaceDef nic = pluggedNics.get(i);
-                    if (nic.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
+                    LibvirtVMDef.InterfaceDef.GuestNetType type = nic.getNetType();
+                    // HOSTDEV (VF passthrough) and VDPA (VF+vDPA) both expose the
+                    // underlying SR-IOV VF PCI via InterfaceDef.getPciAddress().
+                    if (type != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV &&
+                        type != LibvirtVMDef.InterfaceDef.GuestNetType.VDPA) {
+                        continue;
+                    }
+                    String pci = nic.getPciAddress();
+                    if (pci == null) {
                         continue;
                     }
                     if (i == publicIdx) {
-                        publicVfPci = nic.getPciAddress();
+                        publicVfPci = pci;
                     } else if (guestVfPci == null) {
-                        guestVfPci = nic.getPciAddress();
+                        guestVfPci = pci;
                     } else {
                         // Multi-tier: extra guest VFs (t2, t3, ...) — TC mirrored by IntentReconciler
-                        additionalGuestVfPcis.add(nic.getPciAddress());
+                        additionalGuestVfPcis.add(pci);
                     }
                 }
                 String publicIp = pubIP.getPublicIp();

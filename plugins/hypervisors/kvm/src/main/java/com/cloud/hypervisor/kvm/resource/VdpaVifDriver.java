@@ -69,7 +69,7 @@ public class VdpaVifDriver extends VifDriverBase {
         }
 
         final LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
-        intf.defVdpaNet(vdpaDevice, nic.getMac());
+        intf.defVdpaNet(vdpaDevice, nic.getMac(), nic.getVfPciAddress());
         logger.info("vDPA plug: dev={} rep={} mac={}", vdpaDevice, repName, nic.getMac());
         return intf;
     }
