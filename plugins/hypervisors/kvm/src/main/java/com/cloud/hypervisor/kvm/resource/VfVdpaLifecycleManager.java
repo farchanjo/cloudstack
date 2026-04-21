@@ -100,11 +100,12 @@ public class VfVdpaLifecycleManager {
                         "Failed to resolve VF index for " + vfPciAddress + " on PF " + pfName);
             }
 
+            final String realPfName = resolvePfNetdevFromVfPci(vfPciAddress, pfName);
             Script.runSimpleBashScript(String.format(
-                    "ip link set dev %s vf %d mac %s", pfName, vfIndex, mac));
+                    "ip link set dev %s vf %d mac %s", realPfName, vfIndex, mac));
 
-            LOGGER.info("VF+vDPA created: pf={} vf={} pci={} vdpaName={} vdpaDev={} mac={}",
-                    pfName, vfIndex, vfPciAddress, vdpaName, vdpaDevice, mac);
+            LOGGER.info("VF+vDPA created: pfHint={} realPf={} vf={} pci={} vdpaName={} vdpaDev={} mac={}",
+                    pfName, realPfName, vfIndex, vfPciAddress, vdpaName, vdpaDevice, mac);
             return new CreateVdpaAnswer(cmd, vdpaDevice, vdpaName);
         } catch (Exception e) {
             LOGGER.error("Failed to create vDPA device for VF {}: {}", vfPciAddress, e.getMessage(), e);
@@ -155,13 +156,90 @@ public class VfVdpaLifecycleManager {
     }
 
     /**
-     * Resolve the SR-IOV VF index for {@code vfPciAddress} on {@code pfName}
-     * by walking {@code /sys/class/net/<pf>/device/virtfn*} symlinks.
+     * Resolve the PF netdev (e.g. {@code dx6p0}) that owns a given VF PCI
+     * by following the {@code physfn} sysfs symlink, regardless of any
+     * possibly-stale {@code pfName} hint from the management-side pool.
+     */
+    private static String resolvePfNetdevFromVfPci(final String vfPciAddress, final String pfNameHint) {
+        try {
+            final Path vfPhysfn = Paths.get("/sys/bus/pci/devices", vfPciAddress, "physfn");
+            final String pfPci = Files.readSymbolicLink(vfPhysfn).getFileName().toString();
+            final Path pfNetDir = Paths.get("/sys/bus/pci/devices", pfPci, "net");
+            if (Files.isDirectory(pfNetDir)) {
+                try (Stream<Path> s = Files.list(pfNetDir)) {
+                    return s.findFirst().map(p -> p.getFileName().toString()).orElse(pfNameHint);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return pfNameHint;
+    }
+
+    /**
+     * Resolve the SR-IOV VF index for {@code vfPciAddress}. Walks
+     * {@code /sys/bus/pci/devices/<vf>/physfn} to discover the owning PF
+     * regardless of what {@code pfName} is passed — the management-side
+     * {@code sriov_vf_pool} has been observed to mis-tag which PF owns a
+     * given VF, and trusting that value causes {@code vdpa dev add} to
+     * fail with "Failed to resolve VF index". The canonical mapping lives
+     * in sysfs, so we derive both the PF and the index from it.
      *
      * @return the VF index (0..N), or {@code -1} if it could not be resolved.
      */
     static int resolveVfIndex(final String pfName, final String vfPciAddress) {
-        if (StringUtils.isAnyBlank(pfName, vfPciAddress)) {
+        if (StringUtils.isBlank(vfPciAddress)) {
+            return -1;
+        }
+        // Discover the real PF PCI BDF via /sys/bus/pci/devices/<vf>/physfn.
+        final Path vfPhysfn = Paths.get("/sys/bus/pci/devices", vfPciAddress, "physfn");
+        String pfPci = null;
+        try {
+            pfPci = Files.readSymbolicLink(vfPhysfn).getFileName().toString();
+        } catch (Exception ignored) {
+            // fall through to pfName-based lookup below
+        }
+        if (pfPci != null) {
+            final int idx = resolveVfIndexFromPfPci(pfPci, vfPciAddress);
+            if (idx >= 0) {
+                return idx;
+            }
+        }
+        // Fallback: try the hint pfName (legacy path for hosts where physfn
+        // symlink is not readable).
+        return resolveVfIndexFromPfName(pfName, vfPciAddress);
+    }
+
+    private static int resolveVfIndexFromPfPci(final String pfPci, final String vfPciAddress) {
+        final Path pfDevice = Paths.get("/sys/bus/pci/devices", pfPci);
+        if (!Files.isDirectory(pfDevice)) {
+            return -1;
+        }
+        try (Stream<Path> stream = Files.list(pfDevice)) {
+            return stream
+                    .filter(p -> p.getFileName().toString().startsWith("virtfn"))
+                    .filter(p -> {
+                        try {
+                            return vfPciAddress.equals(Files.readSymbolicLink(p).getFileName().toString());
+                        } catch (Exception ignored) {
+                            return false;
+                        }
+                    })
+                    .findFirst()
+                    .map(p -> {
+                        try {
+                            return Integer.parseInt(p.getFileName().toString().substring("virtfn".length()));
+                        } catch (NumberFormatException ex) {
+                            return -1;
+                        }
+                    })
+                    .orElse(-1);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static int resolveVfIndexFromPfName(final String pfName, final String vfPciAddress) {
+        if (StringUtils.isBlank(pfName)) {
             return -1;
         }
         final Path pfDevice = Paths.get("/sys/class/net", pfName, "device");
@@ -180,9 +258,8 @@ public class VfVdpaLifecycleManager {
                     })
                     .findFirst()
                     .map(p -> {
-                        final String name = p.getFileName().toString();
                         try {
-                            return Integer.parseInt(name.substring("virtfn".length()));
+                            return Integer.parseInt(p.getFileName().toString().substring("virtfn".length()));
                         } catch (NumberFormatException ex) {
                             return -1;
                         }
