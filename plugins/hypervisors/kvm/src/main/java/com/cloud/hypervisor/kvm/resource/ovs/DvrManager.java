@@ -689,28 +689,29 @@ public class DvrManager {
         String actions;
         if (shortcut && dstRepOfPort != null) {
             // Shortcut + local peer known: egress directly on the peer VF
-            // representor ofport. strip_vlan removes the source tier tag so
-            // OVS does not re-apply ingress VLAN policy on the output port
-            // (which is an access port with a different tag). This is the
-            // path that HW-offloads to mlx5 eswitch — datapath action
-            // pop_vlan + output:<rep> matches what switchdev accepts.
-            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,strip_vlan,output:%d",
+            // representor ofport. Frame arrives with vlan_tci=0 (source access
+            // port already stripped the tag). OVS will apply the destination
+            // port's access tag automatically on egress.
+            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,output:%d",
                     dstGwMac, dstVmMac, dstRepOfPort);
         } else if (shortcut) {
             // Shortcut but peer lives on another host (no local ofport):
-            // keep mod_vlan + NORMAL so FDB flood through VXLAN tunnels
-            // delivers to the remote host. NORMAL does not re-enforce the
-            // ingress-port VLAN check for tunnel ports (they accept any tag
-            // because they're trunk). Validated cross-host 5.58 Gbit/s.
-            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,mod_vlan_vid:%d,NORMAL",
+            // push the destination tier tag and hand to NORMAL — the FDB /
+            // flood path delivers through the VXLAN tunnel with this tag;
+            // tunnel ports are trunks and accept arbitrary tags.
+            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,push_vlan:0x8100,mod_vlan_vid:%d,NORMAL",
                     dstGwMac, dstVmMac, dstFoldedTag);
         } else {
             // Virtual-MAC legacy path: only rewrites dl_dst + tag.
-            actions = String.format("mod_dl_dst:%s,mod_vlan_vid:%d,NORMAL",
+            actions = String.format("mod_dl_dst:%s,push_vlan:0x8100,mod_vlan_vid:%d,NORMAL",
                     dstVmMac, dstFoldedTag);
         }
-        String flow = String.format("cookie=%s,table=0,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,actions=%s",
-                DVR_COOKIE_ROUTE, priority, srcFoldedTag, matchMac, dstVmIp, actions);
+        // Access ports strip the VLAN tag before table-0 classification, so
+        // the frame arrives with vlan_tci=0. Match on vlan_tci=0x0000 instead
+        // of dl_vlan=<foldedTag>. Scope is preserved because (dl_dst=<VR MAC
+        // on a specific tier> + nw_dst=<peer VM IP>) is unique per route.
+        String flow = String.format("cookie=%s,table=0,priority=%d,ip,vlan_tci=0x0000,dl_dst=%s,nw_dst=%s,actions=%s",
+                DVR_COOKIE_ROUTE, priority, matchMac, dstVmIp, actions);
         boolean ok = addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s%s",
                 shortcut ? (dstRepOfPort != null ? "shortcut-local" : "shortcut-remote") : "virtual",
                 srcFoldedTag, shortcut ? "/" + srcGwMac : "",
