@@ -125,6 +125,18 @@ public final class LibvirtStopCommandWrapper extends CommandWrapper<StopCommand,
             if (vmName != null && libvirtComputingResource.dvrManager != null) {
                 try {
                     libvirtComputingResource.dvrManager.unregisterVm(vmName);
+                    // Also sweep by MAC: when the stopping VM is the VR
+                    // (its NICs carry the tier gateway MACs), unregisterVm(vmName)
+                    // finds no VM entry but unregisterVmByMac will clear the
+                    // tier.gatewayMac + reap the now-empty tier/vpc.
+                    if (ifaces != null) {
+                        for (final InterfaceDef iface : ifaces) {
+                            String mac = iface.getMacAddress();
+                            if (mac != null && !mac.isEmpty()) {
+                                libvirtComputingResource.dvrManager.unregisterVmByMac(mac);
+                            }
+                        }
+                    }
                 } catch (Exception e) {
                     logger.warn("DVR: failed to unregister VM " + vmName + ": " + e.getMessage());
                 }
