@@ -308,7 +308,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             if (!isVr) {
                 com.cloud.offerings.NetworkOfferingVO off =
                         networkOfferingDao.findById(network.getNetworkOfferingId());
-                if (off == null || !off.isVdpaEnabled()) {
+                if (off == null || (!off.isVdpaEnabled() && !off.isHwOffloadEnabled())) {
                     return;
                 }
             }
