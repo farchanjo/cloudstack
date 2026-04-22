@@ -3013,7 +3013,52 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         intentReconciler.applyIntent(newSpec);
         LOGGER.info("Programmed {} TC ACL rules for VR {} (HW offload, kernel iptables remains as fallback)",
                 aclRules.size(), routerName);
+        // In parallel: send ACL rules to the OVS/OpenFlow DVR pipeline for
+        // cross-tier shortcut ACL enforcement. Resolves vpcId by matching
+        // the VR's known NIC MACs (from libvirt) against the DvrManager's
+        // registered tier gateway MACs — no direct vpcId propagation needed.
+        try {
+            if (dvrManager != null && routerName != null) {
+                java.util.Set<String> vrMacs = listVrMacs(routerName);
+                String vpcId = dvrManager.findVpcIdByAnyGatewayMac(vrMacs);
+                if (vpcId != null) {
+                    dvrManager.translateAndSetAclRules(vpcId, aclRules);
+                    LOGGER.info("DvrManager: pushed {} ACL rules for vpc={} vr={}",
+                            aclRules.size(), vpcId, routerName);
+                } else {
+                    LOGGER.debug("DvrManager: skipping ACL push, no matching VPC for vr={} macs={}",
+                            routerName, vrMacs);
+                }
+            }
+        } catch (RuntimeException e) {
+            LOGGER.warn("DvrManager ACL push failed for vr {}: {}", routerName, e.getMessage());
+        }
         return new ExecutionResult(true, null);
+    }
+
+    /**
+     * Enumerate MAC addresses of all interfaces attached to a VR libvirt
+     * domain. Used for reverse lookup of the owning VPC when the mgmt
+     * command does not carry the vpcId directly.
+     */
+    private java.util.Set<String> listVrMacs(String routerName) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try {
+            String output = Script.runSimpleBashScript(
+                    "virsh domiflist " + routerName + " 2>/dev/null | awk 'NR>2 && NF>=5 {print $NF}'",
+                    5000);
+            if (output != null) {
+                for (String line : output.trim().split("\n")) {
+                    line = line.trim();
+                    if (!line.isEmpty() && line.contains(":")) {
+                        out.add(line.toLowerCase());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.debug("listVrMacs({}) failed: {}", routerName, e.getMessage());
+        }
+        return out;
     }
 
     /**

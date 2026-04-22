@@ -95,6 +95,8 @@ import com.cloud.vm.UserVmManager;
 import com.cloud.vm.VMInstanceVO;
 import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.VirtualMachineProfile;
+import com.cloud.vm.DomainRouterVO;
+import com.cloud.vm.dao.DomainRouterDao;
 import com.cloud.vm.dao.NicDao;
 import com.cloud.vm.dao.NicSecondaryIpDao;
 import com.cloud.vm.dao.VMInstanceDetailsDao;
@@ -141,6 +143,8 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
     protected ServiceOfferingDao serviceOfferingDao;
     @Inject
     private NetworkDetailsDao networkDetailsDao;
+    @Inject
+    protected DomainRouterDao routerDao;
     @Inject
     protected
     HostDao hostDao;
@@ -261,11 +265,64 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             to.setUuid(UUID.randomUUID().toString());
         }
         to.setDetails(getNicDetails(network));
+        populateDvrGatewayDetails(to, network, profile);
 
         //check whether the this nic has secondary ip addresses set
         //set nic secondary ip address in NicTO which are used for security group
         // configuration. Use full when vm stop/start
         return to;
+    }
+
+    /**
+     * Populate {@code dvr.vpc.id} and {@code dvr.gw.mac} NIC details so the
+     * KVM agent's DvrManager can install cross-tier shortcut flows on the
+     * VM host — even when the centralized VR lives on a different host.
+     *
+     * <p>Rules:
+     * <ul>
+     *   <li>Only for Guest-traffic NICs on a network that belongs to a VPC.</li>
+     *   <li>Skip when this NIC IS the VR on that tier (VR's NicTO is built
+     *       for the VR itself; gateway MAC will be learned from the agent's
+     *       own plug event).</li>
+     *   <li>When no VR exists yet (VPC is still coming up), leave the gw MAC
+     *       detail unset — the agent tolerates it and falls back to the
+     *       direct bridge path. A subsequent re-plug (VM start after VR is
+     *       up) will populate the detail correctly.</li>
+     * </ul>
+     */
+    private void populateDvrGatewayDetails(NicTO to, NetworkVO network, NicProfile profile) {
+        if (to == null || network == null || profile == null) {
+            return;
+        }
+        if (network.getVpcId() == null) {
+            return;
+        }
+        if (to.getType() != com.cloud.network.Networks.TrafficType.Guest) {
+            return;
+        }
+        VpcVO vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        to.setNicDetail("dvr.vpc.id", vpc.getUuid());
+        // Look up the VR(s) of this VPC, and find the VR's NIC on THIS
+        // network to extract its MAC. Multi-VR (redundant) VPCs: use the
+        // first VR — both VR MACs answer ARP for the tier gateway via
+        // VRRP, and the agent matches on either real MAC.
+        java.util.List<DomainRouterVO> routers = routerDao.listByVpcId(vpc.getId());
+        if (routers == null || routers.isEmpty()) {
+            return;
+        }
+        for (DomainRouterVO router : routers) {
+            NicVO vrNic = nicDao.findByNtwkIdAndInstanceId(network.getId(), router.getId());
+            if (vrNic != null && vrNic.getMacAddress() != null) {
+                to.setNicDetail("dvr.gw.mac", vrNic.getMacAddress());
+                logger.debug("DVR populate: nic {} vpc={} network={} gwMac={} vr={}",
+                        profile.getId(), vpc.getUuid(), network.getUuid(),
+                        vrNic.getMacAddress(), router.getInstanceName());
+                return;
+            }
+        }
     }
 
     /**

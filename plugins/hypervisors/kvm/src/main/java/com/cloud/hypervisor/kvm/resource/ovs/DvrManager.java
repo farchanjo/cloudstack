@@ -208,6 +208,49 @@ public class DvrManager {
      * @param cidr      tier CIDR, e.g. {@code 10.254.1.0/24}
      * @param gatewayIp tier gateway IP (the .1 of the CIDR), e.g. {@code 10.254.1.1}
      */
+    /**
+     * Translate the subset of {@link HwOffloadIntentApi.AclRule} fields that
+     * map cleanly to our OpenFlow ACL (src cidr + dst proto/port) and atomically
+     * replace the rule set for a VPC. Intended to be called from
+     * {@code LibvirtComputingResource.prepareNetworkElementCommand(SetNetworkACLCommand)}.
+     *
+     * <p>Semantic note: this replaces the WHOLE ACL for the VPC (matching how
+     * mgmt sends the full rule set each call). Rules without a src CIDR / dst
+     * port / proto become wildcards; rules with ACTION=DROP are skipped since
+     * OpenFlow default is drop after table-1 miss.
+     *
+     * @param vpcId       vpcId (uuid); if blank, silently skipped
+     * @param hwOffRules  list of HwOffloadIntentApi.AclRule as received by the handler
+     */
+    public synchronized void translateAndSetAclRules(String vpcId,
+            java.util.List<com.cloud.hypervisor.kvm.resource.hwoffload.HwOffloadIntentApi.AclRule> hwOffRules) {
+        if (StringUtils.isBlank(vpcId)) {
+            return;
+        }
+        java.util.List<AclRule> out = new ArrayList<>();
+        if (hwOffRules != null) {
+            int p = 800;
+            for (var hw : hwOffRules) {
+                if (hw == null) {
+                    continue;
+                }
+                // Skip DROP rules: OpenFlow default in table 1 IS drop; only ACCEPT
+                // rules are needed to carve exceptions. DROP rules as positive
+                // match would require priority ordering vs allows — out of MVP scope.
+                if (!"ACCEPT".equalsIgnoreCase(hw.action)) {
+                    continue;
+                }
+                AclRule r = new AclRule();
+                r.srcCidr = hw.matchSrcIp;
+                r.ipProto = hw.ipProto;
+                r.dstPort = hw.matchPort;
+                r.prio = (hw.prio != null) ? (800 + hw.prio) : p++;
+                out.add(r);
+            }
+        }
+        setAclRules(vpcId, out);
+    }
+
     public synchronized void registerTier(String vpcId, int vni, String cidr, String gatewayIp) {
         if (vni <= 0 || StringUtils.isBlank(cidr) || StringUtils.isBlank(gatewayIp)) {
             return;
@@ -451,6 +494,36 @@ public class DvrManager {
     /** Diagnostic: return an unmodifiable snapshot of current VPC state. */
     public synchronized Map<String, VpcState> snapshot() {
         return Collections.unmodifiableMap(new TreeMap<>(vpcs));
+    }
+
+    /**
+     * Reverse lookup: given a set of MAC addresses (e.g., those of a VR's
+     * NICs), return the vpcId whose tiers' gateway MACs overlap the set.
+     * Used by the agent's SetNetworkACLCommand handler to find which VPC
+     * an ACL update targets without depending on the management server
+     * sending the vpcId explicitly.
+     *
+     * @param macs set of lowercase MAC addresses to probe
+     * @return the matching vpcId, or null if no VPC has a matching tier
+     */
+    public synchronized String findVpcIdByAnyGatewayMac(java.util.Collection<String> macs) {
+        if (macs == null || macs.isEmpty()) {
+            return null;
+        }
+        Set<String> normalized = new java.util.HashSet<>();
+        for (String m : macs) {
+            if (m != null) {
+                normalized.add(m.trim().toLowerCase());
+            }
+        }
+        for (Map.Entry<String, VpcState> ve : vpcs.entrySet()) {
+            for (TierState tier : ve.getValue().tiers.values()) {
+                if (tier.gatewayMac != null && normalized.contains(tier.gatewayMac.toLowerCase())) {
+                    return ve.getKey();
+                }
+            }
+        }
+        return null;
     }
 
     /** Effective bridge. Exposed for tests. */
