@@ -536,8 +536,38 @@ public class DvrManager {
         if (foundVmName != null) {
             LOGGER.info("DVR unregisterVmByMac: mac={} -> vmName={}", needle, foundVmName);
             unregisterVm(foundVmName);
+            return;
+        }
+        // Maybe this MAC is a tier gateway (VR NIC) we captured via
+        // registerGatewayMac. Clear it so reap can collect the tier.
+        boolean clearedGw = false;
+        for (Map.Entry<String, VpcState> ve : vpcs.entrySet()) {
+            VpcState vpc = ve.getValue();
+            for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
+                TierState tier = te.getValue();
+                if (needle.equals(tier.gatewayMac != null ? tier.gatewayMac.toLowerCase() : null)) {
+                    LOGGER.info("DVR unregisterVmByMac: mac={} was gatewayMac of vpc={} vni={} — clearing",
+                            needle, ve.getKey(), te.getKey());
+                    tier.gatewayMac = null;
+                    if (tier.arpInstalled) {
+                        removeArpResponder(tier.foldedTag, tier.gatewayIp);
+                        tier.arpInstalled = false;
+                    }
+                    // Remove all shortcut routes that used this MAC as srcGwMac
+                    // OR dstGwMac — easiest: wipe every ROUTE cookie flow for
+                    // this tag, as shortcut routes are the only cookie family
+                    // keyed on that folded tag in this host's state.
+                    delFlows(String.format("cookie=%s/-1,table=0,ip,vlan_tci=0x0000,dl_dst=%s",
+                            DVR_COOKIE_ROUTE, needle), "vr-gone vpc=" + ve.getKey());
+                    clearedGw = true;
+                }
+            }
+        }
+        if (clearedGw) {
+            reapEmptyTiersAndVpcs();
+            persistState();
         } else {
-            LOGGER.debug("DVR unregisterVmByMac: no VM with mac={}", needle);
+            LOGGER.debug("DVR unregisterVmByMac: no VM or gw match for mac={}", needle);
         }
     }
 
