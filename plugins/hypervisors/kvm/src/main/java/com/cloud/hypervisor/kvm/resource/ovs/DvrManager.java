@@ -288,7 +288,8 @@ public class DvrManager {
             if (dstTier == null) {
                 continue;
             }
-            installL3Route(folded, tier.gatewayMac, peerVm.ip, peerVm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+            installL3Route(folded, tier.gatewayMac, peerVm.ip, peerVm.mac, dstTier.foldedTag, dstTier.gatewayMac,
+                    peerVm.repOfPort);
             maybeInstallRouteT2(vpc, folded, tier.gatewayMac, peerVm.ip, peerVm.mac,
                     dstTier.foldedTag, dstTier.gatewayMac);
         }
@@ -380,7 +381,7 @@ public class DvrManager {
             // Route where this tier is SRC: dst VM is in another tier, srcTag=touched.foldedTag
             if (vm.vni != touchedVni) {
                 installL3Route(touched.foldedTag, touched.gatewayMac,
-                        vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+                        vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac, vm.repOfPort);
                 maybeInstallRouteT2(vpc, touched.foldedTag, touched.gatewayMac,
                         vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
             } else {
@@ -390,7 +391,7 @@ public class DvrManager {
                         continue;
                     }
                     installL3Route(te.getValue().foldedTag, te.getValue().gatewayMac,
-                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac, vm.repOfPort);
                     maybeInstallRouteT2(vpc, te.getValue().foldedTag, te.getValue().gatewayMac,
                             vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
                 }
@@ -410,6 +411,16 @@ public class DvrManager {
      * @param vmMac   VM MAC address
      */
     public synchronized void registerVmInTier(String vpcId, String vmName, int vni, String vmIp, String vmMac) {
+        registerVmInTier(vpcId, vmName, vni, vmIp, vmMac, null);
+    }
+
+    /**
+     * Variant that accepts the local VF representor name (e.g. {@code dx6p0vf0}).
+     * When present, we resolve its OVS ofport and use it as the direct output
+     * target of shortcut flows, bypassing NORMAL's ingress VLAN check.
+     */
+    public synchronized void registerVmInTier(String vpcId, String vmName, int vni, String vmIp, String vmMac,
+            String repName) {
         if (vni <= 0 || StringUtils.isBlank(vmName) || StringUtils.isBlank(vmIp) || StringUtils.isBlank(vmMac)) {
             return;
         }
@@ -419,6 +430,10 @@ public class DvrManager {
         entry.vni = vni;
         entry.ip = vmIp.trim();
         entry.mac = vmMac.trim().toLowerCase();
+        if (StringUtils.isNotBlank(repName)) {
+            entry.repName = repName.trim();
+            entry.repOfPort = resolveOfPort(entry.repName);
+        }
         vpc.vms.put(vmName.trim(), entry);
 
         // For every OTHER tier in this VPC, install an L3 route flow so a
@@ -439,7 +454,7 @@ public class DvrManager {
             }
             TierState srcTier = te.getValue();
             if (installL3Route(srcTier.foldedTag, srcTier.gatewayMac,
-                    entry.ip, entry.mac, thisTier.foldedTag, thisTier.gatewayMac)) {
+                    entry.ip, entry.mac, thisTier.foldedTag, thisTier.gatewayMac, entry.repOfPort)) {
                 installed++;
             }
             maybeInstallRouteT2(vpc, srcTier.foldedTag, srcTier.gatewayMac,
@@ -663,16 +678,30 @@ public class DvrManager {
      */
     private boolean installL3Route(int srcFoldedTag, String srcGwMac, String dstVmIp, String dstVmMac,
                                    int dstFoldedTag, String dstGwMac) {
+        return installL3Route(srcFoldedTag, srcGwMac, dstVmIp, dstVmMac, dstFoldedTag, dstGwMac, null);
+    }
+
+    private boolean installL3Route(int srcFoldedTag, String srcGwMac, String dstVmIp, String dstVmMac,
+                                   int dstFoldedTag, String dstGwMac, Integer dstRepOfPort) {
         boolean shortcut = StringUtils.isNotBlank(srcGwMac) && StringUtils.isNotBlank(dstGwMac);
         int priority = shortcut ? PRIORITY_L3_SHORTCUT : PRIORITY_L3_ROUTE;
         String matchMac = shortcut ? srcGwMac : DVR_GATEWAY_MAC;
         String actions;
-        if (shortcut) {
-            // Real-MAC shortcut: rewrite src AND dst MAC + swap VLAN tag +
-            // decrement TTL. NORMAL at the tail so OVS delivers via the
-            // learned FDB (local rep) or floods via VXLAN tunnels when
-            // the destination VM lives on another host. Matches exactly
-            // the POC that hit 22 Gbps same-host and 5.6 Gbps cross-host.
+        if (shortcut && dstRepOfPort != null) {
+            // Shortcut + local peer known: egress directly on the peer VF
+            // representor ofport. strip_vlan removes the source tier tag so
+            // OVS does not re-apply ingress VLAN policy on the output port
+            // (which is an access port with a different tag). This is the
+            // path that HW-offloads to mlx5 eswitch — datapath action
+            // pop_vlan + output:<rep> matches what switchdev accepts.
+            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,strip_vlan,output:%d",
+                    dstGwMac, dstVmMac, dstRepOfPort);
+        } else if (shortcut) {
+            // Shortcut but peer lives on another host (no local ofport):
+            // keep mod_vlan + NORMAL so FDB flood through VXLAN tunnels
+            // delivers to the remote host. NORMAL does not re-enforce the
+            // ingress-port VLAN check for tunnel ports (they accept any tag
+            // because they're trunk). Validated cross-host 5.58 Gbit/s.
             actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,mod_vlan_vid:%d,NORMAL",
                     dstGwMac, dstVmMac, dstFoldedTag);
         } else {
@@ -682,10 +711,11 @@ public class DvrManager {
         }
         String flow = String.format("cookie=%s,table=0,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,actions=%s",
                 DVR_COOKIE_ROUTE, priority, srcFoldedTag, matchMac, dstVmIp, actions);
-        boolean ok = addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s",
-                shortcut ? "shortcut" : "virtual",
+        boolean ok = addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s%s",
+                shortcut ? (dstRepOfPort != null ? "shortcut-local" : "shortcut-remote") : "virtual",
                 srcFoldedTag, shortcut ? "/" + srcGwMac : "",
-                dstVmIp, dstVmMac, dstFoldedTag, shortcut ? "/" + dstGwMac : ""));
+                dstVmIp, dstVmMac, dstFoldedTag, shortcut ? "/" + dstGwMac : "",
+                dstRepOfPort != null ? " via_rep_ofport=" + dstRepOfPort : ""));
         // When ACL is active for this VPC, keep an identical-action copy in
         // table 2 so that packets resubmitted from the ACL allow list land
         // on the routing decision. Lookup by (srcTag, dstVmIp) happens in
@@ -746,6 +776,36 @@ public class DvrManager {
         String spec2 = String.format("cookie=%s/-1,table=%d,ip,nw_dst=%s",
                 DVR_COOKIE_ROUTE_T2, TABLE_ROUTE_T2, dstVmIp);
         delFlows(spec2, "l3-route-t2 dst=" + dstVmIp);
+    }
+
+    /**
+     * Resolve the OVS OpenFlow port number for a given interface name. Uses
+     * {@code ovs-vsctl get interface &lt;name&gt; ofport}. Returns null when the
+     * port is not attached to any OVS bridge — caller falls back to the
+     * mod_vlan+NORMAL variant which works for tunneled cross-host delivery.
+     */
+    private Integer resolveOfPort(String ifaceName) {
+        if (StringUtils.isBlank(ifaceName)) {
+            return null;
+        }
+        String cmd = String.format("ovs-vsctl --if-exists get interface %s ofport 2>/dev/null", ifaceName);
+        try {
+            String out = Script.runSimpleBashScript(cmd, OVS_TIMEOUT_MS);
+            if (out == null) {
+                return null;
+            }
+            String trimmed = out.trim();
+            if (trimmed.isEmpty() || "-1".equals(trimmed) || "[]".equals(trimmed)) {
+                return null;
+            }
+            return Integer.valueOf(trimmed);
+        } catch (NumberFormatException e) {
+            LOGGER.debug("resolveOfPort: non-numeric output for {}: {}", ifaceName, e.getMessage());
+            return null;
+        } catch (RuntimeException e) {
+            LOGGER.debug("resolveOfPort: failed for {}: {}", ifaceName, e.getMessage());
+            return null;
+        }
     }
 
     private boolean addFlow(String flow, String label) {
@@ -1098,6 +1158,17 @@ public class DvrManager {
         public int vni;
         public String ip;
         public String mac;
+        /**
+         * OVS ofport of this VM's VF representor on the local bridge. Resolved
+         * at register time via {@code ovs-vsctl get interface &lt;rep&gt; ofport}.
+         * Shortcut flows in table 0 egress directly to this ofport after
+         * {@code strip_vlan} — avoids the ingress VLAN check that NORMAL does.
+         * When unknown (rep not on this host), falls back to legacy
+         * {@code mod_vlan + NORMAL} which still works for VXLAN-tunneled
+         * cross-host peers because the tunnel port accepts any tag.
+         */
+        public Integer repOfPort;
+        public String repName;
     }
 
     /**
@@ -1229,8 +1300,13 @@ public class DvrManager {
                         continue;
                     }
                     TierState srcTier = te.getValue();
+                    // Re-resolve ofport on bootstrap in case OVS assigned a
+                    // different id after openvswitch-switch restart.
+                    if (vm.repOfPort == null && StringUtils.isNotBlank(vm.repName)) {
+                        vm.repOfPort = resolveOfPort(vm.repName);
+                    }
                     if (installL3Route(srcTier.foldedTag, srcTier.gatewayMac,
-                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac)) {
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac, vm.repOfPort)) {
                         reRoute++;
                     }
                     // When ACL was active before the restart, the table-2

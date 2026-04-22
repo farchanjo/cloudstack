@@ -88,7 +88,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             // Register the tier / VM in DvrManager so OpenFlow cross-tier
             // shortcut + ACL flows get installed on br-bond. Runs right after
             // the representor is in the bridge. Silent no-op if missing data.
-            registerDvrIntent(nic, vlanTag);
+            registerDvrIntent(nic, vlanTag, repName);
         }
 
         LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
@@ -372,7 +372,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * this point so DvrManager flows can take effect. Silent no-op when
      * the required bits are absent; the VR path remains the fallback.
      */
-    private void registerDvrIntent(NicTO nic, Integer segmentId) {
+    private void registerDvrIntent(NicTO nic, Integer segmentId, String repName) {
         if (nic == null || segmentId == null || segmentId <= 0) {
             return;
         }
@@ -412,10 +412,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 _libvirtComputingResource.dvrManager.registerGatewayMac(vpcId, segmentId, gatewayMac);
             }
             if (!vmIp.equals(gateway)) {
-                _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, segmentId, vmIp, vmMac);
+                _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, segmentId, vmIp, vmMac, repName);
             }
-            logger.info("registerDvrIntent (hostdev): vpc={} vni={} ip={} mac={} gwMac={}",
-                    vpcId, segmentId, vmIp, vmMac, gatewayMac);
+            logger.info("registerDvrIntent (hostdev): vpc={} vni={} ip={} mac={} gwMac={} rep={}",
+                    vpcId, segmentId, vmIp, vmMac, gatewayMac, repName);
         } catch (RuntimeException e) {
             logger.warn("registerDvrIntent (hostdev) failed for segment={} ip={}: {}",
                     segmentId, nic.getIp(), e.getMessage());
