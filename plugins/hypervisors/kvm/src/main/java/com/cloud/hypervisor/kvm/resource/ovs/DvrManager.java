@@ -152,15 +152,33 @@ public class DvrManager {
 
     /** Cookie stamped on ARP responder flows. */
     static final String DVR_COOKIE_ARP = "0x0dc70ac7e";
-    /** Cookie stamped on L3 routing flows. */
+    /** Cookie stamped on L3 routing flows in table 0 (direct mode). */
     static final String DVR_COOKIE_ROUTE = "0x0dc7e007e";
-    /** Combined mask covering both cookies for bulk del-flows. */
+    /** Cookie stamped on L3 routing flows in table 2 (ACL pipeline mode). */
+    static final String DVR_COOKIE_ROUTE_T2 = "0x0dc7e007f";
+    /** Cookie stamped on the priority=450 table-0 ACL trigger per tier. */
+    static final String DVR_COOKIE_ACL_ENTRY = "0x0dc7ace01";
+    /** Cookie stamped on per-rule ACL allow entries in table 1. */
+    static final String DVR_COOKIE_ACL_RULE = "0x0dc7ace02";
+    /** Cookie stamped on the default drop in table 1. */
+    static final String DVR_COOKIE_ACL_DROP = "0x0dc7ace03";
+    /** Combined mask covering all DVR cookies for bulk del-flows. */
     static final String DVR_COOKIE_MASK = "0x0dc7ffffe";
 
     private static final int PRIORITY_ARP_RESPONDER = 500;
+    /** Priority of the table-0 ACL entry trigger. Must beat L3 shortcut. */
+    private static final int PRIORITY_ACL_ENTRY = 450;
     /** Priority for shortcut-mode L3 routes (real VR MAC). Must beat virtual. */
     private static final int PRIORITY_L3_SHORTCUT = 400;
     private static final int PRIORITY_L3_ROUTE = 300;
+    /** Default priority applied to ACL rule allow entries in table 1. */
+    private static final int PRIORITY_ACL_RULE_DEFAULT = 800;
+    /** Priority of the default drop in table 1 (ACL closed-by-default). */
+    private static final int PRIORITY_ACL_DROP = 100;
+    /** OVS table id for the ACL allow list. */
+    private static final int TABLE_ACL = 1;
+    /** OVS table id for the route copy (only populated while ACL is active). */
+    private static final int TABLE_ROUTE_T2 = 2;
 
     private static final Path STATE_DIR = Paths.get("/var/lib/cloudstack-agent/dvr");
     private static final Path STATE_FILE = STATE_DIR.resolve("state.json");
@@ -228,8 +246,16 @@ public class DvrManager {
                 continue;
             }
             installL3Route(folded, tier.gatewayMac, peerVm.ip, peerVm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+            maybeInstallRouteT2(vpc, folded, tier.gatewayMac, peerVm.ip, peerVm.mac,
+                    dstTier.foldedTag, dstTier.gatewayMac);
         }
         reconcileArpResponders(vpc);
+        // When ACL is active and a tier appears for the first time, the
+        // tier's gateway MAC needs a priority=450 trigger so packets from
+        // this new tier enter the ACL pipeline.
+        if (isAclActive(vpc)) {
+            reconcileAclEntryTriggers(vpc);
+        }
         persistState();
     }
 
@@ -312,6 +338,8 @@ public class DvrManager {
             if (vm.vni != touchedVni) {
                 installL3Route(touched.foldedTag, touched.gatewayMac,
                         vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+                maybeInstallRouteT2(vpc, touched.foldedTag, touched.gatewayMac,
+                        vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
             } else {
                 // Route where this tier is DST: all other tiers as src
                 for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
@@ -319,6 +347,8 @@ public class DvrManager {
                         continue;
                     }
                     installL3Route(te.getValue().foldedTag, te.getValue().gatewayMac,
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+                    maybeInstallRouteT2(vpc, te.getValue().foldedTag, te.getValue().gatewayMac,
                             vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
                 }
             }
@@ -369,6 +399,8 @@ public class DvrManager {
                     entry.ip, entry.mac, thisTier.foldedTag, thisTier.gatewayMac)) {
                 installed++;
             }
+            maybeInstallRouteT2(vpc, srcTier.foldedTag, srcTier.gatewayMac,
+                    entry.ip, entry.mac, thisTier.foldedTag, thisTier.gatewayMac);
         }
         reconcileArpResponders(vpc);
         persistState();
@@ -577,16 +609,70 @@ public class DvrManager {
         }
         String flow = String.format("cookie=%s,table=0,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,actions=%s",
                 DVR_COOKIE_ROUTE, priority, srcFoldedTag, matchMac, dstVmIp, actions);
-        return addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s",
+        boolean ok = addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s",
                 shortcut ? "shortcut" : "virtual",
                 srcFoldedTag, shortcut ? "/" + srcGwMac : "",
                 dstVmIp, dstVmMac, dstFoldedTag, shortcut ? "/" + dstGwMac : ""));
+        // When ACL is active for this VPC, keep an identical-action copy in
+        // table 2 so that packets resubmitted from the ACL allow list land
+        // on the routing decision. Lookup by (srcTag, dstVmIp) happens in
+        // the caller chain (installL3Route has no vpc handle) — we rely on
+        // the caller also invoking {@link #installL3RouteT2} when relevant.
+        return ok;
+    }
+
+    /**
+     * Install the mirror of an L3 route flow in {@value #TABLE_ROUTE_T2}.
+     * Same match + actions as the table-0 primary but a different cookie
+     * ({@link #DVR_COOKIE_ROUTE_T2}) so ACL teardown can bulk-wipe only the
+     * table-2 copies without touching the direct-mode route in table 0.
+     * Only called by the ACL pipeline path.
+     */
+    private boolean installL3RouteT2(int srcFoldedTag, String srcGwMac, String dstVmIp, String dstVmMac,
+                                     int dstFoldedTag, String dstGwMac) {
+        boolean shortcut = StringUtils.isNotBlank(srcGwMac) && StringUtils.isNotBlank(dstGwMac);
+        int priority = shortcut ? PRIORITY_L3_SHORTCUT : PRIORITY_L3_ROUTE;
+        String matchMac = shortcut ? srcGwMac : DVR_GATEWAY_MAC;
+        String actions;
+        if (shortcut) {
+            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,mod_vlan_vid:%d,NORMAL",
+                    dstGwMac, dstVmMac, dstFoldedTag);
+        } else {
+            actions = String.format("mod_dl_dst:%s,mod_vlan_vid:%d,NORMAL",
+                    dstVmMac, dstFoldedTag);
+        }
+        String flow = String.format("cookie=%s,table=%d,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,actions=%s",
+                DVR_COOKIE_ROUTE_T2, TABLE_ROUTE_T2, priority, srcFoldedTag, matchMac, dstVmIp, actions);
+        return addFlow(flow, String.format("l3-route-t2 %s src_tag=%d -> %s/%s tag=%d",
+                shortcut ? "shortcut" : "virtual", srcFoldedTag, dstVmIp, dstVmMac, dstFoldedTag));
+    }
+
+    /**
+     * Install a table-2 mirror only when the VPC has an active ACL list.
+     * Callers use this after each primary {@link #installL3Route} so the
+     * pipeline stays consistent without branching every call site.
+     */
+    private void maybeInstallRouteT2(VpcState vpc, int srcFoldedTag, String srcGwMac,
+                                     String dstVmIp, String dstVmMac, int dstFoldedTag, String dstGwMac) {
+        if (vpc == null || !isAclActive(vpc)) {
+            return;
+        }
+        installL3RouteT2(srcFoldedTag, srcGwMac, dstVmIp, dstVmMac, dstFoldedTag, dstGwMac);
+    }
+
+    /** True when the VPC currently has at least one ACL rule programmed. */
+    private static boolean isAclActive(VpcState vpc) {
+        return vpc != null && vpc.aclRules != null && !vpc.aclRules.isEmpty();
     }
 
     private void removeL3RoutesForDstIp(String dstVmIp) {
         String spec = String.format("cookie=%s/-1,table=0,ip,nw_dst=%s",
                 DVR_COOKIE_ROUTE, dstVmIp);
         delFlows(spec, "l3-route dst=" + dstVmIp);
+        // Also wipe the table-2 mirror (idempotent — NOP if not present).
+        String spec2 = String.format("cookie=%s/-1,table=%d,ip,nw_dst=%s",
+                DVR_COOKIE_ROUTE_T2, TABLE_ROUTE_T2, dstVmIp);
+        delFlows(spec2, "l3-route-t2 dst=" + dstVmIp);
     }
 
     private boolean addFlow(String flow, String label) {
@@ -610,6 +696,242 @@ public class DvrManager {
         } catch (RuntimeException e) {
             LOGGER.warn("DVR del-flows failed ({}): {}", label, e.getMessage());
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Stateless OpenFlow ACL offload (tables 0 → 1 → 2)
+    // -------------------------------------------------------------------
+
+    /**
+     * Shape of an ACL allow rule handed down from management. All CIDR /
+     * proto / port fields are nullable — null means "any". Priority is
+     * honored verbatim so that CloudStack's per-ACL ordering survives.
+     */
+    public static final class AclRule {
+        /** nullable; {@code null} or {@code 0.0.0.0/0} means any. */
+        public String srcCidr;
+        /** nullable; {@code null} or {@code 0.0.0.0/0} means any. */
+        public String dstCidr;
+        /** {@code tcp} | {@code udp} | {@code icmp} | {@code null} (any). */
+        public String ipProto;
+        /** nullable; only honored for tcp/udp. */
+        public Integer dstPort;
+        /** nullable; defaults to {@value #PRIORITY_ACL_RULE_DEFAULT}. */
+        public Integer prio;
+    }
+
+    /**
+     * Add a single rule to the VPC ACL list. Preserves existing rules.
+     * Idempotent with respect to (srcCidr, dstCidr, proto, port, prio) —
+     * {@link #setAclRules} handles programming; this wrapper just appends
+     * and delegates.
+     *
+     * @param vpcId opaque VPC identifier (same fold as {@link #registerTier})
+     * @param rule  rule to add; null is a NOP
+     */
+    public synchronized void registerAclRule(String vpcId, AclRule rule) {
+        if (rule == null) {
+            return;
+        }
+        String vKey = vpcKey(vpcId);
+        VpcState vpc = vpcs.computeIfAbsent(vKey, k -> new VpcState());
+        List<AclRule> merged = new ArrayList<>(vpc.aclRules);
+        merged.add(rule);
+        setAclRules(vpcId, merged);
+    }
+
+    /**
+     * Atomically replace the full ACL rule list for a VPC. This matches
+     * the shape of CloudStack's {@code SetNetworkACLCommand} which sends
+     * the entire effective rule set every time a user edits it.
+     *
+     * <p>Transitions:
+     * <ul>
+     *   <li><b>Empty → non-empty</b>: install per-tier priority=450 table-0
+     *       trigger, table-1 allow rules + default drop, AND a table-2
+     *       copy of every existing L3 route in the VPC.</li>
+     *   <li><b>Non-empty → non-empty</b>: bulk-replace table-1 contents
+     *       (per-rule cookie wipe + re-install). Table-0 trigger + table-2
+     *       copies stay in place.</li>
+     *   <li><b>Non-empty → empty</b>: same as {@link #clearAclRules}.</li>
+     * </ul>
+     *
+     * @param vpcId opaque VPC identifier
+     * @param rules new rule set; null or empty collapses the pipeline
+     */
+    public synchronized void setAclRules(String vpcId, List<AclRule> rules) {
+        String vKey = vpcKey(vpcId);
+        VpcState vpc = vpcs.computeIfAbsent(vKey, k -> new VpcState());
+        List<AclRule> safe = rules == null ? Collections.emptyList() : new ArrayList<>(rules);
+        boolean wasActive = isAclActive(vpc);
+        boolean becomesActive = !safe.isEmpty();
+
+        // Always wipe the per-rule cookie before re-installing — idempotent.
+        delFlows(String.format("cookie=%s/-1,table=%d", DVR_COOKIE_ACL_RULE, TABLE_ACL),
+                "acl-rules table=" + TABLE_ACL);
+
+        vpc.aclRules = safe;
+
+        if (becomesActive) {
+            // Install every rule + the default drop in table 1.
+            int installed = 0;
+            for (AclRule r : safe) {
+                if (installAclRule(r)) {
+                    installed++;
+                }
+            }
+            installAclDefaultDrop();
+            // If we are transitioning empty → non-empty, also install the
+            // per-tier entry trigger (table 0, priority=450) AND back-fill
+            // the table-2 route copies. If we were already active, those
+            // are already in place and need no touch.
+            if (!wasActive) {
+                reconcileAclEntryTriggers(vpc);
+                backfillRouteTableTwo(vpc);
+            }
+            LOGGER.info("DVR setAclRules: vpc={} ruleCount={} installed={} active={}",
+                    vKey, safe.size(), installed, becomesActive);
+        } else {
+            // Non-empty → empty: tear down triggers, table-1 drop, table-2.
+            tearDownAclPipeline();
+            LOGGER.info("DVR setAclRules: vpc={} cleared (pipeline collapsed to table 0)", vKey);
+        }
+        persistState();
+    }
+
+    /** Sugar for {@code setAclRules(vpcId, Collections.emptyList())}. */
+    public synchronized void clearAclRules(String vpcId) {
+        setAclRules(vpcId, Collections.emptyList());
+    }
+
+    /**
+     * Install the per-tier priority=450 trigger so any IP packet addressed
+     * to a known gateway MAC enters the ACL pipeline in table 1. Uses one
+     * flow per tier gateway MAC — the synthetic DVR MAC plus whatever real
+     * VR MACs we learned via {@link #registerGatewayMac}.
+     *
+     * <p>Idempotent: wipes the trigger cookie first, then re-adds the
+     * current set.
+     */
+    private void reconcileAclEntryTriggers(VpcState vpc) {
+        delFlows(String.format("cookie=%s/-1,table=0", DVR_COOKIE_ACL_ENTRY),
+                "acl-entry-trigger table=0");
+        if (vpc == null || !isAclActive(vpc)) {
+            return;
+        }
+        // Collect every distinct gateway MAC in play. DVR gateway MAC is
+        // universal; per-tier real VR MACs light up when shortcut mode is on.
+        Set<String> macs = new LinkedHashSet<>();
+        macs.add(DVR_GATEWAY_MAC);
+        for (TierState tier : vpc.tiers.values()) {
+            if (StringUtils.isNotBlank(tier.gatewayMac)) {
+                macs.add(tier.gatewayMac);
+            }
+        }
+        for (String mac : macs) {
+            String flow = String.format("cookie=%s,table=0,priority=%d,ip,dl_dst=%s,actions=resubmit(,%d)",
+                    DVR_COOKIE_ACL_ENTRY, PRIORITY_ACL_ENTRY, mac, TABLE_ACL);
+            addFlow(flow, "acl-entry-trigger dl_dst=" + mac);
+        }
+    }
+
+    /**
+     * Back-fill table 2 with a copy of every currently installed L3 route
+     * for this VPC. Called once, on empty→non-empty ACL transition.
+     */
+    private void backfillRouteTableTwo(VpcState vpc) {
+        if (vpc == null) {
+            return;
+        }
+        int copied = 0;
+        for (VmEntry vm : vpc.vms.values()) {
+            TierState dstTier = vpc.tiers.get(vm.vni);
+            if (dstTier == null) {
+                continue;
+            }
+            for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
+                if (te.getKey() == vm.vni) {
+                    continue;
+                }
+                TierState srcTier = te.getValue();
+                if (installL3RouteT2(srcTier.foldedTag, srcTier.gatewayMac,
+                        vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac)) {
+                    copied++;
+                }
+            }
+        }
+        LOGGER.info("DVR backfillRouteTableTwo: copied={}", copied);
+    }
+
+    /**
+     * Install one per-rule allow in table 1. Returns {@code true} on success.
+     * Caller is responsible for having wiped the per-rule cookie beforehand
+     * when doing a bulk replace.
+     */
+    private boolean installAclRule(AclRule r) {
+        if (r == null) {
+            return false;
+        }
+        int priority = r.prio == null ? PRIORITY_ACL_RULE_DEFAULT : r.prio;
+        StringBuilder match = new StringBuilder();
+        String proto = r.ipProto == null ? null : r.ipProto.trim().toLowerCase();
+        boolean isIcmp = "icmp".equals(proto);
+        boolean isTcpUdp = "tcp".equals(proto) || "udp".equals(proto);
+        // Base layer: prefer the more specific proto keyword (OVS treats
+        // {tcp,udp,icmp} as "ip,proto=N") so the match is as narrow as the
+        // rule intends. Fallback to bare {@code ip} when proto is null/any.
+        if (isIcmp) {
+            match.append("icmp");
+        } else if ("tcp".equals(proto)) {
+            match.append("tcp");
+        } else if ("udp".equals(proto)) {
+            match.append("udp");
+        } else {
+            match.append("ip");
+        }
+        if (isCidrMeaningful(r.srcCidr)) {
+            match.append(",nw_src=").append(r.srcCidr.trim());
+        }
+        if (isCidrMeaningful(r.dstCidr)) {
+            match.append(",nw_dst=").append(r.dstCidr.trim());
+        }
+        if (isTcpUdp && r.dstPort != null) {
+            match.append(",tp_dst=").append(r.dstPort);
+        }
+        String flow = String.format("cookie=%s,table=%d,priority=%d,%s,actions=resubmit(,%d)",
+                DVR_COOKIE_ACL_RULE, TABLE_ACL, priority, match, TABLE_ROUTE_T2);
+        return addFlow(flow, String.format("acl-rule prio=%d %s", priority, match));
+    }
+
+    /** Install the closed-by-default drop at {@link #PRIORITY_ACL_DROP} in table 1. */
+    private void installAclDefaultDrop() {
+        String flow = String.format("cookie=%s,table=%d,priority=%d,actions=drop",
+                DVR_COOKIE_ACL_DROP, TABLE_ACL, PRIORITY_ACL_DROP);
+        addFlow(flow, "acl-default-drop");
+    }
+
+    /**
+     * Tear down every ACL-related flow across tables 0/1/2. Called when
+     * the last rule is removed (non-empty → empty). Leaves table 0 p=400
+     * L3 routes untouched — they resume direct routing.
+     */
+    private void tearDownAclPipeline() {
+        delFlows(String.format("cookie=%s/-1,table=0", DVR_COOKIE_ACL_ENTRY),
+                "acl-entry-trigger table=0 (teardown)");
+        delFlows(String.format("cookie=%s/-1,table=%d", DVR_COOKIE_ACL_RULE, TABLE_ACL),
+                "acl-rules table=" + TABLE_ACL + " (teardown)");
+        delFlows(String.format("cookie=%s/-1,table=%d", DVR_COOKIE_ACL_DROP, TABLE_ACL),
+                "acl-default-drop table=" + TABLE_ACL + " (teardown)");
+        delFlows(String.format("cookie=%s/-1,table=%d", DVR_COOKIE_ROUTE_T2, TABLE_ROUTE_T2),
+                "l3-route-t2 table=" + TABLE_ROUTE_T2 + " (teardown)");
+    }
+
+    private static boolean isCidrMeaningful(String cidr) {
+        if (StringUtils.isBlank(cidr)) {
+            return false;
+        }
+        String trimmed = cidr.trim();
+        return !"0.0.0.0/0".equals(trimmed) && !"::/0".equals(trimmed);
     }
 
     // -------------------------------------------------------------------
@@ -677,6 +999,12 @@ public class DvrManager {
     public static final class VpcState {
         public Map<Integer, TierState> tiers = new TreeMap<>();
         public Map<String, VmEntry> vms = new LinkedHashMap<>();
+        /**
+         * ACL rule list, driven by {@link #setAclRules}. Non-empty flips
+         * the VPC into the 3-table pipeline; empty collapses back to
+         * single-table direct routing.
+         */
+        public List<AclRule> aclRules = new ArrayList<>();
     }
 
     public static final class TierState {
@@ -711,6 +1039,7 @@ public class DvrManager {
     static final class PersistedVpc {
         public Map<String, TierState> tiers = new HashMap<>();
         public Map<String, VmEntry> vms = new HashMap<>();
+        public List<AclRule> aclRules = new ArrayList<>();
     }
 
     private void loadState() {
@@ -746,6 +1075,9 @@ public class DvrManager {
                 if (pv.vms != null) {
                     vpc.vms.putAll(pv.vms);
                 }
+                if (pv.aclRules != null) {
+                    vpc.aclRules = new ArrayList<>(pv.aclRules);
+                }
                 vpcs.put(ve.getKey(), vpc);
             }
             LOGGER.info("DvrManager loaded state: vpcs={}", vpcs.keySet());
@@ -766,6 +1098,9 @@ public class DvrManager {
                     pv.tiers.put(String.valueOf(te.getKey()), te.getValue());
                 }
                 pv.vms.putAll(ve.getValue().vms);
+                if (ve.getValue().aclRules != null) {
+                    pv.aclRules = new ArrayList<>(ve.getValue().aclRules);
+                }
                 sf.vpcs.put(ve.getKey(), pv);
             }
             Path tmp = STATE_FILE.resolveSibling("state.json.tmp");
@@ -784,6 +1119,7 @@ public class DvrManager {
     public synchronized void bootstrapFromState() {
         int reArp = 0;
         int reRoute = 0;
+        int reAcl = 0;
         for (Map.Entry<String, VpcState> ve : vpcs.entrySet()) {
             VpcState vpc = ve.getValue();
             // Re-install ARP responders for each tier that has at least one
@@ -824,10 +1160,31 @@ public class DvrManager {
                             vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac)) {
                         reRoute++;
                     }
+                    // When ACL was active before the restart, the table-2
+                    // mirror is part of the persisted contract — replay it
+                    // here rather than waiting for the next plug event.
+                    maybeInstallRouteT2(vpc, srcTier.foldedTag, srcTier.gatewayMac,
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
                 }
             }
+            // Re-apply ACL pipeline state after routes so triggers fire into
+            // a fully-populated table 2. Table-1 content is wiped + reinstalled
+            // by installAclRule's cookie contract.
+            if (isAclActive(vpc)) {
+                // Wipe any stale ACL flows that may have survived a crash.
+                delFlows(String.format("cookie=%s/-1,table=%d", DVR_COOKIE_ACL_RULE, TABLE_ACL),
+                        "acl-rules table=" + TABLE_ACL + " (bootstrap)");
+                for (AclRule r : vpc.aclRules) {
+                    if (installAclRule(r)) {
+                        reAcl++;
+                    }
+                }
+                installAclDefaultDrop();
+                reconcileAclEntryTriggers(vpc);
+            }
         }
-        LOGGER.info("DvrManager bootstrapFromState: re-applied arp={} routes={}", reArp, reRoute);
+        LOGGER.info("DvrManager bootstrapFromState: re-applied arp={} routes={} aclRules={}",
+                reArp, reRoute, reAcl);
     }
 
     private static ObjectMapper buildObjectMapper() {
