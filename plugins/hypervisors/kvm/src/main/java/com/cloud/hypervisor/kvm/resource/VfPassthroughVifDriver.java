@@ -85,6 +85,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             // the rep into the bridge; safe no-op for legacy VLAN segments.
             ensureVxlanMeshIfNeeded(nic, vlanTag);
             addRepresentorToOvs(repName, vlanTag);
+            // Register the tier / VM in DvrManager so OpenFlow cross-tier
+            // shortcut + ACL flows get installed on br-bond. Runs right after
+            // the representor is in the bridge. Silent no-op if missing data.
+            registerDvrIntent(nic, vlanTag);
         }
 
         LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
@@ -362,6 +366,107 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * not {@code vxlan://}, and safely swallows errors so plug is not
      * blocked by data-plane issues.
      */
+    /**
+     * Mirror of {@code OvsVifDriver.registerDvrIntent} adapted for VF
+     * passthrough plug: the representor is already in OVS (br-bond) at
+     * this point so DvrManager flows can take effect. Silent no-op when
+     * the required bits are absent; the VR path remains the fallback.
+     */
+    private void registerDvrIntent(NicTO nic, Integer segmentId) {
+        if (nic == null || segmentId == null || segmentId <= 0) {
+            return;
+        }
+        if (_libvirtComputingResource == null || _libvirtComputingResource.dvrManager == null) {
+            return;
+        }
+        if (nic.getType() != com.cloud.network.Networks.TrafficType.Guest) {
+            return;
+        }
+        String vmIp = nic.getIp();
+        String vmMac = nic.getMac();
+        String gateway = nic.getGateway();
+        if (org.apache.commons.lang3.StringUtils.isBlank(vmIp)
+                || org.apache.commons.lang3.StringUtils.isBlank(vmMac)
+                || org.apache.commons.lang3.StringUtils.isBlank(gateway)) {
+            return;
+        }
+        try {
+            String cidr = buildCidrFromIpNetmask(vmIp, nic.getNetmask());
+            String vpcId = nic.getNicDetail("dvr.vpc.id");
+            if (org.apache.commons.lang3.StringUtils.isBlank(vpcId)) {
+                vpcId = nic.getNicDetail("vpc.id");
+            }
+            String gatewayMac = nic.getNicDetail("dvr.gw.mac");
+            if (org.apache.commons.lang3.StringUtils.isBlank(gatewayMac)) {
+                gatewayMac = nic.getNicDetail("gateway.mac");
+            }
+            String vmName = nic.getNicDetail("vxlan.vm.name");
+            if (org.apache.commons.lang3.StringUtils.isBlank(vmName)) {
+                vmName = nic.getUuid();
+            }
+            _libvirtComputingResource.dvrManager.registerTier(vpcId, segmentId,
+                    cidr != null ? cidr : (gateway + "/24"), gateway);
+            if (vmIp.equals(gateway)) {
+                _libvirtComputingResource.dvrManager.registerGatewayMac(vpcId, segmentId, vmMac);
+            } else if (org.apache.commons.lang3.StringUtils.isNotBlank(gatewayMac)) {
+                _libvirtComputingResource.dvrManager.registerGatewayMac(vpcId, segmentId, gatewayMac);
+            }
+            if (!vmIp.equals(gateway)) {
+                _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, segmentId, vmIp, vmMac);
+            }
+            logger.info("registerDvrIntent (hostdev): vpc={} vni={} ip={} mac={} gwMac={}",
+                    vpcId, segmentId, vmIp, vmMac, gatewayMac);
+        } catch (RuntimeException e) {
+            logger.warn("registerDvrIntent (hostdev) failed for segment={} ip={}: {}",
+                    segmentId, nic.getIp(), e.getMessage());
+        }
+    }
+
+    /**
+     * Simple dotted-netmask → {@code a.b.c.d/N} conversion. Falls back to null
+     * when any bit is missing — DvrManager uses the CIDR purely as diagnostic
+     * context, so null is tolerated.
+     */
+    private static String buildCidrFromIpNetmask(String ip, String netmask) {
+        if (org.apache.commons.lang3.StringUtils.isBlank(ip)
+                || org.apache.commons.lang3.StringUtils.isBlank(netmask)) {
+            return null;
+        }
+        try {
+            String[] nm = netmask.trim().split("\\.");
+            if (nm.length != 4) {
+                return null;
+            }
+            int prefix = 0;
+            for (String p : nm) {
+                int v = Integer.parseInt(p);
+                if (v < 0 || v > 255) {
+                    return null;
+                }
+                prefix += Integer.bitCount(v);
+            }
+            String[] ipp = ip.trim().split("\\.");
+            if (ipp.length != 4) {
+                return null;
+            }
+            long ipLong = 0;
+            for (String p : ipp) {
+                int v = Integer.parseInt(p);
+                if (v < 0 || v > 255) {
+                    return null;
+                }
+                ipLong = (ipLong << 8) | v;
+            }
+            long mask = prefix == 0 ? 0 : (-1L << (32 - prefix)) & 0xffffffffL;
+            long net = ipLong & mask;
+            return String.format("%d.%d.%d.%d/%d",
+                    (net >>> 24) & 0xff, (net >>> 16) & 0xff,
+                    (net >>> 8) & 0xff, net & 0xff, prefix);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     private void ensureVxlanMeshIfNeeded(NicTO nic, Integer segmentId) {
         if (segmentId == null || segmentId <= 4094) {
             return;

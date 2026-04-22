@@ -272,24 +272,40 @@ public class OvsVifDriver extends VifDriverBase {
      * never fails a plug; the VR path remains the safe fallback.
      */
     private void registerDvrIntent(NicTO nic, String vlanId) {
+        logger.info("registerDvrIntent ENTRY: vlanId={} nic={} type={} ip={} mac={} gw={} vpc.id={} dvr.gw.mac={}",
+                vlanId,
+                nic == null ? "null" : "present",
+                nic == null ? "n/a" : nic.getType(),
+                nic == null ? "n/a" : nic.getIp(),
+                nic == null ? "n/a" : nic.getMac(),
+                nic == null ? "n/a" : nic.getGateway(),
+                nic == null ? "n/a" : nic.getNicDetail("dvr.vpc.id"),
+                nic == null ? "n/a" : nic.getNicDetail("dvr.gw.mac"));
         if (nic == null || _libvirtComputingResource == null) {
+            logger.info("registerDvrIntent: bail nic/resource null");
             return;
         }
         if (_libvirtComputingResource.dvrManager == null) {
+            logger.info("registerDvrIntent: bail dvrManager null");
             return;
         }
         if (nic.getType() != Networks.TrafficType.Guest) {
+            logger.info("registerDvrIntent: bail type={} not Guest", nic.getType());
             return;
         }
         if (StringUtils.isBlank(vlanId)) {
+            logger.info("registerDvrIntent: bail vlanId blank");
             return;
         }
         String vmIp = nic.getIp();
         String vmMac = nic.getMac();
         String gateway = nic.getGateway();
         if (StringUtils.isBlank(vmIp) || StringUtils.isBlank(vmMac) || StringUtils.isBlank(gateway)) {
+            logger.info("registerDvrIntent: bail blank ip={} mac={} gw={}", vmIp, vmMac, gateway);
             return;
         }
+        logger.info("registerDvrIntent: passed all gates, about to register tier vni={} vpcId={} gwMac={}",
+                vlanId, nic.getNicDetail("dvr.vpc.id"), nic.getNicDetail("dvr.gw.mac"));
         try {
             int vni = Integer.parseInt(vlanId.trim());
             String cidr = buildCidrFromIpNetmask(vmIp, nic.getNetmask());
