@@ -100,7 +100,7 @@ public class VfVdpaLifecycleManager {
                     "ip link set dev %s vf %d mac %s", realPfName, vfIndex, mac));
 
             Script.runSimpleBashScript(String.format(
-                    "vdpa dev add name %s mgmtdev pci/%s mac %s",
+                    "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqp 4",
                     vdpaName, vfPciAddress, mac));
             Script.runSimpleBashScript("modprobe vhost_vdpa");
 

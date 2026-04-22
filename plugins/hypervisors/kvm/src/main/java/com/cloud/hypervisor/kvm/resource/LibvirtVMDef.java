@@ -1889,6 +1889,7 @@ public class LibvirtVMDef {
                 }
                 return netBuilder.toString();
             } else if (_netType == GuestNetType.VDPA) {
+                netBuilder.append("<driver queues='4'/>\n");
                 netBuilder.append("<source dev='" + _vdpaDevPath + "'/>\n");
                 if (_macAddr != null) {
                     netBuilder.append("<mac address='" + _macAddr + "'/>\n");
