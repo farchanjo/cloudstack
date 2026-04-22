@@ -158,6 +158,8 @@ public class DvrManager {
     static final String DVR_COOKIE_MASK = "0x0dc7ffffe";
 
     private static final int PRIORITY_ARP_RESPONDER = 500;
+    /** Priority for shortcut-mode L3 routes (real VR MAC). Must beat virtual. */
+    private static final int PRIORITY_L3_SHORTCUT = 400;
     private static final int PRIORITY_L3_ROUTE = 300;
 
     private static final Path STATE_DIR = Paths.get("/var/lib/cloudstack-agent/dvr");
@@ -225,10 +227,102 @@ public class DvrManager {
             if (dstTier == null) {
                 continue;
             }
-            installL3Route(folded, peerVm.ip, peerVm.mac, dstTier.foldedTag);
+            installL3Route(folded, tier.gatewayMac, peerVm.ip, peerVm.mac, dstTier.foldedTag, dstTier.gatewayMac);
         }
         reconcileArpResponders(vpc);
         persistState();
+    }
+
+    /**
+     * Learn the real MAC address of the VR for a given tier. Called when
+     * the centralized VR plugs into this host (NIC IP == tier gateway IP).
+     * Once known, the shortcut uses the VR's real MAC as the match/rewrite
+     * key and disables the synthetic DVR gateway MAC ARP responder for
+     * this tier (VR answers its own ARP normally — no race).
+     *
+     * <p>Cross-host shortcut (the piece the virtual-MAC DVR couldn't do)
+     * works because the VM sends the packet to its gateway MAC, which is
+     * the VR's real MAC. On the source host, OVS matches on that MAC and
+     * rewrites + tunnels to the destination host where the target VM sits
+     * — no dependency on the VR being local.
+     *
+     * @param vpcId opaque VPC id, same fold as {@link #registerTier}
+     * @param vni   VXLAN VNI of the tier whose gateway MAC we learned
+     * @param gwMac real MAC of the VR on that tier
+     */
+    public synchronized void registerGatewayMac(String vpcId, int vni, String gwMac) {
+        if (vni <= 0 || StringUtils.isBlank(gwMac)) {
+            return;
+        }
+        String vKey = vpcKey(vpcId);
+        VpcState vpc = vpcs.get(vKey);
+        if (vpc == null) {
+            LOGGER.debug("DVR registerGatewayMac: no tier state for vpc={} vni={} yet", vKey, vni);
+            return;
+        }
+        TierState tier = vpc.tiers.get(vni);
+        if (tier == null) {
+            LOGGER.debug("DVR registerGatewayMac: tier vni={} not yet registered for vpc={}", vni, vKey);
+            return;
+        }
+        String normalized = gwMac.trim().toLowerCase();
+        if (normalized.equals(tier.gatewayMac)) {
+            return;
+        }
+        tier.gatewayMac = normalized;
+        LOGGER.info("DVR registerGatewayMac: vpc={} vni={} tag={} gw={} -> real MAC {} (shortcut mode on)",
+                vKey, vni, tier.foldedTag, tier.gatewayIp, normalized);
+        // Tear down the virtual-MAC ARP responder for this tier if it was
+        // installed — VR will answer its own ARP from now on.
+        if (tier.arpInstalled) {
+            removeArpResponder(tier.foldedTag, tier.gatewayIp);
+            tier.arpInstalled = false;
+        }
+        // Re-install every L3 route that touches this tier (as src OR dst)
+        // now that we know the real MAC — old virtual-MAC routes are
+        // superseded by higher-priority real-MAC variants, both cookies
+        // remain cleanly removable by del-flows cookie=DVR_COOKIE_ROUTE.
+        reapplyRoutesTouchingTier(vpc, vni);
+        reconcileArpResponders(vpc);
+        persistState();
+    }
+
+    /**
+     * Re-install every L3 route that has this tier on either side. Called
+     * from {@link #registerGatewayMac} when a tier's real gw MAC becomes
+     * known or changes. Idempotent: OVS replaces flows by (cookie, match)
+     * key. Silently skips routes where either side still lacks a gw MAC —
+     * those stay on the synthetic DVR MAC (backwards-compatible fallback).
+     */
+    private void reapplyRoutesTouchingTier(VpcState vpc, int touchedVni) {
+        if (vpc == null) {
+            return;
+        }
+        TierState touched = vpc.tiers.get(touchedVni);
+        if (touched == null) {
+            return;
+        }
+        for (Map.Entry<String, VmEntry> ve : vpc.vms.entrySet()) {
+            VmEntry vm = ve.getValue();
+            TierState dstTier = vpc.tiers.get(vm.vni);
+            if (dstTier == null) {
+                continue;
+            }
+            // Route where this tier is SRC: dst VM is in another tier, srcTag=touched.foldedTag
+            if (vm.vni != touchedVni) {
+                installL3Route(touched.foldedTag, touched.gatewayMac,
+                        vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+            } else {
+                // Route where this tier is DST: all other tiers as src
+                for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
+                    if (te.getKey() == touchedVni) {
+                        continue;
+                    }
+                    installL3Route(te.getValue().foldedTag, te.getValue().gatewayMac,
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac);
+                }
+            }
+        }
     }
 
     /**
@@ -270,8 +364,9 @@ public class DvrManager {
             if (srcVni == vni) {
                 continue;
             }
-            int srcTag = te.getValue().foldedTag;
-            if (installL3Route(srcTag, entry.ip, entry.mac, thisTier.foldedTag)) {
+            TierState srcTier = te.getValue();
+            if (installL3Route(srcTier.foldedTag, srcTier.gatewayMac,
+                    entry.ip, entry.mac, thisTier.foldedTag, thisTier.gatewayMac)) {
                 installed++;
             }
         }
@@ -364,7 +459,10 @@ public class DvrManager {
         boolean gateOpen = tiersWithLocalVms.size() >= 2;
         for (Map.Entry<Integer, TierState> te : vpc.tiers.entrySet()) {
             TierState tier = te.getValue();
-            boolean shouldInstall = gateOpen && tiersWithLocalVms.contains(te.getKey());
+            // Shortcut mode: when we learned the VR's real MAC, disable
+            // the virtual-MAC ARP responder. VR answers its own ARP.
+            boolean shortcutMode = StringUtils.isNotBlank(tier.gatewayMac);
+            boolean shouldInstall = !shortcutMode && gateOpen && tiersWithLocalVms.contains(te.getKey());
             if (shouldInstall && !tier.arpInstalled) {
                 if (installArpResponder(tier.foldedTag, tier.gatewayIp)) {
                     tier.arpInstalled = true;
@@ -375,7 +473,9 @@ public class DvrManager {
                 removeArpResponder(tier.foldedTag, tier.gatewayIp);
                 tier.arpInstalled = false;
                 LOGGER.info("DVR reconcile: removed ARP responder vni={} tag={} gw={}"
-                        + " (no cross-tier peer)", te.getKey(), tier.foldedTag, tier.gatewayIp);
+                        + " ({})", te.getKey(), tier.foldedTag, tier.gatewayIp,
+                        shortcutMode ? "shortcut mode — real VR MAC known"
+                                : "no cross-tier peer");
             }
         }
     }
@@ -434,21 +534,53 @@ public class DvrManager {
     /**
      * Install a cross-tier L3 route for a specific destination VM.
      *
-     * @param srcFoldedTag the tag packets arrive on (source tier)
+     * <p>Two matching strategies live side by side:
+     * <ul>
+     *   <li><b>Shortcut mode</b> (both {@code srcGwMac} and {@code dstGwMac}
+     *       present) — matches on the VR's real MAC in the source tier and
+     *       rewrites to the VR's real MAC in the destination tier. Works
+     *       cross-host because the VM already addresses the packet to the
+     *       VR MAC via normal ARP. Priority {@value #PRIORITY_L3_SHORTCUT}
+     *       so it wins over the synthetic-MAC variant when both are
+     *       installed during a transition.</li>
+     *   <li><b>Virtual mode</b> (either gwMac is null) — legacy DVR path
+     *       matching on the synthetic {@value #DVR_GATEWAY_MAC}. Requires
+     *       the ARP responder to answer with this MAC so VMs send packets
+     *       to it. Priority {@value #PRIORITY_L3_ROUTE}.</li>
+     * </ul>
+     *
+     * @param srcFoldedTag tag packets arrive on (source tier)
+     * @param srcGwMac     VR's real MAC on the source tier; null → virtual mode
      * @param dstVmIp      destination VM's IP
      * @param dstVmMac     destination VM's MAC (rewritten into dl_dst)
-     * @param dstFoldedTag the tag packets exit on (destination tier)
+     * @param dstFoldedTag tag packets exit on (destination tier)
+     * @param dstGwMac     VR's real MAC on the destination tier; null → virtual mode
      */
-    private boolean installL3Route(int srcFoldedTag, String dstVmIp, String dstVmMac, int dstFoldedTag) {
-        String flow = String.format(
-                "cookie=%s,table=0,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,"
-                        + "actions=mod_dl_dst:%s,"
-                        + "mod_vlan_vid:%d,"
-                        + "NORMAL",
-                DVR_COOKIE_ROUTE, PRIORITY_L3_ROUTE, srcFoldedTag, DVR_GATEWAY_MAC, dstVmIp,
-                dstVmMac, dstFoldedTag);
-        return addFlow(flow, "l3-route src_tag=" + srcFoldedTag + " -> " + dstVmIp + "/" + dstVmMac
-                + " tag=" + dstFoldedTag);
+    private boolean installL3Route(int srcFoldedTag, String srcGwMac, String dstVmIp, String dstVmMac,
+                                   int dstFoldedTag, String dstGwMac) {
+        boolean shortcut = StringUtils.isNotBlank(srcGwMac) && StringUtils.isNotBlank(dstGwMac);
+        int priority = shortcut ? PRIORITY_L3_SHORTCUT : PRIORITY_L3_ROUTE;
+        String matchMac = shortcut ? srcGwMac : DVR_GATEWAY_MAC;
+        String actions;
+        if (shortcut) {
+            // Real-MAC shortcut: rewrite src AND dst MAC + swap VLAN tag +
+            // decrement TTL. NORMAL at the tail so OVS delivers via the
+            // learned FDB (local rep) or floods via VXLAN tunnels when
+            // the destination VM lives on another host. Matches exactly
+            // the POC that hit 22 Gbps same-host and 5.6 Gbps cross-host.
+            actions = String.format("mod_dl_src:%s,mod_dl_dst:%s,dec_ttl,mod_vlan_vid:%d,NORMAL",
+                    dstGwMac, dstVmMac, dstFoldedTag);
+        } else {
+            // Virtual-MAC legacy path: only rewrites dl_dst + tag.
+            actions = String.format("mod_dl_dst:%s,mod_vlan_vid:%d,NORMAL",
+                    dstVmMac, dstFoldedTag);
+        }
+        String flow = String.format("cookie=%s,table=0,priority=%d,ip,dl_vlan=%d,dl_dst=%s,nw_dst=%s,actions=%s",
+                DVR_COOKIE_ROUTE, priority, srcFoldedTag, matchMac, dstVmIp, actions);
+        return addFlow(flow, String.format("l3-route %s src_tag=%d%s -> %s/%s tag=%d%s",
+                shortcut ? "shortcut" : "virtual",
+                srcFoldedTag, shortcut ? "/" + srcGwMac : "",
+                dstVmIp, dstVmMac, dstFoldedTag, shortcut ? "/" + dstGwMac : ""));
     }
 
     private void removeL3RoutesForDstIp(String dstVmIp) {
@@ -552,6 +684,13 @@ public class DvrManager {
         public String gatewayIp;
         public int foldedTag;
         public boolean arpInstalled;
+        /**
+         * Real MAC of the VR on this tier, once observed via
+         * {@link #registerGatewayMac}. Presence flips the tier into
+         * "shortcut mode" — matches real VR MAC, disables virtual-MAC
+         * ARP responder. Null until the VR plugs on this host.
+         */
+        public String gatewayMac;
     }
 
     public static final class VmEntry {
@@ -680,7 +819,9 @@ public class DvrManager {
                     if (te.getKey() == vm.vni) {
                         continue;
                     }
-                    if (installL3Route(te.getValue().foldedTag, vm.ip, vm.mac, dstTier.foldedTag)) {
+                    TierState srcTier = te.getValue();
+                    if (installL3Route(srcTier.foldedTag, srcTier.gatewayMac,
+                            vm.ip, vm.mac, dstTier.foldedTag, dstTier.gatewayMac)) {
                         reRoute++;
                     }
                 }

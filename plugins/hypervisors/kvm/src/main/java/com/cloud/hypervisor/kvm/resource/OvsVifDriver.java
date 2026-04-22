@@ -297,6 +297,18 @@ public class OvsVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(vpcId)) {
                 vpcId = nic.getNicDetail("vpc.id");
             }
+            // Optional: management-supplied VR real MAC for this tier.
+            // When the centralized VR lives on a remote host, the plugging
+            // VM's NIC is the only point that can teach this host the
+            // gateway MAC. Detail keys (first match wins):
+            //   - dvr.gw.mac  : MAC of VR on THIS nic's tier
+            //   - gateway.mac : same, legacy spelling
+            // When present, we register it before the VM so L3 shortcut
+            // routes install with the real MAC immediately.
+            String gatewayMac = nic.getNicDetail("dvr.gw.mac");
+            if (StringUtils.isBlank(gatewayMac)) {
+                gatewayMac = nic.getNicDetail("gateway.mac");
+            }
             // When mgmt doesn't supply a vpc id yet (older mgmt), fold all
             // local tiers into a single synthetic VPC bucket ("*"). Fine
             // for the single-VPC MVP; multi-VPC requires the NIC detail.
@@ -306,7 +318,19 @@ public class OvsVifDriver extends VifDriverBase {
             }
             _libvirtComputingResource.dvrManager.registerTier(vpcId, vni,
                     cidr != null ? cidr : (gateway + "/24"), gateway);
-            _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, vni, vmIp, vmMac);
+            // Teach the gateway MAC before routes get installed, either
+            // because this NIC IS the VR (local plug) or because mgmt
+            // supplied the remote VR's MAC as a NIC detail.
+            if (vmIp.equals(gateway)) {
+                _libvirtComputingResource.dvrManager.registerGatewayMac(vpcId, vni, vmMac);
+            } else if (StringUtils.isNotBlank(gatewayMac)) {
+                _libvirtComputingResource.dvrManager.registerGatewayMac(vpcId, vni, gatewayMac);
+            }
+            // Skip VM registration when the plug is the VR itself —
+            // it's the gateway, not a peer VM.
+            if (!vmIp.equals(gateway)) {
+                _libvirtComputingResource.dvrManager.registerVmInTier(vpcId, vmName, vni, vmIp, vmMac);
+            }
         } catch (NumberFormatException e) {
             logger.warn("registerDvrIntent: non-numeric vlanId '{}': {}", vlanId, e.getMessage());
         } catch (RuntimeException e) {
