@@ -503,7 +503,82 @@ public class DvrManager {
         for (VpcState vpc : vpcs.values()) {
             reconcileArpResponders(vpc);
         }
+        reapEmptyTiersAndVpcs();
         persistState();
+    }
+
+    /**
+     * Alternative unplug entry point: resolve the VM by its MAC address
+     * rather than libvirt instance name. Libvirt sometimes drops the
+     * hostdev PCI metadata on destroy paths, leaving only MAC available in
+     * the InterfaceDef. This path keeps cleanup converging on state even
+     * in that case.
+     *
+     * @param mac VM NIC MAC
+     */
+    public synchronized void unregisterVmByMac(String mac) {
+        if (StringUtils.isBlank(mac)) {
+            return;
+        }
+        String needle = mac.trim().toLowerCase();
+        String foundVmName = null;
+        for (Map.Entry<String, VpcState> ve : vpcs.entrySet()) {
+            for (Map.Entry<String, VmEntry> me : ve.getValue().vms.entrySet()) {
+                if (needle.equals(me.getValue().mac)) {
+                    foundVmName = me.getKey();
+                    break;
+                }
+            }
+            if (foundVmName != null) {
+                break;
+            }
+        }
+        if (foundVmName != null) {
+            LOGGER.info("DVR unregisterVmByMac: mac={} -> vmName={}", needle, foundVmName);
+            unregisterVm(foundVmName);
+        } else {
+            LOGGER.debug("DVR unregisterVmByMac: no VM with mac={}", needle);
+        }
+    }
+
+    /**
+     * Reap tiers without any local VM whose gateway MAC is also unknown
+     * (VR is not on this host either). Then reap VPCs without any tier.
+     * Called at the tail of {@link #unregisterVm} so the persisted state
+     * shrinks back to empty when the last VM of a VPC leaves this host.
+     */
+    private void reapEmptyTiersAndVpcs() {
+        java.util.Iterator<Map.Entry<String, VpcState>> vpcIt = vpcs.entrySet().iterator();
+        while (vpcIt.hasNext()) {
+            Map.Entry<String, VpcState> ve = vpcIt.next();
+            VpcState vpc = ve.getValue();
+            Set<Integer> vnisWithLocalVm = new LinkedHashSet<>();
+            for (VmEntry vm : vpc.vms.values()) {
+                vnisWithLocalVm.add(vm.vni);
+            }
+            java.util.Iterator<Map.Entry<Integer, TierState>> tIt = vpc.tiers.entrySet().iterator();
+            while (tIt.hasNext()) {
+                Map.Entry<Integer, TierState> te = tIt.next();
+                TierState tier = te.getValue();
+                // Keep tier if we have local VMs on it OR the VR lives on
+                // this host (gatewayMac known means we captured it via a
+                // local VR plug). Drop otherwise.
+                boolean hasLocalVm = vnisWithLocalVm.contains(te.getKey());
+                boolean vrLocal = StringUtils.isNotBlank(tier.gatewayMac);
+                if (!hasLocalVm && !vrLocal) {
+                    if (tier.arpInstalled) {
+                        removeArpResponder(tier.foldedTag, tier.gatewayIp);
+                    }
+                    LOGGER.info("DVR reap: removing tier vni={} tag={} (no local VM, no local VR)",
+                            te.getKey(), tier.foldedTag);
+                    tIt.remove();
+                }
+            }
+            if (vpc.tiers.isEmpty() && vpc.vms.isEmpty() && (vpc.aclRules == null || vpc.aclRules.isEmpty())) {
+                LOGGER.info("DVR reap: removing vpc={} (no tiers, no vms, no acl)", ve.getKey());
+                vpcIt.remove();
+            }
+        }
     }
 
     /** Diagnostic: return an unmodifiable snapshot of current VPC state. */

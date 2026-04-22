@@ -104,7 +104,23 @@ public class VfPassthroughVifDriver extends VifDriverBase {
     @Override
     public void unplug(LibvirtVMDef.InterfaceDef iface, boolean delete) {
         String pciAddress = iface.getPciAddress();
+        String mac = iface.getMacAddress();
+        logger.info("VfPassthroughVifDriver.unplug ENTRY: pci={} mac={} netType={} delete={}",
+                pciAddress, mac, iface.getNetType(), delete);
+        // When pciAddress is blank (libvirt teardown strips host info from
+        // the iface on destroy paths), fall back to looking up the VF that
+        // carries this MAC across both PFs.
+        if (StringUtils.isBlank(pciAddress) && StringUtils.isNotBlank(mac)) {
+            pciAddress = lookupVfPciByMac(mac);
+            if (pciAddress != null) {
+                logger.info("VfPassthroughVifDriver.unplug: resolved VF pci={} via mac={}", pciAddress, mac);
+            }
+        }
         if (StringUtils.isBlank(pciAddress)) {
+            logger.info("VfPassthroughVifDriver.unplug: no pciAddress, skipping");
+            // Still notify DvrManager by MAC so state/flows are reaped even
+            // when we cannot find the physical VF.
+            notifyDvrUnregister(mac);
             return;
         }
         String repName = lookupRepresentor(pciAddress);
@@ -113,6 +129,8 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repName));
             logger.info("VF unplug: removed rep {} from OVS and cleared TC", repName);
         }
+        // Notify DvrManager so it reaps the VM entry + shortcut flows.
+        notifyDvrUnregister(mac);
         String pfName = lookupPfFromVf(pciAddress);
         Integer vfId = lookupVfIdFromPci(pciAddress);
         if (pfName != null && vfId != null) {
@@ -127,6 +145,56 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             } catch (RuntimeException e) {
                 logger.warn("refreshAllLocalFlood on VF unplug failed: {}", e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Resolve the VF PCI BDF (e.g. {@code 0000:01:00.2}) that currently
+     * carries the given MAC, scanning both physical functions. Returns null
+     * when no VF matches — caller falls back to skipping the PCI-scoped
+     * teardown steps.
+     */
+    private String lookupVfPciByMac(String mac) {
+        if (StringUtils.isBlank(mac)) {
+            return null;
+        }
+        String norm = mac.trim().toLowerCase();
+        for (String pf : new String[]{"dx6p0", "dx6p1"}) {
+            String cmd = String.format("ip link show dev %s 2>/dev/null | awk -v m=\"%s\" "
+                            + "'/vf / {split($0,a,\" \"); for(i=1;i<=NF;i++) if(a[i]==\"link/ether\"||a[i]==\"MAC\") "
+                            + "{if(tolower(a[i+1])==m) print $2}'", pf, norm);
+            try {
+                String out = Script.runSimpleBashScript(cmd, 5000);
+                if (StringUtils.isBlank(out)) {
+                    continue;
+                }
+                int vfIdx = Integer.parseInt(out.trim());
+                // Map vfIdx -> PCI BDF via /sys/bus/pci/devices/<pf_bdf>/virtfn<N>
+                String pfBdf = pf.equals("dx6p0") ? "0000:01:00.0" : "0000:01:00.1";
+                String bdfCmd = String.format("readlink /sys/bus/pci/devices/%s/virtfn%d 2>/dev/null | awk -F/ '{print $NF}'",
+                        pfBdf, vfIdx);
+                String bdf = Script.runSimpleBashScript(bdfCmd, 5000);
+                if (StringUtils.isNotBlank(bdf)) {
+                    return "0000:" + bdf.trim();
+                }
+            } catch (RuntimeException ignored) {
+                // next PF
+            }
+        }
+        return null;
+    }
+
+    private void notifyDvrUnregister(String mac) {
+        if (_libvirtComputingResource == null || _libvirtComputingResource.dvrManager == null) {
+            return;
+        }
+        if (StringUtils.isBlank(mac)) {
+            return;
+        }
+        try {
+            _libvirtComputingResource.dvrManager.unregisterVmByMac(mac);
+        } catch (RuntimeException e) {
+            logger.warn("DvrManager.unregisterVmByMac({}) failed: {}", mac, e.getMessage());
         }
     }
 
