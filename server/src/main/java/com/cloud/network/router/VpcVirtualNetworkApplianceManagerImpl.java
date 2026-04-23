@@ -87,7 +87,6 @@ import com.cloud.network.vpc.StaticRouteVO;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
 import com.cloud.network.vpc.VpcManager;
-import com.cloud.network.vpc.VpcService;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.PrivateIpDao;
 import com.cloud.network.vpc.dao.StaticRouteDao;
@@ -127,8 +126,6 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
     @Inject
     private VpcManager _vpcMgr;
     @Inject
-    private VpcService _vpcService;
-    @Inject
     private PrivateIpDao _privateIpDao;
     @Inject
     private Site2SiteVpnManager _s2sVpnMgr;
@@ -163,37 +160,6 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         if (network.getTrafficType() != TrafficType.Guest) {
             logger.warn("Network " + network + " is not of type " + TrafficType.Guest);
             return false;
-        }
-
-        // HW offload guest networks use PCI passthrough (hostdev VF) for the VR.
-        // PCI hotplug of VFs into a running VR does not reliably materialise an
-        // eth device inside the guest, so DHCP/SetupGuestNetwork fails with
-        // "Unable to apply dhcp entry on router" on the first VM deploy to a new
-        // tier. Detect this case and trigger restartVpc(cleanup=true) — the
-        // PRE-start pre-alloc in finalizeVirtualMachineProfile will then inject
-        // the new tier NIC into the freshly-started VR's boot XML in a single
-        // start cycle.
-        if (router.getVpcId() != null
-                && router.getState() == VirtualMachine.State.Running
-                && isHwOffloadNetwork(network.getId())
-                && !_networkModel.isVmPartOfNetwork(router.getId(), network.getId())) {
-            logger.info("HW offload tier [{}] being added to running VR [{}] (VPC {}). Hot-plug of hostdev VF is not supported — auto-restarting VPC with cleanup=true.",
-                    network.getName(), router.getInstanceName(), router.getVpcId());
-            try {
-                final boolean restarted = _vpcService.restartVpc(router.getVpcId(), true, false, false, _accountMgr.getSystemUser());
-                if (restarted) {
-                    logger.info("VPC {} restart succeeded; HW offload tier [{}] now attached via boot XML.",
-                            router.getVpcId(), network.getName());
-                    return true;
-                }
-                logger.warn("restartVpc returned false for VPC {} while adding HW offload tier [{}].",
-                        router.getVpcId(), network.getName());
-                return false;
-            } catch (final Exception ex) {
-                logger.error("Auto-restart of VPC {} failed while adding HW offload tier [{}]",
-                        router.getVpcId(), network.getName(), ex);
-                return false;
-            }
         }
 
         // Add router to the Guest network
