@@ -295,6 +295,9 @@ public class NetUtils {
             return addrs;
         }
 
+        if (nic == null) {
+            return addrs;
+        }
         for (InterfaceAddress address : nic.getInterfaceAddresses()) {
             addrs.add(address.getAddress().getHostAddress().split("%")[0]);
         }
@@ -306,7 +309,7 @@ public class NetUtils {
             final String defDev = Script.runSimpleBashScript("/sbin/route -n get default 2> /dev/null | grep interface | awk '{print $2}'");
             return defDev;
         }
-        return Script.runSimpleBashScript("ip route show default 0.0.0.0/0 | head -1 | awk '{print $5}'");
+        return Script.runSimpleBashScript("ip route show default 0.0.0.0/0 | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") {print $(i+1); exit}}'");
     }
 
     public static String getLocalIPString() {
