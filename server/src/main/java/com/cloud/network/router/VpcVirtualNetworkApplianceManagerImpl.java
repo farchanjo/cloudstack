@@ -87,6 +87,7 @@ import com.cloud.network.vpc.StaticRouteVO;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
 import com.cloud.network.vpc.VpcManager;
+import com.cloud.network.vpc.VpcService;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.PrivateIpDao;
 import com.cloud.network.vpc.dao.StaticRouteDao;
@@ -126,6 +127,8 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
     @Inject
     private VpcManager _vpcMgr;
     @Inject
+    private VpcService _vpcService;
+    @Inject
     private PrivateIpDao _privateIpDao;
     @Inject
     private Site2SiteVpnManager _s2sVpnMgr;
@@ -160,6 +163,37 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         if (network.getTrafficType() != TrafficType.Guest) {
             logger.warn("Network " + network + " is not of type " + TrafficType.Guest);
             return false;
+        }
+
+        // HW offload guest networks use PCI passthrough (hostdev VF) for the VR.
+        // PCI hotplug of VFs into a running VR does not reliably materialise an
+        // eth device inside the guest, so DHCP/SetupGuestNetwork fails with
+        // "Unable to apply dhcp entry on router" on the first VM deploy to a new
+        // tier. Detect this case and trigger restartVpc(cleanup=true) — the
+        // PRE-start pre-alloc in finalizeVirtualMachineProfile will then inject
+        // the new tier NIC into the freshly-started VR's boot XML in a single
+        // start cycle.
+        if (router.getVpcId() != null
+                && router.getState() == VirtualMachine.State.Running
+                && isHwOffloadNetwork(network.getId())
+                && !_networkModel.isVmPartOfNetwork(router.getId(), network.getId())) {
+            logger.info("HW offload tier [{}] being added to running VR [{}] (VPC {}). Hot-plug of hostdev VF is not supported — auto-restarting VPC with cleanup=true.",
+                    network.getName(), router.getInstanceName(), router.getVpcId());
+            try {
+                final boolean restarted = _vpcService.restartVpc(router.getVpcId(), true, false, false, _accountMgr.getSystemUser());
+                if (restarted) {
+                    logger.info("VPC {} restart succeeded; HW offload tier [{}] now attached via boot XML.",
+                            router.getVpcId(), network.getName());
+                    return true;
+                }
+                logger.warn("restartVpc returned false for VPC {} while adding HW offload tier [{}].",
+                        router.getVpcId(), network.getName());
+                return false;
+            } catch (final Exception ex) {
+                logger.error("Auto-restart of VPC {} failed while adding HW offload tier [{}]",
+                        router.getVpcId(), network.getName(), ex);
+                return false;
+            }
         }
 
         // Add router to the Guest network
@@ -322,6 +356,47 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
 
         if (vpcId != null) {
             if (domainRouterVO.getState() == State.Starting || domainRouterVO.getState() == State.Running) {
+                // HW offload tier pre-alloc (PRE-start): any guest tier with a
+                // hw-offload offering that does not yet have a VR NIC attached
+                // gets one allocated NOW and inserted into profile.getNics(),
+                // so the tier's hostdev VF appears in the libvirt boot XML on
+                // this VR start (not on the next restart).
+                //
+                // This is the companion of the existing post-start pre-alloc
+                // in finalizeCommandsOnStart: without this PRE-start pass, a
+                // first VM deploy into a brand-new tier boots the VR with only
+                // control+public NICs and DHCP/SetupGuestNetwork fails with
+                // "Unable to apply dhcp entry on router". Running it here makes
+                // the restartVpc path (or any VR start on a VPC with freshly
+                // added tiers) converge in a single start cycle.
+                try {
+                    final java.util.List<? extends Network> vpcNetworksEarly = _vpcMgr.getVpcNetworks(vpcId);
+                    for (final Network vpcNetwork : vpcNetworksEarly) {
+                        if (vpcNetwork.getTrafficType() != TrafficType.Guest) continue;
+                        if (_networkModel.isPrivateGateway(vpcNetwork.getId())) continue;
+                        if (!isHwOffloadNetwork(vpcNetwork.getId())) continue;
+                        final Nic existingNic = _nicDao.findByNtwkIdAndInstanceId(vpcNetwork.getId(), domainRouterVO.getId());
+                        if (existingNic != null) continue;
+                        boolean alreadyInProfile = false;
+                        for (final NicProfile np : profile.getNics()) {
+                            if (np.getNetworkId() == vpcNetwork.getId()) { alreadyInProfile = true; break; }
+                        }
+                        if (alreadyInProfile) continue;
+                        logger.info("PRE-start pre-alloc: allocating NIC for HW offload network {} on VR {} (vpcId={})",
+                                vpcNetwork.getName(), domainRouterVO.getInstanceName(), vpcId);
+                        _routerDao.addRouterToGuestNetwork(domainRouterVO, vpcNetwork);
+                        final NicProfile nicProfile = _networkMgr.createNicForVm(vpcNetwork, null, context, profile, true);
+                        if (nicProfile != null) {
+                            profile.addNic(nicProfile);
+                            logger.info("PRE-start pre-alloc: added NIC profile deviceId={} ip={} network={} to VR {} boot profile",
+                                    nicProfile.getDeviceId(), nicProfile.getIPv4Address(), vpcNetwork.getName(),
+                                    domainRouterVO.getInstanceName());
+                        }
+                    }
+                } catch (final Exception preAllocEx) {
+                    logger.warn("PRE-start pre-alloc failed for VR {} vpcId={}; VR may still boot but require a restart for new HW offload tiers",
+                            domainRouterVO.getInstanceName(), vpcId, preAllocEx);
+                }
                 String defaultDns1 = null;
                 String defaultDns2 = null;
                 String defaultIp6Dns1 = null;
