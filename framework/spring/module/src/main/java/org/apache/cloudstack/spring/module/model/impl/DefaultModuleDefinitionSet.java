@@ -36,6 +36,8 @@ import org.apache.commons.io.IOUtils;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
 import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -164,6 +166,33 @@ public class DefaultModuleDefinitionSet implements ModuleDefinitionSet {
         context.setConfigResources(resources);
         context.setParent(parent);
         context.setClassLoader(def.getClassLoader());
+
+        // Spring 6 does not resolve <property ref="BeanName"/> in a child XML
+        // context via the parent ApplicationContext chain for beans defined in
+        // the grandparent (defaults) context. Mirror DefaultConfigResources /
+        // DefaultConfigProperties / ModuleProperties from the parent into the
+        // child bean factory as singletons so inherited XML fragments resolve.
+        final ApplicationContext parentCtx = parent;
+        if (parentCtx != null) {
+            context.addBeanFactoryPostProcessor(new org.springframework.beans.factory.config.BeanFactoryPostProcessor() {
+                @Override
+                public void postProcessBeanFactory(ConfigurableListableBeanFactory bf) throws BeansException {
+                    for (String beanName : new String[] { DEFAULT_CONFIG_RESOURCES, DEFAULT_CONFIG_PROPERTIES, MODULE_PROPERITES }) {
+                        if (bf.containsBean(beanName)) {
+                            continue;
+                        }
+                        try {
+                            Object bean = parentCtx.getBean(beanName);
+                            bf.registerSingleton(beanName, bean);
+                        } catch (NoSuchBeanDefinitionException ignored) {
+                            // parent lacks this bean; safe to skip
+                        } catch (BeansException ignored) {
+                            // other resolution errors; skip and let refresh() fail naturally
+                        }
+                    }
+                }
+            });
+        }
 
         long start = System.currentTimeMillis();
         if (logger.isInfoEnabled()) {
