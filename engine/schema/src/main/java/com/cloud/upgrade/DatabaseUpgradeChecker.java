@@ -526,6 +526,7 @@ public class DatabaseUpgradeChecker implements SystemIntegrityChecker {
 
             if (dbVersion.compareTo(currentVersion) == 0) {
                 LOGGER.info("DB version and code version matches so no upgrade needed.");
+                executeViewScripts();
                 return;
             }
 
