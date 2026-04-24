@@ -3438,6 +3438,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
     public ConfigKey<?>[] getConfigKeys() {
         return new ConfigKey<?>[] {
                 RouterTemplateKvm,
+                RouterTemplateKvmHwOffload,
                 RouterTemplateVmware,
                 RouterTemplateHyperV,
                 RouterTemplateLxc,
