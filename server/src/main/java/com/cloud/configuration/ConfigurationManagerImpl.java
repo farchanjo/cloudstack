@@ -7082,7 +7082,6 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         boolean specifyAsNumber = cmd.getSpecifyAsNumber();
         String routingModeString = cmd.getRoutingMode();
         boolean hwOffloadEnabled = cmd.isHwOffloadEnabled();
-        boolean vdpaEnabled = cmd.isVdpaEnabled();
         // check if valid domain
         if (CollectionUtils.isNotEmpty(domainIds)) {
             for (final Long domainId: domainIds) {
@@ -7402,10 +7401,6 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         }
         if (hwOffloadEnabled) {
             offering.setHwOffloadEnabled(true);
-            needsUpdate = true;
-        }
-        if (vdpaEnabled) {
-            offering.setVdpaEnabled(true);
             needsUpdate = true;
         }
         if (needsUpdate) {

@@ -176,7 +176,4 @@ public interface NetworkOffering extends InfrastructureEntity, InternalIdentity,
         return false;
     }
 
-    default boolean isVdpaEnabled() {
-        return false;
-    }
 }

@@ -19,7 +19,7 @@
 -- Schema upgrade from 4.24.0.0 to 4.24.1.0
 --;
 -- Drift reconciler: idempotently adds any missing columns/tables from the
--- 4.24.0.0 feature set (SR-IOV VF + SF/vDPA) that may have been introduced
+-- 4.24.0.0 feature set (SR-IOV VF) that may have been introduced
 -- after the original 4.23→4.24 migration was applied, and recreates
 -- network_offering_view to expose hw_offload_enabled in list API responses.
 --;
@@ -92,50 +92,14 @@ VALUES
    'vr.hw.offload.intent.api.port', '9999',
    'TCP port the host agent listens on (cloud0 link-local) for VR HW offload intent API.', '9999');
 
--- ============================================================
--- SR-IOV SF pool + vDPA tables + columns (idempotent)
--- ============================================================
 
-CREATE TABLE IF NOT EXISTS `cloud`.`sriov_sf_pool` (
-  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(40) NOT NULL,
-  `host_id` bigint unsigned NOT NULL,
-  `pf_index` int NOT NULL,
-  `sf_index` int NOT NULL,
-  `devlink_port_handle` varchar(64) NULL,
-  `sf_netdev_name` varchar(32) NULL,
-  `representor_name` varchar(32) NULL,
-  `vdpa_device` varchar(64) NULL,
-  `state` varchar(32) NOT NULL DEFAULT 'FREE',
-  `allocated_to_nic_id` bigint unsigned NULL,
-  `created` datetime NOT NULL,
-  `updated` datetime NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_sriov_sf_pool__host_pf_sf` (`host_id`, `pf_index`, `sf_index`),
-  UNIQUE KEY `uk_sriov_sf_pool__uuid` (`uuid`),
-  KEY `idx_sriov_sf_pool__state` (`state`),
-  KEY `idx_sriov_sf_pool__host_state` (`host_id`, `state`),
-  CONSTRAINT `fk_sriov_sf_pool__host_id` FOREIGN KEY (`host_id`)
-    REFERENCES `cloud`.`host`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_sriov_sf_pool__nic_id` FOREIGN KEY (`allocated_to_nic_id`)
-    REFERENCES `cloud`.`nics`(`id`) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-ALTER TABLE `cloud`.`nics`
-    ADD COLUMN IF NOT EXISTS `sf_pool_id` bigint unsigned NULL COMMENT "Soft reference to sriov_sf_pool.id.";
 
-ALTER TABLE `cloud`.`nics`
-    ADD COLUMN IF NOT EXISTS `vdpa_device` varchar(64) NULL COMMENT "vDPA device path assigned to this NIC.";
 
-ALTER TABLE `cloud`.`network_offerings`
-    ADD COLUMN IF NOT EXISTS `sf_vdpa_enabled` tinyint(1) NOT NULL DEFAULT 0 COMMENT "Enable SR-IOV Sub-Function with vDPA.";
 
 INSERT IGNORE INTO `cloud`.`configuration`
   (`category`, `instance`, `component`, `name`, `value`, `description`, `default_value`)
 VALUES
-  ('Advanced', 'DEFAULT', 'management-server',
-   'vm.sf.vdpa.enabled', 'false',
-   'Master toggle for SR-IOV Sub-Function with vDPA support.', 'false'),
   ('Advanced', 'DEFAULT', 'management-server',
    'vm.sf.pool.size.per.host', '128',
    'Maximum number of Sub-Functions to pre-provision per host via devlink.', '128');

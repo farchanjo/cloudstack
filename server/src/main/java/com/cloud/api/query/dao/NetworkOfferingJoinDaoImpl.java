@@ -131,7 +131,6 @@ public class NetworkOfferingJoinDaoImpl extends GenericDaoBase<NetworkOfferingJo
             networkOfferingResponse.setSpecifyAsNumber(offering.isSpecifyAsNumber());
         }
         networkOfferingResponse.setHwOffloadEnabled(offering.isHwOffloadEnabled());
-        networkOfferingResponse.setVdpaEnabled(offering.isVdpaEnabled());
         networkOfferingResponse.setObjectName("networkoffering");
 
         return networkOfferingResponse;

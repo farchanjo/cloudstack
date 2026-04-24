@@ -34,11 +34,7 @@ import org.apache.cloudstack.api.InternalIdentity;
  * Tracks a single SR-IOV Virtual Function on a host. Allocated to a NIC when
  * a VR (or other VM) with HW offload is plugged. Released when the NIC is
  * removed (FK ON DELETE SET NULL).
- *
- * <p>When a VF is additionally promoted to vDPA (offering.vdpa_enabled=1)
- * {@code vdpaDevice} and {@code vdpaName} are populated so the release path
- * can issue a matching {@code DestroyVdpaCommand}.
- */
+ * */
 @Entity
 @Table(name = "sriov_vf_pool")
 public class SriovVfPoolVO implements InternalIdentity {
@@ -66,12 +62,6 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     @Column(name = "representor_name")
     private String representorName;
-
-    @Column(name = "vdpa_device")
-    private String vdpaDevice;
-
-    @Column(name = "vdpa_name")
-    private String vdpaName;
 
     @Column(name = "state", nullable = false)
     private String state = State.FREE.name();
@@ -125,22 +115,6 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public void setRepresentorName(String representorName) {
         this.representorName = representorName;
-    }
-
-    public String getVdpaDevice() {
-        return vdpaDevice;
-    }
-
-    public void setVdpaDevice(String vdpaDevice) {
-        this.vdpaDevice = vdpaDevice;
-    }
-
-    public String getVdpaName() {
-        return vdpaName;
-    }
-
-    public void setVdpaName(String vdpaName) {
-        this.vdpaName = vdpaName;
     }
 
     public String getState() {

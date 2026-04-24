@@ -1,3 +1,16 @@
+cloudstack (4.24.1.7-SNAPSHOT~noble~noble) unstable; urgency=low
+
+  * Apache CloudStack Release 4.24.1.7-SNAPSHOT~noble
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Fri, 24 Apr 2026 18:39:52 +0000
+
+cloudstack (4.24.1.7-SNAPSHOT~noble) unstable; urgency=low
+
+  * hwoffload router template structural fix + 4.24.1.7-SNAPSHOT
+  * Apache CloudStack Release 4.24.1.7-SNAPSHOT
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Fri, 24 Apr 2026 18:39:11 +0000
+
 cloudstack (4.24.1.6-SNAPSHOT) unstable; urgency=medium
 
   * 4.24.1.6-SNAPSHOT: DVR: refresh peer-host VR MAC after VR (re)start

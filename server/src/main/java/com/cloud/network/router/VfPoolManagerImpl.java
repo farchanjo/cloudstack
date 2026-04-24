@@ -90,20 +90,6 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
     }
 
     @Override
-    public void bindVdpa(long vfPoolId, String vdpaDevice, String vdpaName) {
-        SriovVfPoolVO vf = vfPoolDao.findById(vfPoolId);
-        if (vf == null) {
-            LOGGER.warn(String.format("bindVdpa called for unknown VF pool id=%d", vfPoolId));
-            return;
-        }
-        vf.setVdpaDevice(vdpaDevice);
-        vf.setVdpaName(vdpaName);
-        vfPoolDao.update(vfPoolId, vf);
-        LOGGER.info(String.format("Bound vDPA chardev %s (name=%s) to VF pool id=%d pci=%s",
-                vdpaDevice, vdpaName, vfPoolId, vf.getPciAddress()));
-    }
-
-    @Override
     public boolean release(long vfPoolId) {
         boolean ok = vfPoolDao.release(vfPoolId);
         if (ok) {

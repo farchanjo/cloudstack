@@ -43,12 +43,8 @@ public class NicTO extends NetworkTO {
     String vfPfName;           // Physical Function netdev name (e.g. "dx6p0")
     String vfRepName;          // VF representor netdev name on the host, e.g. "dx6p0vf20"
 
-    /* HW-offload via VF passthrough (hostdev). Mutually exclusive with useVdpa. */
+    /* HW-offload via VF passthrough (hostdev). */
     Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
-
-    /* HW-offload via VF+vDPA (vhost-vdpa chardev). Mutually exclusive with useHwOffload. */
-    String vdpaDevice;         // vhost-vdpa chardev path, e.g. "/dev/vhost-vdpa-0"
-    Boolean useVdpa;           // wrapper Boolean → null preserves wire compat with older agents
 
     /**
      * Free-form String-keyed detail map propagated from the management server
@@ -225,26 +221,6 @@ public class NicTO extends NetworkTO {
 
     public void setVfRepName(String vfRepName) {
         this.vfRepName = vfRepName;
-    }
-
-    public String getVdpaDevice() {
-        return vdpaDevice;
-    }
-
-    public void setVdpaDevice(String vdpaDevice) {
-        this.vdpaDevice = vdpaDevice;
-    }
-
-    public Boolean getUseVdpa() {
-        return useVdpa;
-    }
-
-    public boolean isUseVdpa() {
-        return Boolean.TRUE.equals(useVdpa);
-    }
-
-    public void setUseVdpa(Boolean useVdpa) {
-        this.useVdpa = useVdpa;
     }
 
     /**

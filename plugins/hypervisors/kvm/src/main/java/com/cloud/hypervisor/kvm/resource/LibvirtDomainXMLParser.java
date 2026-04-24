@@ -269,9 +269,6 @@ public class LibvirtDomainXMLParser {
                             hSlot != null ? hSlot.replace("0x", "") : "00",
                             hFunc != null ? hFunc.replace("0x", "") : "0");
                     def.defHostdevNet(pciAddr, mac, 0);
-                } else if (type.equalsIgnoreCase("vdpa")) {
-                    String sourceDev = getAttrValue("source", "dev", nic);
-                    def.defVdpaNet(sourceDev, mac);
                 }
                 String multiQueueNumber = getAttrValue("driver", "queues", nic);
                 if (StringUtils.isNotBlank(multiQueueNumber)) {

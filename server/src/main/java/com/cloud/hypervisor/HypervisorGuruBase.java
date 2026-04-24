@@ -360,12 +360,11 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 return;
             }
             // Non-VRs (user VMs) only receive a VF when the offering has
-            // vdpa_enabled=1. hwOffloadEnabled alone targets VRs (hostdev),
-            // so without this check user VMs would try to grab a VF too.
+            // hwOffloadEnabled=1.
             if (!isVr) {
                 com.cloud.offerings.NetworkOfferingVO off =
                         networkOfferingDao.findById(network.getNetworkOfferingId());
-                if (off == null || (!off.isVdpaEnabled() && !off.isHwOffloadEnabled())) {
+                if (off == null || !off.isHwOffloadEnabled()) {
                     return;
                 }
             }
@@ -392,15 +391,6 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             nicTo.setVfPfName(vf.getPfName());
             nicTo.setVfRepName(vf.getRepresentorName());
 
-            boolean useVdpa = offering != null && offering.isVdpaEnabled();
-            if (!useVdpa && network.getTrafficType() == com.cloud.network.Networks.TrafficType.Public) {
-                useVdpa = vrHasAnyVdpaGuestNic(vmProfile);
-            }
-            if (useVdpa && tryPromoteToVdpa(nicTo, vf, hostId)) {
-                logger.info("Allocated VF {} (PCI {}) on host {} for NIC {} in VF+vDPA mode (vdpa={})",
-                        vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), nicTo.getVdpaDevice());
-                return;
-            }
             nicTo.setUseHwOffload(Boolean.TRUE);
             logger.info("Allocated VF {} (PCI {}) on host {} for NIC {} ({} traffic, HW offload)",
                     vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
@@ -410,65 +400,6 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         } catch (Exception e) {
             logger.warn("Failed to allocate VF for HW offload", e);
         }
-    }
-
-    /**
-     * Attempt to promote an already-allocated VF to VF+vDPA by asking the
-     * agent to bind it as a vhost-vdpa chardev. On success, populates the
-     * vDPA fields on the NicTO and persists the chardev/name on the pool row.
-     *
-     * @return {@code true} if the VF is now bound as vDPA; {@code false} if
-     *         the agent refused and the caller should fall back to hostdev.
-     */
-    private boolean tryPromoteToVdpa(com.cloud.agent.api.to.NicTO nicTo,
-                                     com.cloud.network.router.SriovVfPoolVO vf,
-                                     long hostId) {
-        try {
-            com.cloud.agent.api.CreateVdpaCommand cmd = new com.cloud.agent.api.CreateVdpaCommand(
-                    vf.getPciAddress(), vf.getPfName(), nicTo.getMac());
-            com.cloud.agent.api.Answer answer = agentManager.send(hostId, cmd);
-            if (answer instanceof com.cloud.agent.api.CreateVdpaAnswer && answer.getResult()) {
-                com.cloud.agent.api.CreateVdpaAnswer va = (com.cloud.agent.api.CreateVdpaAnswer) answer;
-                vfPoolManager.bindVdpa(vf.getId(), va.getVdpaDevice(), va.getVdpaName());
-                nicTo.setVdpaDevice(va.getVdpaDevice());
-                nicTo.setUseVdpa(Boolean.TRUE);
-                return true;
-            }
-            logger.warn("CreateVdpa for VF {} on host {} failed ({}); falling back to hostdev VF",
-                    vf.getPciAddress(), hostId, answer != null ? answer.getDetails() : "null answer");
-        } catch (Exception e) {
-            logger.warn("CreateVdpa for VF {} on host {} threw {} — falling back to hostdev VF",
-                    vf.getPciAddress(), hostId, e.getMessage());
-        }
-        return false;
-    }
-
-    /**
-     * True if the VR (DomainRouter) has any Guest-traffic NIC on a network
-     * whose offering has {@code vdpa_enabled=1}. Used to decide whether the
-     * Public NIC of the same VR should also be promoted to vDPA.
-     */
-    private boolean vrHasAnyVdpaGuestNic(VirtualMachineProfile vmProfile) {
-        if (vmProfile.getNics() == null) {
-            return false;
-        }
-        for (com.cloud.vm.NicProfile other : vmProfile.getNics()) {
-            if (other == null || other.getNetworkId() == 0) {
-                continue;
-            }
-            NetworkVO net = networkDao.findById(other.getNetworkId());
-            if (net == null) {
-                continue;
-            }
-            if (net.getTrafficType() != com.cloud.network.Networks.TrafficType.Guest) {
-                continue;
-            }
-            com.cloud.offerings.NetworkOfferingVO off = networkOfferingDao.findById(net.getNetworkOfferingId());
-            if (off != null && off.isVdpaEnabled()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
