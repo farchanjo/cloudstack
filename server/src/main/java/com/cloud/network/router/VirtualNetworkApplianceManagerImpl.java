@@ -102,6 +102,7 @@ import com.cloud.agent.api.NetworkUsageCommand;
 import com.cloud.agent.api.StartupCommand;
 import com.cloud.agent.api.check.CheckSshCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand;
+import com.cloud.agent.api.routing.SetDvrGatewayMacCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand.Action;
 import com.cloud.agent.api.routing.GetRouterAlertsCommand;
 import com.cloud.agent.api.routing.GetRouterMonitorResultsAnswer;
@@ -259,6 +260,7 @@ import com.cloud.vm.Nic;
 import com.cloud.vm.NicIpAlias;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.NicVO;
+import com.cloud.vm.VMInstanceVO;
 import com.cloud.vm.ReservationContext;
 import com.cloud.vm.ReservationContextImpl;
 import com.cloud.vm.VirtualMachine;
@@ -326,6 +328,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
     @Inject protected MonitoringServiceDao _monitorServiceDao;
     @Inject AsyncJobManager _asyncMgr;
     @Inject protected VpcDao _vpcDao;
+    @Inject protected com.cloud.vm.dao.VMInstanceDao _vmDao;
     @Inject protected ApiAsyncJobDispatcher _asyncDispatcher;
     @Inject OpRouterMonitorServiceDao _opRouterMonitorServiceDao;
 
@@ -2809,7 +2812,82 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
             }
         }
 
+        refreshDvrGatewayMacOnPeerHosts(router, routerNics);
+
         return result;
+    }
+
+    /**
+     * After a VPC VR starts (possibly with a newly allocated VF and a new
+     * MAC), push the current guest-tier VR MAC to every data node hosting
+     * a VM in the same VPC so their DvrManager refreshes cross-tier
+     * shortcut flows. Silent best-effort: failure never blocks VR start.
+     */
+    private void refreshDvrGatewayMacOnPeerHosts(final DomainRouterVO router,
+                                                 final java.util.List<? extends Nic> routerNics) {
+        try {
+            final Long vpcId = router.getVpcId();
+            if (vpcId == null) {
+                return;
+            }
+            final Vpc vpc = _vpcDao.findById(vpcId);
+            if (vpc == null) {
+                return;
+            }
+            for (final Nic vrNic : routerNics) {
+                final Network network = _networkModel.getNetwork(vrNic.getNetworkId());
+                if (network == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (vrNic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String host = vrNic.getBroadcastUri().getHost();
+                    vni = host != null ? Integer.parseInt(host) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                final String gwMac = vrNic.getMacAddress();
+                if (gwMac == null) {
+                    continue;
+                }
+                final java.util.Set<Long> targetHostIds = new java.util.LinkedHashSet<>();
+                for (final NicVO tenantNic : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tenantNic.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO vm = _vmDao.findById(tenantNic.getInstanceId());
+                    if (vm == null) {
+                        continue;
+                    }
+                    final Long hostId = vm.getHostId() != null ? vm.getHostId() : vm.getLastHostId();
+                    if (hostId == null || hostId.equals(router.getHostId())) {
+                        continue;
+                    }
+                    targetHostIds.add(hostId);
+                }
+                if (targetHostIds.isEmpty()) {
+                    continue;
+                }
+                for (final Long hostId : targetHostIds) {
+                    try {
+                        _agentMgr.easySend(hostId, new SetDvrGatewayMacCommand(vpc.getUuid(), vni, gwMac));
+                    } catch (final RuntimeException ex) {
+                        logger.debug("refreshDvrGatewayMac: host {} vpc {} vni {} gw {} failed: {}",
+                                hostId, vpc.getUuid(), vni, gwMac, ex.getMessage());
+                    }
+                }
+                logger.info("refreshDvrGatewayMac: dispatched vpc={} vni={} gwMac={} to {} host(s)",
+                        vpc.getUuid(), vni, gwMac, targetHostIds.size());
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("refreshDvrGatewayMacOnPeerHosts: unexpected error {}", e.getMessage());
+        }
     }
 
     @Override
