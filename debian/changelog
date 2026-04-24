@@ -1,3 +1,11 @@
+cloudstack (4.24.1.6-SNAPSHOT) unstable; urgency=medium
+
+  * 4.24.1.6-SNAPSHOT: DVR: refresh peer-host VR MAC after VR (re)start
+    — closes stale-shortcut gap, cross-tier HW offload works out of the
+    box.
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Fri, 24 Apr 2026 10:05:33 +0000
+
 cloudstack (4.24.1.5-SNAPSHOT) unstable; urgency=medium
 
   * 4.24.1.5-SNAPSHOT: no code change (rebuild cycle validation).
