@@ -3141,6 +3141,25 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
             if (Boolean.TRUE.equals(RemoveControlIpOnStop.valueIn(profile.getVirtualMachine().getDataCenterId()))) {
                 removeNics(vm, domR);
             }
+            // Symmetric remove for the VR's own macs (eth1 public hostdev,
+            // eth2 guest tier hostdev). Without this, when the VR is stopped
+            // or destroyed, peer hosts and the VR's own host keep stale
+            // priority=400 OF rules pinning the VR macs (Part A install on
+            // plug had no symmetric remove on full-VM stop — only hot-unplug
+            // calls removeLocalVmFdbRuleByMac via VifPassthroughVifDriver).
+            try {
+                if (vm != null && vm.getType() == VirtualMachine.Type.DomainRouter) {
+                    for (final NicVO nic : _nicDao.listByVmId(vm.getId())) {
+                        final NetworkVO net = _networkDao.findById(nic.getNetworkId());
+                        if (net != null && net.getVpcId() != null && nic.getMacAddress() != null) {
+                            dispatchVxlanFdbBindingRemoveForVm(vm.getId(), nic.getMacAddress());
+                        }
+                    }
+                }
+            } catch (final RuntimeException e) {
+                logger.debug("VR finalizeStop: dispatchVxlanFdbBindingRemove skipped for vm {}: {}",
+                        vm == null ? "?" : vm.getUuid(), e.getMessage());
+            }
         }
     }
 
