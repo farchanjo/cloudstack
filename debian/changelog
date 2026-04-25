@@ -1,3 +1,9 @@
+cloudstack (4.24.1.16-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Drop --strict from FDB pin del-flows so priority=400 rules actually match
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 17:47:25 +0000
+
 cloudstack (4.24.1.15-SNAPSHOT) UNRELEASED; urgency=low
 
   * Symmetric remove dispatch on user VM finalizeStop
