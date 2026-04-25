@@ -1,6 +1,6 @@
-cloudstack (4.24.1.17-SNAPSHOT) UNRELEASED; urgency=low
+cloudstack (4.24.1.18-SNAPSHOT) UNRELEASED; urgency=low
 
-  * Include lastHostId of removed VRs in FDB remove dispatch
+  * Symmetric VR remove dispatch on VR finalizeStop
 
- -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 18:07:38 +0000
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 18:37:50 +0000
 
