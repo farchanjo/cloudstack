@@ -640,8 +640,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             }
             int ofport = Integer.parseInt(ofportStr.trim());
             // Delete any stale rule for this (tag, mac) before adding the fresh one.
+            // NOTE: must NOT use --strict — strict assumes priority=0 for unspecified
+            // fields and won't match the priority=400 rule we want to clear.
             Script.runSimpleBashScript(String.format(
-                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" --strict 2>/dev/null",
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" 2>/dev/null",
                 ovsTag, vmMac));
             Script.runSimpleBashScript(String.format(
                 "ovs-ofctl add-flow br-bond \"table=0,priority=400,dl_vlan=%d,dl_dst=%s,actions=output:%d\"",
@@ -665,8 +667,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         }
         try {
             int ovsTag = toOvsAccessTag(vlanTag);
+            // NOTE: must NOT use --strict here either — strict mode treats
+            // unspecified fields as priority=0 and won't match the priority=400
+            // pin we're trying to clear.
             Script.runSimpleBashScript(String.format(
-                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" --strict 2>/dev/null",
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" 2>/dev/null",
                 ovsTag, vmMac));
             logger.debug("removeLocalVmFdbRule: cleared mac={} tag={}", vmMac, ovsTag);
         } catch (RuntimeException e) {

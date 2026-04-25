@@ -51,10 +51,13 @@ public final class LibvirtSetVxlanFdbBindingCommandWrapper extends
             int ovsTag = VfPassthroughVifDriver.toOvsAccessTag(vni);
             String vxlanPort = String.format("vxlan_%d_%s", vni,
                     remoteIp == null ? "" : remoteIp.substring(remoteIp.lastIndexOf('.') + 1));
-            // Always strip any stale rule first (idempotent). add-flow uses --strict
-            // semantics on (table+match) so we delete by exact match instead of priority.
+            // Always strip any stale rule first (idempotent). NOTE: must NOT use
+            // --strict here — strict mode treats unspecified fields as priority=0
+            // and would never match the priority=400 rule we want to clear. The
+            // non-strict form wildcards everything except (table, dl_vlan, dl_dst)
+            // which is exactly what we need to nuke any existing pin for this mac.
             Script.runSimpleBashScript(String.format(
-                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" --strict 2>/dev/null",
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" 2>/dev/null",
                 ovsTag, mac));
             if (remove) {
                 LOGGER.info("SetVxlanFdbBinding remove: vpc={} vni={} mac={} (cleared)",
