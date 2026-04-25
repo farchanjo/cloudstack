@@ -266,6 +266,19 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
         }
         to.setDetails(getNicDetails(network));
         populateDvrGatewayDetails(to, network, profile);
+        // Enrich VXLAN peer details for the standalone toNicTO path (PlugNicCommand,
+        // hot-plug of additional VR tier NICs after VR is already running). Without
+        // this, agent would only have static agent.properties fallback, and any
+        // VR-host that never had the static config would skip mesh creation.
+        // The toVirtualMachineTO path also calls this — duplicate is idempotent.
+        try {
+            VMInstanceVO vm = virtualMachineDao.findById(profile.getVirtualMachineId());
+            if (vm != null) {
+                enrichVxlanPeerDetails(to, vm);
+            }
+        } catch (RuntimeException e) {
+            logger.debug("toNicTO: enrichVxlanPeerDetails skipped for nic {}: {}", to, e.getMessage());
+        }
 
         //check whether the this nic has secondary ip addresses set
         //set nic secondary ip address in NicTO which are used for security group
