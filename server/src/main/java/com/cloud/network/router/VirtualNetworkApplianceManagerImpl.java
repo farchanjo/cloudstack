@@ -2958,8 +2958,15 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
                 if (macToHost.isEmpty()) {
                     continue;
                 }
-                // For each (mac, hostId) tell every OTHER VM-hosting peer about it.
+                // For each (mac, hostId) tell every OTHER VM-hosting peer about it
+                // PLUS the VR's own host (so the centralized router learns where
+                // tier VMs live and doesn't fall back on its host's NORMAL FDB,
+                // which gets polluted via cross-tunnel hairpin learning).
                 final java.util.Set<Long> allPeerHosts = new java.util.LinkedHashSet<>(macToHost.values());
+                final Long vrHostId = router.getHostId() != null ? router.getHostId() : router.getLastHostId();
+                if (vrHostId != null) {
+                    allPeerHosts.add(vrHostId);
+                }
                 int dispatched = 0;
                 for (final java.util.Map.Entry<String, Long> entry : macToHost.entrySet()) {
                     final String vmMac = entry.getKey();
