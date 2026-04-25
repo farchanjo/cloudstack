@@ -5781,6 +5781,20 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
                 }
             }
         }
+
+        // Tell every peer host of every VPC tier this VM was on to delete the
+        // priority=400 OF rule pinning the VM's mac. Symmetric to the add
+        // dispatch in finalizeStart. Iterate per guest NIC's mac. Best-effort.
+        try {
+            for (final NicVO nic : nics) {
+                final NetworkVO network = _networkDao.findById(nic.getNetworkId());
+                if (network != null && network.getVpcId() != null && nic.getMacAddress() != null) {
+                    _virtualNetAppliance.dispatchVxlanFdbBindingRemoveForVm(vm.getId(), nic.getMacAddress());
+                }
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("UserVm finalizeStop: dispatchVxlanFdbBindingRemove skipped for vm {}: {}", vm.getUuid(), e.getMessage());
+        }
     }
 
     @Override

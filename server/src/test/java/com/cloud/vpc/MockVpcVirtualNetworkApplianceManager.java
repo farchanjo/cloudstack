@@ -317,4 +317,9 @@ public class MockVpcVirtualNetworkApplianceManager extends ManagerBase implement
     public void dispatchVxlanFdbBindingsForVpc(Long vpcId) {
     }
 
+
+    @Override
+    public void dispatchVxlanFdbBindingRemoveForVm(long vmId, String vmMac) {
+    }
+
 }

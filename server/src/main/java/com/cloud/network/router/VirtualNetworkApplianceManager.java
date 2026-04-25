@@ -165,4 +165,12 @@ public interface VirtualNetworkApplianceManager extends Manager, VirtualNetworkA
      * polluted via cross-tunnel hairpin learning. Silent best-effort.
      */
     void dispatchVxlanFdbBindingsForVpc(Long vpcId);
+
+    /**
+     * Symmetric remove counterpart to {@link #dispatchVxlanFdbBindingsForVpc}:
+     * tells every peer host of every VPC tier the VM was on to delete the
+     * priority=400 OF rule for the VM's mac. Called from UserVm finalizeStop
+     * so peer rules don't accumulate as VMs come and go.
+     */
+    void dispatchVxlanFdbBindingRemoveForVm(long vmId, String vmMac);
 }

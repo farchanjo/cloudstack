@@ -3042,6 +3042,91 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
         }
     }
 
+    /**
+     * Symmetric counterpart to {@link #dispatchVxlanFdbBindingsForVpc} for the
+     * stop/destroy path: tells every peer host of every VPC tier the VM was on
+     * to delete the priority=400 OF rule pinning the VM's mac. Without this,
+     * stale rules accumulate on peers as VMs get destroyed (local rule on the
+     * VM's own host is already cleared by VifPassthroughVifDriver.unplug).
+     *
+     * <p>Called from UserVmManagerImpl.finalizeStop. Idempotent — sending the
+     * remove command for an already-cleared rule is a no-op on the agent.
+     * Best-effort: never blocks the stop path.
+     */
+    public void dispatchVxlanFdbBindingRemoveForVm(final long vmId, final String vmMac) {
+        if (vmMac == null || vmMac.isEmpty()) {
+            return;
+        }
+        try {
+            for (final NicVO nic : _nicDao.listByVmId(vmId)) {
+                if (nic.getRemoved() != null) {
+                    continue;
+                }
+                final NetworkVO network = _networkDao.findById(nic.getNetworkId());
+                if (network == null || network.getVpcId() == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (nic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String h = nic.getBroadcastUri().getHost();
+                    vni = h != null ? Integer.parseInt(h) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                final Vpc vpc = _vpcDao.findById(network.getVpcId());
+                if (vpc == null) {
+                    continue;
+                }
+                // Build allHosts set: every host that currently has either a user-VM
+                // tier NIC OR a VR for this VPC. Mirrors the add-side dispatch so
+                // the same set of peers receives the remove.
+                final java.util.Set<Long> allHosts = new java.util.LinkedHashSet<>();
+                for (final NicVO tn : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tn.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO ovm = _vmDao.findById(tn.getInstanceId());
+                    if (ovm == null) {
+                        continue;
+                    }
+                    final Long h = ovm.getHostId() != null ? ovm.getHostId() : ovm.getLastHostId();
+                    if (h != null) {
+                        allHosts.add(h);
+                    }
+                }
+                for (final DomainRouterVO router : _routerDao.listByVpcId(vpc.getId())) {
+                    final Long h = router.getHostId() != null ? router.getHostId() : router.getLastHostId();
+                    if (h != null) {
+                        allHosts.add(h);
+                    }
+                }
+                int dispatched = 0;
+                for (final Long hostId : allHosts) {
+                    try {
+                        _agentMgr.easySend(hostId,
+                                new SetVxlanFdbBindingCommand(vpc.getUuid(), vni, vmMac, "", true));
+                        dispatched++;
+                    } catch (final RuntimeException ex) {
+                        logger.debug("dispatchVxlanFdbBindingRemove: target {} mac {} failed: {}",
+                                hostId, vmMac, ex.getMessage());
+                    }
+                }
+                if (dispatched > 0) {
+                    logger.info("dispatchVxlanFdbBindingRemove: vpc={} vni={} mac={} sent {} remove(s) to {} peer(s)",
+                            vpc.getUuid(), vni, vmMac, dispatched, allHosts.size());
+                }
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingRemoveForVm({}): unexpected error {}", vmId, e.getMessage());
+        }
+    }
+
     @Override
     public void finalizeStop(final VirtualMachineProfile profile, final Answer answer) {
         if (answer != null) {
