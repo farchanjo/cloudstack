@@ -3003,6 +3003,45 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
         }
     }
 
+    /**
+     * Public entry point for non-VR lifecycle hooks (e.g. UserVmManagerImpl
+     * .finalizeStart) to refresh per-tier FDB pins on every peer host whenever
+     * a tier user VM finishes starting. Without this, Part B only fires on VR
+     * finalizeStart — VMs that plug AFTER the VR is already running don't get
+     * their MAC pinned on peer hosts and rely on OVS NORMAL FDB which gets
+     * polluted via cross-tunnel hairpin learning.
+     *
+     * <p>Resolves the VPC's VR(s) and runs the existing per-router dispatch
+     * logic. Multi-VR (redundant) VPCs trigger one dispatch per VR — both
+     * produce the same set of bindings (same user VM topology), so the agent
+     * just receives duplicates which are idempotent.
+     *
+     * <p>Silent best-effort: any error logged at debug, never blocks caller.
+     */
+    public void dispatchVxlanFdbBindingsForVpc(final Long vpcId) {
+        if (vpcId == null) {
+            return;
+        }
+        try {
+            final java.util.List<DomainRouterVO> routers = _routerDao.listByVpcId(vpcId);
+            if (routers == null || routers.isEmpty()) {
+                return;
+            }
+            for (final DomainRouterVO router : routers) {
+                if (router == null) {
+                    continue;
+                }
+                final java.util.List<? extends Nic> routerNics = _nicDao.listByVmId(router.getId());
+                if (routerNics == null || routerNics.isEmpty()) {
+                    continue;
+                }
+                dispatchVxlanFdbBindingsForVpcPeers(router, routerNics);
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingsForVpc({}): unexpected error {}", vpcId, e.getMessage());
+        }
+    }
+
     @Override
     public void finalizeStop(final VirtualMachineProfile profile, final Answer answer) {
         if (answer != null) {

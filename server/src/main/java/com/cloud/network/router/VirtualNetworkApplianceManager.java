@@ -156,4 +156,13 @@ public interface VirtualNetworkApplianceManager extends Manager, VirtualNetworkA
     public boolean prepareAggregatedExecution(Network network, List<DomainRouterVO> routers) throws AgentUnavailableException, ResourceUnavailableException;
 
     public boolean completeAggregatedExecution(Network network, List<DomainRouterVO> routers) throws AgentUnavailableException, ResourceUnavailableException;
+
+    /**
+     * Refresh per-tier static FDB pin OF rules on every peer host of a given
+     * VPC. Called from non-VR lifecycle hooks (UserVm finalizeStart) so that
+     * VMs plugged AFTER the VR is already running get their MAC pinned on all
+     * peers — without this, peers fall back on OVS NORMAL FDB which can be
+     * polluted via cross-tunnel hairpin learning. Silent best-effort.
+     */
+    void dispatchVxlanFdbBindingsForVpc(Long vpcId);
 }

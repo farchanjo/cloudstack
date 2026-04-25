@@ -5667,6 +5667,25 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
             }
         });
 
+        // Refresh per-tier static FDB pin OF rules on every peer host of this
+        // VM's VPC. Without this, VMs plugged AFTER the VR is already running
+        // don't get their MAC pinned on peers — Part B previously only fired
+        // on VR finalizeStart. Idempotent + best-effort (never fails caller).
+        try {
+            final java.util.Set<Long> vpcIds = new java.util.LinkedHashSet<>();
+            for (final NicVO nic : _nicDao.listByVmId(vm.getId())) {
+                final NetworkVO net = _networkDao.findById(nic.getNetworkId());
+                if (net != null && net.getVpcId() != null) {
+                    vpcIds.add(net.getVpcId());
+                }
+            }
+            for (final Long vpcId : vpcIds) {
+                _virtualNetAppliance.dispatchVxlanFdbBindingsForVpc(vpcId);
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("UserVm finalizeStart: dispatchVxlanFdbBindings skipped for vm {}: {}", vm.getUuid(), e.getMessage());
+        }
+
         return true;
     }
 
