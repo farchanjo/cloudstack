@@ -3100,7 +3100,12 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
                         allHosts.add(h);
                     }
                 }
-                for (final DomainRouterVO router : _routerDao.listByVpcId(vpc.getId())) {
+                // Use listIncludingRemovedByVpcId so we also catch the lastHostId of
+                // routers destroyed during a recent restart-vpc-cleanup cycle. Without
+                // this, a VR-migration leaves an orphan pin on the original VR's host
+                // — that host is no longer in the active set and never receives the
+                // remove command (validated 2026-04-25 with 4.24.1.16 deploy+destroy).
+                for (final DomainRouterVO router : _routerDao.listIncludingRemovedByVpcId(vpc.getId())) {
                     final Long h = router.getHostId() != null ? router.getHostId() : router.getLastHostId();
                     if (h != null) {
                         allHosts.add(h);
