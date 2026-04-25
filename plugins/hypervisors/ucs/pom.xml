@@ -23,7 +23,7 @@
     <parent>
         <groupId>org.apache.cloudstack</groupId>
         <artifactId>cloudstack-plugins</artifactId>
-        <version>4.24.1.8-SNAPSHOT</version>
+        <version>4.24.1.9-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <artifactId>cloud-plugin-hypervisor-ucs</artifactId>
