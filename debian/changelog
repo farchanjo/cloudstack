@@ -1,3 +1,10 @@
+cloudstack (4.24.1.14-20260425T170602~noble) unstable; urgency=low
+
+  * Dispatch FDB bindings on user VM finalizeStart, not only on VR start
+  * Apache CloudStack Release 4.24.1.14-20260425T170602
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 17:06:08 +0000
+
 cloudstack (4.24.1.13-SNAPSHOT) UNRELEASED; urgency=low
 
   * Clear static FDB OF rule on VifPassthroughVifDriver.unplug
