@@ -103,6 +103,7 @@ import com.cloud.agent.api.StartupCommand;
 import com.cloud.agent.api.check.CheckSshCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand;
 import com.cloud.agent.api.routing.SetDvrGatewayMacCommand;
+import com.cloud.agent.api.routing.SetVxlanFdbBindingCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand.Action;
 import com.cloud.agent.api.routing.GetRouterAlertsCommand;
 import com.cloud.agent.api.routing.GetRouterMonitorResultsAnswer;
@@ -2813,6 +2814,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
         }
 
         refreshDvrGatewayMacOnPeerHosts(router, routerNics);
+        dispatchVxlanFdbBindingsForVpcPeers(router, routerNics);
 
         return result;
     }
@@ -2887,6 +2889,110 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
             }
         } catch (final RuntimeException e) {
             logger.debug("refreshDvrGatewayMacOnPeerHosts: unexpected error {}", e.getMessage());
+        }
+    }
+
+
+    /**
+     * After a VPC VR start, walk every user VM in each guest tier of the VPC
+     * and tell every peer host (any data node hosting a user VM in this tier
+     * that is NOT the VM's own host) to install a static FDB OF rule pinning
+     * {@code dl_dst=vmMac} on the VXLAN tunnel to the VM's host's storage IP.
+     *
+     * <p>Symmetric to {@link #refreshDvrGatewayMacOnPeerHosts}: the VR-start
+     * event is the single re-convergence point that re-publishes per-tier
+     * topology to all peers. Subsequent user-VM plugs/unplugs are handled
+     * lazily — peers learn via OVS NORMAL until the next VR restart, then
+     * static rules are re-asserted.
+     *
+     * <p>Silent best-effort: never blocks VR start.
+     */
+    private void dispatchVxlanFdbBindingsForVpcPeers(final DomainRouterVO router,
+                                                     final java.util.List<? extends Nic> routerNics) {
+        try {
+            final Long vpcId = router.getVpcId();
+            if (vpcId == null) {
+                return;
+            }
+            final Vpc vpc = _vpcDao.findById(vpcId);
+            if (vpc == null) {
+                return;
+            }
+            for (final Nic vrNic : routerNics) {
+                final Network network = _networkModel.getNetwork(vrNic.getNetworkId());
+                if (network == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (vrNic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String host = vrNic.getBroadcastUri().getHost();
+                    vni = host != null ? Integer.parseInt(host) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                // Build map: vm mac -> vm host id (only for VMs that have a host placement)
+                final java.util.Map<String, Long> macToHost = new java.util.LinkedHashMap<>();
+                for (final NicVO tenantNic : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tenantNic.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO vm = _vmDao.findById(tenantNic.getInstanceId());
+                    if (vm == null) {
+                        continue;
+                    }
+                    final Long hostId = vm.getHostId() != null ? vm.getHostId() : vm.getLastHostId();
+                    if (hostId == null) {
+                        continue;
+                    }
+                    if (tenantNic.getMacAddress() == null) {
+                        continue;
+                    }
+                    macToHost.put(tenantNic.getMacAddress(), hostId);
+                }
+                if (macToHost.isEmpty()) {
+                    continue;
+                }
+                // For each (mac, hostId) tell every OTHER VM-hosting peer about it.
+                final java.util.Set<Long> allPeerHosts = new java.util.LinkedHashSet<>(macToHost.values());
+                int dispatched = 0;
+                for (final java.util.Map.Entry<String, Long> entry : macToHost.entrySet()) {
+                    final String vmMac = entry.getKey();
+                    final Long vmHostId = entry.getValue();
+                    final HostVO vmHost = _hostDao.findById(vmHostId);
+                    if (vmHost == null) {
+                        continue;
+                    }
+                    final String remoteStorageIp = vmHost.getStorageIpAddress();
+                    if (remoteStorageIp == null) {
+                        continue;
+                    }
+                    for (final Long targetHostId : allPeerHosts) {
+                        if (targetHostId.equals(vmHostId)) {
+                            continue; // skip VM's own host (local FDB rule already installed by VifPassthroughVifDriver)
+                        }
+                        try {
+                            _agentMgr.easySend(targetHostId,
+                                    new SetVxlanFdbBindingCommand(vpc.getUuid(), vni, vmMac, remoteStorageIp, false));
+                            dispatched++;
+                        } catch (final RuntimeException ex) {
+                            logger.debug("dispatchVxlanFdbBindings: target {} mac {} -> {} failed: {}",
+                                    targetHostId, vmMac, remoteStorageIp, ex.getMessage());
+                        }
+                    }
+                }
+                if (dispatched > 0) {
+                    logger.info("dispatchVxlanFdbBindings: vpc={} vni={} sent {} binding(s) across {} VM(s) on {} peer host(s)",
+                            vpc.getUuid(), vni, dispatched, macToHost.size(), allPeerHosts.size());
+                }
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingsForVpcPeers: unexpected error {}", e.getMessage());
         }
     }
 
