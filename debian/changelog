@@ -1,3 +1,9 @@
+cloudstack (4.24.1.13-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Clear static FDB OF rule on VifPassthroughVifDriver.unplug
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 16:43:48 +0000
+
 cloudstack (4.24.1.12-SNAPSHOT) UNRELEASED; urgency=low
 
   * Include VR host in Part B FDB binding dispatch targets
