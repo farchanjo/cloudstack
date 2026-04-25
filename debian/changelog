@@ -1,3 +1,9 @@
+cloudstack (4.24.1.15-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Symmetric remove dispatch on user VM finalizeStop
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 17:23:34 +0000
+
 cloudstack (4.24.1.14-20260425T170602~noble) unstable; urgency=low
 
   * Dispatch FDB bindings on user VM finalizeStart, not only on VR start
