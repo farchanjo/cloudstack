@@ -89,6 +89,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             // shortcut + ACL flows get installed on br-bond. Runs right after
             // the representor is in the bridge. Silent no-op if missing data.
             registerDvrIntent(nic, vlanTag, repName);
+            installLocalVmFdbRule(repName, vlanTag, nic.getMac());
         }
 
         LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
@@ -610,4 +611,64 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             return null;
         }
     }
+    /**
+     * Install a high-priority static FDB OF rule that pins {@code vmMac} on
+     * {@code repName}'s ofport for the given access tag. This short-circuits
+     * the OVS NORMAL FDB lookup, so even if FDB gets polluted (e.g. by mesh
+     * hairpin loops), packets destined to this VM are always delivered to the
+     * correct local representor.
+     *
+     * <p>Idempotent: re-installs (replaces) the rule on every plug. Cleaned up
+     * by {@link #removeLocalVmFdbRule}.
+     */
+    private void installLocalVmFdbRule(String repName, Integer vlanTag, String vmMac) {
+        if (repName == null || vmMac == null || vlanTag == null) {
+            return;
+        }
+        try {
+            int ovsTag = toOvsAccessTag(vlanTag);
+            String ofportStr = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl get interface %s ofport 2>/dev/null", repName));
+            if (StringUtils.isBlank(ofportStr) || "-1".equals(ofportStr.trim())) {
+                logger.warn("installLocalVmFdbRule: rep {} has no ofport yet; skipping",
+                    repName);
+                return;
+            }
+            int ofport = Integer.parseInt(ofportStr.trim());
+            // Delete any stale rule for this (tag, mac) before adding the fresh one.
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" --strict 2>/dev/null",
+                ovsTag, vmMac));
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl add-flow br-bond \"table=0,priority=400,dl_vlan=%d,dl_dst=%s,actions=output:%d\"",
+                ovsTag, vmMac, ofport));
+            logger.info("installLocalVmFdbRule: pinned mac={} tag={} -> ofport={} ({})",
+                vmMac, ovsTag, ofport, repName);
+        } catch (RuntimeException e) {
+            logger.warn("installLocalVmFdbRule failed: rep={} tag={} mac={} err={}",
+                repName, vlanTag, vmMac, e.getMessage());
+        }
+    }
+
+    /**
+     * Remove the static FDB rule installed by
+     * {@link #installLocalVmFdbRule}. Called on unplug. Safe to call when the
+     * rule never existed.
+     */
+    private void removeLocalVmFdbRule(Integer vlanTag, String vmMac) {
+        if (vmMac == null || vlanTag == null) {
+            return;
+        }
+        try {
+            int ovsTag = toOvsAccessTag(vlanTag);
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" --strict 2>/dev/null",
+                ovsTag, vmMac));
+            logger.debug("removeLocalVmFdbRule: cleared mac={} tag={}", vmMac, ovsTag);
+        } catch (RuntimeException e) {
+            logger.debug("removeLocalVmFdbRule: cleanup failed mac={} tag={}: {}",
+                vmMac, vlanTag, e.getMessage());
+        }
+    }
+
 }

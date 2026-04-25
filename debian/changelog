@@ -1,3 +1,9 @@
+cloudstack (4.24.1.8-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Remove vDPA feature (SF and VF+vDPA paths)
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Fri, 24 Apr 2026 20:26:54 +0000
+
 cloudstack (4.24.1.7-SNAPSHOT~noble~noble) unstable; urgency=low
 
   * Apache CloudStack Release 4.24.1.7-SNAPSHOT~noble
