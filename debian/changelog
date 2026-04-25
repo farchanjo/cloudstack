@@ -1,3 +1,9 @@
+cloudstack (4.24.1.12-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Include VR host in Part B FDB binding dispatch targets
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 13:35:56 +0000
+
 cloudstack (4.24.1.11-SNAPSHOT) UNRELEASED; urgency=low
 
   * Enrich vxlan.peers in toNicTO so PlugNicCommand path also seeds mesh
