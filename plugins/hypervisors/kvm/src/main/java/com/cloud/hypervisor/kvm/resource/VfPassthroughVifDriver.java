@@ -130,6 +130,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repName));
             logger.info("VF unplug: removed rep {} from OVS and cleared TC", repName);
         }
+        // Clear the static FDB pin OF rule installed at plug time. Match by
+        // dl_dst alone (no --strict) so we don't need to know the access tag
+        // — that info is already gone from the rep we just deleted.
+        removeLocalVmFdbRuleByMac(mac);
         // Notify DvrManager so it reaps the VM entry + shortcut flows.
         notifyDvrUnregister(mac);
         String pfName = lookupPfFromVf(pciAddress);
@@ -668,6 +672,26 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         } catch (RuntimeException e) {
             logger.debug("removeLocalVmFdbRule: cleanup failed mac={} tag={}: {}",
                 vmMac, vlanTag, e.getMessage());
+        }
+    }
+
+    /**
+     * Remove the static FDB pin OF rule by MAC alone — used from unplug when
+     * we no longer have the access tag (the rep is already gone). Non-strict
+     * del-flows wildcards everything except dl_dst so any priority=400 entry
+     * for this VM mac is wiped, regardless of which tier vlan tag it had.
+     */
+    private void removeLocalVmFdbRuleByMac(String vmMac) {
+        if (org.apache.commons.lang3.StringUtils.isBlank(vmMac)) {
+            return;
+        }
+        try {
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_dst=%s\" 2>/dev/null", vmMac));
+            logger.debug("removeLocalVmFdbRuleByMac: cleared mac={}", vmMac);
+        } catch (RuntimeException e) {
+            logger.debug("removeLocalVmFdbRuleByMac: cleanup failed mac={}: {}",
+                vmMac, e.getMessage());
         }
     }
 
