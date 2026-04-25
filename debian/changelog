@@ -1,9 +1,16 @@
-cloudstack (4.24.1.9-SNAPSHOT) UNRELEASED; urgency=low
+cloudstack (4.24.1.11-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Enrich vxlan.peers in toNicTO so PlugNicCommand path also seeds mesh
+
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 12:45:05 +0000
+
+cloudstack (4.24.1.10-SNAPSHOT) UNRELEASED; urgency=low
 
   * Remove vDPA feature (SF and VF+vDPA paths)
   * Static FDB OF rules to bypass NORMAL FDB pollution
+  * VR-driven SetVxlanFdbBindingCommand dispatch (Part B mgmt-side)
 
- -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 11:27:50 +0000
+ -- Fabricio Fonseca <farchanjo@gmail.com>  Sat, 25 Apr 2026 11:59:58 +0000
 
 cloudstack (4.24.1.7-SNAPSHOT~noble~noble) unstable; urgency=low
 
