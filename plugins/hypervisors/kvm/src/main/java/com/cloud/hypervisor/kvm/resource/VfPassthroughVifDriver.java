@@ -28,6 +28,8 @@ import org.apache.commons.lang3.StringUtils;
 import org.libvirt.LibvirtException;
 
 import com.cloud.agent.api.to.NicTO;
+import com.cloud.agent.properties.AgentProperties;
+import com.cloud.agent.properties.AgentPropertiesFileHandler;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.network.Networks;
 import com.cloud.utils.script.Script;
@@ -385,32 +387,102 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         return null;
     }
 
+    private static final java.util.regex.Pattern PF_VF_PHYS_PORT =
+            java.util.regex.Pattern.compile("pf(\\d+)vf(\\d+)");
+
     private void addRepresentorToOvs(String repName, Integer vlanTag) {
-        // Ensure the rep is in br-bond. The boot-time mlx-switchdev.sh script may
-        // already have added it (untagged trunk); we need to (re)apply the VLAN tag.
+        // OVS-DOCA / DPDK userspace path: when openvswitch.dpdk.enabled=true the rep
+        // must be added as a DPDK port bound by the mlx5_pci PMD via dpdk-devargs.
+        // OVS then pushes flows through DOCA Flow / rte_flow into the embedded
+        // e-switch HW. Falls back to kernel netdev path on any resolution failure.
+        boolean dpdkMode = Boolean.TRUE.equals(
+                AgentPropertiesFileHandler.getPropertyValue(AgentProperties.OPENVSWITCH_DPDK_ENABLED));
+        if (dpdkMode) {
+            String physPort = readPhysPortName(repName);
+            java.util.regex.Matcher m = physPort != null ? PF_VF_PHYS_PORT.matcher(physPort) : null;
+            if (m != null && m.matches()) {
+                int pfIdx = Integer.parseInt(m.group(1));
+                int vfIdx = Integer.parseInt(m.group(2));
+                String pfNet = findPfByPhysPortIndex(pfIdx);
+                String pfPci = pfNet != null ? resolvePfPciAddress(pfNet) : null;
+                if (pfPci != null) {
+                    Script.runSimpleBashScript(String.format(
+                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=dpdk options:dpdk-devargs=\"%s,representor=[%d]\"",
+                        repName, repName, pfPci, vfIdx));
+                    applyAccessTagOnRep(repName, vlanTag, true);
+                    logger.info("Added VF representor {} as DPDK port (pf={} vf={} segment={})",
+                            repName, pfPci, vfIdx, vlanTag);
+                    return;
+                }
+                logger.warn("DPDK rep add: failed to resolve PF PCI for rep={} physPort={}; falling back to kernel netdev path",
+                        repName, physPort);
+            } else {
+                logger.warn("DPDK rep add: rep={} has unexpected phys_port_name={}; falling back to kernel netdev path",
+                        repName, physPort);
+            }
+        }
+        // Kernel netdev path (default / fallback). The boot-time mlx-switchdev.sh
+        // script may already have added the rep (untagged trunk); we (re)apply
+        // the VLAN tag below.
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port br-bond %s", repName));
-        // For VLAN-tagged networks (e.g. public VLAN 2988), set tag=N so OVS pops
-        // VLAN on egress to the VF and pushes VLAN on ingress from the VF — same
-        // semantics as a virtio tap on a VLAN access port. Without this tag, the
-        // rep is treated as a trunk port and packets reach the VF still tagged,
-        // which the guest doesn't strip → silent drops.
-        // NOTE: --may-exist add-port doesn't update tag of existing ports, so we
-        // run a separate set/clear to enforce the desired state on every plug.
+        applyAccessTagOnRep(repName, vlanTag, false);
+        Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
+        logger.info("Added VF representor {} to OVS br-bond (segment={}) with clsact qdisc", repName, vlanTag);
+    }
+
+    /**
+     * Apply an OVS access tag on a representor port. Runs separately from add-port
+     * because --may-exist add-port doesn't update tag of an existing port, so we
+     * always re-enforce the desired state on every plug.
+     */
+    private void applyAccessTagOnRep(String repName, Integer vlanTag, boolean dpdkMode) {
         if (vlanTag != null && vlanTag > 0) {
             int ovsTag = toOvsAccessTag(vlanTag);
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set port %s tag=%d", repName, ovsTag));
             if (ovsTag != vlanTag) {
-                logger.info("Mapped network segment {} → internal OVS tag {} (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)",
-                    vlanTag, ovsTag);
+                String suffix = dpdkMode
+                    ? " (DPDK port; segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)"
+                    : " (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)";
+                logger.info("Mapped network segment {} → internal OVS tag {}{}", vlanTag, ovsTag, suffix);
             }
         } else {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl clear port %s tag", repName));
         }
-        Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
-        logger.info("Added VF representor {} to OVS br-bond (segment={}) with clsact qdisc", repName, vlanTag);
+    }
+
+    /**
+     * Find PF netdev by phys_port_name index (eg. pfIdx=0 -> netdev with phys_port_name=p0).
+     */
+    private String findPfByPhysPortIndex(int pfIdx) {
+        String expected = "p" + pfIdx;
+        File netDir = new File("/sys/class/net");
+        String[] ifaces = netDir.list();
+        if (ifaces == null) {
+            return null;
+        }
+        for (String iface : ifaces) {
+            if (expected.equals(readPhysPortName(iface))) {
+                return iface;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the PCI bus address (eg. 0000:01:00.0) of a PF netdev via the
+     * /sys/class/net/&lt;pf&gt;/device symlink.
+     */
+    private String resolvePfPciAddress(String pfName) {
+        try {
+            File devLink = new File("/sys/class/net/" + pfName + "/device");
+            return devLink.getCanonicalFile().getName();
+        } catch (java.io.IOException e) {
+            logger.warn("resolvePfPciAddress failed for {}: {}", pfName, e.getMessage());
+            return null;
+        }
     }
 
     /**
