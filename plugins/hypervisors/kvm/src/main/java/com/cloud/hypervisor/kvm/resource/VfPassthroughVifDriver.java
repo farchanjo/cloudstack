@@ -392,9 +392,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     private void addRepresentorToOvs(String repName, Integer vlanTag) {
         // OVS-DOCA HW offload path: when openvswitch.dpdk.enabled=true the rep is
-        // added as type=doca (NOT type=dpdk). OVS-DOCA auto-completes dv_flow_en=2 +
-        // dv_xmeta_en=4 in dpdk-devargs and programs flows via DOCA Flow API into the
-        // mlx5 e-switch HW table (with LAG offload when kernel bond is detected).
+        // added as type=doca (NOT type=dpdk). dv_flow_en=2,dv_xmeta_en=4 MUST be
+        // passed explicitly in dpdk-devargs to match the shared mlx5_bond_0 LAG
+        // context created by bond1 type=doca; mlx5 PMD rejects re-probe with
+        // mismatched params (see feedback_doca_vf_rep_runtime_add). Programs flows
+        // via DOCA Flow API into the e-switch HW table with LAG offload.
         // Falls back to kernel netdev (linux_tc) on any resolution failure.
         boolean dpdkMode = Boolean.TRUE.equals(
                 AgentPropertiesFileHandler.getPropertyValue(AgentProperties.OPENVSWITCH_DPDK_ENABLED));
@@ -411,7 +413,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                     // dpdk-lsc-interrupt=true enables LSC events for representor link state.
                     // representor=vf[N] is the canonical syntax for switchdev VF representors.
                     Script.runSimpleBashScript(String.format(
-                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=doca options:dpdk-devargs=\"%s,representor=vf[%d]\" options:dpdk-lsc-interrupt=true",
+                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=doca options:dpdk-devargs=\"%s,representor=vf[%d],dv_flow_en=2,dv_xmeta_en=4\" options:dpdk-lsc-interrupt=true",
                         repName, repName, pfPci, vfIdx));
                     applyAccessTagOnRep(repName, vlanTag, true);
                     logger.info("Added VF representor {} as DOCA port (pf={} vf={} segment={})",
