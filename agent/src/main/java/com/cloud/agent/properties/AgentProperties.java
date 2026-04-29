@@ -349,6 +349,15 @@ public class AgentProperties{
      */
     public static final Property<String> OPENVSWITCH_DPDK_OVS_PATH = new Property<>("openvswitch.dpdk.ovs.path", null, String.class);
 
+    /**
+     * Selects the HW-offload backend used by {@link com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler}.<br>
+     * Possible values: <code>tc</code> (kernel TC flower on switchdev VF reps; default, validated 4.24.1.x release train),
+     * <code>of</code> (ovs-ofctl on OVS-DPDK userspace bridges, requires {@code openvswitch.dpdk.enabled=true}).<br>
+     * Data type: String.<br>
+     * Default value: <code>tc</code>
+     */
+    public static final Property<String> HWOFFLOAD_PROGRAMMER = new Property<>("hwoffload.programmer", "tc");
+
     public static final Property<String> HEALTH_CHECK_SCRIPT_PATH =
             new Property<>("agent.health.check.script.path", null, String.class);
 
