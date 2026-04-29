@@ -257,6 +257,23 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 to.setVfPciAddress(vfPci);
                 to.setUseHwOffload(Boolean.TRUE);
                 to.setVfPfName(nicVO.getVfPfName());
+            } else {
+                // NetworkOffering tag-based DPDK vhost-user enablement.
+                // Tag containing "dpdk" or "vhost-user" or "virtio-fast" → DPDK PMD path
+                // (OvsVifDriver auto-creates dpdkvhostuserclient port). Multi-queue + live-migrate.
+                // No tag (or unrelated) → kernel tap (legacy OVS bridge).
+                try {
+                    com.cloud.offerings.NetworkOfferingVO offering =
+                            networkOfferingDao.findById(network.getNetworkOfferingId());
+                    if (offering != null && offering.getTags() != null) {
+                        String tags = offering.getTags().toLowerCase();
+                        if (tags.contains("dpdk") || tags.contains("vhost-user") || tags.contains("virtio-fast")) {
+                            to.setDpdkEnabled(true);
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.debug("toNicTO: NetworkOffering tag lookup failed for nic {}: {}", to, e.getMessage());
+                }
             }
         } else {
             logger.warn("Unable to load NicVO for NicProfile {}", profile);
