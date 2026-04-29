@@ -1837,8 +1837,23 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
         boolean uplinkLag = Boolean.parseBoolean(hwOffloadProps.getProperty("hwoffload.uplink.lag", "false"));
         String uplinkNetdev = hwOffloadProps.getProperty("hwoffload.uplink.netdev");
+        // Pick HW offload backend per hwoffload.programmer (tc default; of = OVS-DPDK userspace).
+        // The cluster can run heterogeneous backends during a rolling migration; mlx5 wire encap
+        // is identical between TC and OF programmed reps, so cross-host VPC traffic stays compatible.
+        String programmerKind = hwOffloadProps.getProperty("hwoffload.programmer", "tc").trim().toLowerCase();
+        com.cloud.hypervisor.kvm.resource.hwoffload.RuleProgrammer hwOffloadProgrammer;
+        if ("of".equals(programmerKind)) {
+            hwOffloadProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.OfFlowProgrammer();
+            LOGGER.info("HW offload backend = of (OVS-DPDK userspace via ovs-ofctl).");
+        } else {
+            if (!"tc".equals(programmerKind)) {
+                LOGGER.warn("Unknown hwoffload.programmer={}, falling back to tc.", programmerKind);
+            }
+            hwOffloadProgrammer = tcRuleProgrammer;
+            LOGGER.info("HW offload backend = tc (kernel TC flower on switchdev VF reps).");
+        }
         intentReconciler = new com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler(
-                representorMapper, tcRuleProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
+                representorMapper, hwOffloadProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
         // Auto-plumb VXLAN tunnel mesh between data nodes when a guest NIC
         // carries a VXLAN VNI. agent.properties legacy keys (vxlan.peers /
         // vxlan.local.ip) are kept only as a fallback — the management

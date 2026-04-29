@@ -43,7 +43,7 @@ import com.cloud.utils.script.Script;
  * {@code IntentReconciler} owns lifecycle (when to add/remove rules) and the
  * {@code RepresentorMapper} maps VF PCI → representor netdev.
  */
-public class TcRuleProgrammer {
+public class TcRuleProgrammer implements RuleProgrammer {
 
     private static final Logger LOGGER = LogManager.getLogger(TcRuleProgrammer.class);
     private static final AtomicInteger ZONE_SEQ = new AtomicInteger(100);

@@ -81,7 +81,7 @@ public class IntentReconciler {
     private static final com.google.gson.Gson GSON = new com.google.gson.Gson();
 
     private final RepresentorMapper repMapper;
-    private final TcRuleProgrammer programmer;
+    private final RuleProgrammer programmer;
     private final Map<String, IntentSpec> currentByVr = new HashMap<>();
 
     /**
@@ -95,11 +95,11 @@ public class IntentReconciler {
     private final boolean uplinkLag;
     private final String uplinkNetdev;
 
-    public IntentReconciler(RepresentorMapper repMapper, TcRuleProgrammer programmer) {
+    public IntentReconciler(RepresentorMapper repMapper, RuleProgrammer programmer) {
         this(repMapper, programmer, UplinkKind.AUTO, false, null);
     }
 
-    public IntentReconciler(RepresentorMapper repMapper, TcRuleProgrammer programmer,
+    public IntentReconciler(RepresentorMapper repMapper, RuleProgrammer programmer,
                             UplinkKind uplinkKind, boolean uplinkLag, String uplinkNetdev) {
         this.repMapper = repMapper;
         this.programmer = programmer;
