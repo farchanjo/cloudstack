@@ -391,10 +391,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             java.util.regex.Pattern.compile("pf(\\d+)vf(\\d+)");
 
     private void addRepresentorToOvs(String repName, Integer vlanTag) {
-        // OVS-DOCA / DPDK userspace path: when openvswitch.dpdk.enabled=true the rep
-        // must be added as a DPDK port bound by the mlx5_pci PMD via dpdk-devargs.
-        // OVS then pushes flows through DOCA Flow / rte_flow into the embedded
-        // e-switch HW. Falls back to kernel netdev path on any resolution failure.
+        // OVS-DOCA HW offload path: when openvswitch.dpdk.enabled=true the rep is
+        // added as type=doca (NOT type=dpdk). OVS-DOCA auto-completes dv_flow_en=2 +
+        // dv_xmeta_en=4 in dpdk-devargs and programs flows via DOCA Flow API into the
+        // mlx5 e-switch HW table (with LAG offload when kernel bond is detected).
+        // Falls back to kernel netdev (linux_tc) on any resolution failure.
         boolean dpdkMode = Boolean.TRUE.equals(
                 AgentPropertiesFileHandler.getPropertyValue(AgentProperties.OPENVSWITCH_DPDK_ENABLED));
         if (dpdkMode) {
@@ -406,18 +407,21 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 String pfNet = findPfByPhysPortIndex(pfIdx);
                 String pfPci = pfNet != null ? resolvePfPciAddress(pfNet) : null;
                 if (pfPci != null) {
+                    // OVS-DOCA expects type=doca (NOT type=dpdk) for HW offload via DOCA Flow.
+                    // dpdk-lsc-interrupt=true enables LSC events for representor link state.
+                    // representor=vf[N] is the canonical syntax for switchdev VF representors.
                     Script.runSimpleBashScript(String.format(
-                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=dpdk options:dpdk-devargs=\"%s,representor=[%d]\"",
+                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=doca options:dpdk-devargs=\"%s,representor=vf[%d]\" options:dpdk-lsc-interrupt=true",
                         repName, repName, pfPci, vfIdx));
                     applyAccessTagOnRep(repName, vlanTag, true);
-                    logger.info("Added VF representor {} as DPDK port (pf={} vf={} segment={})",
+                    logger.info("Added VF representor {} as DOCA port (pf={} vf={} segment={})",
                             repName, pfPci, vfIdx, vlanTag);
                     return;
                 }
-                logger.warn("DPDK rep add: failed to resolve PF PCI for rep={} physPort={}; falling back to kernel netdev path",
+                logger.warn("DOCA rep add: failed to resolve PF PCI for rep={} physPort={}; falling back to kernel netdev path",
                         repName, physPort);
             } else {
-                logger.warn("DPDK rep add: rep={} has unexpected phys_port_name={}; falling back to kernel netdev path",
+                logger.warn("DOCA rep add: rep={} has unexpected phys_port_name={}; falling back to kernel netdev path",
                         repName, physPort);
             }
         }
@@ -443,7 +447,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 "ovs-vsctl set port %s tag=%d", repName, ovsTag));
             if (ovsTag != vlanTag) {
                 String suffix = dpdkMode
-                    ? " (DPDK port; segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)"
+                    ? " (DOCA port; segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)"
                     : " (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)";
                 logger.info("Mapped network segment {} → internal OVS tag {}{}", vlanTag, ovsTag, suffix);
             }
