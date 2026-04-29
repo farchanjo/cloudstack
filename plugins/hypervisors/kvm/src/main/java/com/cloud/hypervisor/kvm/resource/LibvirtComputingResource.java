@@ -1871,6 +1871,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         } catch (RuntimeException e) {
             LOGGER.warn("VxlanTunnelManager.bootstrapFromState failed: {}", e.getMessage());
         }
+        // L2 ghost reconciler: agent restarts can leave OVS vnet ports whose
+        // libvirt tap is gone (VR migrated, agent crash, OvsVifDriver.unplug
+        // missed). Sweep br-bond + cloud0 once at startup and del-port any
+        // vnet not present in a live domain XML.
+        try {
+            com.cloud.hypervisor.kvm.resource.ovs.OvsPortReconciler
+                    .reconcileGhostVnetPorts(LibvirtConnection.getConnection());
+        } catch (Exception ovsRecErr) {
+            LOGGER.warn("OvsPortReconciler invocation failed: {}", ovsRecErr.getMessage());
+        }
 
         // Distributed Virtual Router (MVP). Installs intra-host cross-tier
         // OVS flows so VMs in different tiers of the same VPC on the SAME
