@@ -143,6 +143,17 @@ public class VxlanTunnelManager {
     private final Set<String> localIps;
     /** Fallback peer set from agent.properties; used only when the NIC detail is absent. */
     private final Set<String> fallbackPeers;
+    /**
+     * VNIs that must NEVER receive a VXLAN mesh on this bridge. Populated from
+     * {@code vxlan.public.vnis} (CSV) in {@code agent.properties}. Use case:
+     * the Public VLAN is trunked via the physical uplink (e.g. VLAN 2988 on
+     * {@code bond1}) so a parallel VXLAN mesh produces an L2 loop between
+     * {@code bond1} and the tunnel ports (no split-horizon between those two
+     * paths). Listing the VLAN id here makes both {@code ensureMeshForVni} and
+     * {@code bootstrapFromState} skip plumbing for it and prune any persisted
+     * leftover from {@code state.json}.
+     */
+    private final Set<Integer> publicVnis;
 
     /** In-memory state: VM name -> VNIs plumbed for that VM on this host. */
     private final Map<String, Set<Integer>> activeVnisByVm = new TreeMap<>();
@@ -164,9 +175,11 @@ public class VxlanTunnelManager {
         this.localIpFallback = resolveLocalIp(props);
         this.localIps = discoverAllLocalIpv4Addresses(this.localIpFallback);
         this.fallbackPeers = resolveFallbackPeers(props, this.localIps);
+        this.publicVnis = resolvePublicVnis(props);
         loadState();
-        LOGGER.info("VxlanTunnelManager initialized: bridge={} localIpFallback={} localIps={} fallbackPeers={} activeVms={} activeVnis={}",
-                bridgeName, localIpFallback, localIps, fallbackPeers,
+        pruneBlockedVnisFromState();
+        LOGGER.info("VxlanTunnelManager initialized: bridge={} localIpFallback={} localIps={} fallbackPeers={} publicVnis={} activeVms={} activeVnis={}",
+                bridgeName, localIpFallback, localIps, fallbackPeers, publicVnis,
                 activeVnisByVm.keySet(), lastPeersByVni.keySet());
     }
 
@@ -191,6 +204,10 @@ public class VxlanTunnelManager {
     public synchronized void ensureMeshForVni(String vmName, int vni, Collection<String> peers) {
         if (vni <= 0) {
             LOGGER.warn("ensureMeshForVni: ignoring non-positive vni={}", vni);
+            return;
+        }
+        if (publicVnis.contains(vni)) {
+            LOGGER.warn("ensureMeshForVni: skipping vni={} (listed in vxlan.public.vnis - trunked via uplink, mesh would loop)", vni);
             return;
         }
         Set<String> effectivePeers = effectivePeers(peers);
@@ -326,6 +343,9 @@ public class VxlanTunnelManager {
      *                           in the state file as still alive.
      */
     public synchronized void bootstrapFromState(java.util.function.Predicate<String> runningDomainCheck) {
+        // Re-prune in case publicVnis changed between agent restarts (operator
+        // edited agent.properties without wiping state.json).
+        pruneBlockedVnisFromState();
         LOGGER.info("bootstrapFromState: scanning {} (vms={}, vnis={})",
                 STATE_FILE, activeVnisByVm.size(), lastPeersByVni.size());
         List<String> ghosts = new ArrayList<>();
@@ -347,6 +367,10 @@ public class VxlanTunnelManager {
             for (Integer vni : e.getValue()) {
                 Set<String> peers = lastPeersByVni.get(vni);
                 if (peers == null || peers.isEmpty()) {
+                    continue;
+                }
+                if (publicVnis.contains(vni)) {
+                    LOGGER.warn("bootstrapFromState: skipping public vni={} for vmName={}", vni, vm);
                     continue;
                 }
                 int folded = toOvsAccessTag(vni);
@@ -791,6 +815,61 @@ public class VxlanTunnelManager {
         } catch (RuntimeException e) {
             LOGGER.warn("detectIpv4OnDevice({}) failed: {}", device, e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * Parse {@code vxlan.public.vnis} (CSV of integers) into the set of VNIs
+     * for which a VXLAN mesh must be suppressed because the segment is already
+     * carried as a trunked VLAN on the physical uplink. Tokens that do not
+     * parse cleanly are logged and skipped.
+     */
+    private Set<Integer> resolvePublicVnis(Properties props) {
+        String raw = props.getProperty("vxlan.public.vnis", "");
+        if (StringUtils.isBlank(raw)) {
+            return Collections.emptySet();
+        }
+        Set<Integer> result = new TreeSet<>();
+        for (String token : raw.split(",")) {
+            String t = token.trim();
+            if (StringUtils.isBlank(t)) {
+                continue;
+            }
+            try {
+                int vni = Integer.parseInt(t);
+                if (vni > 0) {
+                    result.add(vni);
+                }
+            } catch (NumberFormatException nfe) {
+                LOGGER.warn("resolvePublicVnis: ignoring non-integer token '{}'", t);
+            }
+        }
+        return Collections.unmodifiableSet(result);
+    }
+
+    /**
+     * Remove every reference to a {@code publicVnis}-listed VNI from the
+     * in-memory state loaded from {@code state.json}. Called from the
+     * constructor and from {@link #bootstrapFromState} so a previously
+     * persisted Public-VLAN entry never gets re-plumbed.
+     */
+    private void pruneBlockedVnisFromState() {
+        if (publicVnis == null || publicVnis.isEmpty()) {
+            return;
+        }
+        int dropped = 0;
+        for (Integer vni : publicVnis) {
+            if (lastPeersByVni.remove(vni) != null) {
+                dropped++;
+            }
+        }
+        for (Map.Entry<String, Set<Integer>> e : activeVnisByVm.entrySet()) {
+            e.getValue().removeAll(publicVnis);
+        }
+        activeVnisByVm.entrySet().removeIf(e -> e.getValue().isEmpty());
+        if (dropped > 0) {
+            persistState();
+            LOGGER.info("pruneBlockedVnisFromState: removed {} public-vni entry(ies) from state", dropped);
         }
     }
 
