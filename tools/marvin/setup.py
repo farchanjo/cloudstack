@@ -27,7 +27,7 @@ except ImportError:
         raise RuntimeError("python setuptools is required to build Marvin")
 
 
-VERSION = "4.24.1.21"
+VERSION = "4.24.1.22"
 
 setup(name="Marvin",
       version=VERSION,
