@@ -2230,8 +2230,15 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         final StopCommand stop = stpCmd;
         try {
             Answer answer = null;
-            if(vm.getHostId() != null) {
+            if (vm.getHostId() != null) {
                 answer = _agentMgr.send(vm.getHostId(), stop);
+            } else {
+                // VM has no host (typical when start failed before allocation, e.g. cleanup
+                // path of a Starting VR whose finalizeCommandsOnStart bailed out).
+                // Nothing to stop on the agent side — treat as already stopped to allow
+                // cleanup to proceed instead of falling through to "Invalid answer" error.
+                logger.debug("sendStop: VM {} has no host_id, treating as already stopped (no-op)", vm.getInstanceName());
+                return true;
             }
             if (answer != null && answer instanceof StopAnswer) {
                 final StopAnswer stopAns = (StopAnswer)answer;
