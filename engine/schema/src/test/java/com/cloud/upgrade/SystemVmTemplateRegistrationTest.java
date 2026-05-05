@@ -221,7 +221,7 @@ public class SystemVmTemplateRegistrationTest {
                 SystemVmTemplateRegistration.getMetadataTemplateDetails(Hypervisor.HypervisorType.VMware,
                         CPU.CPUArch.getDefault());
         assertNotNull(templateDetails);
-        assertEquals(CPU.CPUArch.getDefault(), templateDetails.getArch());
+        assertEquals(CPU.CPUArch.amd64, templateDetails.getArch());
         assertEquals(Hypervisor.HypervisorType.VMware, templateDetails.getHypervisorType());
     }
 

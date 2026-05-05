@@ -32,6 +32,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.function.Consumer;
@@ -43,6 +44,19 @@ import com.cloud.domain.dao.DomainDao;
 import com.cloud.user.AccountVO;
 import com.cloud.user.ApiKeyPairState;
 import com.cloud.user.dao.AccountDao;
+import com.cloud.api.query.ResourceIdSupport;
+import com.cloud.bgp.ASNumber;
+import com.cloud.bgp.ASNumberRange;
+import com.cloud.configuration.ConfigurationService;
+import com.cloud.dc.ASNumberRangeVO;
+import com.cloud.dc.ASNumberVO;
+import com.cloud.dc.VlanDetailsVO;
+import com.cloud.dc.dao.ASNumberDao;
+import com.cloud.dc.dao.ASNumberRangeDao;
+import com.cloud.dc.dao.VlanDetailsDao;
+import com.cloud.hypervisor.Hypervisor;
+import com.cloud.network.vpc.VpcGateway;
+import com.cloud.storage.BucketVO;
 import org.apache.cloudstack.acl.ControlledEntity;
 import org.apache.cloudstack.acl.ControlledEntity.ACLType;
 import org.apache.cloudstack.acl.RoleVO;
@@ -53,6 +67,7 @@ import org.apache.cloudstack.affinity.AffinityGroup;
 import org.apache.cloudstack.affinity.AffinityGroupResponse;
 import org.apache.cloudstack.annotation.AnnotationService;
 import org.apache.cloudstack.annotation.dao.AnnotationDao;
+import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
 import org.apache.cloudstack.api.ApiConstants.DomainDetails;
 import org.apache.cloudstack.api.ApiConstants.HostDetails;
@@ -217,6 +232,7 @@ import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotDataFactory;
 import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotInfo;
 import org.apache.cloudstack.framework.jobs.AsyncJob;
 import org.apache.cloudstack.framework.jobs.AsyncJobManager;
+import org.apache.cloudstack.framework.jobs.dao.AsyncJobDao;
 import org.apache.cloudstack.gui.theme.GuiThemeJoin;
 import org.apache.cloudstack.management.ManagementServerHost;
 import org.apache.cloudstack.network.BgpPeerVO;
@@ -458,7 +474,7 @@ import com.cloud.vm.snapshot.dao.VMSnapshotDao;
 
 import sun.security.x509.X509CertImpl;
 
-public class ApiResponseHelper implements ResponseGenerator {
+public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
 
     protected Logger logger = LogManager.getLogger(ApiResponseHelper.class);
     private static final DecimalFormat s_percentFormat = new DecimalFormat("##.##");
@@ -542,6 +558,8 @@ public class ApiResponseHelper implements ResponseGenerator {
     Site2SiteVpnManager site2SiteVpnManager;
     @Inject
     ResourceIconManager resourceIconManager;
+    @Inject
+    AsyncJobDao asyncJobDao;
 
     public static String getPrettyDomainPath(String path) {
         if (path == null) {
@@ -2335,16 +2353,26 @@ public class ApiResponseHelper implements ResponseGenerator {
 
     @Override
     public AsyncJobResponse queryJobResult(final QueryAsyncJobResultCmd cmd) {
-        final Account caller = CallContext.current().getCallingAccount();
+        ApiCommandResourceType resourceType = getResourceType(cmd.getResourceType());
+        String resourceTypeName = Optional.ofNullable(resourceType).map(ApiCommandResourceType::name).orElse(null);
 
-        final AsyncJob job = _entityMgr.findByIdIncludingRemoved(AsyncJob.class, cmd.getId());
-        if (job == null) {
-            throw new InvalidParameterValueException("Unable to find a job by id " + cmd.getId());
+        Long resourceId = getResourceId(resourceType, cmd.getResourceId());
+        Long jobId = cmd.getId();
+        if (jobId == null && resourceId == null) {
+            throw new InvalidParameterValueException("Expected parameter job id or parameters resource type and resource id");
         }
+
+        final AsyncJob job = asyncJobDao.findJob(jobId, resourceId, resourceTypeName);
+        if (job == null) {
+            throw new InvalidParameterValueException("Unable to find a job by id " + jobId + " resource type "
+                    + cmd.getResourceType() + " resource id " + cmd.getResourceId());
+        }
+        jobId = job.getId();
 
         final User userJobOwner = _accountMgr.getUserIncludingRemoved(job.getUserId());
         final Account jobOwner = _accountMgr.getAccount(userJobOwner.getAccountId());
 
+        final Account caller = CallContext.current().getCallingAccount();
         //check permissions
         if (_accountMgr.isNormalUser(caller.getId())) {
             //regular users can see only jobs they own
@@ -2355,7 +2383,7 @@ public class ApiResponseHelper implements ResponseGenerator {
             _accountMgr.checkAccess(caller, null, true, jobOwner);
         }
 
-        return createAsyncJobResponse(_jobMgr.queryJob(cmd.getId(), true));
+        return createAsyncJobResponse(_jobMgr.queryJob(jobId, true));
     }
 
     public AsyncJobResponse createAsyncJobResponse(AsyncJob job) {
@@ -5840,5 +5868,14 @@ protected Map<String, ResourceIcon> getResourceIconsUsingOsCategory(List<Templat
         }
         response.setResponses(permissionResponses);
         return response;
+    }
+
+    public EntityManager getEntityManager() {
+        return _entityMgr;
+    }
+
+    @Override
+    public AccountManager getAccountManager() {
+        return _accountMgr;
     }
 }
