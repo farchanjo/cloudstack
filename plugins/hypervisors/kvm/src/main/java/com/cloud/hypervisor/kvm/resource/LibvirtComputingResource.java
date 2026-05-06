@@ -449,6 +449,14 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     private VifDriver defaultVifDriver;
     private VifDriver tungstenVifDriver;
     private VifDriver vfPassthroughVifDriver;
+    /**
+     * Driver for the vDPA path (vhost-vdpa mgmt-device on top of an SR-IOV
+     * VF, exposed to the guest via {@code <interface type='vdpa'>}). Loaded
+     * best-effort: when the class is missing the agent still works, just
+     * with the existing passthrough/tap paths — vDPA requests fall back to
+     * a clear error at plug time rather than crashing the whole agent.
+     */
+    private VifDriver vdpaVifDriver;
     private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
@@ -1874,6 +1882,11 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             vfPassthroughVifDriver = getVifDriverClass(VfPassthroughVifDriver.class.getName(), params);
         } catch (ConfigurationException e) {
             LOGGER.warn("VfPassthroughVifDriver not available; SR-IOV VF passthrough requests will fail", e);
+        }
+        try {
+            vdpaVifDriver = getVifDriverClass(VdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("VdpaVifDriver not available; vDPA requests will fail", e);
         }
         representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
         tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
@@ -4718,6 +4731,17 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
+        // Branch order (mutually exclusive): vDPA first, then hostdev
+        // passthrough, then DPDK tag (resolved by the underlying VifDriver),
+        // then kernel tap. NicTO carries only ONE of useVdpa / useHwOffload
+        // / dpdkEnabled at a time; mgmt-side branching enforces this.
+        if (nic.isUseVdpa()) {
+            if (vdpaVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests vDPA (vfPciAddress=" + nic.getVfPciAddress() + ") but VdpaVifDriver is not loaded");
+            }
+            return vdpaVifDriver;
+        }
         if (nic.isUseHwOffload()) {
             if (vfPassthroughVifDriver == null) {
                 throw new InternalErrorException(
