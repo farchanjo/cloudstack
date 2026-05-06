@@ -53,4 +53,7 @@
     <!-- Chassis registration (Phase I.6). -->
     <bean id="ovnChassisRegistrationService" class="com.cloud.network.ovn.manager.OvnChassisRegistrationService"/>
 
+    <!-- AgentManager host-event subscriber that drives the registration service. -->
+    <bean id="ovnChassisListener" class="com.cloud.network.ovn.manager.OvnChassisListener"/>
+
 </beans>
