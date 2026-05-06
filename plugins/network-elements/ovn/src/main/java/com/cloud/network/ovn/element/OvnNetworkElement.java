@@ -212,15 +212,11 @@ public class OvnNetworkElement extends AdapterBase
         if (controller == null) {
             return;
         }
-        // Skip when an LRP mapping already exists for this tier (idempotent).
         // We persist the tier-LRP mapping under Kind.PUBLIC_LRP keyed by
         // network id (re-use of that bucket avoids introducing a new Kind
         // enum value just for tier bindings — semantically the LRP attaches
         // a tier LS to an LR, mirroring the public-side LRP role).
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LRP, network.getId(), controller.getId());
-        if (existing != null) {
-            return;
-        }
         try {
             final String tierName = network.getUuid();
             final String gateway = network.getGateway();
@@ -233,6 +229,17 @@ public class OvnNetworkElement extends AdapterBase
             final int prefix = Integer.parseInt(cidr.substring(cidr.indexOf('/') + 1));
             final List<String> networks = List.of(gateway + "/" + prefix);
             final String gwMac = deriveGatewayMac(gateway);
+            if (existing != null) {
+                // Already bound — reconcile gateway IP / CIDR. Cheap idempotent
+                // path: rewrite LRP.networks (and MAC) so a tier reconfigure
+                // (CloudStack updateNetwork on gateway/CIDR) propagates without
+                // tearing the patch pair down.
+                pluginManager.nbClient(network.getDataCenterId())
+                        .updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
+                LOGGER.debug("OvnNetworkElement.ensureTierBound: LRP {} reconciled (tier id={}, networks={})",
+                        existing.getOvnUuid(), network.getId(), networks);
+                return;
+            }
             final OvnNbClient.BindResult bind = vpcElement.bindTierToVpc(vpc, tierLsUuid, tierName, gwMac, networks);
             logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PUBLIC_LRP, network.getId(), controller.getId(),
                     bind.lrpUuid, "lrp-" + tierName));
@@ -281,9 +288,9 @@ public class OvnNetworkElement extends AdapterBase
             return true;
         }
         final OvnLogicalIdMapVO already = logicalIdMapDao.findByCsId(Kind.NIC, nic.getId(), controller.getId());
+        final List<String> addresses = buildAddresses(nic);
         if (already == null) {
             final String lsUuid = ensureLogicalSwitch(network);
-            final List<String> addresses = buildAddresses(nic);
             final String lspName = buildLspName(nic);
             try {
                 final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
@@ -296,6 +303,20 @@ public class OvnNetworkElement extends AdapterBase
             } catch (OvnException e) {
                 throw new ResourceUnavailableException("OVN LSP create failed: " + e.getMessage(),
                         Network.class, network.getId());
+            }
+        } else {
+            // LSP already exists — reconcile addresses + port_security so an
+            // updateVmNicIp / NIC IP change without VM stop+start propagates
+            // to OVN. Idempotent: writing the same set is a no-op cost-wise
+            // but lets the spoof guard track the new IP.
+            try {
+                pluginManager.nbClient(network.getDataCenterId())
+                        .updateLogicalSwitchPortAddresses(already.getOvnUuid(), addresses);
+                LOGGER.debug("OvnNetworkElement.prepare: LSP {} reconciled (nic id={}, addrs={})",
+                        already.getOvnUuid(), nic.getId(), addresses);
+            } catch (OvnException e) {
+                LOGGER.warn("OvnNetworkElement.prepare: LSP {} reconcile failed: {}",
+                        already.getOvnUuid(), e.getMessage());
             }
         }
         // DHCP pin (idempotent — OvnDhcpService handles the per-tier row).
@@ -678,12 +699,46 @@ public class OvnNetworkElement extends AdapterBase
     public boolean implementVpc(final Vpc vpc, final DeployDestination dest, final ReservationContext context)
             throws ConcurrentOperationException, ResourceUnavailableException, InsufficientCapacityException {
         try {
-            vpcElement.createLogicalRouterFor(vpc);
+            final String lrUuid = vpcElement.createLogicalRouterFor(vpc);
+            // Idempotent: if VPC already has a source-NAT public IP allocated,
+            // program the VPC-level SNAT row up front (parent CIDR -> ext IP)
+            // instead of waiting for the per-tier applyIps lifecycle (which
+            // CloudStack only fires when a public IP is explicitly associated
+            // to a tier — typically never for the source-NAT IP).
+            ensureVpcSourceNat(vpc, lrUuid);
             return true;
         } catch (com.cloud.network.ovn.client.OvnException e) {
             LOGGER.error("OvnNetworkElement.implementVpc: VPC id={} OVN LR create failed: {}", vpc.getId(), e.getMessage());
             throw new ResourceUnavailableException("OVN LR create failed: " + e.getMessage(),
                     Vpc.class, vpc.getId());
+        }
+    }
+
+    /**
+     * Programs the VPC-level SNAT row when a source-NAT public IP exists.
+     * Best-effort: missing IP / missing CIDR is a soft no-op (the VPC just
+     * has no public-side egress configured yet — the row will be added when
+     * {@link #updateVpcSourceNatIp} fires later).
+     */
+    private void ensureVpcSourceNat(final Vpc vpc, final String lrUuid) {
+        final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
+        if (sourceNatIps == null || sourceNatIps.isEmpty()) {
+            LOGGER.debug("OvnNetworkElement.ensureVpcSourceNat: VPC id={} no source-NAT IP yet", vpc.getId());
+            return;
+        }
+        final IPAddressVO ip = sourceNatIps.get(0);
+        final String externalIp = ip.getAddress() == null ? null : ip.getAddress().addr();
+        final String vpcCidr = vpc.getCidr();
+        if (StringUtils.isBlank(externalIp) || StringUtils.isBlank(vpcCidr)) {
+            LOGGER.warn("OvnNetworkElement.ensureVpcSourceNat: VPC id={} missing ext={} or cidr={}; skipping",
+                    vpc.getId(), externalIp, vpcCidr);
+            return;
+        }
+        try {
+            sourceNatService.ensureVpcSourceNat(vpc.getZoneId(), vpc.getId(), lrUuid, externalIp, vpcCidr);
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.ensureVpcSourceNat: VPC id={} SNAT add failed: {}",
+                    vpc.getId(), e.getMessage());
         }
     }
 
@@ -737,12 +792,40 @@ public class OvnNetworkElement extends AdapterBase
 
     @Override
     public boolean updateVpcSourceNatIp(final Vpc vpc, final com.cloud.network.IpAddress address) {
-        // Source NAT IP rotation via OvnSourceNatService.updateSnatExternalIp
-        // is not yet exposed; accept and log so the orchestrator does not
-        // bounce the rotation. Real swap lands when the public network
-        // manager wires the new IP to the VPC's public-side LRP.
-        LOGGER.debug("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} new ip={} accepted as no-op",
-                vpc.getId(), address == null ? null : address.getAddress());
+        // Rewrite the VPC-level SNAT row's external_ip in place. The NAT
+        // row UUID stays, the LR.nat strong-ref is untouched, only the
+        // external_ip column changes. Caller (CloudStack) handles the
+        // upstream public-side announcement (BGP / next-hop), which is
+        // out of band for OVN NB DB.
+        final String newExt = address == null || address.getAddress() == null
+                ? null : address.getAddress().addr();
+        if (StringUtils.isBlank(newExt)) {
+            LOGGER.warn("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} new IP missing; skipping", vpc.getId());
+            return true;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
+        if (controller == null) {
+            LOGGER.warn("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} no controller for zone", vpc.getId());
+            return true;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            LOGGER.warn("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} no LR mapping; skipping", vpc.getId());
+            return true;
+        }
+        final String vpcCidr = vpc.getCidr();
+        if (StringUtils.isBlank(vpcCidr)) {
+            return true;
+        }
+        try {
+            sourceNatService.ensureVpcSourceNat(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid(), newExt, vpcCidr);
+            LOGGER.info("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} SNAT ext_ip rewritten to {}",
+                    vpc.getId(), newExt);
+        } catch (RuntimeException e) {
+            LOGGER.error("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} SNAT update failed: {}",
+                    vpc.getId(), e.getMessage());
+            return false;
+        }
         return true;
     }
 
