@@ -2636,6 +2636,10 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
             vpcElements = new ArrayList<VpcProvider>();
             vpcElements.add((VpcProvider) _ntwkModel.getElementImplementingProvider(Provider.VPCVirtualRouter.getName()));
             vpcElements.add((VpcProvider) _ntwkModel.getElementImplementingProvider(Provider.JuniperContrailVpcRouter.getName()));
+            // Optional providers — only register when their NetworkElement
+            // is present on the classpath AND implements VpcProvider. Avoids
+            // hard build-time coupling to plugin modules.
+            tryRegisterOptionalVpcElement(Provider.Ovn);
         }
 
         if (vpcElements == null) {
@@ -2643,6 +2647,18 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         }
 
         return vpcElements;
+    }
+
+    private void tryRegisterOptionalVpcElement(final Provider provider) {
+        try {
+            final Object element = _ntwkModel.getElementImplementingProvider(provider.getName());
+            if (element instanceof VpcProvider) {
+                vpcElements.add((VpcProvider) element);
+                logger.info("VpcManagerImpl: registered optional VpcProvider [{}]", provider.getName());
+            }
+        } catch (final Exception e) {
+            logger.debug("VpcManagerImpl: optional VpcProvider [{}] not registered: {}", provider.getName(), e.getMessage());
+        }
     }
 
     @Override
