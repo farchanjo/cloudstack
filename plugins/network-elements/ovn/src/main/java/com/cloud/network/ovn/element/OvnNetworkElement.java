@@ -72,6 +72,7 @@ import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.PrivateGateway;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
+import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.utils.component.AdapterBase;
 import com.cloud.vm.NicProfile;
@@ -148,6 +149,8 @@ public class OvnNetworkElement extends AdapterBase
     private IPAddressDao ipAddressDao;
     @Inject
     private OvnVpcElement vpcElement;
+    @Inject
+    private VpcDao vpcDao;
 
     @Override
     public Map<Service, Map<Capability, String>> getCapabilities() {
@@ -175,11 +178,95 @@ public class OvnNetworkElement extends AdapterBase
         try {
             final String lsUuid = guru.createLogicalSwitchFor(network);
             LOGGER.info("OvnNetworkElement.implement: LS {} ready (network id={})", lsUuid, network.getId());
+            // When the tier is part of a VPC, bind it to the VPC LR via a
+            // router-patch pair so east-west routing across tiers works
+            // without an external VR. Idempotent: bindTierToVpc returns the
+            // existing LRP/LSP UUIDs when the patch already exists.
+            ensureTierBoundToVpcLr(network, lsUuid);
         } catch (OvnException e) {
             throw new ResourceUnavailableException("OVN LS create failed: " + e.getMessage(),
                     Network.class, network.getId());
         }
         return true;
+    }
+
+    /**
+     * If the network belongs to a VPC, ensure the LRP/LSP router-patch pair
+     * connecting this tier's Logical_Switch to the VPC's Logical_Router is
+     * present. The LRP carries the tier gateway IP/MAC; OVN auto-installs
+     * the L3 forwarding entries on every chassis once the patch exists.
+     *
+     * <p>Best-effort: a missing VPC mapping or a transient OVN failure logs
+     * and returns without aborting the tier implement (caller already
+     * succeeded creating the LS — the LRP can be reconciled later).
+     */
+    private void ensureTierBoundToVpcLr(final Network network, final String tierLsUuid) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        // Skip when an LRP mapping already exists for this tier (idempotent).
+        // We persist the tier-LRP mapping under Kind.PUBLIC_LRP keyed by
+        // network id (re-use of that bucket avoids introducing a new Kind
+        // enum value just for tier bindings — semantically the LRP attaches
+        // a tier LS to an LR, mirroring the public-side LRP role).
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LRP, network.getId(), controller.getId());
+        if (existing != null) {
+            return;
+        }
+        try {
+            final String tierName = network.getUuid();
+            final String gateway = network.getGateway();
+            final String cidr = network.getCidr();
+            if (gateway == null || cidr == null) {
+                LOGGER.warn("OvnNetworkElement.ensureTierBound: network id={} missing gateway/cidr; skipping LRP bind",
+                        network.getId());
+                return;
+            }
+            final int prefix = Integer.parseInt(cidr.substring(cidr.indexOf('/') + 1));
+            final List<String> networks = List.of(gateway + "/" + prefix);
+            final String gwMac = deriveGatewayMac(gateway);
+            final OvnNbClient.BindResult bind = vpcElement.bindTierToVpc(vpc, tierLsUuid, tierName, gwMac, networks);
+            logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PUBLIC_LRP, network.getId(), controller.getId(),
+                    bind.lrpUuid, "lrp-" + tierName));
+            LOGGER.info("OvnNetworkElement.ensureTierBound: LRP {} + LSP {} created (tier id={}, vpc id={})",
+                    bind.lrpUuid, bind.lspUuid, network.getId(), vpc.getId());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnNetworkElement.ensureTierBound: tier id={} bind to VPC LR failed: {}",
+                    network.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * Build a deterministic MAC for the tier gateway LRP. Encodes the last
+     * three octets of the gateway IP into the locally-administered range
+     * {@code 02:01:01:**:**:**}; matches the convention used by
+     * OvnDhcpService.deriveServerMac so the LRP and DHCP responder share
+     * an identity prefix per tier.
+     */
+    private static String deriveGatewayMac(final String gatewayIp) {
+        if (gatewayIp == null || !gatewayIp.contains(".")) {
+            return "02:01:01:00:00:01";
+        }
+        final String[] octets = gatewayIp.trim().split("\\.");
+        if (octets.length != 4) {
+            return "02:01:01:00:00:01";
+        }
+        try {
+            final int o1 = Integer.parseInt(octets[1]) & 0xff;
+            final int o2 = Integer.parseInt(octets[2]) & 0xff;
+            final int o3 = Integer.parseInt(octets[3]) & 0xff;
+            return String.format("02:01:01:%02x:%02x:%02x", o1, o2, o3);
+        } catch (NumberFormatException e) {
+            return "02:01:01:00:00:01";
+        }
     }
 
     @Override
@@ -260,31 +347,49 @@ public class OvnNetworkElement extends AdapterBase
     @Override
     public boolean destroy(final Network network, final ReservationContext context) {
         try {
-            // Order matters:
-            //  1. Drop per-tier QoS rows first (depend on LSP+LS still present
-            //     for their parent LS lookup; QoS rows tied to specific LSPs
-            //     get dropped via release() per NIC, but the bean's
-            //     remove-by-network safety net runs here too via removeTierDhcp
-            //     side effect of LSP cascade).
-            //  2. Drop per-tier DHCP_Options + DNS rows.
-            //  3. Detach the tier from any VPC LR (drops the LRP/LSP
-            //     router-patch pair so the LS has no dangling ref).
-            //  4. Drop the LS itself.
+            //  1. Drop per-tier DHCP_Options + DNS rows.
+            //  2. Drop tier-LRP from VPC LR (OvnNbClient detach handles
+            //     ports set; LRP-side router-patch LSP gets cascade-dropped
+            //     when the parent LS goes away in step 3).
+            //  3. Drop the Logical_Switch (cascade kills any leftover LSPs).
             dhcpService.removeTierDhcp(network);
             dnsService.removeTierDns(network);
-            // Detach from VPC LR if attached. Skip when network has no VPC.
-            // OvnVpcElement helper carries the LRP cleanup; weak-ref detach
-            // not needed because router-patch LSPs are strong refs from LS
-            // and OVSDB cascades on LS delete. We still drop the LRP first
-            // so the LR's ports set doesn't dangle.
-            // (Implementation pending — for the MVP we rely on LR delete in
-            // shutdownVpc() to cascade-drop LRPs; orphan LRP only persists
-            // when tier is removed without the VPC also being removed.)
+            detachTierFromVpcLr(network);
             guru.deleteLogicalSwitchFor(network);
         } catch (OvnException e) {
             LOGGER.warn("OvnNetworkElement.destroy: failed network id={}: {}", network.getId(), e.getMessage());
         }
         return true;
+    }
+
+    /**
+     * Drop the tier-LRP attached to the VPC LR. Matches the
+     * {@link Kind#PUBLIC_LRP} mapping persisted by
+     * {@link #ensureTierBoundToVpcLr}; mapping row stays gone so a future
+     * re-create of the same tier triggers a fresh bind.
+     */
+    private void detachTierFromVpcLr(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.PUBLIC_LRP, network.getId(), controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        try {
+            pluginManager.nbClient(network.getDataCenterId()).deleteLogicalRouterPort(mapping.getOvnUuid());
+            LOGGER.info("OvnNetworkElement.detachTier: LRP {} dropped (tier id={})",
+                    mapping.getOvnUuid(), network.getId());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnNetworkElement.detachTier: LRP {} delete failed: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+        } finally {
+            logicalIdMapDao.remove(mapping.getId());
+        }
     }
 
     @Override
