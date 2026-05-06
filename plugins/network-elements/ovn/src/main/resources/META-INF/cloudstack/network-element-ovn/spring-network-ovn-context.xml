@@ -49,6 +49,9 @@
     <!-- Admin API service (Phase I.5). -->
     <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
 
+    <!-- On-demand orphan / stale-mapping reaper (admin runOvnReconciler API). -->
+    <bean id="ovnReconcilerService" class="com.cloud.network.ovn.manager.OvnReconcilerService"/>
+
     <!-- importOvnVpc adoption pipeline (Phase I.5). -->
     <bean id="ovnVpcImporter" class="com.cloud.network.ovn.manager.OvnVpcImporter"/>
 
