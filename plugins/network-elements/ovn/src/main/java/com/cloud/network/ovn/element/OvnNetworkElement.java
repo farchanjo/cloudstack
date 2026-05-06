@@ -348,12 +348,16 @@ public class OvnNetworkElement extends AdapterBase
     public boolean destroy(final Network network, final ReservationContext context) {
         try {
             //  1. Drop per-tier DHCP_Options + DNS rows.
-            //  2. Drop tier-LRP from VPC LR (OvnNbClient detach handles
+            //  2. Drop the SOURCE_NAT row for this tier (mapped under
+            //     Kind.SOURCE_NAT keyed by network id; safely no-op when
+            //     applyIps never ran for this tier).
+            //  3. Drop tier-LRP from VPC LR (OvnNbClient detach handles
             //     ports set; LRP-side router-patch LSP gets cascade-dropped
-            //     when the parent LS goes away in step 3).
-            //  3. Drop the Logical_Switch (cascade kills any leftover LSPs).
+            //     when the parent LS goes away in step 4).
+            //  4. Drop the Logical_Switch (cascade kills any leftover LSPs).
             dhcpService.removeTierDhcp(network);
             dnsService.removeTierDns(network);
+            sourceNatService.removeSnatForTier(network.getDataCenterId(), network.getId());
             detachTierFromVpcLr(network);
             guru.deleteLogicalSwitchFor(network);
         } catch (OvnException e) {
@@ -487,15 +491,65 @@ public class OvnNetworkElement extends AdapterBase
     @Override
     public boolean applyIps(final Network network, final List<? extends PublicIpAddress> ipAddress,
                             final Set<Service> services) {
-        // OVN encodes public-IP semantics directly inside SNAT / DNAT rules
-        // and via the public-side LRP — the orchestrator's "deploy IP" hook
-        // is a no-op here; SourceNat/StaticNat/PortForwarding bring the IP
-        // online when their rules are applied.
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("OvnNetworkElement.applyIps: network id={} ips={} services={} — handled by NAT rules",
-                    network.getId(), ipAddress == null ? 0 : ipAddress.size(), services);
+        // Emit an OVN snat row for the VPC's source-NAT public IP scoped to
+        // the tier CIDR. Public LRP attachment + default route to upstream
+        // gateway are deferred (Phase II / OvnPublicNetworkManager) — this
+        // hook only programs the rule shape so re-applies / cleanup remain
+        // observable in the OVN NB DB.
+        if (ipAddress == null || ipAddress.isEmpty()) {
+            return true;
         }
-        return true;
+        if (services == null || !services.contains(Service.SourceNat)) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("OvnNetworkElement.applyIps: network id={} services={} no SourceNat — skip",
+                        network.getId(), services);
+            }
+            return true;
+        }
+        final Long vpcId = network.getVpcId();
+        if (vpcId == null) {
+            return true;
+        }
+        final long zoneId = network.getDataCenterId();
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return false;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpcId, controller.getId());
+        if (lrMapping == null) {
+            LOGGER.warn("OvnNetworkElement.applyIps: VPC LR not found for vpc id={}; skipping SNAT apply", vpcId);
+            return false;
+        }
+        final String tierCidr = network.getCidr();
+        if (StringUtils.isBlank(tierCidr)) {
+            return true;
+        }
+        boolean overall = true;
+        for (final PublicIpAddress pip : ipAddress) {
+            if (pip == null || !pip.isSourceNat()) {
+                continue;
+            }
+            final String externalIp = pip.getAddress() == null ? null : pip.getAddress().addr();
+            if (StringUtils.isBlank(externalIp)) {
+                continue;
+            }
+            try {
+                final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.SOURCE_NAT,
+                        network.getId(), controller.getId());
+                if (existing == null) {
+                    sourceNatService.addSnat(zoneId, network.getId(), lrMapping.getOvnUuid(),
+                            externalIp, tierCidr);
+                } else if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("OvnNetworkElement.applyIps: SNAT for tier id={} already mapped (uuid={})",
+                            network.getId(), existing.getOvnUuid());
+                }
+            } catch (RuntimeException e) {
+                LOGGER.error("OvnNetworkElement.applyIps: SNAT add for tier id={} cidr={} ext={} failed: {}",
+                        network.getId(), tierCidr, externalIp, e.getMessage());
+                overall = false;
+            }
+        }
+        return overall;
     }
 
     @Override
