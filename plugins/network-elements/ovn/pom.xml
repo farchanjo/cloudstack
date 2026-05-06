@@ -1,0 +1,112 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>cloud-plugin-network-ovn</artifactId>
+    <name>Apache CloudStack Plugin - Network OVN</name>
+
+    <parent>
+        <groupId>org.apache.cloudstack</groupId>
+        <artifactId>cloudstack-plugins</artifactId>
+        <version>4.24.1.22-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <!--
+      OVSDB client transport.
+
+      The libovsdb-jvm artifact (org.opendaylight.ovsdb:library) drags in the
+      entire OpenDaylight YANG / yangtools / aaa-cert dependency tree, plus a
+      custom Maven parent (`ovsdb-binding-parent`) that lives only in the
+      OpenDaylight Nexus repository. Bringing that into the CloudStack
+      reactor would force a new repository entry in the root pom and a
+      cascading set of transitive bumps.
+
+      The OVN NB / SB schemas only need a small subset of the OVSDB protocol
+      (RFC 7047 §4: list_dbs, get_schema, transact, monitor, monitor_cancel).
+      The plugin therefore ships a thin native JSON-RPC OVSDB client in
+      `com.cloud.network.ovn.client.transport`, sitting on top of Jackson
+      (already provided by the reactor at version `${cs.jackson.version}`)
+      and the JDK NIO socket primitives. No extra Maven coordinates are
+      required for the protocol layer.
+
+      If the project later wants to swap the native client out for the LF
+      Networking artifact, the swap point is `OvsdbConnection` — see the
+      package javadoc in `com.cloud.network.ovn.client.transport`.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-utils</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-api</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-server</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-engine-schema</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-framework-config</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-engine-api</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-framework-db</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!--
+          Jackson (managed by the root pom) is the only protocol-level
+          dependency. JDK NIO sockets handle transport.
+        -->
+        <!--
+          jackson-databind is dependency-managed inside utils/pom.xml only,
+          so we pin the version explicitly here to align with the rest of
+          the reactor (`cs.jackson.version` in the root pom).
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${cs.jackson.version}</version>
+        </dependency>
+    </dependencies>
+</project>
