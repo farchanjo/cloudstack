@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 import javax.inject.Inject;
@@ -103,6 +104,15 @@ import com.cloud.vm.dao.VMInstanceDetailsDao;
 import com.cloud.vm.dao.VMInstanceDao;
 
 public abstract class HypervisorGuruBase extends AdapterBase implements HypervisorGuru, Configurable {
+
+    /**
+     * Tokens that, when present as a comma-separated tag on a NetworkOffering,
+     * route the NIC through the OVS DPDK vhost-user PMD path instead of the
+     * legacy kernel tap. Matched after splitting the offering's tag string by
+     * comma and trimming/lower-casing each token, so substrings inside other
+     * tag names (e.g. "vhost-userless") cannot trigger a false positive.
+     */
+    private static final Set<String> DPDK_TOKENS = Set.of("dpdk", "vhost-user", "virtio-fast");
 
     @Inject
     protected
@@ -259,15 +269,20 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 to.setVfPfName(nicVO.getVfPfName());
             } else {
                 // NetworkOffering tag-based DPDK vhost-user enablement.
-                // Tag containing "dpdk" or "vhost-user" or "virtio-fast" → DPDK PMD path
-                // (OvsVifDriver auto-creates dpdkvhostuserclient port). Multi-queue + live-migrate.
-                // No tag (or unrelated) → kernel tap (legacy OVS bridge).
+                // Tag set is a comma-separated list. A NIC is routed through the OVS DPDK
+                // vhost-user PMD path (OvsVifDriver auto-creates dpdkvhostuserclient port —
+                // multi-queue, live-migratable) when ANY token in DPDK_TOKENS is present
+                // as a whole token. Substring matches are rejected: "vhost-userless" must
+                // not flip the flag. Anything else falls back to the kernel tap path.
                 try {
                     com.cloud.offerings.NetworkOfferingVO offering =
                             networkOfferingDao.findById(network.getNetworkOfferingId());
                     if (offering != null && offering.getTags() != null) {
-                        String tags = offering.getTags().toLowerCase();
-                        if (tags.contains("dpdk") || tags.contains("vhost-user") || tags.contains("virtio-fast")) {
+                        boolean dpdkTagged = Arrays.stream(offering.getTags().split(","))
+                                .map(String::trim)
+                                .map(String::toLowerCase)
+                                .anyMatch(DPDK_TOKENS::contains);
+                        if (dpdkTagged) {
                             to.setDpdkEnabled(true);
                         }
                     }
