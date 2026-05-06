@@ -209,11 +209,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
     }
 
     /**
-     * Lazily-populated cache of PF netdev → PF PCI BDF pairs discovered via
-     * {@code /sys/class/net/*/phys_port_name = p<N>}. Order is preserved
+     * Lazily-populated cache of PF netdev to PF PCI BDF pairs discovered via
+     * each entry's phys_port_name attribute under sysfs. Order is preserved
      * (LinkedHashMap) so PF index 0 is scanned before 1, etc. The cache is
-     * computed once per driver instance — sysfs PF topology does not change
-     * after host boot in the deployment models this driver targets.
+     * computed once per driver instance because sysfs PF topology does not
+     * change after host boot in the deployment models this driver targets.
      */
     private final AtomicReference<Map<String, String>> pfCacheRef = new AtomicReference<>();
 
