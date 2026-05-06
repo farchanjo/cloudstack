@@ -62,11 +62,12 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
         }
 
         int added = 0;
-        for (String pci : pciAddresses) {
+        for (int i = 0; i < pciAddresses.size(); i++) {
+            String pci = pciAddresses.get(i);
             if (known.contains(pci)) {
                 continue;
             }
-            String repName = derivePortRepresentor(pfName, pciAddresses.indexOf(pci));
+            String repName = derivePortRepresentor(pfName, i);
             SriovVfPoolVO vf = new SriovVfPoolVO(hostId, pci, pfName, repName);
             vfPoolDao.persist(vf);
             added++;
