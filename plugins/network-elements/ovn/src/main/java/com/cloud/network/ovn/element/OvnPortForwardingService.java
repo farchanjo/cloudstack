@@ -29,6 +29,8 @@ import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
 import com.cloud.network.Network;
+import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -62,6 +64,8 @@ public class OvnPortForwardingService {
     private VpcDao vpcDao;
     @Inject
     private OvnVpcElement vpcElement;
+    @Inject
+    private IPAddressDao ipAddressDao;
 
     /**
      * Apply every supplied PF rule. Idempotent: an existing mapping for the
@@ -107,7 +111,14 @@ public class OvnPortForwardingService {
             LOGGER.debug("OvnPortForwardingService: skipping rule id={} in state {}", rule.getId(), rule.getState());
             return;
         }
-        final String publicIp = rule.getDestinationIpAddress() == null ? null : rule.getDestinationIpAddress().addr();
+        // Public IP comes from FirewallRule.sourceIpAddressId (the floating
+        // IP allocated to the rule); private IP is the VM-side target carried
+        // on PortForwardingRule.destinationIpAddress. Earlier revisions used
+        // destinationIpAddress for both, producing an LB row whose VIP was
+        // the VM internal IP — useless for N-S traffic.
+        final IPAddressVO publicIpRow = ipAddressDao.findById(rule.getSourceIpAddressId());
+        final String publicIp = publicIpRow == null || publicIpRow.getAddress() == null
+                ? null : publicIpRow.getAddress().addr();
         final String privateIp = lookupVmIp(rule);
         if (StringUtils.isBlank(publicIp) || StringUtils.isBlank(privateIp)) {
             LOGGER.warn("OvnPortForwardingService: rule id={} missing public/private IP (pub={} priv={}); skipping",
