@@ -49,6 +49,9 @@
     <!-- Admin API service (Phase I.5). -->
     <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
 
+    <!-- importOvnVpc adoption pipeline (Phase I.5). -->
+    <bean id="ovnVpcImporter" class="com.cloud.network.ovn.manager.OvnVpcImporter"/>
+
     <!-- Chassis registration (Phase I.6). -->
     <bean id="ovnChassisRegistrationService" class="com.cloud.network.ovn.manager.OvnChassisRegistrationService"/>
 
@@ -58,6 +61,11 @@
     <!-- Phase 2 — NetworkACL programming (item 4). -->
     <bean id="ovnFirewallService" class="com.cloud.network.ovn.element.OvnFirewallService">
         <property name="name" value="OvnFirewallService"/>
+    </bean>
+
+    <!-- Phase 2 — Load balancer programming (item 5). -->
+    <bean id="ovnLoadBalancerService" class="com.cloud.network.ovn.element.OvnLoadBalancerService">
+        <property name="name" value="OvnLoadBalancerService"/>
     </bean>
 
 </beans>
