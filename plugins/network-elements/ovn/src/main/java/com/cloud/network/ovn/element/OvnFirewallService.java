@@ -65,8 +65,10 @@ import com.cloud.vm.VirtualMachineProfile;
  *
  * <p>Match expression conventions (OVN match grammar — ovn-sb(5) §15):
  * <ul>
- *   <li>Ingress (CloudStack {@code Ingress}) → direction {@code from-lport}.
- *   <li>Egress (CloudStack {@code Egress})   → direction {@code to-lport}.
+ *   <li>Ingress (CloudStack {@code Ingress}) → direction {@code to-lport}
+ *       (traffic arriving AT the VM from the LS).
+ *   <li>Egress (CloudStack {@code Egress})   → direction {@code from-lport}
+ *       (traffic leaving FROM the VM into the LS).
  *   <li>{@code allow-related} is the canonical action for a stateful
  *       CloudStack {@code Allow} rule.
  *   <li>{@code drop} is the canonical action for a CloudStack {@code Deny}
@@ -261,9 +263,14 @@ public class OvnFirewallService extends AdapterBase {
     }
 
     private static String directionFor(final NetworkACLItem rule) {
+        // OVN ACL direction semantics (ovn-nb(5) §ACL):
+        //   from-lport = packets sent FROM a logical port (egress from VM into LS)
+        //   to-lport   = packets sent TO a logical port (ingress to VM from LS)
+        // CloudStack TrafficType.Ingress = inbound to VM/network, so it must
+        // map to to-lport. Egress = outbound, maps to from-lport.
         return rule.getTrafficType() == NetworkACLItem.TrafficType.Ingress
-                ? OvnNbClient.ACL_DIRECTION_FROM_LPORT
-                : OvnNbClient.ACL_DIRECTION_TO_LPORT;
+                ? OvnNbClient.ACL_DIRECTION_TO_LPORT
+                : OvnNbClient.ACL_DIRECTION_FROM_LPORT;
     }
 
     private static String actionFor(final NetworkACLItem rule) {
