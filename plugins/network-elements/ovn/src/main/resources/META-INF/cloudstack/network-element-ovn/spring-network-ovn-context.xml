@@ -45,7 +45,6 @@
     <bean id="ovnVpcElement" class="com.cloud.network.ovn.element.OvnVpcElement"/>
     <bean id="ovnSourceNatService" class="com.cloud.network.ovn.element.OvnSourceNatService"/>
     <bean id="ovnStaticNatService" class="com.cloud.network.ovn.element.OvnStaticNatService"/>
-    <bean id="ovnFirewallStub" class="com.cloud.network.ovn.element.OvnFirewallStub"/>
 
     <!-- Admin API service (Phase I.5). -->
     <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
@@ -55,5 +54,10 @@
 
     <!-- AgentManager host-event subscriber that drives the registration service. -->
     <bean id="ovnChassisListener" class="com.cloud.network.ovn.manager.OvnChassisListener"/>
+
+    <!-- Phase 2 — NetworkACL programming (item 4). -->
+    <bean id="ovnFirewallService" class="com.cloud.network.ovn.element.OvnFirewallService">
+        <property name="name" value="OvnFirewallService"/>
+    </bean>
 
 </beans>

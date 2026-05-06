@@ -46,7 +46,7 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
     /** Namespaces a CloudStack id so {@code VPC}, {@code NETWORK}, and
      *  {@code NIC} ids never collide. */
     public enum Kind {
-        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT
+        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT, NETWORK_ACL, LOAD_BALANCER
     }
 
     @Id
