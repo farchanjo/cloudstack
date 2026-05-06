@@ -52,7 +52,25 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
      * convert it to a {@code NIC} kind once the owning CloudStack VM is
      * known. */
     public enum Kind {
-        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT, NETWORK_ACL, LOAD_BALANCER, ORPHAN_NIC
+        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT, NETWORK_ACL, LOAD_BALANCER, ORPHAN_NIC,
+        /** DHCP_Options row keyed by tier network id (one per tier subnet). */
+        DHCP_OPTIONS,
+        /** DHCP_Options row for IPv6 — separate kind so v4/v6 coexist on the same tier. */
+        DHCP_OPTIONS_V6,
+        /** DNS row attached to a tier LS (one per tier). */
+        DNS_RECORDS,
+        /** QoS row keyed by CloudStack network-rate / detail id. */
+        QOS,
+        /** Logical_Router_Static_Route row keyed by VPC id (catch-all default). */
+        STATIC_ROUTE,
+        /** HA_Chassis_Group row keyed by zone id (one per zone). */
+        HA_CHASSIS_GROUP,
+        /** Load_Balancer row used as 1:1 port-forward, keyed by PF rule id. */
+        PORT_FORWARDING,
+        /** Zone-scope public Logical_Switch (one per zone). */
+        PUBLIC_LS,
+        /** Per-zone public-side LRP attached to PUBLIC_LS, keyed by VPC id. */
+        PUBLIC_LRP
     }
 
     @Id
