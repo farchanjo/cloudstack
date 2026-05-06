@@ -573,9 +573,69 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     public void deleteNatRule(final String natUuid) {
+        // OVSDB rejects "delete NAT" while the parent Logical_Router.nat set
+        // still references the row (referential integrity violation). Detach
+        // + delete in a single transaction to satisfy the strong-ref
+        // contract; if no LR owns the row (orphan / already detached) the
+        // mutate becomes a no-op.
+        final String parentLrUuid = findLogicalRouterOwningNat(natUuid);
         final OvnTransaction tx = newTransaction();
+        if (parentLrUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                    OvnOpFactory.whereUuid(parentLrUuid), "nat",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(natUuid))));
+        }
         tx.add(OvnOpFactory.delete("NAT", OvnOpFactory.whereUuid(natUuid)));
         tx.commit();
+    }
+
+    /** Locate the LR row holding the supplied NAT in its {@code nat} set. */
+    private String findLogicalRouterOwningNat(final String natUuid) {
+        if (natUuid == null || natUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("nat");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var nat = row.get("nat");
+            if (nat == null || nat.size() < 2) {
+                continue;
+            }
+            if ("uuid".equals(nat.get(0).asText())) {
+                if (natUuid.equals(nat.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = nat.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && natUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
