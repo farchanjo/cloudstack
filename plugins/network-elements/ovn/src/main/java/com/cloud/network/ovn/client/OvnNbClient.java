@@ -234,9 +234,77 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     public void deleteLogicalSwitchPort(final String lspUuid) {
+        // OVSDB rejects "delete LSP" while the parent Logical_Switch.ports
+        // set still references the row (referential integrity violation).
+        // Detach + delete in a single transaction to satisfy the strong-ref
+        // contract; if no LS owns the port (already detached / orphan) the
+        // mutate becomes a no-op since the set won't change.
+        final String parentLsUuid = findLogicalSwitchOwningPort(lspUuid);
         final OvnTransaction tx = newTransaction();
+        if (parentLsUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                    OvnOpFactory.whereUuid(parentLsUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(lspUuid))));
+        }
         tx.add(OvnOpFactory.delete("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid)));
         tx.commit();
+    }
+
+    /**
+     * Locate the Logical_Switch row that holds the supplied LSP in its
+     * {@code ports} set. Returns null when no LS references the LSP (an
+     * orphan or already-detached row). The select walks the LS table once
+     * — fine for typical deployments (tens of LSes per zone) and avoids
+     * forcing every caller to remember the parent UUID.
+     */
+    private String findLogicalSwitchOwningPort(final String lspUuid) {
+        if (lspUuid == null || lspUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("ports");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Switch", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ports = row.get("ports");
+            if (ports == null || ports.size() < 2) {
+                continue;
+            }
+            // ports column is ["set", [["uuid", id1], ["uuid", id2]]] or
+            // ["uuid", id] when single. Walk both shapes.
+            if ("uuid".equals(ports.get(0).asText())) {
+                if (lspUuid.equals(ports.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = ports.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && lspUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
     }
 
     /**
