@@ -73,11 +73,24 @@ public class OvnTransaction {
             throw new OvnException("expected array reply from transact, got: " + reply);
         }
         final ArrayNode arr = (ArrayNode) reply;
-        for (int i = 0; i < arr.size(); i++) {
+        // Per-op error scan. OVSDB sometimes appends one extra "transaction-
+        // wide" entry past the per-op replies (RFC 7047 §4.1.3 — used for
+        // commit-time aborts and lock failures). That trailer has no
+        // matching ops.get(i), so we cap the per-op loop at ops.size() and
+        // surface the trailer separately to avoid IOOBE on otherwise-OK
+        // transactions like a single delete that returns two reply slots.
+        final int perOp = Math.min(arr.size(), ops.size());
+        for (int i = 0; i < perOp; i++) {
             final JsonNode entry = arr.get(i);
             if (entry != null && entry.has("error") && !entry.get("error").isNull()) {
                 throw new OvnException("OVSDB op " + i + " (" + ops.get(i).get("op").asText()
                         + ") failed: " + entry.toString());
+            }
+        }
+        if (arr.size() > ops.size()) {
+            final JsonNode trailer = arr.get(arr.size() - 1);
+            if (trailer != null && trailer.has("error") && !trailer.get("error").isNull()) {
+                throw new OvnException("OVSDB transaction trailer error: " + trailer);
             }
         }
         return new Result(arr);
