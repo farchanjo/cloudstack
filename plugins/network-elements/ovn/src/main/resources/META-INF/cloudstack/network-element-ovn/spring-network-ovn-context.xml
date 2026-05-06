@@ -26,6 +26,14 @@
                       http://www.springframework.org/schema/context
                       http://www.springframework.org/schema/context/spring-context.xsd">
 
-    <!-- Phase I.1 — empty context. Beans are added in subsequent phases. -->
+    <!--
+        DAOs (Phase I.2). The implementations are annotated with @Component,
+        so the cloudstack DI scan picks them up — but legacy CloudStack
+        modules also wire DAOs explicitly here for clarity. Both work; the
+        explicit form documents the bean graph.
+    -->
+    <bean id="ovnControllerDaoImpl" class="com.cloud.network.ovn.dao.OvnControllerDaoImpl"/>
+    <bean id="ovnChassisMapDaoImpl" class="com.cloud.network.ovn.dao.OvnChassisMapDaoImpl"/>
+    <bean id="ovnLogicalIdMapDaoImpl" class="com.cloud.network.ovn.dao.OvnLogicalIdMapDaoImpl"/>
 
 </beans>
