@@ -55,6 +55,7 @@ import com.cloud.exception.OperationTimedoutException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.hypervisor.HypervisorGuru;
+import com.cloud.hypervisor.HypervisorGuruBase;
 import com.cloud.hypervisor.HypervisorGuruManager;
 import com.cloud.network.IpAddress;
 import com.cloud.network.MonitoringService;
@@ -1260,10 +1261,16 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                 return false;
             }
             com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
-            boolean result = offering != null && offering.isHwOffloadEnabled();
-            logger.info("isHwOffloadNetwork: network={} offeringId={} offeringName={} hwOffload={}",
+            // Treat vDPA offerings as HW-offload from the VR pre-alloc gate's
+            // perspective: both need a VF reserved on the destination host
+            // before the VR boots so we can patch the domain XML with either
+            // <interface type='hostdev'> or <interface type='vdpa'>.
+            boolean result = offering != null && (offering.isHwOffloadEnabled() || offering.isVdpaEnabled());
+            logger.info("isHwOffloadNetwork: network={} offeringId={} offeringName={} hwOffload={} vdpa={}",
                     networkId, network.getNetworkOfferingId(),
-                    offering != null ? offering.getName() : "null", result);
+                    offering != null ? offering.getName() : "null",
+                    offering != null && offering.isHwOffloadEnabled(),
+                    offering != null && offering.isVdpaEnabled());
             return result;
         } catch (Exception e) {
             logger.warn("isHwOffloadNetwork: exception for network {}", networkId, e);
@@ -1276,7 +1283,28 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             Network network = _networkDao.findById(networkId);
             if (network == null) return nicTo;
             com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
-            if (offering != null && offering.isHwOffloadEnabled() && _vfPoolManager != null) {
+            if (offering == null || _vfPoolManager == null) {
+                return nicTo;
+            }
+            // vDPA branch wins when both flags are set on a single offering
+            // (defensive: the API rejects that combo, but the DB allows it).
+            if (offering.isVdpaEnabled()) {
+                int maxVqs = HypervisorGuruBase.VmVdpaMaxVqs.value();
+                SriovVfPoolVO vf = _vfPoolManager.allocateForVdpa(hostId, nicId, nicTo.getMac(), maxVqs);
+                if (vf == null) {
+                    logger.warn("VPC PlugNic: no FREE VF for vDPA on host {} (network {}); bridge/TAP fallback",
+                            hostId, networkId);
+                    return nicTo;
+                }
+                nicTo.setVfPciAddress(vf.getPciAddress());
+                nicTo.setVfPfName(vf.getPfName());
+                nicTo.setUseVdpa(Boolean.TRUE);
+                nicTo.setVdpaMaxVqs(maxVqs);
+                logger.info("VPC PlugNic: allocated vDPA VF {} (PCI {}) for NIC on network {} host {}",
+                        vf.getUuid(), vf.getPciAddress(), networkId, hostId);
+                return nicTo;
+            }
+            if (offering.isHwOffloadEnabled()) {
                 SriovVfPoolVO vf = _vfPoolManager.allocate(hostId, nicId);
                 nicTo.setVfPciAddress(vf.getPciAddress());
                 nicTo.setVfPfName(vf.getPfName());

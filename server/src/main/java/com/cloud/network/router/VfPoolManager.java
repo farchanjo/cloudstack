@@ -76,4 +76,24 @@ public interface VfPoolManager extends Manager {
 
     /** Count of FREE VFs on a host (used for capacity scheduling). */
     int countFree(long hostId);
+
+    /**
+     * Allocate one FREE VF on the given host and bind it to the NIC as a vDPA
+     * mgmt-device. The row is flagged {@code vdpa_kind=VDPA} and a canonical
+     * {@code vdpa_name} ({@code vdpa-<nicId>}) is stamped on it. The agent
+     * later runs {@code vdpa dev add ... mac <mac> max_vqs <maxVqs>} and
+     * patches {@code vdpa_device} ({@code /dev/vhost-vdpa-N}) once the SF
+     * comes up.
+     *
+     * @return the allocated VF row, or {@code null} when capacity is exhausted.
+     */
+    SriovVfPoolVO allocateForVdpa(long hostId, long nicId, String mac, int maxVqs);
+
+    /**
+     * Release a vDPA-bound VF: clear vdpa_name / vdpa_device, flip
+     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind} back to
+     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind#PASSTHROUGH},
+     * and free the row. Idempotent.
+     */
+    boolean releaseVdpa(long vfPoolId);
 }

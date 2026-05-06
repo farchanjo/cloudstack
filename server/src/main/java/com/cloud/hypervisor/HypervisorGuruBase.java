@@ -142,6 +142,8 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
     @Inject
     private com.cloud.network.router.VfPoolManager vfPoolManager;
     @Inject
+    private com.cloud.network.router.dao.SriovVfPoolDao sriovVfPoolDao;
+    @Inject
     private com.cloud.agent.AgentManager agentManager;
     @Inject
     private com.cloud.offerings.dao.NetworkOfferingDao networkOfferingDao;
@@ -180,6 +182,17 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
 
     public static ConfigKey<Boolean> VmMinCpuSpeedEqualsCpuSpeedDividedByCpuOverprovisioningFactor = new ConfigKey<Boolean>("Advanced", Boolean.class, "vm.min.cpu.speed.equals.cpu.speed.divided.by.cpu.overprovisioning.factor", "true",
             "If we set this to 'true', a minimum CPU speed (cpu speed/ cpu.overprovisioning.factor) will be set on the VM, independent of using a scalable service offering or not.", true, ConfigKey.Scope.Cluster);
+
+    /**
+     * Number of virtqueues to request from {@code vdpa dev add ... max_vqs <N>}
+     * when a NIC is plumbed via vDPA. Default 33 covers 16 RX + 16 TX + 1
+     * control queue, matching ConnectX-6 Dx defaults. Override per-host
+     * via the {@code hwoffload.vdpa.max_vqs} agent property.
+     */
+    public static ConfigKey<Integer> VmVdpaMaxVqs = new ConfigKey<Integer>("Advanced", Integer.class,
+            "vm.vdpa.max_vqs", "33",
+            "Default queue count requested from `vdpa dev add ... max_vqs <N>` for VMs whose NetworkOffering has vdpaEnabled=true.",
+            true);
 
     private Map<NetworkOffering.Detail, String> getNicDetails(Network network) {
         if (network == null) {
@@ -261,12 +274,26 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             }
             to.setNicSecIps(secIps);
 
-            // Propagate SR-IOV VF binding (HW Offload). Null vf_pci_address means traditional bridge/TAP.
+            // Propagate SR-IOV VF binding. Null vf_pci_address means traditional bridge/TAP.
+            // Branch order (mutually exclusive):
+            //   1. vDPA: pool row's vdpa_kind=VDPA → set useVdpa, vdpaMaxVqs.
+            //      Agent's VdpaVifDriver runs `vdpa dev add ... mac <mac> max_vqs <N>`
+            //      and emits <interface type='vdpa'>.
+            //   2. hostdev passthrough: pool row's vdpa_kind=PASSTHROUGH → set
+            //      useHwOffload. Agent's VfPassthroughVifDriver emits
+            //      <interface type='hostdev' managed='yes'>.
+            // The two flags are mutually exclusive on the wire; an older agent
+            // that does not understand useVdpa silently ignores it.
             String vfPci = nicVO.getVfPciAddress();
             if (vfPci != null && !vfPci.isEmpty()) {
                 to.setVfPciAddress(vfPci);
-                to.setUseHwOffload(Boolean.TRUE);
                 to.setVfPfName(nicVO.getVfPfName());
+                if (isVdpaBoundVf(nicVO)) {
+                    to.setUseVdpa(Boolean.TRUE);
+                    to.setVdpaMaxVqs(VmVdpaMaxVqs.value());
+                } else {
+                    to.setUseHwOffload(Boolean.TRUE);
+                }
             } else {
                 // NetworkOffering tag-based DPDK vhost-user enablement.
                 // Tag set is a comma-separated list. A NIC is routed through the OVS DPDK
@@ -389,6 +416,32 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
      * per-host bridge (cloud0) used by the agent for VR config push and have
      * no presence on the hardware NIC.
      */
+    /**
+     * True when the NIC's allocated SR-IOV VF pool row is currently bound as
+     * a vDPA mgmt-device (i.e. {@code vdpa_kind = VDPA}). False when the row
+     * is unset, missing, or in {@code PASSTHROUGH} state. The lookup goes
+     * through the DAO (not the manager) to keep this hot read cheap — it
+     * runs on every {@code toNicTO} for VRs and HW-offload user VMs.
+     */
+    private boolean isVdpaBoundVf(NicVO nicVO) {
+        if (nicVO == null || sriovVfPoolDao == null) {
+            return false;
+        }
+        Long poolId = nicVO.getVfPoolId();
+        if (poolId == null) {
+            return false;
+        }
+        try {
+            com.cloud.network.router.SriovVfPoolVO row = sriovVfPoolDao.findById(poolId);
+            return row != null
+                    && com.cloud.network.router.SriovVfPoolVO.VdpaKind.VDPA.name().equals(row.getVdpaKind());
+        } catch (RuntimeException e) {
+            logger.debug("isVdpaBoundVf: lookup failed for nic {} pool {}: {}",
+                    nicVO.getId(), poolId, e.getMessage());
+            return false;
+        }
+    }
+
     private void allocateVfIfHwOffload(NicTO nicTo, NicProfile nicProfile, VirtualMachineProfile vmProfile) {
         if (vfPoolManager == null) {
             return;
@@ -414,8 +467,13 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 }
             }
             boolean shouldOffload = false;
+            boolean shouldVdpa = false;
             com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
-            if (offering != null && offering.isHwOffloadEnabled()) {
+            if (offering != null && offering.isVdpaEnabled()) {
+                // vDPA path: highest priority. Mutually exclusive with hostdev
+                // passthrough — a single offering enables one or the other.
+                shouldVdpa = true;
+            } else if (offering != null && offering.isHwOffloadEnabled()) {
                 shouldOffload = true;
             } else if (network.getTrafficType() == com.cloud.network.Networks.TrafficType.Public &&
                        vrHasAnyHwOffloadGuestNic(vmProfile)) {
@@ -424,11 +482,29 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 logger.debug("Public NIC for VR {} promoted to HW offload (sibling guest tier is HW-offload)",
                         vmProfile.getVirtualMachine().getInstanceName());
             }
-            if (!shouldOffload) {
+            if (!shouldOffload && !shouldVdpa) {
                 return;
             }
             Long hostId = vmProfile.getVirtualMachine().getHostId();
             if (hostId == null) {
+                return;
+            }
+            if (shouldVdpa) {
+                int maxVqs = VmVdpaMaxVqs.value();
+                com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocateForVdpa(
+                        hostId, nicProfile.getId(), nicTo.getMac(), maxVqs);
+                if (vf == null) {
+                    logger.warn("No free VF for vDPA on host {}; NIC {} will use bridge/TAP fallback",
+                            hostId, nicProfile.getId());
+                    return;
+                }
+                nicTo.setVfPciAddress(vf.getPciAddress());
+                nicTo.setVfPfName(vf.getPfName());
+                nicTo.setVfRepName(vf.getRepresentorName());
+                nicTo.setUseVdpa(Boolean.TRUE);
+                nicTo.setVdpaMaxVqs(maxVqs);
+                logger.info("Allocated vDPA VF {} (PCI {}) on host {} for NIC {} ({} traffic, vDPA mgmtdev)",
+                        vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
                 return;
             }
             com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocate(hostId, nicProfile.getId());
@@ -774,7 +850,8 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
     public ConfigKey<?>[] getConfigKeys() {
         return new ConfigKey<?>[] {VmMinMemoryEqualsMemoryDividedByMemOverprovisioningFactor,
                 VmMinCpuSpeedEqualsCpuSpeedDividedByCpuOverprovisioningFactor,
-                HypervisorCustomDisplayName
+                HypervisorCustomDisplayName,
+                VmVdpaMaxVqs
         };
     }
 

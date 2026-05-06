@@ -131,6 +131,30 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
         return vfPoolDao.countByHostAndState(hostId, State.FREE);
     }
 
+    @Override
+    public SriovVfPoolVO allocateForVdpa(long hostId, long nicId, String mac, int maxVqs) {
+        SriovVfPoolVO vf = vfPoolDao.allocateForVdpa(hostId, nicId, mac, maxVqs);
+        if (vf == null) {
+            LOGGER.warn(String.format(
+                "allocateForVdpa: no FREE VF available on host %d for NIC %d (mac=%s)",
+                hostId, nicId, mac));
+            return null;
+        }
+        LOGGER.info(String.format(
+            "allocateForVdpa: host=%d nic=%d mac=%s maxVqs=%d -> vf=%s pci=%s vdpaName=%s",
+            hostId, nicId, mac, maxVqs, vf.getUuid(), vf.getPciAddress(), vf.getVdpaName()));
+        return vf;
+    }
+
+    @Override
+    public boolean releaseVdpa(long vfPoolId) {
+        boolean ok = vfPoolDao.releaseVdpa(vfPoolId);
+        if (ok) {
+            LOGGER.debug(String.format("Released vDPA VF pool id=%d", vfPoolId));
+        }
+        return ok;
+    }
+
     /**
      * Derive the representor netdev name for a VF index on a given PF.
      * Mirrors the udev/script naming applied in {@code mlx-switchdev.sh}:
