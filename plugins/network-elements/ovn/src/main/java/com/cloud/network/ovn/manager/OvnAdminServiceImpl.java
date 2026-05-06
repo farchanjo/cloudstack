@@ -27,6 +27,7 @@ import org.springframework.stereotype.Component;
 
 import com.cloud.network.ovn.api.response.OvnControllerResponse;
 import com.cloud.network.ovn.api.response.OvnLogicalIdResponse;
+import com.cloud.network.ovn.api.response.OvnReconcileResultResponse;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnNbReader;
@@ -47,6 +48,8 @@ public class OvnAdminServiceImpl implements OvnAdminService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnVpcImporter vpcImporter;
+    @Inject
+    private OvnReconcilerService reconcilerService;
 
     @Override
     public OvnControllerResponse addController(final long zoneId, final String name,
@@ -158,5 +161,22 @@ public class OvnAdminServiceImpl implements OvnAdminService {
         r.setSbEndpoints(row.getSbEndpoints());
         r.setObjectName("ovncontroller");
         return r;
+    }
+
+    @Override
+    public OvnReconcileResultResponse runReconciler(final long zoneId, final boolean dryRun) {
+        try {
+            final OvnReconcilerService.Result result = reconcilerService.reconcileZone(zoneId, dryRun);
+            final OvnReconcileResultResponse r = new OvnReconcileResultResponse();
+            r.setDryRun(result.isDryRun());
+            r.setOrphansByTable(result.getOrphansByTable());
+            r.setStaleMappingsByTable(result.getStaleMappingsByTable());
+            r.setTotalOrphans(result.totalOrphans());
+            r.setTotalStaleMappings(result.totalStaleMappings());
+            r.setObjectName("ovnreconcile");
+            return r;
+        } catch (OvnException e) {
+            throw new CloudRuntimeException("OVN reconciler failed for zone " + zoneId + ": " + e.getMessage());
+        }
     }
 }

@@ -1069,6 +1069,7 @@ public class OvnNetworkElement extends AdapterBase
         cmds.add(DeleteOvnControllerCmd.class);
         cmds.add(ListOvnControllersCmd.class);
         cmds.add(ImportOvnVpcCmd.class);
+        cmds.add(com.cloud.network.ovn.api.command.admin.RunOvnReconcilerCmd.class);
         return cmds;
     }
 

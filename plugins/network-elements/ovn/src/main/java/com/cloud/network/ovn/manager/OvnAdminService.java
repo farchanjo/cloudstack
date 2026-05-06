@@ -20,6 +20,7 @@ import java.util.List;
 
 import com.cloud.network.ovn.api.response.OvnControllerResponse;
 import com.cloud.network.ovn.api.response.OvnLogicalIdResponse;
+import com.cloud.network.ovn.api.response.OvnReconcileResultResponse;
 
 /**
  * Admin-side service the API commands consume. Decouples the {@code @APICommand}
@@ -56,4 +57,15 @@ public interface OvnAdminService {
      * @return one mapping row per adopted entity
      */
     List<OvnLogicalIdResponse> importVpc(long zoneId, String ovnLrName, String vpcName);
+
+    /**
+     * Run an OVN NB reconcile pass: drops orphan NB rows whose CS-side
+     * mapping is gone, and removes stale mapping rows whose NB UUID no
+     * longer resolves. {@code dryRun=true} reports counts without mutating.
+     *
+     * @param zoneId target zone
+     * @param dryRun {@code true} = no mutation, just counts
+     * @return per-table counts + dry-run flag
+     */
+    OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun);
 }
