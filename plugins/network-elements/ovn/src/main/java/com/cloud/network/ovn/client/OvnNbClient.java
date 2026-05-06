@@ -16,6 +16,7 @@
 // under the License.
 package com.cloud.network.ovn.client;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -231,6 +232,161 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(lsUuid), "ports",
                 OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
         return tx.commit().insertedUuid(0);
+    }
+
+    // ------------------------------------------------------------------
+    // ACL operations.
+    // ------------------------------------------------------------------
+
+    /** OVN ACL direction applied at ingress to the LSP / from the guest. */
+    public static final String ACL_DIRECTION_FROM_LPORT = "from-lport";
+    /** OVN ACL direction applied at egress towards the LSP / to the guest. */
+    public static final String ACL_DIRECTION_TO_LPORT = "to-lport";
+
+    /** OVN ACL action: allow but skip conntrack (rare; default-deny baseline). */
+    public static final String ACL_ACTION_ALLOW = "allow";
+    /** OVN ACL action: stateful allow; the canonical CloudStack default. */
+    public static final String ACL_ACTION_ALLOW_RELATED = "allow-related";
+    /** OVN ACL action: stateless allow (no conntrack entry created). */
+    public static final String ACL_ACTION_ALLOW_STATELESS = "allow-stateless";
+    /** OVN ACL action: silently drop. */
+    public static final String ACL_ACTION_DROP = "drop";
+    /** OVN ACL action: drop and emit ICMP unreachable / TCP RST. */
+    public static final String ACL_ACTION_REJECT = "reject";
+
+    /**
+     * Inserts one ACL row and links it to a logical switch in a single
+     * transaction. Returns the new ACL UUID.
+     *
+     * @param lsUuid       parent logical switch UUID
+     * @param direction    {@link #ACL_DIRECTION_FROM_LPORT} or
+     *                     {@link #ACL_DIRECTION_TO_LPORT}
+     * @param priority     OVN priority (0..32767, larger wins)
+     * @param match        OVN match expression (see ovn-sb(5) §15)
+     * @param action       OVN action (allow / allow-related /
+     *                     allow-stateless / drop / reject)
+     * @param externalIds  source-of-truth metadata (CloudStack rule id)
+     * @param log          when {@code true} the datapath emits a hit record
+     * @param severity     log severity (alert / warning / notice / info /
+     *                     debug); ignored when {@code log} is false
+     * @param name         optional human-readable label
+     */
+    public String addAclToLogicalSwitch(final String lsUuid, final String direction, final int priority,
+                                        final String match, final String action,
+                                        final Map<String, String> externalIds,
+                                        final boolean log, final String severity, final String name) {
+        final String namedAcl = OvnNamedUuid.next("acl");
+        final ObjectNode aclRow = buildAclRow(direction, priority, match, action, externalIds, log, severity, name);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("ACL", namedAcl, aclRow));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "acls",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(namedAcl))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildAclRow(final String direction, final int priority, final String match, final String action,
+                                   final Map<String, String> externalIds, final boolean log, final String severity,
+                                   final String name) {
+        if (direction == null || direction.isEmpty()) {
+            throw new OvnException("ACL direction is required");
+        }
+        if (action == null || action.isEmpty()) {
+            throw new OvnException("ACL action is required");
+        }
+        if (match == null || match.isEmpty()) {
+            throw new OvnException("ACL match is required");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("direction", direction);
+        row.put("priority", priority);
+        row.put("match", match);
+        row.put("action", action);
+        row.put("log", log);
+        if (severity != null && !severity.isEmpty()) {
+            row.put("severity", severity);
+        }
+        if (name != null && !name.isEmpty()) {
+            row.put("name", name);
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        return row;
+    }
+
+    /**
+     * Detaches an ACL row from the parent logical switch and deletes the row
+     * itself in a single transaction.
+     */
+    public void removeAclFromLogicalSwitch(final String lsUuid, final String aclUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "acls",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(aclUuid))));
+        tx.add(OvnOpFactory.delete("ACL", OvnOpFactory.whereUuid(aclUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Clears the {@code acls} set on the given logical switch (sets it to
+     * empty). Note that orphaned ACL rows are then garbage-collected by
+     * northd; for an explicit cascade delete the caller must list-then-delete.
+     */
+    public void clearAllAclsFromLogicalSwitch(final String lsUuid) {
+        final OvnTransaction tx = newTransaction();
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+        emptySet.add("set");
+        emptySet.add(JsonNodeFactory.instance.arrayNode());
+        row.set("acls", emptySet);
+        tx.add(OvnOpFactory.update("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Lists the ACL UUIDs currently attached to the given logical switch.
+     * Returns an empty list when the switch has no ACLs.
+     */
+    public List<String> listAclsOnLogicalSwitch(final String lsUuid) {
+        final OvnTransaction tx = newTransaction();
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("acls");
+        tx.add(OvnOpFactory.select("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        return extractUuidSet(r.raw(), 0, "acls");
+    }
+
+    private List<String> extractUuidSet(final ArrayNode replies, final int index, final String column) {
+        final List<String> out = new ArrayList<>();
+        if (replies == null || replies.size() <= index) {
+            return out;
+        }
+        final var entry = replies.get(index);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null || rows.size() == 0) {
+            return out;
+        }
+        final var col = rows.get(0).get(column);
+        if (col == null || col.size() < 2) {
+            return out;
+        }
+        // Either ["uuid", "<id>"] for a single value or ["set", [["uuid", id], ...]].
+        if (col.get(0).asText().equals("uuid")) {
+            out.add(col.get(1).asText());
+            return out;
+        }
+        final var elements = col.get(1);
+        if (elements == null) {
+            return out;
+        }
+        for (int i = 0; i < elements.size(); i++) {
+            final var ref = elements.get(i);
+            if (ref != null && ref.size() >= 2 && "uuid".equals(ref.get(0).asText())) {
+                out.add(ref.get(1).asText());
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------

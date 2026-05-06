@@ -76,6 +76,22 @@ public final class OvnOpFactory {
      */
     public static ObjectNode mutateInsertSet(final String table, final ArrayNode where, final String column,
                                              final ArrayNode setValue) {
+        return buildMutateSetOp(table, where, column, setValue, "insert");
+    }
+
+    /**
+     * Builds an OVSDB {@code mutate} operation that removes one or more
+     * elements from a set column. Used to detach references (e.g. an ACL
+     * UUID from {@code Logical_Switch.acls} or a load_balancer UUID from
+     * {@code Logical_Router.load_balancer}).
+     */
+    public static ObjectNode mutateDeleteSet(final String table, final ArrayNode where, final String column,
+                                             final ArrayNode setValue) {
+        return buildMutateSetOp(table, where, column, setValue, "delete");
+    }
+
+    private static ObjectNode buildMutateSetOp(final String table, final ArrayNode where, final String column,
+                                               final ArrayNode setValue, final String mutator) {
         final ObjectNode op = JsonNodeFactory.instance.objectNode();
         op.put("op", "mutate");
         op.put("table", table);
@@ -83,7 +99,7 @@ public final class OvnOpFactory {
         final ArrayNode mutations = JsonNodeFactory.instance.arrayNode();
         final ArrayNode mutation = JsonNodeFactory.instance.arrayNode();
         mutation.add(column);
-        mutation.add("insert");
+        mutation.add(mutator);
         mutation.add(setValue);
         mutations.add(mutation);
         op.set("mutations", mutations);
