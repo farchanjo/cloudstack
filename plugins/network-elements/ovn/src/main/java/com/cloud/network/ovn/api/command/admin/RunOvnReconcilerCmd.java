@@ -62,10 +62,17 @@ public class RunOvnReconcilerCmd extends BaseCmd {
             description = "when true, return counts without mutating NB / DAO state (default false)")
     private Boolean dryRun;
 
+    @Parameter(name = "purgeuntagged", type = CommandType.BOOLEAN,
+            description = "when true, also drop DHCP_Options / DNS / ACL rows whose external_ids "
+                    + "lacks the cs_kind tag (typically operator pollution from manual ovn-nbctl "
+                    + "sessions or pre-plugin state). Destructive — off by default.")
+    private Boolean purgeUntagged;
+
     @Override
     public void execute() throws ServerApiException {
         final boolean isDryRun = Boolean.TRUE.equals(dryRun);
-        final OvnReconcileResultResponse response = ovnAdminService.runReconciler(zoneId, isDryRun);
+        final boolean isPurgeUntagged = Boolean.TRUE.equals(purgeUntagged);
+        final OvnReconcileResultResponse response = ovnAdminService.runReconciler(zoneId, isDryRun, isPurgeUntagged);
         response.setResponseName(getCommandName());
         setResponseObject(response);
     }

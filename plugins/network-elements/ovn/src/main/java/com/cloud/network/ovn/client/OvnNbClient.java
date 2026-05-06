@@ -139,6 +139,45 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * List every row UUID in the supplied NB table. Used by the reconciler
+     * to walk a table without an external_ids predicate (e.g. find rows
+     * whose external_ids map is empty / missing cs_kind).
+     */
+    public List<String> listAllUuids(final String table) {
+        final List<String> out = new ArrayList<>();
+        if (table == null || table.isEmpty()) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return out;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            final var uuidNode = row == null ? null : row.get("_uuid");
+            if (uuidNode != null && uuidNode.size() >= 2) {
+                out.add(uuidNode.get(1).asText());
+            }
+        }
+        return out;
+    }
+
+    /**
      * List UUIDs of every row in {@code table} whose {@code external_ids}
      * map contains an entry {@code key=value}. Used by destroy paths to
      * sweep orphan rows when the local mapping has already been wiped or

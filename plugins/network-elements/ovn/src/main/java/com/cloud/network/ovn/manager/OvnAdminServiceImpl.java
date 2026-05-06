@@ -164,9 +164,10 @@ public class OvnAdminServiceImpl implements OvnAdminService {
     }
 
     @Override
-    public OvnReconcileResultResponse runReconciler(final long zoneId, final boolean dryRun) {
+    public OvnReconcileResultResponse runReconciler(final long zoneId, final boolean dryRun,
+                                                    final boolean purgeUntagged) {
         try {
-            final OvnReconcilerService.Result result = reconcilerService.reconcileZone(zoneId, dryRun);
+            final OvnReconcilerService.Result result = reconcilerService.reconcileZone(zoneId, dryRun, purgeUntagged);
             final OvnReconcileResultResponse r = new OvnReconcileResultResponse();
             r.setDryRun(result.isDryRun());
             r.setOrphansByTable(result.getOrphansByTable());

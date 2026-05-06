@@ -97,6 +97,19 @@ public class OvnReconcilerService {
      * @return summary keyed by table name -&gt; (orphans, stale-mappings).
      */
     public Result reconcileZone(final long zoneId, final boolean dryRun) {
+        return reconcileZone(zoneId, dryRun, false);
+    }
+
+    /**
+     * Same as {@link #reconcileZone(long, boolean)} but with a switch to
+     * also purge rows whose {@code external_ids} map is empty / missing
+     * the {@code cs_kind} tag. Those are typically left over from manual
+     * {@code ovn-nbctl} sessions or pre-plugin operator activity — never
+     * created by the plugin itself. Off by default; the caller has to opt
+     * in explicitly because there is no way for the plugin to tell an
+     * operator-managed untagged row apart from a stale one.
+     */
+    public Result reconcileZone(final long zoneId, final boolean dryRun, final boolean purgeUntagged) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             throw new OvnException("OvnReconcilerService: no controller for zone " + zoneId);
@@ -108,10 +121,46 @@ public class OvnReconcilerService {
             final Kind[] kinds = entry.getValue();
             sweepOrphanNbRows(nb, controller, table, kinds, dryRun, out);
             sweepStaleMappings(nb, controller, table, kinds, dryRun, out);
+            if (purgeUntagged) {
+                sweepUntaggedRows(nb, controller, table, dryRun, out);
+            }
         }
-        LOGGER.info("OvnReconcilerService: zone={} dryRun={} orphansFound={} staleMappingsFound={}",
-                zoneId, dryRun, out.totalOrphans(), out.totalStaleMappings());
+        LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
+                zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
         return out;
+    }
+
+    /**
+     * Walk all rows in {@code table} and drop anything whose
+     * {@code external_ids} is empty OR lacks the {@code cs_kind} key. Used
+     * only when {@code purgeUntagged=true}; off by default because operator-
+     * created rows look identical to the plugin's view here. Limited to
+     * tables where this kind of pollution was observed in the field
+     * (DHCP_Options, DNS, ACL); other tables are skipped to keep the
+     * destructive surface narrow.
+     */
+    private void sweepUntaggedRows(final OvnNbClient nb, final OvnControllerVO controller,
+                                   final String table, final boolean dryRun, final Result out) {
+        if (!"DHCP_Options".equals(table) && !"DNS".equals(table) && !"ACL".equals(table)) {
+            return;
+        }
+        // Empty-string-on-key match returns rows that explicitly have no
+        // cs_kind tag. The findUuids helper expects a value match, so we
+        // emulate by filtering all rows whose tagged-uuid set excludes
+        // every known kind. Cheap because tables stay small.
+        final java.util.Set<String> tagged = new java.util.HashSet<>();
+        for (final Kind k : TABLE_KINDS.getOrDefault(table, new Kind[]{})) {
+            tagged.addAll(nb.findUuidsByExternalIds(table, OvnConstants.EXT_ID_KIND, k.name()));
+        }
+        for (final String uuid : nb.listAllUuids(table)) {
+            if (tagged.contains(uuid)) {
+                continue;
+            }
+            out.recordOrphan(table, uuid, null);
+            if (!dryRun) {
+                deleteByTable(nb, controller, table, uuid, null);
+            }
+        }
     }
 
     /**

@@ -63,9 +63,13 @@ public interface OvnAdminService {
      * mapping is gone, and removes stale mapping rows whose NB UUID no
      * longer resolves. {@code dryRun=true} reports counts without mutating.
      *
-     * @param zoneId target zone
-     * @param dryRun {@code true} = no mutation, just counts
+     * @param zoneId         target zone
+     * @param dryRun         {@code true} = no mutation, just counts
+     * @param purgeUntagged  {@code true} = also drop DHCP_Options / DNS / ACL
+     *                       rows with empty external_ids (operator pollution
+     *                       from manual ovn-nbctl sessions or pre-plugin
+     *                       state). Off by default — destructive.
      * @return per-table counts + dry-run flag
      */
-    OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun);
+    OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun, boolean purgeUntagged);
 }
