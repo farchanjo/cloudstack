@@ -19,14 +19,23 @@ package com.cloud.upgrade.dao;
 import java.io.InputStream;
 
 /**
- * Schema upgrade 4.24.1.18 → 4.24.1.19. NO-OP on schema. Bumps version row
- * only so the cluster DatabaseUpgradeChecker accepts the new code version
- * without requiring single-mgmt mode.
+ * Schema upgrade 4.24.1.{1..18} → 4.24.1.19. NO-OP on schema. Bumps version
+ * row only so the cluster DatabaseUpgradeChecker accepts the new code
+ * version without requiring single-mgmt mode.
  *
  * <p>The 4.24.1.19 release introduces the {@link
  * com.cloud.hypervisor.kvm.resource.hwoffload.RuleProgrammer} Strategy
  * pattern (TC default, OF opt-in via OVS-DPDK). All changes are agent-side
  * Java; no DB schema, no view, no procedure mutated.
+ *
+ * <p>The fork-internal SNAPSHOT versions {@code 4.24.1.2 .. 4.24.1.17} were
+ * never registered in {@link com.cloud.upgrade.DatabaseUpgradeChecker}; this
+ * upgrader is the canonical no-op landing for any DB row stamped at one of
+ * those interim versions. Both the {@code getUpgradableVersionRange} entry
+ * point and the explicit {@code next("4.24.1.1", new Upgrade42418to42419())}
+ * registration in {@link com.cloud.upgrade.DatabaseUpgradeChecker} cover the
+ * gap. {@code getUpgradableVersionRange} is informational (logged only);
+ * {@code next} is what the hierarchy walks, which is why we register both.
  *
  * <p>Idempotent and safe on a re-run.
  */
@@ -34,7 +43,7 @@ public class Upgrade42418to42419 extends DbUpgradeAbstractImpl implements DbUpgr
 
     @Override
     public String[] getUpgradableVersionRange() {
-        return new String[]{"4.24.1.18", "4.24.1.19"};
+        return new String[]{"4.24.1.1", "4.24.1.19"};
     }
 
     @Override
