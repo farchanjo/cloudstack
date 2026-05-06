@@ -142,6 +142,27 @@ public class OvnNbClient implements AutoCloseable {
         return OvnOpFactory.insert("Logical_Router_Port", namedUuid, row);
     }
 
+    /**
+     * Replace {@code networks} (and optionally {@code mac}) of an existing
+     * LRP in place. Used when a tier's gateway IP / CIDR changes — the
+     * router-patch pair stays put, only the LRP's gateway prefix list is
+     * rewritten so OVN northd recomputes the L3 forwarding entries on the
+     * next tick. Pass {@code null} for {@code mac} to leave it untouched.
+     */
+    public void updateLogicalRouterPortNetworks(final String lrpUuid, final List<String> networks, final String mac) {
+        if (networks == null || networks.isEmpty()) {
+            throw new OvnException("updateLogicalRouterPortNetworks requires at least one network");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("networks", stringSet(networks));
+        if (mac != null && !mac.isEmpty()) {
+            row.put("mac", mac);
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
+        tx.commit();
+    }
+
     public void deleteLogicalRouterPort(final String lrpUuid) {
         // Detach from parent Logical_Router.ports before deleting the row;
         // otherwise OVSDB rejects with "referential integrity violation".
@@ -289,6 +310,27 @@ public class OvnNbClient implements AutoCloseable {
             row.set("options", buildMap(options));
         }
         return row;
+    }
+
+    /**
+     * Replace {@code addresses} (and {@code port_security}) of an existing
+     * LSP in place. Used when a NIC's IP changes without a release+prepare
+     * cycle (CloudStack {@code updateVmNicIp} surfaces this path). The LSP
+     * UUID, parent LS attachment, and external_ids stay the same.
+     */
+    public void updateLogicalSwitchPortAddresses(final String lspUuid, final List<String> addresses) {
+        if (addresses == null) {
+            throw new OvnException("updateLogicalSwitchPortAddresses requires non-null addresses");
+        }
+        final OvnTransaction tx = newTransaction();
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("addresses", stringSet(addresses));
+        // Keep port_security in lockstep with addresses (spoof-guard mirrors
+        // declared addresses; otherwise OVN drops legitimate traffic when
+        // the IP changes underneath the spoof rule).
+        row.set("port_security", stringSet(addresses));
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
     }
 
     public void deleteLogicalSwitchPort(final String lspUuid) {
@@ -570,6 +612,30 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(lrUuid), "nat",
                 OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
         return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Replace the {@code external_ip} (and optionally {@code logical_ip}) of
+     * an existing NAT row in place. Used by SourceNAT IP rotation
+     * ({@link com.cloud.network.element.VpcProvider#updateVpcSourceNatIp})
+     * so the SNAT row keeps the same UUID + parent reference; only the
+     * external IP changes. Pass {@code null} for {@code logicalIp} to leave
+     * the column untouched.
+     */
+    public void updateNatRule(final String natUuid, final String externalIp, final String logicalIp) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        if (externalIp != null && !externalIp.isEmpty()) {
+            row.put("external_ip", externalIp);
+        }
+        if (logicalIp != null && !logicalIp.isEmpty()) {
+            row.put("logical_ip", logicalIp);
+        }
+        if (row.size() == 0) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("NAT", OvnOpFactory.whereUuid(natUuid), row));
+        tx.commit();
     }
 
     public void deleteNatRule(final String natUuid) {
