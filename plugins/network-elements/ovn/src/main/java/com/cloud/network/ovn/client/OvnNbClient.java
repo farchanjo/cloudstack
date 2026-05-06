@@ -119,6 +119,46 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Check whether a row with the given UUID still lives in the supplied
+     * NB table. Used by ensure* idempotent helpers to detect stale mapping
+     * rows whose underlying NB DB entity was deleted out-of-band (admin
+     * intervention, prior bug, partial cleanup). When this returns false
+     * the caller should drop the local mapping row and re-create the NB
+     * entity so the cluster heals on the next reconcile pass.
+     *
+     * @param table OVN_Northbound table name (e.g. {@code Logical_Switch},
+     *              {@code Logical_Router}, {@code HA_Chassis_Group}).
+     * @param uuid  the row UUID to probe.
+     * @return {@code true} if the row exists, {@code false} when the table
+     *         lookup returns zero rows or the input is blank.
+     */
+    public boolean rowExistsByUuid(final String table, final String uuid) {
+        if (table == null || table.isEmpty() || uuid == null || uuid.isEmpty()) {
+            return false;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereUuid(uuid), columns));
+        try {
+            final OvnTransaction.Result r = tx.commit();
+            final ArrayNode arr = r.raw();
+            if (arr == null || arr.size() == 0) {
+                return false;
+            }
+            final var entry = arr.get(0);
+            final var rows = entry == null ? null : entry.get("rows");
+            return rows != null && rows.size() > 0;
+        } catch (OvnException e) {
+            // Treat transport / parse errors as "unknown" -> conservative
+            // false so the caller falls back to the recreate path. Logging
+            // is the caller's responsibility (we keep this surface silent
+            // to avoid double-logging on retries).
+            return false;
+        }
+    }
+
     public String addLogicalRouterPort(final String lrUuid, final String name, final String mac, final List<String> networks) {
         if (networks == null || networks.isEmpty()) {
             throw new OvnException("addLogicalRouterPort requires at least one network");

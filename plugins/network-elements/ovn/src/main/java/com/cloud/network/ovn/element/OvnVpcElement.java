@@ -66,11 +66,19 @@ public class OvnVpcElement {
         if (controller == null) {
             throw new OvnException("no OVN controller for zone " + vpc.getZoneId());
         }
+        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            // Stale-mapping guard: cluster recovery / partial cleanup may
+            // have left a CS row pointing at a NB row that no longer exists.
+            // Recreate transparently instead of returning a dead UUID.
+            if (nb.rowExistsByUuid("Logical_Router", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnVpcElement.createLogicalRouterFor: mapping VPC={} -> {} stale (NB gone); recreating",
+                    vpc.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
-        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
         final String uuid = nb.createLogicalRouter(buildLrName(vpc), buildExternalIds(vpc));
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC, vpc.getId(), controller.getId(), uuid, buildLrName(vpc)));
         LOGGER.info("OVN LR {} created for VPC id={} name={}", uuid, vpc.getId(), vpc.getName());

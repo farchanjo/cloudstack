@@ -227,7 +227,17 @@ public class OvnNetworkElement extends AdapterBase
         // network id (re-use of that bucket avoids introducing a new Kind
         // enum value just for tier bindings — semantically the LRP attaches
         // a tier LS to an LR, mirroring the public-side LRP role).
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LRP, network.getId(), controller.getId());
+        OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LRP, network.getId(), controller.getId());
+        if (existing != null) {
+            // Stale-mapping guard — see OvnPublicNetworkManager for rationale.
+            final OvnNbClient probe = pluginManager.nbClient(network.getDataCenterId());
+            if (!probe.rowExistsByUuid("Logical_Router_Port", existing.getOvnUuid())) {
+                LOGGER.warn("OvnNetworkElement.ensureTierBound: PUBLIC_LRP mapping net={} -> {} stale; recreating",
+                        network.getId(), existing.getOvnUuid());
+                logicalIdMapDao.remove(existing.getId());
+                existing = null;
+            }
+        }
         try {
             final String tierName = network.getUuid();
             final String gateway = network.getGateway();

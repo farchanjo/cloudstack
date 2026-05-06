@@ -80,11 +80,20 @@ public class OvnPublicNetworkManager {
         if (controller == null) {
             throw new OvnException("OvnPublicNetworkManager: no OVN controller for zone " + zoneId);
         }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LS, zoneId, controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            // Stale-mapping guard: the NB row may have been deleted
+            // out-of-band (manual ovn-nbctl ls-del, partial cleanup,
+            // earlier failed transaction). Verify before returning the
+            // cached UUID so we don't hand the caller a dead reference.
+            if (nb.rowExistsByUuid("Logical_Switch", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnPublicNetworkManager: PUBLIC_LS mapping {} -> {} stale (NB row gone); recreating",
+                    zoneId, existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
-        final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final String lsName = "ls-public-z" + zoneId;
         final Map<String, String> ext = new HashMap<>();
         ext.put(OvnConstants.EXT_ID_KIND, Kind.PUBLIC_LS.name());
@@ -111,9 +120,15 @@ public class OvnPublicNetworkManager {
         if (controller == null) {
             throw new OvnException("OvnPublicNetworkManager: no OVN controller for zone " + zoneId);
         }
+        final OvnNbClient nbExist = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.HA_CHASSIS_GROUP, zoneId, controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            if (nbExist.rowExistsByUuid("HA_Chassis_Group", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnPublicNetworkManager: HA_CHASSIS_GROUP mapping {} -> {} stale; recreating",
+                    zoneId, existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final List<OvnChassisMapVO> chassis = chassisMapDao.listByController(controller.getId());
         if (chassis.isEmpty()) {
@@ -197,9 +212,21 @@ public class OvnPublicNetworkManager {
         if (controller == null) {
             throw new OvnException("OvnPublicNetworkManager: no controller for zone " + zoneId);
         }
+        final OvnNbClient nbExist = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            if (nbExist.rowExistsByUuid("Logical_Router_Port", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnPublicNetworkManager: VPC_PUBLIC_LRP mapping vpc={} -> {} stale; recreating",
+                    vpcId, existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
+            // Drop the paired STATIC_ROUTE mapping too — a stale public LRP
+            // implies the default route may also have been GC'd by cascade.
+            final OvnLogicalIdMapVO staleRoute = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
+            if (staleRoute != null) {
+                logicalIdMapDao.remove(staleRoute.getId());
+            }
         }
         // Pre-create public LS with the supplied vlan/physnet so the localnet
         // port is correctly tagged on first creation. Subsequent calls hit the
