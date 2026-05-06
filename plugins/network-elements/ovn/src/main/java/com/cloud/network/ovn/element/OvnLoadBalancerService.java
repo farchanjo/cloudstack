@@ -88,8 +88,16 @@ import com.cloud.vm.VirtualMachineProfile;
  * line and proceeds without a health-check row; tests assert the warning
  * is emitted so the operator notices.
  */
+/**
+ * Helper bean. Not a CloudStack {@code NetworkElement}: the plugin federates
+ * all per-service implementations through the single {@link OvnNetworkElement}
+ * (CloudStack enforces a 1:1 Provider &lt;-&gt; NetworkElement registration). The
+ * element {@code @Inject}s this helper and delegates the {@code
+ * LoadBalancingServiceProvider} contract to it. {@code AdapterBase} is kept
+ * so the bean retains a stable {@code name} for log-line attribution.
+ */
 @Component
-public class OvnLoadBalancerService extends AdapterBase implements LoadBalancingServiceProvider {
+public class OvnLoadBalancerService extends AdapterBase {
 
     private static final Logger LOGGER = LogManager.getLogger(OvnLoadBalancerService.class);
 
@@ -105,22 +113,18 @@ public class OvnLoadBalancerService extends AdapterBase implements LoadBalancing
     @Inject
     private NetworkDao networkDao;
 
-    @Override
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
     }
 
-    @Override
     public Provider getProvider() {
         return OvnNetworkProvider.OVN_PROVIDER;
     }
 
-    @Override
     public boolean configure(final String name, final Map<String, Object> params) throws ConfigurationException {
         return super.configure(name, params);
     }
 
-    @Override
     public boolean applyLBRules(final Network network, final List<LoadBalancingRule> rules)
             throws ResourceUnavailableException {
         if (rules == null || rules.isEmpty()) {
@@ -152,7 +156,6 @@ public class OvnLoadBalancerService extends AdapterBase implements LoadBalancing
         return overall;
     }
 
-    @Override
     public boolean validateLBRule(final Network network, final LoadBalancingRule rule) {
         // Reject algorithms OVN cannot represent before the rule is committed.
         final String algo = rule.getAlgorithm() == null ? "" : rule.getAlgorithm().toLowerCase(Locale.ROOT);
@@ -164,7 +167,6 @@ public class OvnLoadBalancerService extends AdapterBase implements LoadBalancing
         return true;
     }
 
-    @Override
     public List<LoadBalancerTO> updateHealthChecks(final Network network, final List<LoadBalancingRule> lbrules) {
         // OVN's L4 health-check table cannot represent CloudStack's HTTP /
         // TCP probe primitives 1:1; the MVP defers and relies on CloudStack
@@ -173,12 +175,10 @@ public class OvnLoadBalancerService extends AdapterBase implements LoadBalancing
         return new ArrayList<>();
     }
 
-    @Override
     public boolean handlesOnlyRulesInTransitionState() {
         return false;
     }
 
-    @Override
     public IpDeployer getIpDeployer(final Network network) {
         // OVN handles IP deployment via the VPC LR LRP gateway IP / NAT
         // rules already programmed by OvnVpcElement + OvnSourceNatService.
@@ -357,53 +357,44 @@ public class OvnLoadBalancerService extends AdapterBase implements LoadBalancing
     // NetworkElement boilerplate.
     // ------------------------------------------------------------------
 
-    @Override
     public boolean implement(final Network network, final NetworkOffering offering, final DeployDestination dest,
                              final ReservationContext context) throws ConcurrentOperationException,
             ResourceUnavailableException, InsufficientCapacityException {
         return true;
     }
 
-    @Override
     public boolean prepare(final Network network, final NicProfile nic, final VirtualMachineProfile vm,
                            final DeployDestination dest, final ReservationContext context)
             throws ConcurrentOperationException, ResourceUnavailableException, InsufficientCapacityException {
         return true;
     }
 
-    @Override
     public boolean release(final Network network, final NicProfile nic, final VirtualMachineProfile vm,
                            final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean shutdown(final Network network, final ReservationContext context, final boolean cleanup) {
         return true;
     }
 
-    @Override
     public boolean destroy(final Network network, final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean isReady(final PhysicalNetworkServiceProvider provider) {
         return true;
     }
 
-    @Override
     public boolean shutdownProviderInstances(final PhysicalNetworkServiceProvider provider,
                                              final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean canEnableIndividualServices() {
         return true;
     }
 
-    @Override
     public boolean verifyServicesCombination(final Set<Service> services) {
         return services.contains(Service.Lb);
     }

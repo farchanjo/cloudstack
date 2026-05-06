@@ -77,8 +77,16 @@ import com.cloud.vm.VirtualMachineProfile;
  *   <li>Protocol {@code icmp} → {@code icmp4} predicate.
  * </ul>
  */
+/**
+ * Helper bean. Not a CloudStack {@code NetworkElement}: the plugin federates
+ * all per-service implementations through the single {@link OvnNetworkElement}
+ * (CloudStack enforces a 1:1 Provider &lt;-&gt; NetworkElement registration). The
+ * element {@code @Inject}s this helper and delegates the {@code
+ * NetworkACLServiceProvider} contract to it. {@code AdapterBase} is kept so
+ * the bean retains a stable {@code name} for log-line attribution.
+ */
 @Component
-public class OvnFirewallService extends AdapterBase implements NetworkACLServiceProvider {
+public class OvnFirewallService extends AdapterBase {
 
     private static final Logger LOGGER = LogManager.getLogger(OvnFirewallService.class);
 
@@ -97,22 +105,18 @@ public class OvnFirewallService extends AdapterBase implements NetworkACLService
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
 
-    @Override
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
     }
 
-    @Override
     public Provider getProvider() {
         return OvnNetworkProvider.OVN_PROVIDER;
     }
 
-    @Override
     public boolean configure(final String name, final Map<String, Object> params) throws ConfigurationException {
         return super.configure(name, params);
     }
 
-    @Override
     public boolean applyNetworkACLs(final Network network, final List<? extends NetworkACLItem> rules)
             throws ResourceUnavailableException {
         if (rules == null || rules.isEmpty()) {
@@ -144,7 +148,6 @@ public class OvnFirewallService extends AdapterBase implements NetworkACLService
         return overall;
     }
 
-    @Override
     public boolean reorderAclRules(final Vpc vpc, final List<? extends Network> networks,
                                    final List<? extends NetworkACLItem> networkACLItems) {
         if (networks == null || networks.isEmpty() || networkACLItems == null || networkACLItems.isEmpty()) {
@@ -411,53 +414,44 @@ public class OvnFirewallService extends AdapterBase implements NetworkACLService
     // NetworkElement boilerplate.
     // ------------------------------------------------------------------
 
-    @Override
     public boolean implement(final Network network, final NetworkOffering offering, final DeployDestination dest,
                              final ReservationContext context) throws ConcurrentOperationException,
             ResourceUnavailableException, InsufficientCapacityException {
         return true;
     }
 
-    @Override
     public boolean prepare(final Network network, final NicProfile nic, final VirtualMachineProfile vm,
                            final DeployDestination dest, final ReservationContext context)
             throws ConcurrentOperationException, ResourceUnavailableException, InsufficientCapacityException {
         return true;
     }
 
-    @Override
     public boolean release(final Network network, final NicProfile nic, final VirtualMachineProfile vm,
                            final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean shutdown(final Network network, final ReservationContext context, final boolean cleanup) {
         return true;
     }
 
-    @Override
     public boolean destroy(final Network network, final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean isReady(final PhysicalNetworkServiceProvider provider) {
         return true;
     }
 
-    @Override
     public boolean shutdownProviderInstances(final PhysicalNetworkServiceProvider provider,
                                              final ReservationContext context) {
         return true;
     }
 
-    @Override
     public boolean canEnableIndividualServices() {
         return true;
     }
 
-    @Override
     public boolean verifyServicesCombination(final Set<Service> services) {
         return services.contains(Service.NetworkACL);
     }
