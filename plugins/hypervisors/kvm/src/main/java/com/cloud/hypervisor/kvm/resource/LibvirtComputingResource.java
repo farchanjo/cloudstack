@@ -457,6 +457,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
      * a clear error at plug time rather than crashing the whole agent.
      */
     private VifDriver vdpaVifDriver;
+    /**
+     * VifDrivers for the OVN datapath. Selected when {@code NicTO.useOvn=true}
+     * via {@link #selectVifDriver(NicTO)}; orthogonal to HW-offload / vDPA
+     * (the OVN counterparts handle the combined cases). Loaded best-effort:
+     * when the OVN plugin / classes are missing the agent stays functional
+     * for the legacy paths, and OVN-tagged NICs fail loudly at plug time.
+     */
+    private VifDriver ovnVifDriver;
+    private VifDriver ovnVfPassthroughVifDriver;
+    private VifDriver ovnVdpaVifDriver;
     private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
@@ -1888,6 +1898,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         } catch (ConfigurationException e) {
             LOGGER.warn("VdpaVifDriver not available; vDPA requests will fail", e);
         }
+        // OVN datapath drivers — loaded best-effort. Skipping is fine for
+        // hosts that never serve an OVN-tagged NIC; the dispatch in
+        // selectVifDriver throws a clear error if mgmt later sends one.
+        try {
+            ovnVifDriver = getVifDriverClass(OvnVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVifDriver not available; OVN-tagged kernel-tap NICs will fail at plug time", e);
+        }
+        try {
+            ovnVfPassthroughVifDriver = getVifDriverClass(OvnVfPassthroughVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVfPassthroughVifDriver not available; OVN + HW-offload NICs will fail at plug time", e);
+        }
+        try {
+            ovnVdpaVifDriver = getVifDriverClass(OvnVdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVdpaVifDriver not available; OVN + vDPA NICs will fail at plug time", e);
+        }
         representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
         tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
         // HW offload uplink config is read directly from agent.properties because
@@ -2018,6 +2046,22 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     public VifDriver getVifDriver(final NicTO nic) {
+        // Diagnostics-only accessor (selectVifDriver(NicTO) is the
+        // authoritative path used at plug time). Mirrors the same priority
+        // matrix: OVN → vDPA → HW offload → traffic type. Falls back
+        // gracefully when an OVN driver is absent so callers (e.g.
+        // logging / state queries) never NPE.
+        if (nic.isUseOvn()) {
+            if (nic.isUseVdpa() && ovnVdpaVifDriver != null) {
+                return ovnVdpaVifDriver;
+            }
+            if (nic.isUseHwOffload() && ovnVfPassthroughVifDriver != null) {
+                return ovnVfPassthroughVifDriver;
+            }
+            if (ovnVifDriver != null) {
+                return ovnVifDriver;
+            }
+        }
         if (nic.getUseHwOffload() != null && nic.getUseHwOffload() && vfPassthroughVifDriver != null) {
             return vfPassthroughVifDriver;
         }
@@ -4731,10 +4775,38 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
-        // Branch order (mutually exclusive): vDPA first, then hostdev
-        // passthrough, then DPDK tag (resolved by the underlying VifDriver),
-        // then kernel tap. NicTO carries only ONE of useVdpa / useHwOffload
-        // / dpdkEnabled at a time; mgmt-side branching enforces this.
+        // Branch order (mutually exclusive on the wire — mgmt enforces only
+        // ONE of useVdpa / useHwOffload / dpdkEnabled per NicTO; useOvn is
+        // orthogonal and combines with the offload flags through the OVN-
+        // specific driver variants below):
+        //
+        //   useOvn=true + useVdpa=true        -> OvnVdpaVifDriver
+        //   useOvn=true + useHwOffload=true   -> OvnVfPassthroughVifDriver
+        //   useOvn=true + (no offload)        -> OvnVifDriver (br-int kernel tap)
+        //   useOvn=false + useVdpa=true       -> VdpaVifDriver (legacy)
+        //   useOvn=false + useHwOffload=true  -> VfPassthroughVifDriver (legacy)
+        //   useOvn=false + (no offload)       -> default driver via traffic type
+        if (nic.isUseOvn()) {
+            if (nic.isUseVdpa()) {
+                if (ovnVdpaVifDriver == null) {
+                    throw new InternalErrorException(
+                        "NicTO requests OVN + vDPA (vfPciAddress=" + nic.getVfPciAddress() + ") but OvnVdpaVifDriver is not loaded");
+                }
+                return ovnVdpaVifDriver;
+            }
+            if (nic.isUseHwOffload()) {
+                if (ovnVfPassthroughVifDriver == null) {
+                    throw new InternalErrorException(
+                        "NicTO requests OVN + HW offload (vfPciAddress=" + nic.getVfPciAddress() + ") but OvnVfPassthroughVifDriver is not loaded");
+                }
+                return ovnVfPassthroughVifDriver;
+            }
+            if (ovnVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests OVN (lsp=" + nic.getOvnLspName() + ") but OvnVifDriver is not loaded");
+            }
+            return ovnVifDriver;
+        }
         if (nic.isUseVdpa()) {
             if (vdpaVifDriver == null) {
                 throw new InternalErrorException(
