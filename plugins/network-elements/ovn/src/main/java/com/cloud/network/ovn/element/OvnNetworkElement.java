@@ -790,7 +790,26 @@ public class OvnNetworkElement extends AdapterBase
         }
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpc.getId(), controller.getId());
         if (existing != null) {
-            return;
+            // Stale-mapping guard: when the VPC_PUBLIC_LRP row was deleted
+            // out-of-band (manual ovn-nbctl lrp-del, partial cleanup), the
+            // mapping points to a dead UUID. Drop the stale row + paired
+            // STATIC_ROUTE row and fall through to recreate via
+            // publicNetworkManager.ensureVpcBoundToPublic. Without this
+            // guard the helper short-circuits without recreating.
+            final OvnNbClient probe = pluginManager.nbClient(vpc.getZoneId());
+            if (probe.rowExistsByUuid("Logical_Router_Port", existing.getOvnUuid())) {
+                return;
+            }
+            LOGGER.warn("OvnNetworkElement.ensureVpcPublicAttached: VPC_PUBLIC_LRP mapping vpc={} -> {} stale; recreating",
+                    vpc.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
+            // Paired STATIC_ROUTE mapping likely orphan too (LR.static_routes
+            // strong-ref cascaded when LRP was dropped via lrp-del). Drop
+            // unconditionally so bindVpcToPublic can recreate cleanly.
+            final OvnLogicalIdMapVO staleRoute = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpc.getId(), controller.getId());
+            if (staleRoute != null) {
+                logicalIdMapDao.remove(staleRoute.getId());
+            }
         }
         final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
         if (sourceNatIps == null || sourceNatIps.isEmpty()) {
