@@ -89,4 +89,62 @@ public class OvnSourceNatService {
             logicalIdMapDao.remove(mapping.getId());
         }
     }
+
+    // ------------------------------------------------------------------
+    // VPC-level SourceNAT — one snat row per VPC mapping the parent CIDR
+    // (e.g. 10.235.0.0/16) to the VPC's source-NAT public IP. Keyed under
+    // Kind.VPC_SOURCE_NAT so it never collides with the per-tier rows
+    // emitted from applyIps when an IP is explicitly associated to a tier.
+    // ------------------------------------------------------------------
+
+    /**
+     * Idempotent VPC-level SNAT writer. Re-running with the same external
+     * IP returns the existing UUID; running with a new external IP updates
+     * the NAT row in place (UUID stays, external_ip column changes) so the
+     * LR.nat strong-ref set does not need to be rewritten.
+     */
+    public String ensureVpcSourceNat(final long zoneId, final long vpcId, final String lrUuid,
+                                     final String externalIp, final String vpcCidr) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            throw new com.cloud.network.ovn.client.OvnException("no OVN controller for zone " + zoneId);
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_SOURCE_NAT, vpcId, controller.getId());
+        if (existing != null) {
+            // Update path: rewrite external_ip / logical_ip in place. Cheap
+            // (one OVSDB update; LR.nat reference stays valid).
+            nb.updateNatRule(existing.getOvnUuid(), externalIp, vpcCidr);
+            LOGGER.info("OVN VPC SNAT {} updated: {} -> {} on LR {}",
+                    existing.getOvnUuid(), vpcCidr, externalIp, lrUuid);
+            return existing.getOvnUuid();
+        }
+        final String natUuid = nb.addNatRule(lrUuid, NAT_TYPE_SNAT, externalIp, vpcCidr, null);
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_SOURCE_NAT, vpcId, controller.getId(), natUuid,
+                NAT_TYPE_SNAT + "-vpc-" + vpcId));
+        LOGGER.info("OVN VPC SNAT {} added: {} -> {} on LR {}", natUuid, vpcCidr, externalIp, lrUuid);
+        return natUuid;
+    }
+
+    /** Removes the VPC-level SNAT row when the VPC is shut down or its
+     *  source-NAT IP is released. Best-effort — caller already drops the
+     *  containing LR via cascade in most flows. */
+    public void removeVpcSourceNat(final long zoneId, final long vpcId) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC_SOURCE_NAT, vpcId, controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        try {
+            pluginManager.nbClient(zoneId).deleteNatRule(mapping.getOvnUuid());
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnSourceNatService.removeVpcSourceNat: NAT {} delete failed: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+        } finally {
+            logicalIdMapDao.remove(mapping.getId());
+        }
+    }
 }

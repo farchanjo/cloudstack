@@ -70,7 +70,13 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
         /** Zone-scope public Logical_Switch (one per zone). */
         PUBLIC_LS,
         /** Per-zone public-side LRP attached to PUBLIC_LS, keyed by VPC id. */
-        PUBLIC_LRP
+        PUBLIC_LRP,
+        /** VPC-level SourceNAT row keyed by VPC id (one per VPC, mapping VPC
+         *  parent CIDR to the VPC's source-NAT public IP). Distinct from
+         *  {@link #SOURCE_NAT} which is per-tier (keyed by tier network id);
+         *  the per-tier kind survives for callers that explicitly associate
+         *  a public IP to a tier. */
+        VPC_SOURCE_NAT
     }
 
     @Id
