@@ -237,7 +237,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * {@code /sys/class/net/<pf>/device}. Returns an ordered map keyed by PF
      * physical port index (so p0, p1, ...) for deterministic iteration.
      */
-    static Map<String, String> scanPfsFromSysfs() {
+    public static Map<String, String> scanPfsFromSysfs() {
         File netDir = new File("/sys/class/net");
         String[] ifaces = netDir.list();
         if (ifaces == null) {
