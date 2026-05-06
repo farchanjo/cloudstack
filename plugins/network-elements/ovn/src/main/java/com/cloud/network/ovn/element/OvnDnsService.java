@@ -139,32 +139,42 @@ public class OvnDnsService {
         if (controller == null) {
             return;
         }
+        final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
         final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.DNS_RECORDS, network.getId(), controller.getId());
-        if (mapping == null) {
-            return;
+        if (mapping != null) {
+            final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+            if (lsMapping == null) {
+                try {
+                    nb.updateDnsRecords(mapping.getOvnUuid(), Map.of());
+                } catch (OvnException ignored) {
+                    // best-effort
+                }
+                logicalIdMapDao.remove(mapping.getId());
+            } else {
+                try {
+                    nb.deleteDnsRecords(lsMapping.getOvnUuid(), mapping.getOvnUuid());
+                } catch (OvnException e) {
+                    LOGGER.warn("OvnDnsService.removeTierDns failed (network id={}): {}", network.getId(), e.getMessage());
+                } finally {
+                    logicalIdMapDao.remove(mapping.getId());
+                }
+            }
         }
-        final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
-        if (lsMapping == null) {
-            // Detach impossible without LS UUID; drop the row directly via NB.
-            // (OVN cascades the dangling reference on next sync.)
+        // Orphan sweep — drop any DNS rows tagged with this network's cs_id
+        // whose CS-side mapping was already wiped (earlier failed tx, prior
+        // plugin version pre-stale-guard). Each orphan gets emptied; ovsdb
+        // cascades the dangling reference on next sync once parent LS dies.
+        for (final String orphan : nb.findUuidsByExternalIds("DNS",
+                OvnConstants.EXT_ID_ID, String.valueOf(network.getId()))) {
             try {
-                pluginManager.nbClient(network.getDataCenterId()).updateDnsRecords(mapping.getOvnUuid(), Map.of());
+                nb.updateDnsRecords(orphan, Map.of());
+                LOGGER.info("OvnDnsService.removeTierDns: orphan DNS {} swept (network id={})",
+                        orphan, network.getId());
             } catch (OvnException ignored) {
                 // best-effort
             }
-            logicalIdMapDao.remove(mapping.getId());
-            snapshots.remove(network.getId());
-            return;
         }
-        try {
-            pluginManager.nbClient(network.getDataCenterId())
-                    .deleteDnsRecords(lsMapping.getOvnUuid(), mapping.getOvnUuid());
-        } catch (OvnException e) {
-            LOGGER.warn("OvnDnsService.removeTierDns failed (network id={}): {}", network.getId(), e.getMessage());
-        } finally {
-            logicalIdMapDao.remove(mapping.getId());
-            snapshots.remove(network.getId());
-        }
+        snapshots.remove(network.getId());
     }
 
     private String ensureDnsRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network) {

@@ -120,6 +120,70 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * List UUIDs of every row in {@code table} whose {@code external_ids}
+     * map contains an entry {@code key=value}. Used by destroy paths to
+     * sweep orphan rows when the local mapping has already been wiped or
+     * was never persisted (e.g. earlier failed transaction). Implementation
+     * walks the table client-side because OVSDB's {@code includes} predicate
+     * over a typed map returns a column-indexed shape; iterating the rows
+     * is robust and the affected NB tables (DHCP_Options, DNS) hold a
+     * handful of rows per zone.
+     */
+    public List<String> findUuidsByExternalIds(final String table, final String key, final String value) {
+        final List<String> out = new ArrayList<>();
+        if (table == null || table.isEmpty() || key == null || value == null) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("external_ids");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return out;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ext = row.get("external_ids");
+            if (ext == null || ext.size() < 2 || !"map".equals(ext.get(0).asText())) {
+                continue;
+            }
+            final var pairs = ext.get(1);
+            if (pairs == null) {
+                continue;
+            }
+            for (int j = 0; j < pairs.size(); j++) {
+                final var pair = pairs.get(j);
+                if (pair != null && pair.size() >= 2
+                        && key.equals(pair.get(0).asText())
+                        && value.equals(pair.get(1).asText())) {
+                    final var uuidNode = row.get("_uuid");
+                    if (uuidNode != null && uuidNode.size() >= 2) {
+                        out.add(uuidNode.get(1).asText());
+                    }
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
      * Check whether a row with the given UUID still lives in the supplied
      * NB table. Used by ensure* idempotent helpers to detect stale mapping
      * rows whose underlying NB DB entity was deleted out-of-band (admin

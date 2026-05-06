@@ -149,6 +149,21 @@ public class OvnDhcpService {
                 logicalIdMapDao.remove(v4.getId());
             }
         }
+        // Orphan sweep: catch any DHCP_Options rows tagged with this network's
+        // cs_id but whose CS-side mapping was already wiped (earlier failed
+        // tx, manual cleanup, prior plugin version pre-stale-guard). Without
+        // this NB rows accumulate forever — visible as growing
+        // `ovn-nbctl list dhcp_options` between full VPC tear-downs.
+        for (final String orphan : nb.findUuidsByExternalIds("DHCP_Options",
+                OvnConstants.EXT_ID_ID, String.valueOf(network.getId()))) {
+            try {
+                nb.deleteDhcpOptions(orphan);
+                LOGGER.info("OvnDhcpService.removeTierDhcp: orphan DHCP_Options {} swept (network id={})",
+                        orphan, network.getId());
+            } catch (OvnException ignored) {
+                // best-effort; row may have just gone via cascade
+            }
+        }
         final OvnLogicalIdMapVO v6 = logicalIdMapDao.findByCsId(Kind.DHCP_OPTIONS_V6, network.getId(), controller.getId());
         if (v6 != null) {
             try {
