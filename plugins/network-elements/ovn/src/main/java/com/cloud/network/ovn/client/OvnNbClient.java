@@ -172,6 +172,23 @@ public class OvnNbClient implements AutoCloseable {
 
     public String addLogicalSwitchPort(final String lsUuid, final String name, final List<String> addresses,
                                        final String type, final Map<String, String> options) {
+        // Idempotent insert: an LSP with the same name (NIC UUID-derived)
+        // can survive in OVN_Northbound when an earlier deploy attempt
+        // crashed between LSP create and CloudStack-side mapping persist.
+        // Pre-query by name and adopt the existing row instead of failing
+        // the new transaction with "constraint violation: identical name".
+        final String existing = findLogicalSwitchPortUuidByName(name);
+        if (existing != null) {
+            // Re-attach to the LS in case the orphan got detached
+            // somehow; mutateInsertSet on a set is idempotent (OVSDB
+            // semantics: adding a duplicate to a set is a no-op).
+            final OvnTransaction reAttach = newTransaction();
+            reAttach.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                    OvnOpFactory.whereUuid(lsUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(existing))));
+            reAttach.commit();
+            return existing;
+        }
         final String namedLsp = OvnNamedUuid.next("lsp");
         final ObjectNode lspRow = buildLspRow(name, addresses, type, options);
         final OvnTransaction tx = newTransaction();
@@ -180,6 +197,24 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(lsUuid), "ports",
                 OvnRowRef.singletonSet(OvnRowRef.namedUuid(namedLsp))));
         return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Look up a Logical_Switch_Port UUID by its unique {@code name} column.
+     * Returns {@code null} when no row matches.
+     */
+    public String findLogicalSwitchPortUuidByName(final String name) {
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("name");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Switch_Port", OvnOpFactory.whereName(name), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final List<String> uuids = extractUuidSet(r.raw(), 0, "_uuid");
+        return uuids.isEmpty() ? null : uuids.get(0);
     }
 
     private ObjectNode buildLspRow(final String name, final List<String> addresses, final String type,

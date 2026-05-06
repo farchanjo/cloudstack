@@ -124,4 +124,19 @@ public final class OvnOpFactory {
     public static ArrayNode whereAll() {
         return JsonNodeFactory.instance.arrayNode();
     }
+
+    /**
+     * Builds a {@code where} clause matching by the {@code name} column. Used
+     * for idempotent lookups on tables whose {@code name} index is unique
+     * (Logical_Switch, Logical_Switch_Port, Logical_Router, Logical_Router_Port).
+     */
+    public static ArrayNode whereName(final String name) {
+        final ArrayNode where = JsonNodeFactory.instance.arrayNode();
+        final ArrayNode condition = JsonNodeFactory.instance.arrayNode();
+        condition.add("name");
+        condition.add("==");
+        condition.add(name);
+        where.add(condition);
+        return where;
+    }
 }
