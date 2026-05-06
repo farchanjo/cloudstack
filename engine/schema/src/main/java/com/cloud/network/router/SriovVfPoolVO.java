@@ -39,8 +39,30 @@ import org.apache.cloudstack.api.InternalIdentity;
 @Table(name = "sriov_vf_pool")
 public class SriovVfPoolVO implements InternalIdentity {
 
+    /**
+     * Pool-row lifecycle state.
+     * <ul>
+     *   <li>{@link #FREE}: VF is unallocated and available.
+     *   <li>{@link #ALLOCATED}: VF is bound to a NIC ({@code allocated_to_nic_id}
+     *       set) and the agent has confirmed it.
+     *   <li>{@link #RESERVED}: VF is staged for allocation but not yet plugged
+     *       (rare, used for two-phase allocation paths).
+     *   <li>{@link #UNAVAILABLE}: VF cannot be used (driver bind error,
+     *       hardware fault). Operator action required.
+     *   <li>{@link #SUSPECT}: VF is allocated in the DB but the agent has not
+     *       confirmed it for longer than {@code vf.pool.suspect.timeout.seconds}
+     *       (host disconnect, VR fault, agent restart in progress). The mgmt
+     *       reconciler raises an alert and waits for operator action; no
+     *       auto-release.
+     *   <li>{@link #ORPHAN_MANUAL}: vDPA SF reported by the agent that has no
+     *       backing pool row — typically a manually-provisioned SF the
+     *       operator set up before adopting the orchestrator. Synthetic rows
+     *       are inserted in this state by the reconciler so the operator can
+     *       see them in the UI and decide whether to release.
+     * </ul>
+     */
     public enum State {
-        FREE, ALLOCATED, RESERVED, UNAVAILABLE
+        FREE, ALLOCATED, RESERVED, UNAVAILABLE, SUSPECT, ORPHAN_MANUAL
     }
 
     /**
@@ -108,6 +130,19 @@ public class SriovVfPoolVO implements InternalIdentity {
     @Column(name = "updated")
     @Temporal(TemporalType.TIMESTAMP)
     private Date updated;
+
+    /**
+     * Last time the host agent confirmed this VF in its inventory advertise.
+     * Driven by {@code UpdateHostVfInventoryCommand} processing on the mgmt
+     * side. The mgmt reconciler flips {@link State#ALLOCATED} rows to
+     * {@link State#SUSPECT} when this column is older than
+     * {@code vf.pool.suspect.timeout.seconds}. Null until the first inventory
+     * arrives — fresh installs and pre-Phase-H.1 rows therefore start
+     * unconfirmed and are included in the first sweep.
+     */
+    @Column(name = "last_seen")
+    @Temporal(TemporalType.TIMESTAMP)
+    private Date lastSeen;
 
     public SriovVfPoolVO() {
     }
@@ -212,5 +247,13 @@ public class SriovVfPoolVO implements InternalIdentity {
     public void setVdpaDevice(String vdpaDevice) {
         this.vdpaDevice = vdpaDevice;
         this.updated = new Date();
+    }
+
+    public Date getLastSeen() {
+        return lastSeen;
+    }
+
+    public void setLastSeen(Date lastSeen) {
+        this.lastSeen = lastSeen;
     }
 }
