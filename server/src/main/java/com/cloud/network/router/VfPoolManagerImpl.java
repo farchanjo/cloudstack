@@ -35,7 +35,7 @@ import com.cloud.network.router.dao.SriovVfPoolDao;
 import com.cloud.utils.component.ManagerBase;
 
 @Component
-public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
+public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfPoolService {
 
     private static final Logger LOGGER = LogManager.getLogger(VfPoolManagerImpl.class);
 
