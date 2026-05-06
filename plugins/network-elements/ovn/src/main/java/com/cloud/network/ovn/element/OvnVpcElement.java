@@ -78,8 +78,18 @@ public class OvnVpcElement {
     }
 
     /**
-     * Removes the LR backing the given VPC. Cleans up the mapping row even
-     * when the OVN call fails (best-effort delete).
+     * Cascade-removes the LR backing the given VPC + every CloudStack-managed
+     * dependency: NAT rules, static_routes, attached load_balancers, public
+     * LRPs. The {@code Logical_Router} schema marks {@code ports / nat /
+     * static_routes} as strong refs (OVSDB cascades on parent delete), but
+     * {@code load_balancer} is a weak ref — explicitly detach LBs first to
+     * avoid leaving them attached to a dead LR.
+     *
+     * <p>Mapping rows in {@code ovn_logical_id_map} for this VPC's children
+     * (PUBLIC_LRP, STATIC_ROUTE, SOURCE_NAT, STATIC_NAT, PORT_FORWARDING,
+     * LOAD_BALANCER) are dropped on a best-effort basis. The caller should
+     * already have run rule-revoke flows; the sweep here covers crash-leftover
+     * mappings.
      */
     public void deleteLogicalRouterFor(final Vpc vpc) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
@@ -90,12 +100,44 @@ public class OvnVpcElement {
         if (mapping == null) {
             return;
         }
+        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
+        // Detach all LBs from this LR; weak refs would otherwise dangle.
+        for (final String lbUuid : nb.listLoadBalancersOnLogicalRouter(mapping.getOvnUuid())) {
+            try {
+                nb.detachLoadBalancerFromLogicalRouter(mapping.getOvnUuid(), lbUuid);
+            } catch (OvnException e) {
+                LOGGER.warn("OvnVpcElement.deleteLR: detach LB {} from LR {} failed: {}",
+                        lbUuid, mapping.getOvnUuid(), e.getMessage());
+            }
+        }
         try {
-            pluginManager.nbClient(vpc.getZoneId()).deleteLogicalRouter(mapping.getOvnUuid());
+            nb.deleteLogicalRouter(mapping.getOvnUuid());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnVpcElement.deleteLR: LR {} delete failed (children left orphan): {}",
+                    mapping.getOvnUuid(), e.getMessage());
         } finally {
             logicalIdMapDao.remove(mapping.getId());
         }
-        LOGGER.info("OVN LR {} removed for VPC id={}", mapping.getOvnUuid(), vpc.getId());
+        // Best-effort sweep child mapping rows for this VPC; OVN cascade
+        // dropped the actual NB rows, but the CS-side rows still need to go.
+        sweepChildMappings(vpc.getId(), controller.getId(),
+                Kind.PUBLIC_LRP, Kind.STATIC_ROUTE, Kind.SOURCE_NAT,
+                Kind.STATIC_NAT, Kind.PORT_FORWARDING, Kind.LOAD_BALANCER);
+        LOGGER.info("OVN LR {} removed for VPC id={} (cascade)", mapping.getOvnUuid(), vpc.getId());
+    }
+
+    /**
+     * Drop every mapping row whose {@code cs_id} matches the given VPC id
+     * across the supplied {@code Kind}s. Cheap because the table is small
+     * (one row per OVN child entity).
+     */
+    private void sweepChildMappings(final long csId, final long controllerId, final Kind... kinds) {
+        for (final Kind kind : kinds) {
+            final OvnLogicalIdMapVO row = logicalIdMapDao.findByCsId(kind, csId, controllerId);
+            if (row != null) {
+                logicalIdMapDao.remove(row.getId());
+            }
+        }
     }
 
     /**

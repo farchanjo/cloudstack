@@ -523,6 +523,20 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Lists Load_Balancer UUIDs currently attached to a Logical_Router.
+     * Used by the VPC delete cascade to detach LB weak refs before dropping
+     * the LR (OVSDB does not cascade weak refs on parent delete).
+     */
+    public List<String> listLoadBalancersOnLogicalRouter(final String lrUuid) {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("load_balancer");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereUuid(lrUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        return extractUuidSet(r.raw(), 0, "load_balancer");
+    }
+
     /** Detaches a load_balancer row from a Logical_Router. */
     public void detachLoadBalancerFromLogicalRouter(final String lrUuid, final String lbUuid) {
         final OvnTransaction tx = newTransaction();
