@@ -121,23 +121,26 @@ public class OvnPublicNetworkManager {
                     + controller.getId());
         }
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
-        final List<String> haChassisUuids = new ArrayList<>(chassis.size());
         // Priority decreases by host id order so failover deterministically
-        // picks the lower-id chassis when multiple are healthy.
+        // picks the lower-id chassis when multiple are healthy. We insert
+        // every HA_Chassis row + the HA_Chassis_Group in a single OVSDB
+        // transaction via createHaChassisGroupAtomic — separate transactions
+        // would let ovsdb-server GC the orphan HA_Chassis rows before the
+        // group references them, raising "referential integrity violation".
+        final List<java.util.Map.Entry<String, Integer>> members = new ArrayList<>(chassis.size());
         int prio = 100;
         for (final OvnChassisMapVO row : chassis) {
-            final String hacUuid = nb.createHaChassis(row.getChassisUuid(), prio--);
-            haChassisUuids.add(hacUuid);
+            members.add(java.util.Map.entry(row.getChassisUuid(), prio--));
         }
         final Map<String, String> ext = new HashMap<>();
         ext.put(OvnConstants.EXT_ID_KIND, Kind.HA_CHASSIS_GROUP.name());
         ext.put(OvnConstants.EXT_ID_ID, String.valueOf(zoneId));
         ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(zoneId));
         final String hagName = "hag-public-z" + zoneId;
-        final String hagUuid = nb.createHaChassisGroup(hagName, haChassisUuids, ext);
+        final String hagUuid = nb.createHaChassisGroupAtomic(hagName, members, ext);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.HA_CHASSIS_GROUP, zoneId, controller.getId(), hagUuid, hagName));
         LOGGER.info("OvnPublicNetworkManager: created HA_Chassis_Group {} with {} chassis (zone={})",
-                hagUuid, haChassisUuids.size(), zoneId);
+                hagUuid, members.size(), zoneId);
         return hagUuid;
     }
 

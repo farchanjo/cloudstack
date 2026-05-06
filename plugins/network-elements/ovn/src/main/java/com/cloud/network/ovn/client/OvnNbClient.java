@@ -1210,6 +1210,52 @@ public class OvnNbClient implements AutoCloseable {
         return tx.commit().insertedUuid(0);
     }
 
+    /**
+     * Atomic single-transaction variant: inserts every HA_Chassis row + the
+     * parent HA_Chassis_Group referencing them by named UUID, in one
+     * commit. Required because OVSDB GCs orphan HA_Chassis rows between
+     * transactions — the original {@link #createHaChassis} +
+     * {@link #createHaChassisGroup} pair fails referential integrity when
+     * the chassis rows get GC'd before the group references them.
+     *
+     * @param name           HA_Chassis_Group.name
+     * @param members        ordered list of (chassisName, priority) pairs
+     * @param externalIds    HA_Chassis_Group.external_ids
+     * @return the new HA_Chassis_Group UUID
+     */
+    public String createHaChassisGroupAtomic(final String name,
+                                             final List<Map.Entry<String, Integer>> members,
+                                             final Map<String, String> externalIds) {
+        if (members == null || members.isEmpty()) {
+            throw new OvnException("createHaChassisGroupAtomic requires at least one member");
+        }
+        final OvnTransaction tx = newTransaction();
+        final ArrayNode hacRefs = JsonNodeFactory.instance.arrayNode();
+        for (final Map.Entry<String, Integer> m : members) {
+            final ObjectNode hacRow = JsonNodeFactory.instance.objectNode();
+            hacRow.put("chassis_name", m.getKey());
+            hacRow.put("priority", m.getValue());
+            final String hacNamed = OvnNamedUuid.next("hac");
+            tx.add(OvnOpFactory.insert("HA_Chassis", hacNamed, hacRow));
+            hacRefs.add(OvnRowRef.namedUuid(hacNamed));
+        }
+        // Wrap the named-uuid array as a typed OVSDB set.
+        final ArrayNode hacSet = JsonNodeFactory.instance.arrayNode();
+        hacSet.add("set");
+        hacSet.add(hacRefs);
+        final ObjectNode hagRow = JsonNodeFactory.instance.objectNode();
+        hagRow.put("name", name);
+        hagRow.set("ha_chassis", hacSet);
+        if (externalIds != null && !externalIds.isEmpty()) {
+            hagRow.set("external_ids", buildMap(externalIds));
+        }
+        final String hagNamed = OvnNamedUuid.next("hag");
+        tx.add(OvnOpFactory.insert("HA_Chassis_Group", hagNamed, hagRow));
+        // The HA_Chassis_Group insert is the last op; its uuid is at index
+        // == members.size() (HA_Chassis inserts come first).
+        return tx.commit().insertedUuid(members.size());
+    }
+
     /** Pins an LRP to an HA_Chassis_Group (sets the {@code ha_chassis_group} column). */
     public void lrpSetHaChassisGroup(final String lrpUuid, final String hagUuid) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
