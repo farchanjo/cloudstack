@@ -418,6 +418,127 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------
+    // Load_Balancer operations.
+    // ------------------------------------------------------------------
+
+    /** OVN load_balancer protocol values (per ovn-nb(5)). */
+    public static final String LB_PROTOCOL_TCP = "tcp";
+    public static final String LB_PROTOCOL_UDP = "udp";
+    public static final String LB_PROTOCOL_SCTP = "sctp";
+
+    /**
+     * Inserts one {@code load_balancer} row. Returns the new UUID. The caller
+     * is responsible for attaching the row to a Logical_Router or
+     * Logical_Switch via {@link #attachLoadBalancerToLogicalRouter} /
+     * {@link #attachLoadBalancerToLogicalSwitch}.
+     *
+     * @param name           human-readable name; CloudStack uses
+     *                       {@code cs-lb-<rule-id>}
+     * @param vips           map of {@code "vip:port"} ->
+     *                       {@code "ip1:port,ip2:port,..."} (OVN format)
+     * @param protocol       one of {@link #LB_PROTOCOL_TCP},
+     *                       {@link #LB_PROTOCOL_UDP},
+     *                       {@link #LB_PROTOCOL_SCTP}; {@code null} for
+     *                       protocol-agnostic
+     * @param selectionFields source-hash columns (e.g.
+     *                       {@code ip4_src,ip4_dst,tcp_src,tcp_dst}); empty
+     *                       or {@code null} for OVN's default round-robin
+     * @param externalIds    metadata; CloudStack records the rule id here
+     */
+    public String createLoadBalancer(final String name, final Map<String, String> vips, final String protocol,
+                                     final List<String> selectionFields, final Map<String, String> externalIds) {
+        if (vips == null || vips.isEmpty()) {
+            throw new OvnException("createLoadBalancer requires at least one VIP entry");
+        }
+        final String namedLb = OvnNamedUuid.next("lb");
+        final ObjectNode row = buildLbRow(name, vips, protocol, selectionFields, externalIds);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Load_Balancer", namedLb, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildLbRow(final String name, final Map<String, String> vips, final String protocol,
+                                  final List<String> selectionFields, final Map<String, String> externalIds) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        if (name != null && !name.isEmpty()) {
+            row.put("name", name);
+        }
+        row.set("vips", buildMap(vips));
+        if (protocol != null && !protocol.isEmpty()) {
+            row.put("protocol", protocol);
+        }
+        if (selectionFields != null && !selectionFields.isEmpty()) {
+            row.set("selection_fields", stringSet(selectionFields));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        return row;
+    }
+
+    /**
+     * Attaches a load_balancer row to a Logical_Router (north-south LB on
+     * the VPC's gateway).
+     */
+    public void attachLoadBalancerToLogicalRouter(final String lrUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /** Detaches a load_balancer row from a Logical_Router. */
+    public void detachLoadBalancerFromLogicalRouter(final String lrUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Attaches a load_balancer row to a Logical_Switch (east-west LB on a
+     * tier; not used by the MVP but exposed for completeness).
+     */
+    public void attachLoadBalancerToLogicalSwitch(final String lsUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Atomically replaces the backend list for a single VIP. Other VIPs on
+     * the same load_balancer are preserved by re-emitting the supplied
+     * {@code allVips} map: the caller is expected to compute the desired
+     * full state and pass it in (CloudStack drives the LB rule lifecycle so
+     * it knows the full state).
+     */
+    public void updateLoadBalancerBackends(final String lbUuid, final Map<String, String> allVips) {
+        if (allVips == null) {
+            throw new OvnException("updateLoadBalancerBackends requires a non-null vips map");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("vips", buildMap(allVips));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Deletes a load_balancer row. The caller is responsible for detaching
+     * it from any Logical_Router / Logical_Switch first; otherwise the OVSDB
+     * server emits a constraint violation.
+     */
+    public void deleteLoadBalancer(final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("Load_Balancer", OvnOpFactory.whereUuid(lbUuid)));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
     // LR <-> LS patch pair.
     // ------------------------------------------------------------------
 
