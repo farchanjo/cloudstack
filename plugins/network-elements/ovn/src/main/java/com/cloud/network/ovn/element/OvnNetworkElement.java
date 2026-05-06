@@ -56,10 +56,15 @@ import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnControllerVO;
+import com.cloud.network.ovn.api.command.admin.AddOvnControllerCmd;
+import com.cloud.network.ovn.api.command.admin.DeleteOvnControllerCmd;
+import com.cloud.network.ovn.api.command.admin.ImportOvnVpcCmd;
+import com.cloud.network.ovn.api.command.admin.ListOvnControllersCmd;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.manager.OvnPluginManager;
+import com.cloud.utils.component.PluggableService;
 import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.rules.StaticNat;
 import com.cloud.network.vpc.NetworkACLItem;
@@ -106,7 +111,8 @@ public class OvnNetworkElement extends AdapterBase
                    PortForwardingServiceProvider,
                    LoadBalancingServiceProvider,
                    NetworkACLServiceProvider,
-                   IpDeployer {
+                   IpDeployer,
+                   PluggableService {
 
     private static final Logger LOGGER = LogManager.getLogger(OvnNetworkElement.class);
 
@@ -481,21 +487,44 @@ public class OvnNetworkElement extends AdapterBase
         return "lsp-nic-" + nic.getId();
     }
 
+    @Override
+    public List<Class<?>> getCommands() {
+        final List<Class<?>> cmds = new ArrayList<>();
+        cmds.add(AddOvnControllerCmd.class);
+        cmds.add(DeleteOvnControllerCmd.class);
+        cmds.add(ListOvnControllersCmd.class);
+        cmds.add(ImportOvnVpcCmd.class);
+        return cmds;
+    }
+
     private static Map<Service, Map<Capability, String>> buildCapabilities() {
         final Map<Service, Map<Capability, String>> caps = new HashMap<>();
-        caps.put(Service.Connectivity, null);
+        // Every Service entry must have a (possibly empty) map; CloudStack
+        // capability look-ups assume non-null values. Service.Firewall and
+        // Service.Gateway intentionally left out: their upstream definitions
+        // enforce sub-capability lists OVN does not surface natively
+        // (Firewall: TrafficStatistics, Gateway: RedundantRouter).
+        caps.put(Service.Connectivity, new HashMap<>());
         caps.put(Service.Dhcp, dhcpCaps());
-        caps.put(Service.Dns, null);
+        caps.put(Service.Dns, dnsCaps());
         caps.put(Service.SourceNat, sourceNatCaps());
         caps.put(Service.StaticNat, staticNatCaps());
-        caps.put(Service.PortForwarding, null);
+        caps.put(Service.PortForwarding, portForwardingCaps());
         caps.put(Service.Lb, lbCaps());
         caps.put(Service.NetworkACL, aclCaps());
-        // Service.Firewall and Service.Gateway intentionally left out: their
-        // upstream definitions enforce sub-capability lists OVN does not
-        // surface natively (Firewall: TrafficStatistics, Gateway: RedundantRouter).
-        // Connectivity + NetworkACL together cover the relevant guardrails.
         return caps;
+    }
+
+    private static Map<Capability, String> dnsCaps() {
+        final Map<Capability, String> m = new HashMap<>();
+        m.put(Capability.AllowDnsSuffixModification, "true");
+        return m;
+    }
+
+    private static Map<Capability, String> portForwardingCaps() {
+        final Map<Capability, String> m = new HashMap<>();
+        m.put(Capability.SupportedProtocols, "tcp,udp");
+        return m;
     }
 
     private static Map<Capability, String> dhcpCaps() {
