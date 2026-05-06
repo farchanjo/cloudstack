@@ -1235,6 +1235,22 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Direct delete of a DNS row when the owning Logical_Switch is unknown
+     * (typical orphan path: parent LS already cascaded out, the DNS row
+     * lingered with no remaining strong-ref). Skips the LS detach step in
+     * {@link #deleteDnsRecords} which would fail OVSDB without a live
+     * lsUuid.
+     */
+    public void deleteDnsRowDirect(final String dnsUuid) {
+        if (dnsUuid == null || dnsUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("DNS", OvnOpFactory.whereUuid(dnsUuid)));
+        tx.commit();
+    }
+
     // ------------------------------------------------------------------
     // QoS operations (rate-limit / dscp).
     // ------------------------------------------------------------------

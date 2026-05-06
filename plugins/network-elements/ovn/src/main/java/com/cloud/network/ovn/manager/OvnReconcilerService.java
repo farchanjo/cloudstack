@@ -298,8 +298,11 @@ public class OvnReconcilerService {
                     nb.deleteDhcpOptions(uuid);
                     break;
                 case "DNS":
-                    // No detach helper: best-effort empty + leave for cascade.
-                    nb.updateDnsRecords(uuid, java.util.Map.of());
+                    // Orphan DNS row — parent LS already gone (cascade did
+                    // the detach), so a direct delete is safe. updateDnsRecords
+                    // would only clear the records map without dropping the
+                    // row.
+                    nb.deleteDnsRowDirect(uuid);
                     break;
                 case "NAT":
                     nb.deleteNatRule(uuid);
