@@ -96,4 +96,20 @@ public interface VfPoolManager extends Manager {
      * and free the row. Idempotent.
      */
     boolean releaseVdpa(long vfPoolId);
+
+    /**
+     * Mark every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * row owned by the host as
+     * {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT}. Used when
+     * the host disconnects: operator must inspect and force-release. No
+     * auto-release. Returns the number of rows affected.
+     */
+    int markSuspectByHostId(long hostId);
+
+    /**
+     * Force every ALLOCATED or SUSPECT row on the host back to FREE. Driven
+     * by the {@code forceReleaseHostVfs} admin command. Returns the number of
+     * rows released.
+     */
+    int forceReleaseByHostId(long hostId);
 }

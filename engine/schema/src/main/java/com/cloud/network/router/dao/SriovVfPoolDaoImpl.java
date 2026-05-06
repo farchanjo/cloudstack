@@ -17,7 +17,10 @@
 package com.cloud.network.router.dao;
 
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 import org.apache.logging.log4j.LogManager;
@@ -71,12 +74,46 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
             "     OR n.removed IS NOT NULL " +
             "     OR v.removed IS NOT NULL )";
 
+    /**
+     * Mark every ALLOCATED row on the host SUSPECT in one statement. The
+     * Phase H.1 reconciler uses this when an agent disconnects so the operator
+     * can review the affected VFs without auto-release.
+     */
+    private static final String SQL_MARK_SUSPECT_BY_HOST_ID =
+            "UPDATE sriov_vf_pool " +
+            "   SET state = 'SUSPECT', updated = NOW() " +
+            " WHERE host_id = ? AND state = 'ALLOCATED'";
+
+    /**
+     * Force every ALLOCATED or SUSPECT row on the host back to FREE — clears
+     * nic binding and vdpa fields. Driven by the {@code forceReleaseHostVfs}
+     * admin command. Idempotent.
+     */
+    private static final String SQL_FORCE_RELEASE_BY_HOST_ID =
+            "UPDATE sriov_vf_pool " +
+            "   SET state = 'FREE', allocated_to_nic_id = NULL, " +
+            "       vdpa_kind = 'PASSTHROUGH', vdpa_name = NULL, vdpa_device = NULL, " +
+            "       updated = NOW() " +
+            " WHERE host_id = ? AND state IN ('ALLOCATED', 'SUSPECT')";
+
+    /**
+     * Stale ALLOCATED rows: last_seen older than NOW() - threshold seconds, OR
+     * last_seen IS NULL (the agent never confirmed this row since the column
+     * was added). Caller flips them to SUSPECT.
+     */
+    private static final String SQL_FIND_STALE_ALLOCATED =
+            "SELECT id FROM sriov_vf_pool " +
+            " WHERE state = 'ALLOCATED' " +
+            "   AND (last_seen IS NULL OR last_seen < (NOW() - INTERVAL ? SECOND))";
+
     private final SearchBuilder<SriovVfPoolVO> hostStateSearch;
     private final SearchBuilder<SriovVfPoolVO> hostPciSearch;
     private final SearchBuilder<SriovVfPoolVO> nicIdSearch;
     private final SearchBuilder<SriovVfPoolVO> hostNicIdSearch;
     /** Free + vDPA-capable VFs on a host. Used by {@link #findFreeVdpaCapableVf}. */
     private final SearchBuilder<SriovVfPoolVO> hostStateKindSearch;
+    /** Lookup by {@code (hostId, vdpaName)} for the agent advertise reconciler. */
+    private final SearchBuilder<SriovVfPoolVO> hostVdpaNameSearch;
 
     public SriovVfPoolDaoImpl() {
         hostStateSearch = createSearchBuilder();
@@ -102,6 +139,11 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         hostStateKindSearch.and("hostId", hostStateKindSearch.entity().getHostId(), SearchCriteria.Op.EQ);
         hostStateKindSearch.and("state", hostStateKindSearch.entity().getState(), SearchCriteria.Op.EQ);
         hostStateKindSearch.done();
+
+        hostVdpaNameSearch = createSearchBuilder();
+        hostVdpaNameSearch.and("hostId", hostVdpaNameSearch.entity().getHostId(), SearchCriteria.Op.EQ);
+        hostVdpaNameSearch.and("vdpaName", hostVdpaNameSearch.entity().getVdpaName(), SearchCriteria.Op.EQ);
+        hostVdpaNameSearch.done();
     }
 
     @Override
@@ -332,6 +374,85 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
      */
     private static String buildVdpaName(long nicId) {
         return "vdpa-" + nicId;
+    }
+
+    @Override
+    public boolean touchLastSeen(final long hostId, final String pciAddress) {
+        return Transaction.execute(new TransactionCallback<Boolean>() {
+            @Override
+            public Boolean doInTransaction(TransactionStatus status) {
+                SriovVfPoolVO vf = findByHostAndPci(hostId, pciAddress);
+                if (vf == null) {
+                    return false;
+                }
+                SriovVfPoolVO updateVo = createForUpdate();
+                updateVo.setLastSeen(new Date());
+                update(vf.getId(), updateVo);
+                return true;
+            }
+        });
+    }
+
+    @Override
+    public int markSuspectByHostId(final long hostId) {
+        return Transaction.execute(new TransactionCallback<Integer>() {
+            @Override
+            public Integer doInTransaction(TransactionStatus status) {
+                return executeUpdateWithCount(SQL_MARK_SUSPECT_BY_HOST_ID, hostId);
+            }
+        });
+    }
+
+    @Override
+    public int forceReleaseByHostId(final long hostId) {
+        return Transaction.execute(new TransactionCallback<Integer>() {
+            @Override
+            public Integer doInTransaction(TransactionStatus status) {
+                return executeUpdateWithCount(SQL_FORCE_RELEASE_BY_HOST_ID, hostId);
+            }
+        });
+    }
+
+    @Override
+    public List<SriovVfPoolVO> findStaleAllocated(final int thresholdSeconds) {
+        return Transaction.execute(new TransactionCallback<List<SriovVfPoolVO>>() {
+            @Override
+            public List<SriovVfPoolVO> doInTransaction(TransactionStatus status) {
+                List<Long> ids = new ArrayList<>();
+                TransactionLegacy txn = TransactionLegacy.currentTxn();
+                try {
+                    PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_FIND_STALE_ALLOCATED);
+                    pstmt.setInt(1, thresholdSeconds);
+                    try (ResultSet rs = pstmt.executeQuery()) {
+                        while (rs.next()) {
+                            ids.add(rs.getLong(1));
+                        }
+                    }
+                } catch (SQLException e) {
+                    LOGGER.warn(String.format("findStaleAllocated failed: %s", e.getMessage()));
+                    throw new CloudRuntimeException("findStaleAllocated query failed", e);
+                }
+                List<SriovVfPoolVO> out = new ArrayList<>(ids.size());
+                for (Long id : ids) {
+                    SriovVfPoolVO vf = findById(id);
+                    if (vf != null) {
+                        out.add(vf);
+                    }
+                }
+                return out;
+            }
+        });
+    }
+
+    @Override
+    public SriovVfPoolVO findByHostAndVdpaName(final long hostId, final String vdpaName) {
+        if (vdpaName == null) {
+            return null;
+        }
+        SearchCriteria<SriovVfPoolVO> sc = hostVdpaNameSearch.create();
+        sc.setParameters("hostId", hostId);
+        sc.setParameters("vdpaName", vdpaName);
+        return findOneBy(sc);
     }
 
     /**

@@ -95,4 +95,46 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
      * and {@link #release} the row. Idempotent.
      */
     boolean releaseVdpa(long vfPoolId);
+
+    /**
+     * Stamp {@code last_seen=NOW()} on the row identified by
+     * {@code (hostId, pciAddress)}. Used by the mgmt-side reconciler when an
+     * agent inventory advertise confirms the VF is still present. Idempotent;
+     * returns {@code true} when the row was found and updated.
+     */
+    boolean touchLastSeen(long hostId, String pciAddress);
+
+    /**
+     * Flip every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * row on the host to {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT}.
+     * Used when the host disconnects: the operator decides whether to force-
+     * release. Idempotent. Returns the number of rows updated.
+     */
+    int markSuspectByHostId(long hostId);
+
+    /**
+     * Force every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * or {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT} row on the
+     * host back to {@link com.cloud.network.router.SriovVfPoolVO.State#FREE},
+     * clearing nic binding and vDPA fields. Used by the
+     * {@code forceReleaseHostVfs} admin API. Returns the number of rows
+     * released.
+     */
+    int forceReleaseByHostId(long hostId);
+
+    /**
+     * Find every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * row whose {@code last_seen} is null or older than
+     * {@code (NOW() - thresholdSeconds)}. Caller flips them to
+     * {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT}.
+     */
+    List<SriovVfPoolVO> findStaleAllocated(int thresholdSeconds);
+
+    /**
+     * Lookup by {@code (hostId, vdpaName)}. Returns null when no row matches.
+     * Used by the reconciler when adopting a vDPA SF discovered on the host
+     * — if a row already exists, mark it VDPA; otherwise insert a synthetic
+     * {@link com.cloud.network.router.SriovVfPoolVO.State#ORPHAN_MANUAL} row.
+     */
+    SriovVfPoolVO findByHostAndVdpaName(long hostId, String vdpaName);
 }

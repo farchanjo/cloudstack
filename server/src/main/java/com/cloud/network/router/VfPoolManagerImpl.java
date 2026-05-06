@@ -155,6 +155,25 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager {
         return ok;
     }
 
+    @Override
+    public int markSuspectByHostId(long hostId) {
+        int affected = vfPoolDao.markSuspectByHostId(hostId);
+        if (affected > 0) {
+            LOGGER.warn("Marked {} ALLOCATED VF row(s) on host {} as SUSPECT (host disconnect or stale inventory)",
+                    affected, hostId);
+        }
+        return affected;
+    }
+
+    @Override
+    public int forceReleaseByHostId(long hostId) {
+        int affected = vfPoolDao.forceReleaseByHostId(hostId);
+        if (affected > 0) {
+            LOGGER.warn("Force-released {} VF row(s) on host {} (operator action)", affected, hostId);
+        }
+        return affected;
+    }
+
     /**
      * Derive the representor netdev name for a VF index on a given PF.
      * Mirrors the udev/script naming applied in {@code mlx-switchdev.sh}:
