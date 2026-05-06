@@ -26,6 +26,7 @@ import org.springframework.stereotype.Component;
 
 import com.cloud.network.router.SriovVfPoolVO;
 import com.cloud.network.router.SriovVfPoolVO.State;
+import com.cloud.network.router.SriovVfPoolVO.VdpaKind;
 import com.cloud.utils.db.DB;
 import com.cloud.utils.db.GenericDaoBase;
 import com.cloud.utils.db.SearchBuilder;
@@ -74,6 +75,8 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
     private final SearchBuilder<SriovVfPoolVO> hostPciSearch;
     private final SearchBuilder<SriovVfPoolVO> nicIdSearch;
     private final SearchBuilder<SriovVfPoolVO> hostNicIdSearch;
+    /** Free + vDPA-capable VFs on a host. Used by {@link #findFreeVdpaCapableVf}. */
+    private final SearchBuilder<SriovVfPoolVO> hostStateKindSearch;
 
     public SriovVfPoolDaoImpl() {
         hostStateSearch = createSearchBuilder();
@@ -94,6 +97,11 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         hostNicIdSearch.and("hostId", hostNicIdSearch.entity().getHostId(), SearchCriteria.Op.EQ);
         hostNicIdSearch.and("allocatedToNicId", hostNicIdSearch.entity().getAllocatedToNicId(), SearchCriteria.Op.EQ);
         hostNicIdSearch.done();
+
+        hostStateKindSearch = createSearchBuilder();
+        hostStateKindSearch.and("hostId", hostStateKindSearch.entity().getHostId(), SearchCriteria.Op.EQ);
+        hostStateKindSearch.and("state", hostStateKindSearch.entity().getState(), SearchCriteria.Op.EQ);
+        hostStateKindSearch.done();
     }
 
     @Override
@@ -225,6 +233,105 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 return executeUpdateWithCount(SQL_SWEEP_ORPHANS);
             }
         });
+    }
+
+    @Override
+    public SriovVfPoolVO findFreeVdpaCapableVf(final long hostId) {
+        // For now any FREE VF is vDPA-capable (the eswitch itself is the gate;
+        // any mlx5 VF behind a switchdev PF can host a vDPA mgmtdev). Future
+        // hardware-specific gating (e.g. ConnectX-7-only sub-set) belongs
+        // here as an extra column or filter.
+        SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
+        sc.setParameters("hostId", hostId);
+        sc.setParameters("state", State.FREE.name());
+        List<SriovVfPoolVO> free = listBy(sc);
+        return (free == null || free.isEmpty()) ? null : free.get(0);
+    }
+
+    @Override
+    public SriovVfPoolVO allocateForVdpa(final long hostId, final long nicId, final String mac, final int maxVqs) {
+        return Transaction.execute(new TransactionCallback<SriovVfPoolVO>() {
+            @Override
+            public SriovVfPoolVO doInTransaction(TransactionStatus status) {
+                // Idempotency: an existing ALLOCATED row for (hostId, nicId)
+                // whose vdpa_kind is already VDPA is reused as-is. Avoids
+                // burning a fresh VF on StartCommand re-fires (HA, mgmt
+                // cluster races) — same shape as plain allocate().
+                SearchCriteria<SriovVfPoolVO> existSc = hostNicIdSearch.create();
+                existSc.setParameters("hostId", hostId);
+                existSc.setParameters("allocatedToNicId", nicId);
+                List<SriovVfPoolVO> existing = listBy(existSc);
+                if (existing != null && !existing.isEmpty()) {
+                    SriovVfPoolVO row = existing.get(0);
+                    if (VdpaKind.VDPA.name().equals(row.getVdpaKind())) {
+                        return row;
+                    }
+                    // Row exists but was previously bound as PASSTHROUGH —
+                    // flip it in place rather than allocating a second VF.
+                    SriovVfPoolVO promote = createForUpdate();
+                    promote.setVdpaKind(VdpaKind.VDPA);
+                    promote.setVdpaName(buildVdpaName(nicId));
+                    update(row.getId(), promote);
+                    row.setVdpaKind(VdpaKind.VDPA);
+                    row.setVdpaName(buildVdpaName(nicId));
+                    return row;
+                }
+
+                SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
+                sc.setParameters("hostId", hostId);
+                sc.setParameters("state", State.FREE.name());
+                List<SriovVfPoolVO> free = lockRows(sc, null, false);
+                if (free == null || free.isEmpty()) {
+                    return null;
+                }
+                SriovVfPoolVO vf = free.get(0);
+                SriovVfPoolVO updateVo = createForUpdate();
+                updateVo.setState(State.ALLOCATED.name());
+                updateVo.setAllocatedToNicId(nicId);
+                updateVo.setVdpaKind(VdpaKind.VDPA);
+                updateVo.setVdpaName(buildVdpaName(nicId));
+                update(vf.getId(), updateVo);
+                vf.setState(State.ALLOCATED.name());
+                vf.setAllocatedToNicId(nicId);
+                vf.setVdpaKind(VdpaKind.VDPA);
+                vf.setVdpaName(buildVdpaName(nicId));
+                LOGGER.info(String.format(
+                    "allocateForVdpa: host=%d nic=%d vf=%s pci=%s mac=%s maxVqs=%d vdpaName=%s",
+                    hostId, nicId, vf.getUuid(), vf.getPciAddress(), mac, maxVqs, vf.getVdpaName()));
+                return vf;
+            }
+        });
+    }
+
+    @Override
+    public boolean releaseVdpa(final long vfPoolId) {
+        return Transaction.execute(new TransactionCallback<Boolean>() {
+            @Override
+            public Boolean doInTransaction(TransactionStatus status) {
+                SriovVfPoolVO vf = lockRow(vfPoolId, false);
+                if (vf == null) {
+                    return false;
+                }
+                SriovVfPoolVO updateVo = createForUpdate();
+                updateVo.setState(State.FREE.name());
+                updateVo.setAllocatedToNicId(null);
+                updateVo.setVdpaKind(VdpaKind.PASSTHROUGH);
+                updateVo.setVdpaName(null);
+                updateVo.setVdpaDevice(null);
+                update(vf.getId(), updateVo);
+                return true;
+            }
+        });
+    }
+
+    /**
+     * Build the canonical vDPA mgmt-device name for a NIC id. The ConnectX
+     * family limits the name length, so we keep it short ({@code vdpa-<nicId>})
+     * — the NIC id is unique within a CloudStack deployment and short enough
+     * to fit even with a future {@code -mig} / {@code -dst} suffix.
+     */
+    private static String buildVdpaName(long nicId) {
+        return "vdpa-" + nicId;
     }
 
     /**

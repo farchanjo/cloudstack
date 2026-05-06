@@ -43,6 +43,22 @@ public class SriovVfPoolVO implements InternalIdentity {
         FREE, ALLOCATED, RESERVED, UNAVAILABLE
     }
 
+    /**
+     * How the VF is currently bound on the host.
+     * <ul>
+     *   <li>{@link #PASSTHROUGH}: VF is detached from the host and assigned
+     *       directly to the guest via {@code <interface type='hostdev'>}.
+     *   <li>{@link #VDPA}: a vDPA management device sits on top of the VF
+     *       ({@code vdpa dev add ... mgmtdev pci/<vfPci>}). Guest sees a
+     *       {@code <interface type='vdpa'>} pointing at /dev/vhost-vdpa-N.
+     * </ul>
+     * Default is {@link #PASSTHROUGH} for backward compatibility with rows
+     * pre-dating Upgrade42422to42423.
+     */
+    public enum VdpaKind {
+        PASSTHROUGH, VDPA
+    }
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "id")
@@ -68,6 +84,22 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     @Column(name = "allocated_to_nic_id")
     private Long allocatedToNicId;
+
+    /**
+     * Backing kind of the VF binding. Default {@link VdpaKind#PASSTHROUGH}
+     * for backward compatibility (rows pre-dating Upgrade42422to42423 have
+     * the column populated by the SQL DEFAULT).
+     */
+    @Column(name = "vdpa_kind", nullable = false)
+    private String vdpaKind = VdpaKind.PASSTHROUGH.name();
+
+    /** vDPA mgmt-device name (e.g. {@code vdpa-vmA2}) when {@link #vdpaKind} == VDPA. */
+    @Column(name = "vdpa_name")
+    private String vdpaName;
+
+    /** Host-side {@code /dev/vhost-vdpa-N} path bound to this VF (VDPA only). */
+    @Column(name = "vdpa_device")
+    private String vdpaDevice;
 
     @Column(name = "created", nullable = false)
     @Temporal(TemporalType.TIMESTAMP)
@@ -149,5 +181,36 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public Date getUpdated() {
         return updated;
+    }
+
+    public String getVdpaKind() {
+        return vdpaKind;
+    }
+
+    public VdpaKind getVdpaKindEnum() {
+        return VdpaKind.valueOf(vdpaKind);
+    }
+
+    public void setVdpaKind(VdpaKind kind) {
+        this.vdpaKind = kind.name();
+        this.updated = new Date();
+    }
+
+    public String getVdpaName() {
+        return vdpaName;
+    }
+
+    public void setVdpaName(String vdpaName) {
+        this.vdpaName = vdpaName;
+        this.updated = new Date();
+    }
+
+    public String getVdpaDevice() {
+        return vdpaDevice;
+    }
+
+    public void setVdpaDevice(String vdpaDevice) {
+        this.vdpaDevice = vdpaDevice;
+        this.updated = new Date();
     }
 }
