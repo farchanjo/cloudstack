@@ -1143,7 +1143,49 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         // Without this VirtualNetworkApplianceManagerImpl.postStateTransitionEvent() gets called twice as part of listeners -
         // once from VpcVirtualNetworkApplianceManagerImpl and once from VirtualNetworkApplianceManagerImpl itself
         releaseHwOffloadVfsOnExpunge(transition, vo);
+        releaseHwOffloadVfsOnBootFail(transition, vo);
         return true;
+    }
+
+    /**
+     * Phase H.1 (audit E4.2): release VFs when a VR fails to boot. The state
+     * machine transitions {@code Starting -> Stopped} via
+     * {@link VirtualMachine.Event#OperationFailed} and through
+     * {@link VirtualMachine.Event#AgentReportStopped} /
+     * {@link VirtualMachine.Event#AgentReportShutdowned}. Pre-allocated VFs
+     * stay {@code ALLOCATED} on the row, leaking pool capacity until orphan
+     * sweep catches up. The cheap defence is to release them as soon as the
+     * boot fails so the next deploy attempt has the same VFs available.
+     *
+     * <p>We do <em>not</em> release on a clean stop ({@code StopRequested})
+     * because the operator may restart the VR and want VF affinity preserved.
+     */
+    private void releaseHwOffloadVfsOnBootFail(final StateMachine2.Transition<State, VirtualMachine.Event> transition,
+                                               final VirtualMachine vo) {
+        if (_vfPoolManager == null || vo == null || vo.getType() != VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        final State from = transition.getCurrentState();
+        final State to = transition.getToState();
+        if (from != State.Starting || to != State.Stopped) {
+            return;
+        }
+        final VirtualMachine.Event event = transition.getEvent();
+        if (event != VirtualMachine.Event.OperationFailed
+                && event != VirtualMachine.Event.AgentReportStopped
+                && event != VirtualMachine.Event.AgentReportShutdowned) {
+            return;
+        }
+        try {
+            int swept = _vfPoolManager.releaseByVmId(vo.getId());
+            if (swept > 0) {
+                logger.warn("Phase H.1: VR {} boot failed (event={}) — released {} VF(s) (releaseByVmId)",
+                        vo.getInstanceName(), event, swept);
+            }
+        } catch (Exception e) {
+            logger.warn("Phase H.1: failed to release VFs after VR {} boot fail (event={}): {}",
+                    vo.getInstanceName(), event, e.getMessage());
+        }
     }
 
     /**
