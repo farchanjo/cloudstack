@@ -319,6 +319,14 @@ public class OvnNetworkElement extends AdapterBase
                         already.getOvnUuid(), e.getMessage());
             }
         }
+        // VPC-level SourceNAT reconciler — CloudStack allocates the source-NAT
+        // public IP lazily (typically on the first VM deploy that triggers VR
+        // boot, which in OVN's case is bypassed). The implementVpc hook fires
+        // before any IP exists; updateVpcSourceNatIp only fires on explicit
+        // rotation. Catching the case here, on every NIC prepare, ensures
+        // the SNAT row exists as soon as both the VPC LR and the source-NAT
+        // IP coexist. Idempotent — re-runs return the existing UUID.
+        ensureVpcSourceNatFromTier(network);
         // DHCP pin (idempotent — OvnDhcpService handles the per-tier row).
         dhcpService.ensureDhcpForNic(network, nic);
         // DNS record (best-effort — DnsServiceProvider path runs separately
@@ -712,6 +720,33 @@ public class OvnNetworkElement extends AdapterBase
             throw new ResourceUnavailableException("OVN LR create failed: " + e.getMessage(),
                     Vpc.class, vpc.getId());
         }
+    }
+
+    /**
+     * Same intent as {@link #ensureVpcSourceNat(Vpc, String)} but driven from
+     * a tier {@link Network} (no Vpc reference handy). Loads the parent Vpc
+     * + LR mapping + source-NAT IP from the DAO chain. Used from {@link
+     * #prepare} so the SNAT row appears as soon as the first VM in the VPC
+     * boots, even if {@code implementVpc} ran before the source-NAT IP got
+     * allocated.
+     */
+    private void ensureVpcSourceNatFromTier(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        ensureVpcSourceNat(vpc, lrMapping.getOvnUuid());
     }
 
     /**
