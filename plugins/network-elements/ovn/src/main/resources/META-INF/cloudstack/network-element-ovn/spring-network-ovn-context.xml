@@ -68,4 +68,11 @@
         <property name="name" value="OvnLoadBalancerService"/>
     </bean>
 
+    <!-- Phase 3 — DHCP / DNS / PF / QoS / Public network helpers. -->
+    <bean id="ovnDhcpService" class="com.cloud.network.ovn.element.OvnDhcpService"/>
+    <bean id="ovnDnsService" class="com.cloud.network.ovn.element.OvnDnsService"/>
+    <bean id="ovnPortForwardingService" class="com.cloud.network.ovn.element.OvnPortForwardingService"/>
+    <bean id="ovnQosService" class="com.cloud.network.ovn.element.OvnQosService"/>
+    <bean id="ovnPublicNetworkManager" class="com.cloud.network.ovn.element.OvnPublicNetworkManager"/>
+
 </beans>
