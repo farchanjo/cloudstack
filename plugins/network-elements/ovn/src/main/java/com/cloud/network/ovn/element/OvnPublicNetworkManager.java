@@ -165,16 +165,81 @@ public class OvnPublicNetworkManager {
         nb.lrpSetHaChassisGroup(result.lrpUuid, hagUuid);
         // Default route so VPC traffic reaches upstream BGP fabric. The
         // nexthop is the first IP on the public network — caller controls.
-        nb.addLogicalRouterStaticRoute(lrUuid, "0.0.0.0/0",
+        final String routeUuid = nb.addLogicalRouterStaticRoute(lrUuid, "0.0.0.0/0",
                 pickGatewayFromNetworks(publicNetworks),
                 req.lrpName, "dst-ip",
                 Map.of(OvnConstants.EXT_ID_KIND, Kind.STATIC_ROUTE.name(),
                         OvnConstants.EXT_ID_ID, String.valueOf(vpcId)));
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PUBLIC_LRP, vpcId, controller.getId(),
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId(),
                 result.lrpUuid, req.lrpName));
+        // Persist the static-route mapping so unbind can drop it cleanly.
+        // Uses Kind.STATIC_ROUTE keyed by vpcId — one default route per VPC.
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.STATIC_ROUTE, vpcId, controller.getId(),
+                routeUuid, "default-vpc" + vpcId));
         LOGGER.info("OvnPublicNetworkManager: bound VPC LR {} to public LS {} (lrp={} hag={})",
                 lrUuid, publicLsUuid, result.lrpUuid, hagUuid);
         return result;
+    }
+
+    /**
+     * Idempotent wrapper around {@link #bindVpcToPublic(long, String, List, long)}
+     * that accepts the public VLAN tag and physnet name (typically derived
+     * by the caller from the CloudStack public Vlan / network). Re-running
+     * with the same VPC id returns the existing LRP without re-creating it.
+     */
+    public String ensureVpcBoundToPublic(final long zoneId, final long vpcId, final String lrUuid,
+                                         final String publicMac, final List<String> publicNetworks,
+                                         final Integer publicVlanTag, final String physnetName) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            throw new OvnException("OvnPublicNetworkManager: no controller for zone " + zoneId);
+        }
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (existing != null) {
+            return existing.getOvnUuid();
+        }
+        // Pre-create public LS with the supplied vlan/physnet so the localnet
+        // port is correctly tagged on first creation. Subsequent calls hit the
+        // idempotent path inside ensurePublicLogicalSwitch.
+        ensurePublicLogicalSwitch(zoneId, publicVlanTag, physnetName);
+        ensureHaChassisGroupForZone(zoneId);
+        final OvnNbClient.BindResult bound = bindVpcToPublic(zoneId, lrUuid, publicMac, publicNetworks, vpcId);
+        return bound.lrpUuid;
+    }
+
+    /** Drops the public LRP + default route for a VPC (called from VPC delete). */
+    public void unbindVpcFromPublic(final long zoneId, final long vpcId, final String lrUuid) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        // Drop default static route first (uses its own mapping row).
+        final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
+        if (routeMapping != null) {
+            try {
+                nb.deleteLogicalRouterStaticRoute(lrUuid, routeMapping.getOvnUuid());
+            } catch (OvnException e) {
+                LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed: {}",
+                        routeMapping.getOvnUuid(), e.getMessage());
+            } finally {
+                logicalIdMapDao.remove(routeMapping.getId());
+            }
+        }
+        try {
+            nb.deleteLogicalRouterPort(mapping.getOvnUuid());
+            LOGGER.info("OvnPublicNetworkManager: unbound VPC {} from public LS (lrp={})",
+                    vpcId, mapping.getOvnUuid());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: VPC {} unbind failed: {}",
+                    vpcId, e.getMessage());
+        } finally {
+            logicalIdMapDao.remove(mapping.getId());
+        }
     }
 
     /**

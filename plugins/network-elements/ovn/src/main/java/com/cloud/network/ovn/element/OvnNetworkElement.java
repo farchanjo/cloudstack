@@ -35,6 +35,8 @@ import com.cloud.deploy.DeployDestination;
 import com.cloud.exception.ConcurrentOperationException;
 import com.cloud.exception.InsufficientCapacityException;
 import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.dc.Vlan;
+import com.cloud.dc.dao.VlanDao;
 import com.cloud.network.Network;
 import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
@@ -43,6 +45,7 @@ import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.PublicIpAddress;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.network.element.ConnectivityProvider;
 import com.cloud.network.element.DhcpServiceProvider;
 import com.cloud.network.element.DnsServiceProvider;
@@ -151,6 +154,14 @@ public class OvnNetworkElement extends AdapterBase
     private OvnVpcElement vpcElement;
     @Inject
     private VpcDao vpcDao;
+    @Inject
+    private VlanDao vlanDao;
+    @Inject
+    private OvnPublicNetworkManager publicNetworkManager;
+
+    /** Default OVS bridge mapping name; must match {@code ovn-bridge-mappings}
+     *  on every chassis. Aragog deployment uses {@code physnet1:br-bond}. */
+    private static final String DEFAULT_PUBLIC_PHYSNET = "physnet1";
 
     @Override
     public Map<Service, Map<Capability, String>> getCapabilities() {
@@ -327,6 +338,10 @@ public class OvnNetworkElement extends AdapterBase
         // the SNAT row exists as soon as both the VPC LR and the source-NAT
         // IP coexist. Idempotent — re-runs return the existing UUID.
         ensureVpcSourceNatFromTier(network);
+        // Phase II — public-side LRP + default route attachment. Same
+        // motivation as ensureVpcSourceNatFromTier: the VPC LR may have
+        // implemented before the source-NAT IP existed, so retry on prepare.
+        ensureVpcPublicAttachedFromTier(network);
         // DHCP pin (idempotent — OvnDhcpService handles the per-tier row).
         dhcpService.ensureDhcpForNic(network, nic);
         // DNS record (best-effort — DnsServiceProvider path runs separately
@@ -714,11 +729,142 @@ public class OvnNetworkElement extends AdapterBase
             // CloudStack only fires when a public IP is explicitly associated
             // to a tier — typically never for the source-NAT IP).
             ensureVpcSourceNat(vpc, lrUuid);
+            // Phase II: attach the LR to the per-zone public Logical_Switch
+            // via a router-patch pair pinned to the HA chassis group, plus a
+            // default route 0.0.0.0/0 nexthop=upstream. The localnet LSP on
+            // the public LS exits via ovn-bridge-mappings to br-bond.
+            ensureVpcPublicAttached(vpc, lrUuid);
             return true;
         } catch (com.cloud.network.ovn.client.OvnException e) {
             LOGGER.error("OvnNetworkElement.implementVpc: VPC id={} OVN LR create failed: {}", vpc.getId(), e.getMessage());
             throw new ResourceUnavailableException("OVN LR create failed: " + e.getMessage(),
                     Vpc.class, vpc.getId());
+        }
+    }
+
+    /**
+     * Phase II — public-side attachment of the VPC LR. Idempotent: when the
+     * VPC already has a {@code VPC_PUBLIC_LRP} mapping, returns immediately.
+     * Soft no-op when the source-NAT public IP / Vlan metadata is missing
+     * (the orchestrator may not have allocated one yet — caller retries via
+     * {@link #ensureVpcPublicAttachedFromTier} on the first NIC prepare).
+     *
+     * <p>Derives:
+     * <ul>
+     *   <li>publicNetworks — {@code <sourceNAT-ip>/<prefix>} from the Vlan
+     *       netmask (one CIDR per LRP).</li>
+     *   <li>nexthop — the Vlan's gateway IP, pushed as the LR's default
+     *       static route by {@link OvnPublicNetworkManager#bindVpcToPublic}.</li>
+     *   <li>publicMac — deterministic {@code 02:02:02:%02x:%02x:%02x} from
+     *       the source-NAT IPv4 last three octets. Distinct from the tier
+     *       gateway MAC ({@code 02:01:01:...}).</li>
+     *   <li>vlanTag — parsed from {@code Vlan.getVlanTag()} (CloudStack
+     *       stores the bare numeric tag for tagged Vlans).</li>
+     * </ul>
+     */
+    private void ensureVpcPublicAttached(final Vpc vpc, final String lrUuid) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpc.getId(), controller.getId());
+        if (existing != null) {
+            return;
+        }
+        final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
+        if (sourceNatIps == null || sourceNatIps.isEmpty()) {
+            LOGGER.debug("OvnNetworkElement.ensureVpcPublicAttached: VPC id={} no source-NAT IP yet — deferred",
+                    vpc.getId());
+            return;
+        }
+        final IPAddressVO ip = sourceNatIps.get(0);
+        final String externalIp = ip.getAddress() == null ? null : ip.getAddress().addr();
+        if (StringUtils.isBlank(externalIp)) {
+            return;
+        }
+        final Vlan vlan = vlanDao.findById(ip.getVlanId());
+        if (vlan == null) {
+            LOGGER.warn("OvnNetworkElement.ensureVpcPublicAttached: VPC id={} no Vlan for IP {}",
+                    vpc.getId(), externalIp);
+            return;
+        }
+        final String netmask = vlan.getVlanNetmask();
+        if (StringUtils.isBlank(netmask)) {
+            return;
+        }
+        final long prefix = NetUtils.getCidrSize(netmask);
+        final List<String> publicNetworks = List.of(externalIp + "/" + prefix);
+        final String publicMac = derivePublicMac(externalIp);
+        final Integer vlanTag = parseVlanTag(vlan.getVlanTag());
+        try {
+            publicNetworkManager.ensureVpcBoundToPublic(vpc.getZoneId(), vpc.getId(), lrUuid,
+                    publicMac, publicNetworks, vlanTag, DEFAULT_PUBLIC_PHYSNET);
+            LOGGER.info("OvnNetworkElement.ensureVpcPublicAttached: VPC id={} bound to public (lrp networks={}, mac={}, vlan={})",
+                    vpc.getId(), publicNetworks, publicMac, vlanTag);
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.ensureVpcPublicAttached: VPC id={} bind failed: {}",
+                    vpc.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * Tier-driven retry path. Same intent as
+     * {@link #ensureVpcPublicAttached(Vpc, String)} but invoked from
+     * {@link #prepare} after the SNAT reconciler — when CloudStack allocated
+     * the source-NAT IP only after the VPC was implemented (lazy
+     * allocation), this catches it on the first VM bring-up.
+     */
+    private void ensureVpcPublicAttachedFromTier(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        ensureVpcPublicAttached(vpc, lrMapping.getOvnUuid());
+    }
+
+    /** {@code 02:02:02:XX:XX:XX} derived from the IPv4 last three octets.
+     *  Stable across plugin restarts; distinct from tier gateway MACs
+     *  ({@code 02:01:01:...}) so a packet capture can tell them apart. */
+    private static String derivePublicMac(final String ipv4) {
+        if (ipv4 == null || !ipv4.contains(".")) {
+            return "02:02:02:00:00:01";
+        }
+        final String[] octets = ipv4.trim().split("\\.");
+        if (octets.length != 4) {
+            return "02:02:02:00:00:01";
+        }
+        try {
+            final int o1 = Integer.parseInt(octets[1]) & 0xff;
+            final int o2 = Integer.parseInt(octets[2]) & 0xff;
+            final int o3 = Integer.parseInt(octets[3]) & 0xff;
+            return String.format("02:02:02:%02x:%02x:%02x", o1, o2, o3);
+        } catch (NumberFormatException e) {
+            return "02:02:02:00:00:01";
+        }
+    }
+
+    /** CloudStack stores Vlan.vlan_tag as the bare numeric tag for tagged
+     *  Vlans (e.g. {@code "2988"}); untagged is {@code "untagged"}. Returns
+     *  {@code null} for the untagged case (localnet without {@code tag}). */
+    private static Integer parseVlanTag(final String raw) {
+        if (raw == null || raw.isBlank() || "untagged".equalsIgnoreCase(raw)) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 
@@ -781,6 +927,18 @@ public class OvnNetworkElement extends AdapterBase
     public boolean shutdownVpc(final Vpc vpc, final ReservationContext context)
             throws ConcurrentOperationException, ResourceUnavailableException {
         try {
+            // Phase II — drop the public-side LRP + default route + STATIC_ROUTE
+            // mapping row before the LR cascade. The cascade-on-LR-delete
+            // would also tear them down (strong refs), but explicit unbind
+            // keeps the CS-side mapping rows clean and avoids relying on
+            // OVSDB's cascade for our bookkeeping.
+            final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
+            if (controller != null) {
+                final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+                if (lrMapping != null) {
+                    publicNetworkManager.unbindVpcFromPublic(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid());
+                }
+            }
             vpcElement.deleteLogicalRouterFor(vpc);
             return true;
         } catch (com.cloud.network.ovn.client.OvnException e) {

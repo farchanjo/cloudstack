@@ -121,7 +121,8 @@ public class OvnVpcElement {
         // Best-effort sweep child mapping rows for this VPC; OVN cascade
         // dropped the actual NB rows, but the CS-side rows still need to go.
         sweepChildMappings(vpc.getId(), controller.getId(),
-                Kind.PUBLIC_LRP, Kind.STATIC_ROUTE, Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT,
+                Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP, Kind.STATIC_ROUTE,
+                Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT,
                 Kind.STATIC_NAT, Kind.PORT_FORWARDING, Kind.LOAD_BALANCER);
         LOGGER.info("OVN LR {} removed for VPC id={} (cascade)", mapping.getOvnUuid(), vpc.getId());
     }
