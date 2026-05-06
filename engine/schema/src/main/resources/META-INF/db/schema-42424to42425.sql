@@ -27,17 +27,21 @@
 --   * Configuration knobs              for the suspect timeout, the mgmt-side
 --                                      reconcile cadence, and the agent-side
 --                                      vdpa SF reconcile cadence.
--- All ALTER / CREATE / INSERT statements are idempotent
--- (IF NOT EXISTS / ON DUPLICATE KEY UPDATE).
+-- All ALTER / CREATE / INSERT statements are idempotent.
+-- ALTERs go through `cloud.IDEMPOTENT_ADD_COLUMN` because MySQL 8.0 does NOT
+-- support the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` extension; the
+-- procedure swallows MySQL error 1060 (duplicate column).
 --
 -- Note: the Java enum `SriovVfPoolVO.State` already declares the new values
 -- (SUSPECT, ORPHAN_MANUAL) — the column type is VARCHAR(32) so MySQL accepts
 -- the new strings without further DDL.
 --;
 
-ALTER TABLE `cloud`.`sriov_vf_pool`
-    ADD COLUMN IF NOT EXISTS `last_seen` DATETIME NULL DEFAULT NULL
-    COMMENT 'last time the agent confirmed this VF in its inventory; SUSPECT trigger source';
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.sriov_vf_pool',
+    'last_seen',
+    "DATETIME NULL DEFAULT NULL COMMENT 'last time the agent confirmed this VF in its inventory; SUSPECT trigger source'"
+);
 
 -- Idempotent index creation. MySQL 8 supports `CREATE INDEX IF NOT EXISTS`
 -- starting 8.0.x; `INFORMATION_SCHEMA.STATISTICS` lookup keeps the script
@@ -64,13 +68,13 @@ INSERT INTO `cloud`.`configuration` (
     ('Advanced', 'DEFAULT', 'management-server',
      'vf.pool.suspect.timeout.seconds', '900',
      'Mark VF pool entries as SUSPECT when last_seen is older than this many seconds (default 15 min).',
-     '900', NOW(), NULL),
+     '900', NOW(), 0),
     ('Advanced', 'DEFAULT', 'management-server',
      'vf.pool.reconcile.interval.seconds', '120',
      'How often the mgmt-side reconciler walks the VF pool against agent inventory.',
-     '120', NOW(), NULL),
+     '120', NOW(), 0),
     ('Advanced', 'DEFAULT', 'management-server',
      'vdpa.sf.reconcile.interval.seconds', '60',
      'How often each agent walks vdpa dev show against IntentReconciler state and reports orphans.',
-     '60', NOW(), NULL)
+     '60', NOW(), 0)
 ON DUPLICATE KEY UPDATE `value` = `value`;

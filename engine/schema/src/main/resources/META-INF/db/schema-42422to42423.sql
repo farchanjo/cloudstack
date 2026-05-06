@@ -18,36 +18,53 @@
 --;
 -- Schema upgrade 4.24.1.22 to 4.24.1.23.
 -- Re-introduces vDPA orchestration as a CloudStack offering. Originally added
--- in fork prototype, retired by schema-42410to42411.sql. All ALTER and INSERT
--- statements below are idempotent (IF NOT EXISTS / ON DUPLICATE KEY UPDATE),
--- so the script is safe on a re-run or on a DB where the columns already exist.
+-- in fork prototype, retired by schema-42410to42411.sql.
+--
+-- All ALTER statements go through `cloud.IDEMPOTENT_ADD_COLUMN`, which swallows
+-- MySQL error 1060 (duplicate column). MySQL 8.0 does NOT support the
+-- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` extension (MariaDB only), so the
+-- procedure is the portable form. Defined in
+-- `META-INF/db/procedures/cloud.idempotent_add_column.sql`, loaded by
+-- DatabaseUpgradeChecker before any upgrade script runs.
 --;
 
--- Re-add the vDPA opt-in flag on network_offerings.
-ALTER TABLE `cloud`.`network_offerings`
-    ADD COLUMN IF NOT EXISTS `vdpa_enabled` TINYINT(1) NOT NULL DEFAULT 0
-    AFTER `hwoffload_enabled`;
+-- Re-add the vDPA opt-in flag on network_offerings, immediately after the
+-- existing `hw_offload_enabled` column so the two fork-specific flags sit
+-- side-by-side in the row layout.
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.network_offerings',
+    'vdpa_enabled',
+    "TINYINT(1) NOT NULL DEFAULT 0 AFTER `hw_offload_enabled`"
+);
 
 -- Re-add per-NIC vDPA fields. The agent populates vdpa_device at plug time
 -- (host-side /dev/vhost-vdpa-N path). Mgmt server reads it back for state
 -- queries and for live-migration patching of the destination domain XML.
-ALTER TABLE `cloud`.`nics`
-    ADD COLUMN IF NOT EXISTS `vdpa_device` VARCHAR(64) NULL DEFAULT NULL
-    COMMENT 'host-side /dev/vhost-vdpa-N path for this nic';
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.nics',
+    'vdpa_device',
+    "VARCHAR(64) NULL DEFAULT NULL COMMENT 'host-side /dev/vhost-vdpa-N path for this nic'"
+);
 
 -- Pool-side bookkeeping: record which VF is currently bound as a vDPA
 -- mgmt device, with what name, and which character device the agent created
 -- on top of it. Different from the SR-IOV passthrough fields that already
 -- exist on sriov_vf_pool.
-ALTER TABLE `cloud`.`sriov_vf_pool`
-    ADD COLUMN IF NOT EXISTS `vdpa_kind` VARCHAR(16) NOT NULL DEFAULT 'PASSTHROUGH'
-    COMMENT 'PASSTHROUGH | VDPA';
-ALTER TABLE `cloud`.`sriov_vf_pool`
-    ADD COLUMN IF NOT EXISTS `vdpa_name` VARCHAR(64) NULL DEFAULT NULL
-    COMMENT 'vdpa dev name (e.g. vdpa-vmA2) when vdpa_kind=VDPA';
-ALTER TABLE `cloud`.`sriov_vf_pool`
-    ADD COLUMN IF NOT EXISTS `vdpa_device` VARCHAR(64) NULL DEFAULT NULL
-    COMMENT '/dev/vhost-vdpa-N when vdpa_kind=VDPA';
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.sriov_vf_pool',
+    'vdpa_kind',
+    "VARCHAR(16) NOT NULL DEFAULT 'PASSTHROUGH' COMMENT 'PASSTHROUGH | VDPA'"
+);
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.sriov_vf_pool',
+    'vdpa_name',
+    "VARCHAR(64) NULL DEFAULT NULL COMMENT 'vdpa dev name (e.g. vdpa-vmA2) when vdpa_kind=VDPA'"
+);
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.sriov_vf_pool',
+    'vdpa_device',
+    "VARCHAR(64) NULL DEFAULT NULL COMMENT '/dev/vhost-vdpa-N when vdpa_kind=VDPA'"
+);
 
 -- Master toggles via the configuration table. ON DUPLICATE KEY UPDATE keeps
 -- existing operator overrides untouched on a re-run; only fresh installs
@@ -59,13 +76,13 @@ INSERT INTO `cloud`.`configuration` (
     ('Advanced', 'DEFAULT', 'management-server',
      'vr.vdpa.enabled', 'false',
      'Enable vDPA for VPC virtual routers (and any user VM whose offering opts in).',
-     'false', NOW(), NULL),
+     'false', NOW(), 0),
     ('Advanced', 'DEFAULT', 'management-server',
      'vm.vdpa.enabled', 'false',
      'Master switch for user-VM vDPA path. Per-offering vdpa_enabled flag still required.',
-     'false', NOW(), NULL),
+     'false', NOW(), 0),
     ('Advanced', 'DEFAULT', 'management-server',
      'vm.vdpa.max_vqs', '33',
      '16 RX + 16 TX + 1 control queue. Override per-host with hwoffload.vdpa.max_vqs.',
-     '33', NOW(), NULL)
+     '33', NOW(), 0)
 ON DUPLICATE KEY UPDATE `value` = `value`;
