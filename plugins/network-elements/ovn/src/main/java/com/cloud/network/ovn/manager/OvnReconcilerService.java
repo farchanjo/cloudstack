@@ -26,6 +26,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
+import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -33,6 +35,8 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnConstants;
+import com.cloud.network.vpc.dao.VpcDao;
+import com.cloud.vm.dao.NicDao;
 
 /**
  * Periodic / on-demand reconciler. Walks every NB table and the mapping
@@ -75,6 +79,14 @@ public class OvnReconcilerService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private NetworkDao networkDao;
+    @Inject
+    private VpcDao vpcDao;
+    @Inject
+    private NicDao nicDao;
+    @Inject
+    private IPAddressDao ipAddressDao;
 
     /**
      * Run a reconcile pass against the supplied zone's NB DB.
@@ -146,8 +158,12 @@ public class OvnReconcilerService {
 
     /**
      * Walk mapping rows for the given kinds and drop any whose NB UUID is
-     * absent. Pairs with the orphan sweep — that path catches NB rows with
-     * no mapping; this path catches mappings with no NB row.
+     * absent OR whose owning CloudStack entity has been removed. Pairs
+     * with the orphan sweep — that path catches NB rows with no mapping;
+     * this path catches mappings with no NB row OR mappings whose CS-side
+     * parent (Network, Vpc, Nic, PublicIp, etc) has been deleted while the
+     * NB row + mapping survived (e.g. plugin crash mid-destroy, prior
+     * plugin version pre-stale-guard).
      */
     private void sweepStaleMappings(final OvnNbClient nb, final OvnControllerVO controller,
                                     final String table, final Kind[] kinds, final boolean dryRun,
@@ -155,14 +171,68 @@ public class OvnReconcilerService {
         for (final Kind kind : kinds) {
             final List<OvnLogicalIdMapVO> mappings = logicalIdMapDao.listByKind(kind, controller.getId());
             for (final OvnLogicalIdMapVO mapping : mappings) {
-                if (nb.rowExistsByUuid(table, mapping.getOvnUuid())) {
+                final boolean nbGone = !nb.rowExistsByUuid(table, mapping.getOvnUuid());
+                final boolean csGone = !cloudstackEntityExists(kind, mapping.getCsId());
+                if (!nbGone && !csGone) {
                     continue;
                 }
                 out.recordStaleMapping(table, mapping);
                 if (!dryRun) {
+                    // CS entity gone but NB row still alive -> drop NB row first
+                    // (otherwise the next plugin touch will resurrect it via the
+                    // ensure* helpers' rowExistsByUuid path).
+                    if (!nbGone && csGone) {
+                        deleteByTable(nb, controller, table, mapping.getOvnUuid(), kind);
+                        out.recordOrphan(table, mapping.getOvnUuid(), kind);
+                    }
                     logicalIdMapDao.remove(mapping.getId());
                 }
             }
+        }
+    }
+
+    /**
+     * Verify that the CloudStack-side entity referenced by a mapping row
+     * still exists. The {@code Kind} dictates which DAO to consult.
+     * Returns {@code true} when the entity is alive (or when the kind has
+     * no straightforward CS-side parent — e.g. {@link Kind#HA_CHASSIS_GROUP}
+     * is keyed by zone id and zones are forever).
+     */
+    private boolean cloudstackEntityExists(final Kind kind, final long csId) {
+        switch (kind) {
+            case VPC:
+            case VPC_PUBLIC_LRP:
+            case VPC_SOURCE_NAT:
+                return vpcDao.findById(csId) != null;
+            case NETWORK:
+            case PUBLIC_LRP:
+            case DHCP_OPTIONS:
+            case DHCP_OPTIONS_V6:
+            case DNS_RECORDS:
+            case SOURCE_NAT:
+                return networkDao.findById(csId) != null;
+            case NIC:
+            case ORPHAN_NIC:
+            case QOS:
+                return nicDao.findById(csId) != null;
+            case STATIC_NAT:
+                return ipAddressDao.findById(csId) != null;
+            case PORT_FORWARDING:
+            case LOAD_BALANCER:
+            case NETWORK_ACL:
+            case STATIC_ROUTE:
+                // Per-rule kinds keyed by FirewallRule / NetworkACL / LB id.
+                // No cheap "exists" probe across all rule DAOs without
+                // pulling more deps; fall back to NB-presence-only for
+                // these. Their cleanup is well-driven by revoke flows
+                // anyway.
+                return true;
+            case PUBLIC_LS:
+            case HA_CHASSIS_GROUP:
+                // Per-zone, never expires while controller registered.
+                return true;
+            default:
+                return true;
         }
     }
 
