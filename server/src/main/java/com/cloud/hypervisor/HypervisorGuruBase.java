@@ -317,6 +317,29 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                     logger.debug("toNicTO: NetworkOffering tag lookup failed for nic {}: {}", to, e.getMessage());
                 }
             }
+            // OVN datapath enablement (orthogonal to VF/vDPA/DPDK). When the
+            // NetworkOffering carries the "useOvn" tag, populate the OVN
+            // binding fields the agent VifDrivers consume to write
+            // external_ids:iface-id on br-int. Names match the convention
+            // used in OvnGuestNetworkGuru.logicalSwitchNameFor / OvnNetworkElement.buildLspName.
+            try {
+                com.cloud.offerings.NetworkOfferingVO offeringForOvn =
+                        networkOfferingDao.findById(network.getNetworkOfferingId());
+                if (offeringForOvn != null && offeringForOvn.getTags() != null) {
+                    boolean ovnTagged = Arrays.stream(offeringForOvn.getTags().split(","))
+                            .map(String::trim)
+                            .anyMatch("useOvn"::equalsIgnoreCase);
+                    if (ovnTagged) {
+                        to.setUseOvn(Boolean.TRUE);
+                        to.setOvnLsName("ls-" + network.getUuid());
+                        if (StringUtils.isNotBlank(nicVO.getUuid())) {
+                            to.setOvnLspName("lsp-" + nicVO.getUuid());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.debug("toNicTO: OVN tag lookup failed for nic {}: {}", to, e.getMessage());
+            }
         } else {
             logger.warn("Unable to load NicVO for NicProfile {}", profile);
             //Workaround for dynamically created nics
