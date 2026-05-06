@@ -20,8 +20,10 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.io.File;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,40 +75,82 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
 
-        // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
-        // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
-        // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
-        // VLAN config via the PF in switchdev fails with "Operation not
-        // supported" and prevents the VR from booting.
-        // Same for the libvirt hostdev <vlan> element — it triggers the same
-        // ip link command on libvirt's side and fails. So we pass vlanTag=0
-        // to defHostdevNet (no <vlan> element) and let the OVS rep tag handle
-        // VLAN push/pop on egress/ingress.
-        String repName = lookupRepresentor(pciAddress);
-        boolean switchdev = repName != null;
-        Integer pfVlanTag = switchdev ? null : vlanTag;
-        configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
+        // Phase H.1: every step that mutates host state pushes its inverse
+        // onto rollback. If a later step throws, rollback runs LIFO and the
+        // original exception is re-thrown so callers see the real failure
+        // cause and the VR isn't left straddling a partial plug.
+        Deque<Runnable> rollback = new ArrayDeque<>();
+        try {
+            // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
+            // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
+            // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
+            // VLAN config via the PF in switchdev fails with "Operation not
+            // supported" and prevents the VR from booting.
+            // Same for the libvirt hostdev <vlan> element — it triggers the same
+            // ip link command on libvirt's side and fails. So we pass vlanTag=0
+            // to defHostdevNet (no <vlan> element) and let the OVS rep tag handle
+            // VLAN push/pop on egress/ingress.
+            String repName = lookupRepresentor(pciAddress);
+            boolean switchdev = repName != null;
+            Integer pfVlanTag = switchdev ? null : vlanTag;
+            configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
+            final String pfNameFinal = pfName != null ? pfName : lookupPfFromVf(pciAddress);
+            final Integer vfIdFinal = lookupVfIdFromPci(pciAddress);
+            rollback.push(() -> {
+                if (pfNameFinal != null && vfIdFinal != null) {
+                    Script.runSimpleBashScript(String.format(
+                        "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfNameFinal, vfIdFinal));
+                }
+            });
 
-        if (repName != null) {
-            // Auto-plumb OVS VXLAN tunnels to peer data nodes before we drop
-            // the rep into the bridge; safe no-op for legacy VLAN segments.
-            ensureVxlanMeshIfNeeded(nic, vlanTag);
-            addRepresentorToOvs(repName, vlanTag);
-            // Register the tier / VM in DvrManager so OpenFlow cross-tier
-            // shortcut + ACL flows get installed on br-bond. Runs right after
-            // the representor is in the bridge. Silent no-op if missing data.
-            registerDvrIntent(nic, vlanTag, repName);
-            installLocalVmFdbRule(repName, vlanTag, nic.getMac());
+            if (repName != null) {
+                // Auto-plumb OVS VXLAN tunnels to peer data nodes before we drop
+                // the rep into the bridge; safe no-op for legacy VLAN segments.
+                ensureVxlanMeshIfNeeded(nic, vlanTag);
+                addRepresentorToOvs(repName, vlanTag);
+                final String repNameFinal = repName;
+                rollback.push(() -> {
+                    Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
+                    Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repNameFinal));
+                });
+                // Register the tier / VM in DvrManager so OpenFlow cross-tier
+                // shortcut + ACL flows get installed on br-bond. Runs right after
+                // the representor is in the bridge. Silent no-op if missing data.
+                registerDvrIntent(nic, vlanTag, repName);
+                final String macForRollback = nic.getMac();
+                rollback.push(() -> notifyDvrUnregister(macForRollback));
+                installLocalVmFdbRule(repName, vlanTag, nic.getMac());
+                rollback.push(() -> removeLocalVmFdbRuleByMac(macForRollback));
+            }
+
+            LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
+            int xmlVlanTag = switchdev ? 0 : (vlanTag != null ? vlanTag : 0);
+            intf.defHostdevNet(pciAddress, nic.getMac(), xmlVlanTag);
+            intf.setLinkStateUp(nic.isEnabled());
+
+            logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={} switchdev={}",
+                    pciAddress, pfName, nic.getMac(), vlanTag, repName, switchdev);
+            return intf;
+        } catch (RuntimeException ex) {
+            drainRollback(rollback, "VfPassthroughVifDriver.plug");
+            throw ex;
         }
+    }
 
-        LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
-        int xmlVlanTag = switchdev ? 0 : (vlanTag != null ? vlanTag : 0);
-        intf.defHostdevNet(pciAddress, nic.getMac(), xmlVlanTag);
-        intf.setLinkStateUp(nic.isEnabled());
-
-        logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={} switchdev={}",
-                pciAddress, pfName, nic.getMac(), vlanTag, repName, switchdev);
-        return intf;
+    /**
+     * Run every queued rollback step in LIFO order. Each step's failure is
+     * logged but does not abort subsequent steps — best-effort cleanup is the
+     * goal so we leave host state as close to "pre-plug" as possible.
+     */
+    private void drainRollback(Deque<Runnable> rollback, String label) {
+        while (!rollback.isEmpty()) {
+            Runnable step = rollback.pop();
+            try {
+                step.run();
+            } catch (RuntimeException e) {
+                logger.warn("{}: rollback step failed: {}", label, e.getMessage());
+            }
+        }
     }
 
     @Override

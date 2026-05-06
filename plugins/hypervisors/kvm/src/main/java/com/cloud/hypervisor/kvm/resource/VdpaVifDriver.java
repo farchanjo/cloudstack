@@ -20,6 +20,8 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.io.File;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Map;
 
 import javax.naming.ConfigurationException;
@@ -91,48 +93,87 @@ public class VdpaVifDriver extends VifDriverBase {
         Integer vlanTag = extractVlanTag(nic);
         int maxVqs = nic.getVdpaMaxVqs() != null ? nic.getVdpaMaxVqs() : 33;
 
-        String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
-        boolean switchdev = repName != null;
-        Integer pfVlanTag = switchdev ? null : vlanTag;
-        configureVfOnPf(pfName, pciAddress, mac, pfVlanTag);
+        // Phase H.1: every step that mutates host state pushes its inverse
+        // onto rollback. If a later step throws, rollback runs LIFO and the
+        // original exception is re-thrown.
+        Deque<Runnable> rollback = new ArrayDeque<>();
+        try {
+            String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+            boolean switchdev = repName != null;
+            Integer pfVlanTag = switchdev ? null : vlanTag;
+            configureVfOnPf(pfName, pciAddress, mac, pfVlanTag);
+            final String pfNameFinal = pfName != null
+                    ? pfName : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
+            final Integer vfIdFinal = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
+            rollback.push(() -> {
+                if (pfNameFinal != null && vfIdFinal != null) {
+                    Script.runSimpleBashScript(String.format(
+                        "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfNameFinal, vfIdFinal));
+                }
+            });
 
-        if (repName != null) {
-            addRepresentorToOvs(repName, vlanTag);
-        }
-
-        String vdpaName = buildVdpaName(nic);
-        // `vdpa dev add` is idempotent only by name; pre-clean so a stale
-        // entry from a previous boot does not pin /dev/vhost-vdpa-N to the
-        // wrong VF.
-        Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
-        String addCmd = String.format(
-            "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqs %d",
-            vdpaName, pciAddress, mac, maxVqs);
-        Script.runSimpleBashScript(addCmd, 5000);
-
-        String vhostDev = resolveVhostVdpaDevice(vdpaName);
-        if (StringUtils.isBlank(vhostDev)) {
-            // Roll back the SF before bubbling up, otherwise the next plug
-            // will trip on the pre-existing name.
+            String vdpaName = buildVdpaName(nic);
+            // `vdpa dev add` is idempotent only by name; pre-clean so a stale
+            // entry from a previous boot does not pin /dev/vhost-vdpa-N to the
+            // wrong VF.
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
-            throw new InternalErrorException(String.format(
-                "VdpaVifDriver could not resolve /dev/vhost-vdpa-N for vdpa name %s; aborting plug", vdpaName));
+            String addCmd = String.format(
+                "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqs %d",
+                vdpaName, pciAddress, mac, maxVqs);
+            Script.runSimpleBashScript(addCmd, 5000);
+            final String vdpaNameFinal = vdpaName;
+            rollback.push(() -> Script.runSimpleBashScript(
+                    String.format("vdpa dev del %s 2>/dev/null", vdpaNameFinal)));
+
+            String vhostDev = resolveVhostVdpaDevice(vdpaName);
+            if (StringUtils.isBlank(vhostDev)) {
+                throw new InternalErrorException(String.format(
+                    "VdpaVifDriver could not resolve /dev/vhost-vdpa-N for vdpa name %s; aborting plug", vdpaName));
+            }
+
+            if (repName != null) {
+                addRepresentorToOvs(repName, vlanTag);
+                final String repNameFinal = repName;
+                rollback.push(() -> {
+                    Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
+                    Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repNameFinal));
+                });
+            }
+
+            // Capture the host /dev path on the NicTO so the mgmt server can store it
+            // in nics.vdpa_device for state queries / live-migrate handoff.
+            nic.setVdpaDevice(vhostDev);
+
+            LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
+            // queues = max_vqs / 2 (TX+RX pair count). 33 max_vqs (16 RX + 16 TX +
+            // 1 control) → 16 queue pairs.
+            Integer queues = maxVqs > 1 ? maxVqs / 2 : null;
+            intf.defVdpaNet(vhostDev, mac, queues);
+            intf.setLinkStateUp(nic.isEnabled());
+
+            logger.info("vDPA plug: name={} pci={} pf={} mac={} vlan={} rep={} maxVqs={} vhost={}",
+                    vdpaName, pciAddress, pfName, mac, vlanTag, repName, maxVqs, vhostDev);
+            return intf;
+        } catch (RuntimeException | InternalErrorException ex) {
+            drainRollback(rollback);
+            throw ex;
         }
+    }
 
-        // Capture the host /dev path on the NicTO so the mgmt server can store it
-        // in nics.vdpa_device for state queries / live-migrate handoff.
-        nic.setVdpaDevice(vhostDev);
-
-        LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
-        // queues = max_vqs / 2 (TX+RX pair count). 33 max_vqs (16 RX + 16 TX +
-        // 1 control) → 16 queue pairs.
-        Integer queues = maxVqs > 1 ? maxVqs / 2 : null;
-        intf.defVdpaNet(vhostDev, mac, queues);
-        intf.setLinkStateUp(nic.isEnabled());
-
-        logger.info("vDPA plug: name={} pci={} pf={} mac={} vlan={} rep={} maxVqs={} vhost={}",
-                vdpaName, pciAddress, pfName, mac, vlanTag, repName, maxVqs, vhostDev);
-        return intf;
+    /**
+     * Run every queued rollback step in LIFO order. Each step's failure is
+     * logged but does not abort the others — best-effort cleanup so the host
+     * is left as close to pre-plug as possible.
+     */
+    private void drainRollback(Deque<Runnable> rollback) {
+        while (!rollback.isEmpty()) {
+            Runnable step = rollback.pop();
+            try {
+                step.run();
+            } catch (RuntimeException e) {
+                logger.warn("VdpaVifDriver.plug rollback step failed: {}", e.getMessage());
+            }
+        }
     }
 
     @Override
