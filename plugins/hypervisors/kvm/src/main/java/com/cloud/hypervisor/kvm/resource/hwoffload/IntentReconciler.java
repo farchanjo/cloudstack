@@ -18,8 +18,10 @@
  */
 package com.cloud.hypervisor.kvm.resource.hwoffload;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -82,14 +84,45 @@ public class IntentReconciler {
 
     private final RepresentorMapper repMapper;
     private final RuleProgrammer programmer;
-    private final Map<String, IntentSpec> currentByVr = new HashMap<>();
+    /**
+     * Per-VR IntentSpec map. Concurrent so {@link #currentIntent} and
+     * {@link #gcOrphans} can read without contending with a slow apply on a
+     * single VR; per-VR mutual exclusion is provided by {@link #vrLocks}.
+     */
+    private final ConcurrentMap<String, IntentSpec> currentByVr = new ConcurrentHashMap<>();
+    /**
+     * Per-VR mutual-exclusion locks. apply/remove for the SAME VR must
+     * serialise (TC programming is not idempotent across racing applies),
+     * but apply/remove for DIFFERENT VRs can run in parallel — TC blocks,
+     * representor netdevs, and persistence files are all VR-scoped. The
+     * shared uplink ingress block is the only cross-VR resource and the
+     * inner {@code clearPfwBlock}/{@code clearStaticNatBlock} sequence is
+     * itself short and runs under the per-VR lock; if cross-VR coordination
+     * on that block becomes a bottleneck we can introduce a second
+     * uplink-scoped lock.
+     */
+    private final ConcurrentMap<String, ReentrantLock> vrLocks = new ConcurrentHashMap<>();
+    /**
+     * Coarse lock guarding {@link #gcOrphans} and any whole-state walks
+     * (e.g. {@link #loadPersistedSpecs}). gcOrphans iterates every rep on
+     * the host, so it must observe a consistent {@link #currentByVr}
+     * snapshot — held in write mode while it walks. Per-VR apply/remove
+     * acquire it in read mode (via {@code lock.readLock()}) so they can
+     * run concurrently with each other, but never against a GC pass.
+     */
+    private final java.util.concurrent.locks.ReentrantReadWriteLock gcLock =
+            new java.util.concurrent.locks.ReentrantReadWriteLock();
 
     /**
      * Cached ingress block id of the host uplink (e.g. 37 for bond1 on aragog).
      * Populated lazily on first PFW apply; reused for both add and remove.
-     * -1 means "unknown / no block"; 0+ is a valid block id.
+     * -1 means "unknown / no block"; 0+ is a valid block id. Marked volatile
+     * because multiple per-VR apply paths can read/write this concurrently
+     * once the global synchronized was dropped — write order does not need a
+     * full lock since lossy lazy init (one VR resolves first, others may
+     * resolve and find the same answer) is harmless.
      */
-    private int cachedUplinkBlockId = -1;
+    private volatile int cachedUplinkBlockId = -1;
 
     private final UplinkKind uplinkKind;
     private final boolean uplinkLag;
@@ -117,7 +150,7 @@ public class IntentReconciler {
      * malformed files are logged and skipped, the directory is created if
      * missing.
      */
-    private synchronized void loadPersistedSpecs() {
+    private void loadPersistedSpecs() {
         try {
             java.nio.file.Files.createDirectories(STATE_DIR);
         } catch (java.io.IOException e) {
@@ -178,11 +211,26 @@ public class IntentReconciler {
         return s.replaceAll("[^A-Za-z0-9_-]", "_");
     }
 
-    public synchronized void applyIntent(IntentSpec spec) {
+    public void applyIntent(IntentSpec spec) {
         if (spec == null || spec.vrId == null) {
             LOGGER.warn("applyIntent called with null spec or vrId");
             return;
         }
+        gcLock.readLock().lock();
+        try {
+            ReentrantLock lock = lockFor(spec.vrId);
+            lock.lock();
+            try {
+                applyIntentLocked(spec);
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            gcLock.readLock().unlock();
+        }
+    }
+
+    private void applyIntentLocked(IntentSpec spec) {
         IntentSpec previous = currentByVr.get(spec.vrId);
         if (previous != null && previous.version >= spec.version) {
             LOGGER.debug("Skipping stale intent for VR {} (got version {}, current {})",
@@ -286,7 +334,28 @@ public class IntentReconciler {
      * Remove all TC rules for a VR — called when the VR is being destroyed or
      * fails over to BACKUP (BACKUP submits empty intent → reconciler invokes this).
      */
-    public synchronized void removeIntent(String vrId) {
+    public void removeIntent(String vrId) {
+        if (vrId == null) {
+            return;
+        }
+        gcLock.readLock().lock();
+        try {
+            ReentrantLock lock = lockFor(vrId);
+            lock.lock();
+            try {
+                removeIntentLocked(vrId);
+            } finally {
+                lock.unlock();
+                // Best-effort: drop the per-VR lock once we're done; concurrent
+                // resurrection in another thread will re-create it.
+                vrLocks.remove(vrId, lock);
+            }
+        } finally {
+            gcLock.readLock().unlock();
+        }
+    }
+
+    private void removeIntentLocked(String vrId) {
         IntentSpec prev = currentByVr.remove(vrId);
         deletePersistedSpec(vrId);
         if (prev == null) {
@@ -372,15 +441,37 @@ public class IntentReconciler {
         }
     }
 
-    public synchronized IntentSpec currentIntent(String vrId) {
+    public IntentSpec currentIntent(String vrId) {
         return currentByVr.get(vrId);
     }
 
     /**
-     * Periodic sweep: any rep not associated with a current intent has its TC
-     * rules cleared. Call from a scheduled executor every 30-60s.
+     * Lazily allocate a per-VR lock so concurrent applies for different VRs do
+     * not block each other. The acquisition path uses
+     * {@link ConcurrentMap#computeIfAbsent} so the same VR id always converges
+     * on the same {@link ReentrantLock} instance.
      */
-    public synchronized void gcOrphans() {
+    private ReentrantLock lockFor(String vrId) {
+        return vrLocks.computeIfAbsent(vrId, k -> new ReentrantLock());
+    }
+
+    /**
+     * Periodic sweep: any rep not associated with a current intent has its TC
+     * rules cleared. Call from a scheduled executor every 30-60s. Acquires
+     * {@link #gcLock} in write mode so it observes a consistent
+     * {@link #currentByVr} snapshot and excludes any in-flight per-VR
+     * apply/remove for the duration of the walk.
+     */
+    public void gcOrphans() {
+        gcLock.writeLock().lock();
+        try {
+            gcOrphansLocked();
+        } finally {
+            gcLock.writeLock().unlock();
+        }
+    }
+
+    private void gcOrphansLocked() {
         // Build set of "owned" reps from current intents.
         java.util.Set<String> owned = new java.util.HashSet<>();
         for (IntentSpec spec : currentByVr.values()) {
