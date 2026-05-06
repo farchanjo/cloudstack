@@ -164,7 +164,13 @@ public class OvnDhcpService {
     private String ensureDhcpOptionsRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network) {
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.DHCP_OPTIONS, network.getId(), controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            // Stale-mapping guard — recreate when NB row was deleted out-of-band.
+            if (nb.rowExistsByUuid("DHCP_Options", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnDhcpService: DHCP_OPTIONS mapping net={} -> {} stale; recreating",
+                    network.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final Map<String, String> options = buildDhcpv4Options(network);
         final Map<String, String> ext = buildExternalIds(network, Kind.DHCP_OPTIONS);
@@ -177,7 +183,12 @@ public class OvnDhcpService {
     private String ensureDhcpOptionsRowV6(final OvnNbClient nb, final OvnControllerVO controller, final Network network) {
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.DHCP_OPTIONS_V6, network.getId(), controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            if (nb.rowExistsByUuid("DHCP_Options", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnDhcpService: DHCP_OPTIONS_V6 mapping net={} -> {} stale; recreating",
+                    network.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final Map<String, String> options = buildDhcpv6Options(network);
         final Map<String, String> ext = buildExternalIds(network, Kind.DHCP_OPTIONS_V6);

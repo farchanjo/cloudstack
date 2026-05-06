@@ -308,8 +308,19 @@ public class OvnNetworkElement extends AdapterBase
         if (controller == null) {
             return true;
         }
-        final OvnLogicalIdMapVO already = logicalIdMapDao.findByCsId(Kind.NIC, nic.getId(), controller.getId());
+        OvnLogicalIdMapVO already = logicalIdMapDao.findByCsId(Kind.NIC, nic.getId(), controller.getId());
         final List<String> addresses = buildAddresses(nic);
+        if (already != null) {
+            // Stale-mapping guard — recreate when LSP was deleted out-of-band
+            // (manual ovn-nbctl lsp-del, parent LS rebuild, etc).
+            final OvnNbClient probe = pluginManager.nbClient(network.getDataCenterId());
+            if (!probe.rowExistsByUuid("Logical_Switch_Port", already.getOvnUuid())) {
+                LOGGER.warn("OvnNetworkElement.prepare: NIC mapping nic={} -> {} stale; recreating",
+                        nic.getId(), already.getOvnUuid());
+                logicalIdMapDao.remove(already.getId());
+                already = null;
+            }
+        }
         if (already == null) {
             final String lsUuid = ensureLogicalSwitch(network);
             final String lspName = buildLspName(nic);

@@ -202,9 +202,15 @@ public class OvnFirewallService extends AdapterBase {
         }
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId());
         if (existing != null) {
-            LOGGER.debug("OvnFirewallService: rule id={} already mapped to ACL {}; idempotent skip",
+            // Stale-mapping guard — recreate when ACL row was deleted out-of-band.
+            if (nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
+                LOGGER.debug("OvnFirewallService: rule id={} already mapped to ACL {}; idempotent skip",
+                        rule.getId(), existing.getOvnUuid());
+                return;
+            }
+            LOGGER.warn("OvnFirewallService: NETWORK_ACL mapping rule={} -> {} stale; recreating",
                     rule.getId(), existing.getOvnUuid());
-            return;
+            logicalIdMapDao.remove(existing.getId());
         }
         final String direction = directionFor(rule);
         final String action = actionFor(rule);

@@ -112,12 +112,22 @@ public class OvnSourceNatService {
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_SOURCE_NAT, vpcId, controller.getId());
         if (existing != null) {
-            // Update path: rewrite external_ip / logical_ip in place. Cheap
-            // (one OVSDB update; LR.nat reference stays valid).
-            nb.updateNatRule(existing.getOvnUuid(), externalIp, vpcCidr);
-            LOGGER.info("OVN VPC SNAT {} updated: {} -> {} on LR {}",
-                    existing.getOvnUuid(), vpcCidr, externalIp, lrUuid);
-            return existing.getOvnUuid();
+            // Stale-mapping guard: if the NAT row was deleted out-of-band
+            // (manual ovn-nbctl, parent LR cascade we missed bookkeeping
+            // for, prior bug), updateNatRule is a silent no-op (OVSDB
+            // update against zero-row WHERE clause does nothing). Verify
+            // before update so we fall through to create on miss.
+            if (nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
+                // Update path: rewrite external_ip / logical_ip in place. Cheap
+                // (one OVSDB update; LR.nat reference stays valid).
+                nb.updateNatRule(existing.getOvnUuid(), externalIp, vpcCidr);
+                LOGGER.info("OVN VPC SNAT {} updated: {} -> {} on LR {}",
+                        existing.getOvnUuid(), vpcCidr, externalIp, lrUuid);
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnSourceNatService.ensureVpcSourceNat: VPC_SOURCE_NAT mapping vpc={} -> {} stale (NAT row gone); recreating",
+                    vpcId, existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final String natUuid = nb.addNatRule(lrUuid, NAT_TYPE_SNAT, externalIp, vpcCidr, null);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_SOURCE_NAT, vpcId, controller.getId(), natUuid,

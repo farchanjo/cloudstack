@@ -113,11 +113,17 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
         if (controller == null) {
             throw new OvnException("no OVN controller for zone " + network.getDataCenterId());
         }
+        final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            // Stale-mapping guard — recreate when NB LS was deleted out-of-band.
+            if (nb.rowExistsByUuid("Logical_Switch", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnGuestNetworkGuru: NETWORK mapping net={} -> {} stale; recreating",
+                    network.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
-        final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
         final Map<String, String> ext = buildExternalIds(network, Kind.NETWORK);
         final String uuid = nb.createLogicalSwitch(buildLsName(network), ext);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK, network.getId(), controller.getId(), uuid, buildLsName(network)));

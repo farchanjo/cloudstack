@@ -170,7 +170,13 @@ public class OvnDnsService {
     private String ensureDnsRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network) {
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.DNS_RECORDS, network.getId(), controller.getId());
         if (existing != null) {
-            return existing.getOvnUuid();
+            // Stale-mapping guard — recreate when NB row was deleted out-of-band.
+            if (nb.rowExistsByUuid("DNS", existing.getOvnUuid())) {
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnDnsService: DNS_RECORDS mapping net={} -> {} stale; recreating",
+                    network.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
         if (lsMapping == null) {

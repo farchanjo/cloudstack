@@ -135,12 +135,21 @@ public class OvnPortForwardingService {
         ext.put(OvnConstants.EXT_ID_ID, String.valueOf(rule.getId()));
 
         if (existing != null) {
-            // Backend may have changed (VM moved, port renumber); replace
-            // atomically. Re-attach is unnecessary — the LB row is already
-            // attached to the LR.
-            nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
-            LOGGER.debug("OvnPortForwardingService: rule id={} backend updated to {}", rule.getId(), vips);
-            return;
+            // Stale-mapping guard — if the LB row was deleted out-of-band,
+            // updateLoadBalancerBackends silently no-ops (OVSDB update
+            // against an empty WHERE clause does nothing). Verify before
+            // update so we recreate cleanly on miss.
+            if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
+                // Backend may have changed (VM moved, port renumber); replace
+                // atomically. Re-attach is unnecessary — the LB row is already
+                // attached to the LR.
+                nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
+                LOGGER.debug("OvnPortForwardingService: rule id={} backend updated to {}", rule.getId(), vips);
+                return;
+            }
+            LOGGER.warn("OvnPortForwardingService: PORT_FORWARDING mapping rule={} -> {} stale; recreating",
+                    rule.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final String name = "cs-pf-" + rule.getId();
         final String lbUuid = nb.createLoadBalancer(name, vips, mapProtocol(protocol), null, ext);

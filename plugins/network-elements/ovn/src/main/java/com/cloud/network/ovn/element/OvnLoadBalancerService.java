@@ -204,11 +204,17 @@ public class OvnLoadBalancerService extends AdapterBase {
         }
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.LOAD_BALANCER, rule.getId(), controller.getId());
         if (existing != null) {
-            // Backend pool change → atomic vips re-write.
-            nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
-            LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}",
-                    existing.getOvnUuid(), rule.getId());
-            return;
+            // Stale-mapping guard — recreate when LB row was deleted out-of-band.
+            if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
+                // Backend pool change → atomic vips re-write.
+                nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
+                LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}",
+                        existing.getOvnUuid(), rule.getId());
+                return;
+            }
+            LOGGER.warn("OvnLoadBalancerService: LOAD_BALANCER mapping rule={} -> {} stale; recreating",
+                    rule.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
         }
         final List<String> selectionFields = selectionFieldsFor(rule);
         final String protocol = protocolFor(rule);
