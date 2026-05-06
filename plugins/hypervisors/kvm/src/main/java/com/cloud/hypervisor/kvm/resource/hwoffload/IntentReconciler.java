@@ -446,6 +446,16 @@ public class IntentReconciler {
     }
 
     /**
+     * Read-only snapshot of every live VR id this reconciler currently tracks.
+     * Used by Phase H.1 {@code VdpaPoolReconciler} to cross-reference agent
+     * inventory against the VRs known to the IntentReconciler so that an
+     * SF whose owner VR is still live is never deleted.
+     */
+    public java.util.Set<String> currentVrIds() {
+        return new java.util.HashSet<>(currentByVr.keySet());
+    }
+
+    /**
      * Lazily allocate a per-VR lock so concurrent applies for different VRs do
      * not block each other. The acquisition path uses
      * {@link ConcurrentMap#computeIfAbsent} so the same VR id always converges
