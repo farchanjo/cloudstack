@@ -20,7 +20,12 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.naming.ConfigurationException;
 
@@ -157,16 +162,30 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     /**
      * Resolve the VF PCI BDF (e.g. {@code 0000:01:00.2}) that currently
-     * carries the given MAC, scanning both physical functions. Returns null
-     * when no VF matches — caller falls back to skipping the PCI-scoped
-     * teardown steps.
+     * carries the given MAC, scanning every PF the kernel exposes in
+     * {@code /sys/class/net} whose {@code phys_port_name} matches
+     * {@code p<digits>} (the canonical mlx5 marker for PF uplinks in
+     * switchdev mode). The PF list is cached at first call; the cache holds
+     * an ordered map of PF netdev → PF PCI BDF so repeat lookups stay cheap.
+     * Returns null when no VF matches — caller falls back to skipping the
+     * PCI-scoped teardown steps.
      */
     private String lookupVfPciByMac(String mac) {
         if (StringUtils.isBlank(mac)) {
             return null;
         }
         String norm = mac.trim().toLowerCase();
-        for (String pf : new String[]{"dx6p0", "dx6p1"}) {
+        Map<String, String> pfs = pfCache();
+        if (pfs.isEmpty()) {
+            logger.warn("lookupVfPciByMac: no PFs found in sysfs (phys_port_name=p<N>); cannot resolve VF for mac={}", mac);
+            return null;
+        }
+        for (Map.Entry<String, String> e : pfs.entrySet()) {
+            String pf = e.getKey();
+            String pfBdf = e.getValue();
+            if (StringUtils.isBlank(pfBdf)) {
+                continue;
+            }
             String cmd = String.format("ip link show dev %s 2>/dev/null | awk -v m=\"%s\" "
                             + "'/vf / {split($0,a,\" \"); for(i=1;i<=NF;i++) if(a[i]==\"link/ether\"||a[i]==\"MAC\") "
                             + "{if(tolower(a[i+1])==m) print $2}'", pf, norm);
@@ -176,8 +195,6 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                     continue;
                 }
                 int vfIdx = Integer.parseInt(out.trim());
-                // Map vfIdx -> PCI BDF via /sys/bus/pci/devices/<pf_bdf>/virtfn<N>
-                String pfBdf = pf.equals("dx6p0") ? "0000:01:00.0" : "0000:01:00.1";
                 String bdfCmd = String.format("readlink /sys/bus/pci/devices/%s/virtfn%d 2>/dev/null | awk -F/ '{print $NF}'",
                         pfBdf, vfIdx);
                 String bdf = Script.runSimpleBashScript(bdfCmd, 5000);
@@ -189,6 +206,86 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             }
         }
         return null;
+    }
+
+    /**
+     * Lazily-populated cache of PF netdev → PF PCI BDF pairs discovered via
+     * {@code /sys/class/net/*/phys_port_name = p<N>}. Order is preserved
+     * (LinkedHashMap) so PF index 0 is scanned before 1, etc. The cache is
+     * computed once per driver instance — sysfs PF topology does not change
+     * after host boot in the deployment models this driver targets.
+     */
+    private final AtomicReference<Map<String, String>> pfCacheRef = new AtomicReference<>();
+
+    Map<String, String> pfCache() {
+        Map<String, String> cached = pfCacheRef.get();
+        if (cached != null) {
+            return cached;
+        }
+        Map<String, String> scanned = scanPfsFromSysfs();
+        // Compare-and-set so concurrent first-callers converge on the same map.
+        if (pfCacheRef.compareAndSet(null, scanned)) {
+            return scanned;
+        }
+        return pfCacheRef.get();
+    }
+
+    /**
+     * Enumerate {@code /sys/class/net/*} and keep entries whose
+     * {@code phys_port_name} matches {@code p<digits>} (the mlx5 PF marker).
+     * Resolve each PF's PCI BDF by canonicalising
+     * {@code /sys/class/net/<pf>/device}. Returns an ordered map keyed by PF
+     * physical port index (so p0, p1, ...) for deterministic iteration.
+     */
+    static Map<String, String> scanPfsFromSysfs() {
+        File netDir = new File("/sys/class/net");
+        String[] ifaces = netDir.list();
+        if (ifaces == null) {
+            return Collections.emptyMap();
+        }
+        // Collect (pfIdx, name) pairs first so we can sort by index before
+        // resolving BDFs.
+        List<int[]> indices = new ArrayList<>();
+        Map<Integer, String> byIndex = new java.util.HashMap<>();
+        for (String iface : ifaces) {
+            String port = readPhysPortName(iface);
+            if (port == null || !port.matches("p\\d+")) {
+                continue;
+            }
+            try {
+                int idx = Integer.parseInt(port.substring(1));
+                if (byIndex.put(idx, iface) == null) {
+                    indices.add(new int[]{idx});
+                }
+            } catch (NumberFormatException ignore) {
+                // skip; not a numeric phys_port_name index
+            }
+        }
+        indices.sort((a, b) -> Integer.compare(a[0], b[0]));
+        Map<String, String> out = new LinkedHashMap<>();
+        for (int[] idx : indices) {
+            String pf = byIndex.get(idx[0]);
+            String bdf = resolvePfPciBdf(pf);
+            out.put(pf, bdf);
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    /**
+     * Resolve a PF netdev's PCI BDF by canonicalising its
+     * {@code /sys/class/net/<pf>/device} symlink (e.g. {@code 0000:01:00.0}).
+     * Returns null on any I/O error.
+     */
+    static String resolvePfPciBdf(String pfName) {
+        if (StringUtils.isBlank(pfName)) {
+            return null;
+        }
+        try {
+            File devLink = new File("/sys/class/net/" + pfName + "/device");
+            return devLink.getCanonicalFile().getName();
+        } catch (java.io.IOException e) {
+            return null;
+        }
     }
 
     private void notifyDvrUnregister(String mac) {
@@ -479,16 +576,15 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     /**
      * Resolve the PCI bus address (eg. 0000:01:00.0) of a PF netdev via the
-     * /sys/class/net/&lt;pf&gt;/device symlink.
+     * /sys/class/net/&lt;pf&gt;/device symlink. Delegates to the static helper
+     * shared with {@link #scanPfsFromSysfs()}.
      */
     private String resolvePfPciAddress(String pfName) {
-        try {
-            File devLink = new File("/sys/class/net/" + pfName + "/device");
-            return devLink.getCanonicalFile().getName();
-        } catch (java.io.IOException e) {
-            logger.warn("resolvePfPciAddress failed for {}: {}", pfName, e.getMessage());
-            return null;
+        String bdf = resolvePfPciBdf(pfName);
+        if (bdf == null) {
+            logger.warn("resolvePfPciAddress failed for {}", pfName);
         }
+        return bdf;
     }
 
     /**
