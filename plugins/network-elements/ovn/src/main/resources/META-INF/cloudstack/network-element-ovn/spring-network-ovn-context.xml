@@ -47,4 +47,7 @@
     <bean id="ovnStaticNatService" class="com.cloud.network.ovn.element.OvnStaticNatService"/>
     <bean id="ovnFirewallStub" class="com.cloud.network.ovn.element.OvnFirewallStub"/>
 
+    <!-- Admin API service (Phase I.5). -->
+    <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
+
 </beans>
