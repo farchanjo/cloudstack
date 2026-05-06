@@ -73,6 +73,15 @@ public class OvnVpcElement {
             // have left a CS row pointing at a NB row that no longer exists.
             // Recreate transparently instead of returning a dead UUID.
             if (nb.rowExistsByUuid("Logical_Router", existing.getOvnUuid())) {
+                // Rename re-sync — VpcProvider has no updateVpc callback,
+                // so refresh LR.external_ids on every idempotent touch.
+                // updateVPC name -> LR external_ids[cs_name] eventually.
+                try {
+                    nb.updateLogicalRouterExternalIds(existing.getOvnUuid(), buildExternalIds(vpc));
+                } catch (OvnException e) {
+                    LOGGER.warn("OvnVpcElement.createLogicalRouterFor: re-sync external_ids failed for VPC {}: {}",
+                            vpc.getId(), e.getMessage());
+                }
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnVpcElement.createLogicalRouterFor: mapping VPC={} -> {} stale (NB gone); recreating",
@@ -181,6 +190,14 @@ public class OvnVpcElement {
         ext.put(OvnConstants.EXT_ID_KIND, Kind.VPC.name());
         ext.put(OvnConstants.EXT_ID_ID, String.valueOf(vpc.getId()));
         ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(vpc.getZoneId()));
+        // Carry the live VPC name into LR.external_ids[cs_name]. Refreshed
+        // on every idempotent createLogicalRouterFor invocation so that a
+        // CloudStack updateVPC that changed the name shows up in NB DB on
+        // the next plugin operation (no dedicated rename hook in
+        // VpcProvider — see OvnNetworkElement docs for #2 update gap).
+        if (vpc.getName() != null) {
+            ext.put("cs_name", vpc.getName());
+        }
         return ext;
     }
 }

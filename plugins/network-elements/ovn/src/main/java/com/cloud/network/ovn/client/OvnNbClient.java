@@ -120,6 +120,25 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * Replace {@code external_ids} on an existing Logical_Router in place.
+     * Used by the VPC rename re-sync hook: every {@code createLogicalRouterFor}
+     * invocation passes the current VPC name + cs_kind + cs_id so a CloudStack
+     * {@code updateVPC} that changed the VPC name eventually shows up in
+     * {@code LR.external_ids[cs_name]} on the next plugin touch (no
+     * dedicated rename callback exists in {@code VpcProvider}).
+     */
+    public void updateLogicalRouterExternalIds(final String uuid, final Map<String, String> externalIds) {
+        if (uuid == null || uuid.isEmpty() || externalIds == null) {
+            return;
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("external_ids", buildMap(externalIds));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(uuid), row));
+        tx.commit();
+    }
+
+    /**
      * List UUIDs of every row in {@code table} whose {@code external_ids}
      * map contains an entry {@code key=value}. Used by destroy paths to
      * sweep orphan rows when the local mapping has already been wiped or
@@ -1358,6 +1377,30 @@ public class OvnNbClient implements AutoCloseable {
         // The HA_Chassis_Group insert is the last op; its uuid is at index
         // == members.size() (HA_Chassis inserts come first).
         return tx.commit().insertedUuid(members.size());
+    }
+
+    /**
+     * Drop an HA_Chassis_Group row + its ha_chassis members in one
+     * transaction. The group's {@code ha_chassis} column is a strong-ref
+     * set, so we must blank it before delete; the embedded HA_Chassis rows
+     * then become orphans + are GC'd by ovsdb-server on next sync.
+     * Used by the reaper when a stale {@code hag-public-z<zone>} appears
+     * (chassis pool changed, prior plugin version pre-stale-guard).
+     */
+    public void destroyHaChassisGroup(final String hagUuid) {
+        if (hagUuid == null || hagUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        // Empty the ha_chassis set so ovsdb-server stops holding references.
+        final ObjectNode emptyRow = JsonNodeFactory.instance.objectNode();
+        final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+        emptySet.add("set");
+        emptySet.add(JsonNodeFactory.instance.arrayNode());
+        emptyRow.set("ha_chassis", emptySet);
+        tx.add(OvnOpFactory.update("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid), emptyRow));
+        tx.add(OvnOpFactory.delete("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid)));
+        tx.commit();
     }
 
     /** Pins an LRP to an HA_Chassis_Group (sets the {@code ha_chassis_group} column). */
