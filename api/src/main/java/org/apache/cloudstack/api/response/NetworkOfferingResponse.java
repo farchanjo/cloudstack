@@ -103,6 +103,10 @@ public class NetworkOfferingResponse extends BaseResponseWithAnnotations {
     @Param(description = "True if VRs from this offering use SR-IOV VF passthrough + TC flower HW offload (line-rate NAT/ACL/LB in NIC ASIC).", since = "4.24.0")
     private Boolean hwOffloadEnabled;
 
+    @SerializedName("vdpaenabled")
+    @Param(description = "True if NICs created on this offering are plumbed via vDPA (vhost-vdpa mgmt device on top of an SR-IOV VF, exposed to the guest as <interface type='vdpa'>). Mutually exclusive with the legacy passthrough path; the agent picks vDPA first when this flag is set.", since = "4.24.1.23")
+    private Boolean vdpaEnabled;
+
     @SerializedName(ApiConstants.FOR_NSX)
     @Param(description = "true if network offering can be used by NSX networks only")
     private Boolean forNsx;
@@ -341,5 +345,13 @@ public class NetworkOfferingResponse extends BaseResponseWithAnnotations {
 
     public void setHwOffloadEnabled(Boolean hwOffloadEnabled) {
         this.hwOffloadEnabled = hwOffloadEnabled;
+    }
+
+    public Boolean getVdpaEnabled() {
+        return vdpaEnabled;
+    }
+
+    public void setVdpaEnabled(Boolean vdpaEnabled) {
+        this.vdpaEnabled = vdpaEnabled;
     }
 }

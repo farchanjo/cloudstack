@@ -134,6 +134,15 @@ public abstract class NetworkOfferingBaseCmd extends BaseCmd {
             since = "4.24.0")
     private Boolean hwOffloadEnabled;
 
+    @Parameter(name = "vdpaenabled",
+            type = CommandType.BOOLEAN,
+            description = "True if NICs created on this offering should be plumbed via vDPA "
+                    + "(vhost-vdpa mgmt device on top of an SR-IOV VF, exposed to the guest as "
+                    + "<interface type='vdpa'>). Mutually exclusive with hwoffloadenabled passthrough; "
+                    + "the agent picks vDPA first when this flag is set. Default: false.",
+            since = "4.24.1.23")
+    private Boolean vdpaEnabled;
+
     @Deprecated
     @Parameter(name = ApiConstants.FOR_NSX,
             type = CommandType.BOOLEAN,
@@ -327,6 +336,14 @@ public abstract class NetworkOfferingBaseCmd extends BaseCmd {
 
     public boolean isHwOffloadEnabled() {
         return Boolean.TRUE.equals(hwOffloadEnabled);
+    }
+
+    public Boolean getVdpaEnabled() {
+        return vdpaEnabled;
+    }
+
+    public boolean isVdpaEnabled() {
+        return Boolean.TRUE.equals(vdpaEnabled);
     }
 
     public String getNetworkMode() {

@@ -46,6 +46,18 @@ public class NicTO extends NetworkTO {
     /* HW-offload via VF passthrough (hostdev). */
     Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
 
+    /*
+     * vDPA path (vhost-vdpa mgmt device on top of an SR-IOV VF). Mutually
+     * exclusive with the hostdev passthrough path above and with
+     * {@link #dpdkEnabled}; the agent picks vDPA first when {@link #useVdpa}
+     * is true. {@link #vdpaDevice} is populated by the agent at plug time
+     * after parsing {@code vdpa dev show -j}; mgmt only sets the request
+     * (useVdpa + maxVqs).
+     */
+    Boolean useVdpa;          // wrapper Boolean → null preserves wire compat
+    String vdpaDevice;        // host-side /dev/vhost-vdpa-N path, agent-populated
+    Integer vdpaMaxVqs;       // queues to request from `vdpa dev add ... max_vqs <N>`
+
     /**
      * Free-form String-keyed detail map propagated from the management server
      * to the agent. Distinct from {@link #details} (which is typed by
@@ -221,6 +233,34 @@ public class NicTO extends NetworkTO {
 
     public void setVfRepName(String vfRepName) {
         this.vfRepName = vfRepName;
+    }
+
+    public Boolean getUseVdpa() {
+        return useVdpa;
+    }
+
+    public boolean isUseVdpa() {
+        return Boolean.TRUE.equals(useVdpa);
+    }
+
+    public void setUseVdpa(Boolean useVdpa) {
+        this.useVdpa = useVdpa;
+    }
+
+    public String getVdpaDevice() {
+        return vdpaDevice;
+    }
+
+    public void setVdpaDevice(String vdpaDevice) {
+        this.vdpaDevice = vdpaDevice;
+    }
+
+    public Integer getVdpaMaxVqs() {
+        return vdpaMaxVqs;
+    }
+
+    public void setVdpaMaxVqs(Integer vdpaMaxVqs) {
+        this.vdpaMaxVqs = vdpaMaxVqs;
     }
 
     /**
