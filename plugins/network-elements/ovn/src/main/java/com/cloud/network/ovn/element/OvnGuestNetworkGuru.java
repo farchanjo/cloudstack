@@ -69,7 +69,15 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
     protected OvnLogicalIdMapDao logicalIdMapDao;
 
     public OvnGuestNetworkGuru() {
-        _isolationMethods = new IsolationMethod[]{new IsolationMethod(OvnConstants.ISOLATION_METHOD)};
+        // OVN encap is always Geneve regardless of CloudStack isolation label.
+        // Accept both the plugin-native "OVN" method and pre-existing "VXLAN"
+        // physical networks so operators can opt a tier into OVN by tagging the
+        // network offering ({@link OvnConstants#OFFERING_TAG}) without having
+        // to recreate the physical network.
+        _isolationMethods = new IsolationMethod[]{
+                new IsolationMethod(OvnConstants.ISOLATION_METHOD),
+                new IsolationMethod("VXLAN"),
+        };
     }
 
     @Override
@@ -94,20 +102,60 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
 
     /**
      * Creates the OVN logical switch backing the given CloudStack network.
+     * Idempotent: a second call for the same network returns the existing
+     * UUID without touching OVN. Required for the network-element
+     * {@code implement()} hook which fires on every VM start.
      *
-     * @return the OVN UUID of the created LS.
+     * @return the OVN UUID of the (possibly pre-existing) LS.
      */
     public String createLogicalSwitchFor(final Network network) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
         if (controller == null) {
             throw new OvnException("no OVN controller for zone " + network.getDataCenterId());
         }
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        if (existing != null) {
+            return existing.getOvnUuid();
+        }
         final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
         final Map<String, String> ext = buildExternalIds(network, Kind.NETWORK);
         final String uuid = nb.createLogicalSwitch(buildLsName(network), ext);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK, network.getId(), controller.getId(), uuid, buildLsName(network)));
+        // Enable IGMP/MLD snooping on every guest LS by default. Cuts the
+        // broadcast tax on multicast-heavy guests (PIM/IGMPv3, mDNS/SSDP).
+        // Cheap toggle; harmless when no multicast traffic exists.
+        try {
+            nb.lsSetMcastSnoop(uuid, true);
+        } catch (OvnException e) {
+            LOGGER.warn("OVN LS {} mcast_snoop toggle failed: {}", uuid, e.getMessage());
+        }
         LOGGER.info("OVN LS {} created for network id={} name={}", uuid, network.getId(), network.getName());
         return uuid;
+    }
+
+    /**
+     * Returns the OVN logical-switch UUID backing the given CloudStack
+     * network, or {@code null} when no mapping exists yet. Read-only — does
+     * not create the LS. Used by {@link OvnNetworkElement#prepare} to
+     * resolve the parent LS before adding the per-NIC LSP.
+     */
+    public String findLogicalSwitchUuidFor(final Network network) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return null;
+        }
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        return existing == null ? null : existing.getOvnUuid();
+    }
+
+    /**
+     * Returns the deterministic OVN logical-switch name for the given
+     * CloudStack network ({@code ls-<networkUuid>}). Useful for callers
+     * that need to populate {@code NicTO.ovnLsName} without an OVN round
+     * trip.
+     */
+    public String logicalSwitchNameFor(final Network network) {
+        return buildLsName(network);
     }
 
     /**
