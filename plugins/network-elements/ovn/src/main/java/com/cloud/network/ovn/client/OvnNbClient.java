@@ -143,9 +143,67 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     public void deleteLogicalRouterPort(final String lrpUuid) {
+        // Detach from parent Logical_Router.ports before deleting the row;
+        // otherwise OVSDB rejects with "referential integrity violation".
+        // Mirrors the LSP detach pattern in deleteLogicalSwitchPort.
+        final String parentLrUuid = findLogicalRouterOwningPort(lrpUuid);
         final OvnTransaction tx = newTransaction();
+        if (parentLrUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                    OvnOpFactory.whereUuid(parentLrUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(lrpUuid))));
+        }
         tx.add(OvnOpFactory.delete("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid)));
         tx.commit();
+    }
+
+    /** Locate the LR row holding the supplied LRP in its {@code ports} set. */
+    private String findLogicalRouterOwningPort(final String lrpUuid) {
+        if (lrpUuid == null || lrpUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("ports");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ports = row.get("ports");
+            if (ports == null || ports.size() < 2) {
+                continue;
+            }
+            if ("uuid".equals(ports.get(0).asText())) {
+                if (lrpUuid.equals(ports.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = ports.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && lrpUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
