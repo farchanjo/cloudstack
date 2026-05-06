@@ -27,6 +27,7 @@ import org.springframework.stereotype.Component;
 
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.client.OvnNbReader;
 import com.cloud.network.ovn.client.OvnSbClient;
 import com.cloud.network.ovn.dao.OvnControllerDao;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -63,6 +64,15 @@ public class OvnPluginManager {
      */
     public OvnSbClient sbClient(final long zoneId) {
         return sbCache.computeIfAbsent(zoneId, this::openSbClient);
+    }
+
+    /**
+     * Returns a fresh {@link OvnNbReader} sharing the NB client's connection
+     * pool. Used by {@code importOvnVpc} to walk the existing topology
+     * without holding a separate transport.
+     */
+    public OvnNbReader nbReader(final long zoneId) {
+        return OvnNbReader.from(nbClient(zoneId));
     }
 
     /**

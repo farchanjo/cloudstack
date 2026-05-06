@@ -44,9 +44,15 @@ import org.apache.cloudstack.api.InternalIdentity;
 public class OvnLogicalIdMapVO implements InternalIdentity {
 
     /** Namespaces a CloudStack id so {@code VPC}, {@code NETWORK}, and
-     *  {@code NIC} ids never collide. */
+     *  {@code NIC} ids never collide.
+     *
+     * <p>{@code ORPHAN_NIC} marks an OVN logical-switch port discovered by
+     * {@code importOvnVpc} that has no {@code external_ids:cloudstack:vmId}
+     * yet. Operators run a follow-up {@code adoptOvnNic} command to
+     * convert it to a {@code NIC} kind once the owning CloudStack VM is
+     * known. */
     public enum Kind {
-        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT, NETWORK_ACL, LOAD_BALANCER
+        VPC, NETWORK, NIC, STATIC_NAT, SOURCE_NAT, NETWORK_ACL, LOAD_BALANCER, ORPHAN_NIC
     }
 
     @Id

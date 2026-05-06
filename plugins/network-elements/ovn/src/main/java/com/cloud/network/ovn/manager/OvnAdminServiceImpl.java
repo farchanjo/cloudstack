@@ -17,7 +17,6 @@
 package com.cloud.network.ovn.manager;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 import javax.inject.Inject;
@@ -30,9 +29,11 @@ import com.cloud.network.ovn.api.response.OvnControllerResponse;
 import com.cloud.network.ovn.api.response.OvnLogicalIdResponse;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.client.OvnNbReader;
+import com.cloud.network.ovn.client.OvnNbReader.Topology;
 import com.cloud.network.ovn.dao.OvnControllerDao;
 import com.cloud.network.ovn.dao.OvnControllerVO;
-import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
+import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 @Component
@@ -43,9 +44,9 @@ public class OvnAdminServiceImpl implements OvnAdminService {
     @Inject
     private OvnControllerDao controllerDao;
     @Inject
-    private OvnLogicalIdMapDao logicalIdMapDao;
-    @Inject
     private OvnPluginManager pluginManager;
+    @Inject
+    private OvnVpcImporter vpcImporter;
 
     @Override
     public OvnControllerResponse addController(final long zoneId, final String name,
@@ -87,8 +88,6 @@ public class OvnAdminServiceImpl implements OvnAdminService {
 
     @Override
     public List<OvnLogicalIdResponse> importVpc(final long zoneId, final String ovnLrName, final String vpcName) {
-        // MVP scope: validate input + verify the LR exists. Full NIC adoption
-        // is deferred to a follow-up pass.
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             throw new CloudRuntimeException("no OVN controller registered in zone " + zoneId);
@@ -97,11 +96,46 @@ public class OvnAdminServiceImpl implements OvnAdminService {
         if (!nb.ping()) {
             throw new CloudRuntimeException("OVN NB unreachable at [" + controller.getNbEndpoints() + "]");
         }
-        LOGGER.warn("importOvnVpc Phase I.5 stub: validated zone={} ovnLr={} vpcName={}; "
-                + "full NIC adoption is deferred (TODO)", zoneId, ovnLrName, vpcName);
-        // Until the full import flow lands, return an empty list so the
-        // operator gets a clear "nothing was imported yet" signal.
-        return Collections.emptyList();
+        // Snapshot the OVN topology BEFORE any CloudStack write.
+        final OvnNbReader reader = pluginManager.nbReader(zoneId);
+        final Topology topology = reader.findLogicalRouter(ovnLrName);
+        if (topology == null) {
+            throw new CloudRuntimeException("OVN logical router '" + ovnLrName + "' not found in zone " + zoneId);
+        }
+        return adoptTopology(topology, controller.getId(), vpcName);
+    }
+
+    /**
+     * Validates + persists the parsed topology. Visible for unit tests so the
+     * import flow can be exercised with a synthetic {@link Topology} without
+     * standing up a real NB client.
+     */
+    public List<OvnLogicalIdResponse> adoptTopology(final Topology topology, final long controllerId,
+                                                    final String vpcName) {
+        try {
+            final OvnImportValidator.Plan plan = OvnImportValidator.validate(topology);
+            final List<OvnLogicalIdMapVO> rows = vpcImporter.adopt(plan, controllerId, vpcName);
+            final List<OvnLogicalIdResponse> out = new ArrayList<>();
+            for (final OvnLogicalIdMapVO row : rows) {
+                out.add(toLogicalIdResponse(row));
+            }
+            LOGGER.info("importOvnVpc adopted lr={} -> {} mapping rows under controller id={}",
+                    topology.lr.name, rows.size(), controllerId);
+            return out;
+        } catch (final OvnException oe) {
+            // Translate OVN-specific errors so the caller sees a clean ServerApiException.
+            throw new CloudRuntimeException(oe.getMessage());
+        }
+    }
+
+    private OvnLogicalIdResponse toLogicalIdResponse(final OvnLogicalIdMapVO row) {
+        final OvnLogicalIdResponse r = new OvnLogicalIdResponse();
+        r.setKind(row.getCsKind());
+        r.setCsId(row.getCsId());
+        r.setOvnUuid(row.getOvnUuid());
+        r.setOvnName(row.getOvnName());
+        r.setObjectName("ovnlogicalid");
+        return r;
     }
 
     private void validateConnectivity(final OvnControllerVO row) {
