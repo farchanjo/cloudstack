@@ -131,6 +131,33 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
             " WHERE state = 'ALLOCATED' " +
             "   AND (last_seen IS NULL OR last_seen < (NOW() - INTERVAL ? SECOND))";
 
+    /**
+     * Reverse pointer write: stamp {@code nics.vf_pool_id = ?} on the NIC
+     * that the allocator just bound. Fired inside the same transaction as
+     * the {@code sriov_vf_pool} row update so the two columns stay in sync.
+     *
+     * <p>Without this dual-write the {@link #SQL_RECOVER_BY_HOST_ID} JOIN
+     * matches zero rows in production (NIC always has {@code vf_pool_id IS
+     * NULL}), making {@code recoverHostVfs} a no-op against pools created
+     * before the JOIN was added.
+     */
+    private static final String SQL_BIND_NIC_VF_POOL_ID =
+            "UPDATE nics SET vf_pool_id = ? WHERE id = ?";
+
+    /**
+     * Inverse of {@link #SQL_BIND_NIC_VF_POOL_ID} — clears the reverse
+     * pointer when a VF is released. Fired inside the same release
+     * transaction so a NIC that was bound through {@code allocate()} /
+     * {@code allocateForVdpa()} ends up with {@code vf_pool_id IS NULL}
+     * once the VF goes back to FREE.
+     */
+    private static final String SQL_UNBIND_NIC_VF_POOL_ID_BY_NIC =
+            "UPDATE nics SET vf_pool_id = NULL WHERE id = ?";
+
+    // NOTE: forceReleaseByHostId() intentionally leaves nics.vf_pool_id
+    // intact — that reverse pointer is the anchor recoverHostVfs() walks
+    // back to re-bind the pool row to its still-live NIC.
+
     private final SearchBuilder<SriovVfPoolVO> hostStateSearch;
     private final SearchBuilder<SriovVfPoolVO> hostPciSearch;
     private final SearchBuilder<SriovVfPoolVO> nicIdSearch;
@@ -237,6 +264,9 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 update(vf.getId(), updateVo);
                 vf.setState(State.ALLOCATED.name());
                 vf.setAllocatedToNicId(nicId);
+                // Dual-write nics.vf_pool_id so the recoverHostVfs JOIN can
+                // re-bind the row after a force-release. See SQL_BIND_NIC_VF_POOL_ID.
+                bindNicVfPoolId(nicId, vf.getId());
                 return vf;
             }
         });
@@ -251,10 +281,16 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (vf == null) {
                     return false;
                 }
+                Long boundNic = vf.getAllocatedToNicId();
                 SriovVfPoolVO updateVo = createForUpdate();
                 updateVo.setState(State.FREE.name());
                 updateVo.setAllocatedToNicId(null);
                 update(vf.getId(), updateVo);
+                // Mirror the unbind on the NIC side so a future
+                // recoverHostVfs JOIN does not resurrect a stale link.
+                if (boundNic != null) {
+                    unbindNicVfPoolIdByNic(boundNic);
+                }
                 return true;
             }
         });
@@ -277,6 +313,11 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 updateVo.setState(State.FREE.name());
                 updateVo.setAllocatedToNicId(null);
                 int affected = update(updateVo, sc);
+                // Same-tx reverse-pointer clear so the NIC stops referring
+                // to the freed pool row.
+                if (affected > 0) {
+                    unbindNicVfPoolIdByNic(nicId);
+                }
                 return affected > 0;
             }
         });
@@ -331,6 +372,10 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (existing != null && !existing.isEmpty()) {
                     SriovVfPoolVO row = existing.get(0);
                     if (VdpaKind.VDPA.name().equals(row.getVdpaKind())) {
+                        // Idempotent reuse — make sure reverse pointer is
+                        // present even if a previous run pre-dated the
+                        // dual-write logic.
+                        bindNicVfPoolId(nicId, row.getId());
                         return row;
                     }
                     // Row exists but was previously bound as PASSTHROUGH —
@@ -346,6 +391,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     update(row.getId(), promote);
                     row.setVdpaKind(VdpaKind.VDPA);
                     row.setVdpaName(buildVdpaName(nicId));
+                    bindNicVfPoolId(nicId, row.getId());
                     return row;
                 }
 
@@ -372,6 +418,9 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 vf.setAllocatedToNicId(nicId);
                 vf.setVdpaKind(VdpaKind.VDPA);
                 vf.setVdpaName(buildVdpaName(nicId));
+                // Dual-write reverse pointer in the same tx. Required for
+                // recoverHostVfs JOIN; see SQL_BIND_NIC_VF_POOL_ID javadoc.
+                bindNicVfPoolId(nicId, vf.getId());
                 LOGGER.info(String.format(
                     "allocateForVdpa: host=%d nic=%d vf=%s pci=%s mac=%s maxVqs=%d vdpaName=%s",
                     hostId, nicId, vf.getUuid(), vf.getPciAddress(), mac, maxVqs, vf.getVdpaName()));
@@ -389,6 +438,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (vf == null) {
                     return false;
                 }
+                Long boundNic = vf.getAllocatedToNicId();
                 // createForUpdate() proxy demands String for enum-backed
                 // columns — see allocateForVdpa() for the failure mode.
                 SriovVfPoolVO updateVo = createForUpdate();
@@ -398,6 +448,9 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 updateVo.setVdpaName(null);
                 updateVo.setVdpaDevice(null);
                 update(vf.getId(), updateVo);
+                if (boundNic != null) {
+                    unbindNicVfPoolIdByNic(boundNic);
+                }
                 return true;
             }
         });
@@ -500,6 +553,28 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         sc.setParameters("hostId", hostId);
         sc.setParameters("vdpaName", vdpaName);
         return findOneBy(sc);
+    }
+
+    /**
+     * Stamp {@code nics.vf_pool_id = poolId} on the given NIC. Caller must
+     * already be inside a transaction; the helper delegates to {@link
+     * #executeUpdateWithCount} which uses the enclosing connection.
+     *
+     * <p>No-ops cleanly when the NIC row was removed between allocation and
+     * this call (UPDATE matches zero rows, no error).
+     */
+    private void bindNicVfPoolId(long nicId, long poolId) {
+        executeUpdateWithCount(SQL_BIND_NIC_VF_POOL_ID, poolId, nicId);
+    }
+
+    /**
+     * Inverse of {@link #bindNicVfPoolId} — clears the reverse pointer on
+     * a single NIC. Used by every release path so a NIC that went through
+     * dual-write allocation does not stay tagged with a stale {@code
+     * vf_pool_id} after the VF was returned to the pool.
+     */
+    private void unbindNicVfPoolIdByNic(long nicId) {
+        executeUpdateWithCount(SQL_UNBIND_NIC_VF_POOL_ID_BY_NIC, nicId);
     }
 
     /**
