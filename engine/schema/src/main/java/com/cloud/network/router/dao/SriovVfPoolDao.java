@@ -123,6 +123,25 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     int forceReleaseByHostId(long hostId);
 
     /**
+     * Re-bind every {@link com.cloud.network.router.SriovVfPoolVO.State#FREE}
+     * pool entry on the host to the live NIC that still references it via
+     * {@code nics.vf_pool_id}. Walks {@code nics} ⇒ {@code vm_instance}
+     * filtering on live VMs ({@code v.removed IS NULL AND v.state IN
+     * ('Running','Starting','Stopping','Migrating')}), flips the matching
+     * pool row to {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED},
+     * stamps {@code allocated_to_nic_id} from {@code nics.id}, and refreshes
+     * {@code last_seen=NOW()}. Idempotent (no-op for already-allocated
+     * rows).
+     *
+     * <p>Companion to {@link #forceReleaseByHostId(long)} — used by the
+     * {@code recoverHostVfs} admin API to undo an over-zealous force-
+     * release without bouncing live VMs / VRs.
+     *
+     * @return number of rows promoted from {@code FREE} to {@code ALLOCATED}.
+     */
+    int recoverByHostId(long hostId);
+
+    /**
      * Find every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
      * row whose {@code last_seen} is null or older than
      * {@code (NOW() - thresholdSeconds)}. Caller flips them to

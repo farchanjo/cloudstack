@@ -112,4 +112,13 @@ public interface VfPoolManager extends Manager {
      * rows released.
      */
     int forceReleaseByHostId(long hostId);
+
+    /**
+     * Re-bind FREE pool rows on the host to the live NIC that still
+     * references them via {@code nics.vf_pool_id}. Idempotent; reverses
+     * an over-zealous {@link #forceReleaseByHostId(long)} without
+     * bouncing live VMs / VRs. Driven by the {@code recoverHostVfs}
+     * admin command. Returns the number of rows recovered.
+     */
+    int recoverByHostId(long hostId);
 }

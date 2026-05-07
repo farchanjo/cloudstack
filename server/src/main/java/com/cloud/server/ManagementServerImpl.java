@@ -106,6 +106,7 @@ import org.apache.cloudstack.api.command.admin.host.AddHostCmd;
 import org.apache.cloudstack.api.command.admin.host.AddSecondaryStorageCmd;
 import org.apache.cloudstack.api.command.admin.host.CancelHostAsDegradedCmd;
 import org.apache.cloudstack.api.command.admin.host.ForceReleaseHostVfsCmd;
+import org.apache.cloudstack.api.command.admin.host.RecoverHostVfsCmd;
 import org.apache.cloudstack.api.command.admin.host.CancelHostMaintenanceCmd;
 import org.apache.cloudstack.api.command.admin.host.DeclareHostAsDegradedCmd;
 import org.apache.cloudstack.api.command.admin.host.DeleteHostCmd;
@@ -3868,6 +3869,7 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         cmdList.add(CancelHostMaintenanceCmd.class);
         cmdList.add(CancelHostAsDegradedCmd.class);
         cmdList.add(ForceReleaseHostVfsCmd.class);
+        cmdList.add(RecoverHostVfsCmd.class);
         cmdList.add(DeclareHostAsDegradedCmd.class);
         cmdList.add(DeleteHostCmd.class);
         cmdList.add(ListHostsCmd.class);

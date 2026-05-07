@@ -174,6 +174,17 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         return affected;
     }
 
+    @Override
+    public int recoverByHostId(long hostId) {
+        int affected = vfPoolDao.recoverByHostId(hostId);
+        if (affected > 0) {
+            LOGGER.info("Recovered {} VF row(s) on host {} from FREE → ALLOCATED via live-NIC join", affected, hostId);
+        } else {
+            LOGGER.info("recoverByHostId: nothing to recover on host {} (no FREE pool entries with live NIC binding)", hostId);
+        }
+        return affected;
+    }
+
     /**
      * Derive the representor netdev name for a VF index on a given PF.
      * Mirrors the udev/script naming applied in {@code mlx-switchdev.sh}:
