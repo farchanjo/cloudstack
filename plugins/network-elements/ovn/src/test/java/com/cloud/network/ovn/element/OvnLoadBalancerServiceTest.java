@@ -170,6 +170,9 @@ public class OvnLoadBalancerServiceTest {
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
         when(existing.getOvnUuid()).thenReturn("lb-uuid-existing");
         when(logicalIdMapDao.findByCsId(eq(Kind.LOAD_BALANCER), eq(404L), eq(CONTROLLER_ID))).thenReturn(existing);
+        // The OVN row must still exist so applyOne takes the update-backends
+        // fast path instead of falling through to recreate.
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-existing"))).thenReturn(true);
 
         final LoadBalancingRule rule = lbRule(404L, "192.168.100.40", 80, 80,
                 List.of(dest("10.0.0.5", 80, false), dest("10.0.0.6", 80, false), dest("10.0.0.7", 80, false)),
