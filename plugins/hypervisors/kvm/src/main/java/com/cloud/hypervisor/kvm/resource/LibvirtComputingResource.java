@@ -2829,6 +2829,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         vm = getDomain(conn, vmName);
         final List<InterfaceDef> pluggedNics = getInterfaces(conn, vmName);
         for (final InterfaceDef pluggedNic : pluggedNics) {
+            if (pluggedNic.getMacAddress() == null) {
+                continue;
+            }
             if (pluggedNic.getMacAddress().equalsIgnoreCase(macAddr)) {
                 vm.detachDevice(pluggedNic.toString());
                 // We don't know which "traffic type" is associated with
@@ -2854,6 +2857,15 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             for (final InterfaceDef pluggedNic : pluggedNics) {
                 LOGGER.info("SetupGuestNetwork: found interface type={} mac={} dev={} pciAddr={}",
                         pluggedNic.getNetType(), pluggedNic.getMacAddress(), pluggedNic.getDevName(), pluggedNic.getPciAddress());
+                // Phantom InterfaceDef entries with all-null fields can leak into
+                // the parsed list when libvirt domain XML carries an
+                // <interface> stub the parser does not recognise (e.g.
+                // type='hostdev' with the source PCI address stripped after a
+                // failed unplug). Skip nulls instead of crashing the whole
+                // SetupGuestNetwork path with NullPointerException.
+                if (pluggedNic.getMacAddress() == null) {
+                    continue;
+                }
                 if (pluggedNic.getMacAddress().equalsIgnoreCase(nic.getMac())) {
                     routerNic = pluggedNic;
                     break;
@@ -5780,7 +5792,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public InterfaceDef getInterface(final Connect conn, final String vmName, final String macAddress) {
         List<InterfaceDef> interfaces = getInterfaces(conn, vmName);
-        return interfaces.stream().filter(interfaceDef -> interfaceDef.getMacAddress().equals(macAddress))
+        return interfaces.stream()
+                .filter(interfaceDef -> interfaceDef.getMacAddress() != null
+                        && interfaceDef.getMacAddress().equals(macAddress))
                 .findFirst().orElseThrow(() -> new CloudRuntimeException(String.format("Unable to find NIC with MAC address %s.", macAddress)));
     }
 
