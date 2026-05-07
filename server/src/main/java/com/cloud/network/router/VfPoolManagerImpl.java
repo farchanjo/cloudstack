@@ -27,8 +27,14 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
+import com.cloud.agent.AgentManager;
+import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
+import com.cloud.agent.api.HostVfPurgeOrphansCommand;
+import com.cloud.exception.AgentUnavailableException;
 import com.cloud.exception.InsufficientCapacityException;
 import com.cloud.exception.InsufficientServerCapacityException;
+import com.cloud.exception.OperationTimedoutException;
 import com.cloud.host.Host;
 import com.cloud.network.router.SriovVfPoolVO.State;
 import com.cloud.network.router.dao.SriovVfPoolDao;
@@ -41,6 +47,9 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     @Inject
     private SriovVfPoolDao vfPoolDao;
+
+    @Inject
+    private AgentManager agentMgr;
 
     @Override
     public boolean configure(String name, java.util.Map<String, Object> params) throws ConfigurationException {
@@ -171,7 +180,53 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         if (affected > 0) {
             LOGGER.warn("Force-released {} VF row(s) on host {} (operator action)", affected, hostId);
         }
+        // After the DB rows are flipped to FREE, instruct the agent to bring
+        // the kernel back into agreement with the database: delete every
+        // orphan vdpa-net device AND rebind every VF stranded on vfio-pci
+        // back to mlx5_core. Without this lock-step the next allocator pick
+        // on a previously-bound PCI BDF fails with either
+        //   'kernel answers: No space left on device' (mlx5_vdpa allows one
+        //    vdpa-net per VF, prior failure left the slot occupied), or
+        //   'device is busy' / hostdev attach refused (VF still on vfio-pci
+        //    with a stale driver_override).
+        // See HostVfPurgeOrphansCommand javadoc.
+        purgeKernelOrphans(hostId, false);
         return affected;
+    }
+
+    /**
+     * Send {@link HostVfPurgeOrphansCommand} so the kernel state mirrors
+     * the DB after a force-release. Best-effort: agent unreachable or
+     * pre-dating the wrapper degrades to a warning, never aborts the
+     * caller. Empty keep-sets ⇒ wipe every vdpa-net dev and rebind every
+     * vfio-pci VF on the host.
+     */
+    private void purgeKernelOrphans(long hostId, boolean dryRun) {
+        HostVfPurgeOrphansCommand cmd = new HostVfPurgeOrphansCommand(
+                new HashSet<>(), new HashSet<>(), dryRun);
+        try {
+            Answer answer = agentMgr.send(hostId, cmd);
+            if (answer instanceof HostVfPurgeOrphansAnswer) {
+                HostVfPurgeOrphansAnswer purge = (HostVfPurgeOrphansAnswer) answer;
+                LOGGER.info(
+                        "HostVfPurgeOrphans on host {}: vdpa[found={} kept={} deleted={}] vfio[scanned={} bound={} kept={} rebound={}] dryRun={}",
+                        hostId,
+                        purge.getVdpaFound(), purge.getVdpaKept(), purge.getVdpaDeleted(),
+                        purge.getVfsScanned(), purge.getVfsBoundVfio(), purge.getVfsKept(), purge.getVfsRebound(),
+                        dryRun);
+            } else if (answer != null) {
+                LOGGER.warn("HostVfPurgeOrphans on host {}: agent answered {} (unexpected): {}",
+                        hostId, answer.getClass().getSimpleName(), answer.getDetails());
+            } else {
+                LOGGER.warn("HostVfPurgeOrphans on host {}: null answer from agent", hostId);
+            }
+        } catch (AgentUnavailableException e) {
+            LOGGER.warn("HostVfPurgeOrphans on host {}: agent unavailable ({}); kernel state may diverge from DB",
+                    hostId, e.getMessage());
+        } catch (OperationTimedoutException e) {
+            LOGGER.warn("HostVfPurgeOrphans on host {}: timed out ({}); kernel state may diverge from DB",
+                    hostId, e.getMessage());
+        }
     }
 
     @Override
