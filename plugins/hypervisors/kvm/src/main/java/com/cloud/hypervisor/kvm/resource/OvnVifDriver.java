@@ -28,6 +28,7 @@ import org.libvirt.LibvirtException;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef;
+import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef.NicModel;
 import com.cloud.utils.script.Script;
 
 /**
@@ -82,26 +83,64 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(nic.getOvnLspName())) {
             throw new InternalErrorException("OvnVifDriver: NicTO is missing ovnLspName (mac=" + nic.getMac() + ")");
         }
+        // Stamp the bridge-wide tc-policy on the very first OVN-aware plug
+        // this JVM performs. Subsequent calls are no-ops via the per-JVM
+        // latch inside the applier.
+        OvnNicTunableApplier.applyTcPolicyOnce(nic.getOvsTcPolicy());
         logger.info("OvnVifDriver.plug: nic mac={} ip={} lsp={} ls={} bridge={}",
                 nic.getMac(), nic.getIp(), nic.getOvnLspName(), nic.getOvnLsName(), integrationBridge);
 
         final InterfaceDef intf = new InterfaceDef();
         // bridge type + virtualport=openvswitch + interfaceid lets libvirt
         // run `ovs-vsctl add-port br-int <vnet> -- set Interface <vnet>
-        // external_ids:iface-id=<lspName>` on attach. We do NOT call
+        // external_ids:iface-id=<...>` on attach. We do NOT call
         // defBridgeNet on a non-OVS bridge because that path emits
         // <virtualport type='openvswitch'> implicitly only when the bridge
         // is OVS-managed; we set it explicitly to keep the intent obvious.
+        //
+        // libvirt requires `interfaceid` to be a well-formed UUID — passing
+        // {@code ovnLspName} (which carries the {@code lsp-} prefix) makes
+        // libvirt reject the domain XML with
+        //   "XML error: cannot parse interfaceid parameter as a uuid"
+        // Use the NIC UUID instead (same shape as {@link OvsVifDriver}); the
+        // OVN binding key {@code external_ids:iface-id=<lspName>} is set on
+        // the OVS Port row separately by the post-plug stamping logic in
+        // {@link OvnNicTunableApplier} and by ovn-controller itself.
         intf.setVirtualPortType("openvswitch");
-        intf.setVirtualPortInterfaceId(nic.getOvnLspName());
+        intf.setVirtualPortInterfaceId(nic.getUuid());
 
         final Integer rateKBps = getNetworkRateKbps(nic);
-        intf.defBridgeNet(integrationBridge, null, nic.getMac(),
-                getGuestNicModel(guestOsType, nicAdapter), rateKBps);
+        // OVN tunable ovn.driver_model overrides the legacy guestOs/nicAdapter
+        // resolution. Defaults to virtio when the operator did not set it.
+        final NicModel tunableModel = OvnNicTunableApplier.resolveDriverModel(nic.getDriverModel());
+        final NicModel model = tunableModel != null ? tunableModel : getGuestNicModel(guestOsType, nicAdapter);
+        intf.defBridgeNet(integrationBridge, null, nic.getMac(), model, rateKBps);
         // No VLAN tag: OVN owns segmentation via Geneve VNI. Setting a tag
         // here would cause OVS to strip/insert .1Q on the access port and
         // collide with the OVN-injected metadata in the pipeline.
+
+        // Stamp libvirt-XML tunables resolved by mgmt: vhost queues,
+        // tx/rx queue size, vhost driver name, packed virtqueues.
+        OvnNicTunableApplier.applyInterfaceDefTunables(nic, intf);
         return intf;
+    }
+
+    /**
+     * Apply ethtool-style offload toggles + MTU on the freshly-created tap
+     * once libvirt has spawned it. Triggered by the agent post-plug callback
+     * (see {@link LibvirtComputingResource#postNicConfigure}); the vnet name
+     * is only known after libvirt allocates it.
+     */
+    public void applyPostPlugTunables(final NicTO nic, final String hostNetdev) {
+        if (nic == null || StringUtils.isBlank(hostNetdev)) {
+            return;
+        }
+        OvnNicTunableApplier.applyEthtoolOffloads(nic, hostNetdev);
+        // Stamp hairpin on the OVS Port now that libvirt has spawned the
+        // tap and added it to br-int. Required for VF<->VF same-host
+        // hardware offload via TC flower; harmless on kernel datapaths
+        // that ignore the flag.
+        OvnNicTunableApplier.applyHairpin(hostNetdev, nic.getOvsHairpin());
     }
 
     @Override
