@@ -896,18 +896,36 @@ public class OvnNbClient implements AutoCloseable {
      */
     public String createLoadBalancer(final String name, final Map<String, String> vips, final String protocol,
                                      final List<String> selectionFields, final Map<String, String> externalIds) {
+        return createLoadBalancer(name, vips, protocol, selectionFields, externalIds, null);
+    }
+
+    /**
+     * Overload that also writes the {@code options} column. Used to enable
+     * OVN load_balancer hairpin so that a backend hitting its own VIP gets
+     * SNAT'd to {@code options:hairpin_snat_ip} (typically the VIP itself),
+     * preventing the kernel-loopback short-circuit and forcing the reflected
+     * packet back through the LR datapath.
+     *
+     * @param options OVN load_balancer options (e.g.
+     *                {@code hairpin_snat_ip}, {@code hairpin_orig_tuple},
+     *                {@code skip_snat}); {@code null}/empty omits the column
+     */
+    public String createLoadBalancer(final String name, final Map<String, String> vips, final String protocol,
+                                     final List<String> selectionFields, final Map<String, String> externalIds,
+                                     final Map<String, String> options) {
         if (vips == null || vips.isEmpty()) {
             throw new OvnException("createLoadBalancer requires at least one VIP entry");
         }
         final String namedLb = OvnNamedUuid.next("lb");
-        final ObjectNode row = buildLbRow(name, vips, protocol, selectionFields, externalIds);
+        final ObjectNode row = buildLbRow(name, vips, protocol, selectionFields, externalIds, options);
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.insert("Load_Balancer", namedLb, row));
         return tx.commit().insertedUuid(0);
     }
 
     private ObjectNode buildLbRow(final String name, final Map<String, String> vips, final String protocol,
-                                  final List<String> selectionFields, final Map<String, String> externalIds) {
+                                  final List<String> selectionFields, final Map<String, String> externalIds,
+                                  final Map<String, String> options) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
         if (name != null && !name.isEmpty()) {
             row.put("name", name);
@@ -921,6 +939,9 @@ public class OvnNbClient implements AutoCloseable {
         }
         if (externalIds != null && !externalIds.isEmpty()) {
             row.set("external_ids", buildMap(externalIds));
+        }
+        if (options != null && !options.isEmpty()) {
+            row.set("options", buildMap(options));
         }
         return row;
     }

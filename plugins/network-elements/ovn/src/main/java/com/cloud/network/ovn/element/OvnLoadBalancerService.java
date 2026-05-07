@@ -220,7 +220,8 @@ public class OvnLoadBalancerService extends AdapterBase {
         final String protocol = protocolFor(rule);
         final String name = "cs-lb-" + rule.getId();
         final Map<String, String> ext = buildExternalIds(rule);
-        final String lbUuid = nb.createLoadBalancer(name, vips, protocol, selectionFields, ext);
+        final Map<String, String> options = buildLbOptions(rule);
+        final String lbUuid = nb.createLoadBalancer(name, vips, protocol, selectionFields, ext, options);
         try {
             nb.attachLoadBalancerToLogicalRouter(lrUuid, lbUuid);
         } catch (final OvnException oe) {
@@ -343,6 +344,27 @@ public class OvnLoadBalancerService extends AdapterBase {
             ext.put("cs_algo", rule.getAlgorithm());
         }
         return ext;
+    }
+
+    /**
+     * Build the OVN {@code Load_Balancer.options} column. The MVP sets
+     * {@code hairpin_snat_ip} so that a backend VM hitting its own VIP gets
+     * SNAT'd back to the VIP, preventing the kernel-loopback short-circuit
+     * and forcing the reflected packet through the LR datapath. Without
+     * this, a backend client hitting its own VIP would see the request
+     * arrive with src=its-own-IP, dst=its-own-IP and drop it as a martian.
+     *
+     * <p>Visible for testing.
+     */
+    public static Map<String, String> buildLbOptions(final LoadBalancingRule rule) {
+        final Map<String, String> opts = new HashMap<>();
+        if (rule.getSourceIp() != null) {
+            final String vip = rule.getSourceIp().addr();
+            if (vip != null && !vip.isEmpty()) {
+                opts.put("hairpin_snat_ip", vip);
+            }
+        }
+        return opts;
     }
 
     /**

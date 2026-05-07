@@ -41,6 +41,7 @@ import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 
 import com.cloud.network.Network;
+import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.lb.LoadBalancingRule.LbDestination;
 import com.cloud.network.ovn.client.OvnNbClient;
@@ -48,6 +49,7 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.LoadBalancer;
@@ -97,11 +99,13 @@ public class OvnLoadBalancerServiceTest {
         service = new OvnLoadBalancerService();
         injectField(service, "pluginManager", pluginManager);
         injectField(service, "logicalIdMapDao", logicalIdMapDao);
+        injectField(service, "ipAddressDao", mock(IPAddressDao.class));
+        injectField(service, "bgpRedistributeManager", mock(OvnBgpRedistributeManager.class));
     }
 
     @Test
     public void roundRobinTcpRuleProducesLbAndAttach() throws Exception {
-        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap()))
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap(), anyMap()))
                 .thenReturn("lb-uuid-1");
 
         final LoadBalancingRule rule = lbRule(401L, "192.168.100.10", 80, 80,
@@ -114,9 +118,13 @@ public class OvnLoadBalancerServiceTest {
         final ArgumentCaptor<List<String>> selCaptor = listCaptor();
         final ArgumentCaptor<String> protoCaptor = ArgumentCaptor.forClass(String.class);
 
+        final ArgumentCaptor<Map<String, String>> optsCaptor = mapCaptor();
         verify(nbClient, times(1)).createLoadBalancer(anyString(), vipCaptor.capture(),
-                protoCaptor.capture(), selCaptor.capture(), anyMap());
+                protoCaptor.capture(), selCaptor.capture(), anyMap(), optsCaptor.capture());
         verify(nbClient, times(1)).attachLoadBalancerToLogicalRouter(eq(LR_UUID), eq("lb-uuid-1"));
+        // Hairpin SNAT IP must equal the LB VIP so backends hitting their
+        // own VIP get reflected back through the LR.
+        assertEquals("192.168.100.10", optsCaptor.getValue().get("hairpin_snat_ip"));
         verify(logicalIdMapDao, times(1)).persist(any(OvnLogicalIdMapVO.class));
 
         final Map<String, String> vips = vipCaptor.getValue();
@@ -129,7 +137,7 @@ public class OvnLoadBalancerServiceTest {
 
     @Test
     public void sourceHashAlgorithmProducesSelectionFields() throws Exception {
-        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap()))
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap(), anyMap()))
                 .thenReturn("lb-uuid-2");
 
         final LoadBalancingRule rule = lbRule(402L, "192.168.100.20", 443, 443,
@@ -140,7 +148,7 @@ public class OvnLoadBalancerServiceTest {
 
         final ArgumentCaptor<List<String>> selCaptor = listCaptor();
         final ArgumentCaptor<String> protoCaptor = ArgumentCaptor.forClass(String.class);
-        verify(nbClient).createLoadBalancer(anyString(), anyMap(), protoCaptor.capture(), selCaptor.capture(), anyMap());
+        verify(nbClient).createLoadBalancer(anyString(), anyMap(), protoCaptor.capture(), selCaptor.capture(), anyMap(), anyMap());
         // ssl maps to tcp on the wire.
         assertEquals("tcp", protoCaptor.getValue());
         assertFalse("selection_fields must be present", selCaptor.getValue().isEmpty());
@@ -169,7 +177,7 @@ public class OvnLoadBalancerServiceTest {
 
         assertTrue(service.applyLBRules(network, List.of(rule)));
 
-        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap());
+        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap(), anyMap());
         final ArgumentCaptor<Map<String, String>> capt = mapCaptor();
         verify(nbClient, times(1)).updateLoadBalancerBackends(eq("lb-uuid-existing"), capt.capture());
         assertEquals("10.0.0.5:80,10.0.0.6:80,10.0.0.7:80", capt.getValue().get("192.168.100.40:80"));
@@ -233,7 +241,16 @@ public class OvnLoadBalancerServiceTest {
                 "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
 
         assertFalse(service.applyLBRules(network, List.of(rule)));
-        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap());
+        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap(), anyMap());
+    }
+
+    @Test
+    public void buildLbOptionsEmitsHairpinSnatIp() {
+        final LoadBalancingRule rule = lbRule(420L, "203.0.113.42", 80, 80,
+                List.of(dest("10.0.0.5", 80, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
+        final Map<String, String> opts = OvnLoadBalancerService.buildLbOptions(rule);
+        assertEquals("203.0.113.42", opts.get("hairpin_snat_ip"));
     }
 
     @Test

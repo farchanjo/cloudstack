@@ -163,6 +163,42 @@ public class OvnNbClientLbTest {
         client.createLoadBalancer("bad", Map.of(), null, null, null);
     }
 
+    @Test
+    public void createLbWithOptionsEmitsOptionsColumn() {
+        when(pool.call(anyString(), any())).thenReturn(singleInsertReply("lb-uuid-3"));
+
+        client.createLoadBalancer("cs-lb-3",
+                Map.of("203.0.113.42:80", "10.0.0.5:80,10.0.0.6:80"),
+                OvnNbClient.LB_PROTOCOL_TCP,
+                List.of(),
+                Map.of("cs_id", "3"),
+                Map.of("hairpin_snat_ip", "203.0.113.42"));
+
+        final ArrayNode params = captureTransactCall();
+        final JsonNode row = params.get(1).get("row");
+        final JsonNode options = row.get("options");
+        assertNotNull("options column must be present", options);
+        assertEquals("map", options.get(0).asText());
+        // options -> ["map", [ ["hairpin_snat_ip", "203.0.113.42"] ]]
+        assertEquals("hairpin_snat_ip", options.get(1).get(0).get(0).asText());
+        assertEquals("203.0.113.42", options.get(1).get(0).get(1).asText());
+    }
+
+    @Test
+    public void createLbWithoutOptionsOmitsTheColumn() {
+        when(pool.call(anyString(), any())).thenReturn(singleInsertReply("lb-uuid-4"));
+
+        client.createLoadBalancer("cs-lb-4",
+                Map.of("10.10.0.1:443", "172.16.0.5:443"),
+                OvnNbClient.LB_PROTOCOL_TCP,
+                List.of(),
+                Map.of("cs_id", "4"));
+
+        final ArrayNode params = captureTransactCall();
+        final JsonNode row = params.get(1).get("row");
+        assertNull("options must be absent when not supplied", row.get("options"));
+    }
+
     @Test(expected = OvnException.class)
     public void updateBackendsWithNullMapFails() {
         client.updateLoadBalancerBackends("lb-uuid", null);
