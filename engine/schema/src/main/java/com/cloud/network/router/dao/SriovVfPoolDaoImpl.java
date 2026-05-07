@@ -97,6 +97,31 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
             " WHERE host_id = ? AND state IN ('ALLOCATED', 'SUSPECT')";
 
     /**
+     * Recovery JOIN — re-bind every FREE pool entry to the live NIC that
+     * still references it via {@code nics.vf_pool_id}. Filters on live VMs
+     * (DomainRouter / User in Running / Starting / Stopping / Migrating).
+     * Pool row keeps its {@code vdpa_kind} / {@code vdpa_name} / {@code
+     * vdpa_device} columns intact (caller is responsible for vDPA-specific
+     * state restoration).
+     *
+     * <p>Companion to {@link #SQL_FORCE_RELEASE_BY_HOST_ID} — used by the
+     * {@code recoverHostVfs} admin API to undo an over-zealous force-
+     * release without bouncing live VMs / VRs.
+     */
+    private static final String SQL_RECOVER_BY_HOST_ID =
+            "UPDATE sriov_vf_pool p " +
+            "  JOIN nics n ON n.vf_pool_id = p.id AND n.removed IS NULL " +
+            "  JOIN vm_instance v ON v.id = n.instance_id " +
+            "    SET p.state = 'ALLOCATED', " +
+            "        p.allocated_to_nic_id = n.id, " +
+            "        p.last_seen = NOW(), " +
+            "        p.updated = NOW() " +
+            "  WHERE p.host_id = ? " +
+            "    AND p.state = 'FREE' " +
+            "    AND v.removed IS NULL " +
+            "    AND v.state IN ('Running','Starting','Stopping','Migrating')";
+
+    /**
      * Stale ALLOCATED rows: last_seen older than NOW() - threshold seconds, OR
      * last_seen IS NULL (the agent never confirmed this row since the column
      * was added). Caller flips them to SUSPECT.
@@ -310,8 +335,13 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     }
                     // Row exists but was previously bound as PASSTHROUGH —
                     // flip it in place rather than allocating a second VF.
+                    // Pass String to the createForUpdate proxy: the proxy
+                    // intercepts setters and stores the raw argument; if we
+                    // pass the enum, GenericDaoBase later serializes it as
+                    // a Java object stream and MySQL utf8mb4 rejects the
+                    // \xAC\xED... bytes.
                     SriovVfPoolVO promote = createForUpdate();
-                    promote.setVdpaKind(VdpaKind.VDPA);
+                    promote.setVdpaKind(VdpaKind.VDPA.name());
                     promote.setVdpaName(buildVdpaName(nicId));
                     update(row.getId(), promote);
                     row.setVdpaKind(VdpaKind.VDPA);
@@ -327,10 +357,15 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     return null;
                 }
                 SriovVfPoolVO vf = free.get(0);
+                // createForUpdate() returns a CGLib proxy that captures
+                // setter args verbatim into a diff map. Pass String for
+                // enum-backed columns (state, vdpa_kind) — the enum overload
+                // would store the enum object and trigger Java-serialization
+                // BLOB output that MySQL utf8mb4 rejects.
                 SriovVfPoolVO updateVo = createForUpdate();
                 updateVo.setState(State.ALLOCATED.name());
                 updateVo.setAllocatedToNicId(nicId);
-                updateVo.setVdpaKind(VdpaKind.VDPA);
+                updateVo.setVdpaKind(VdpaKind.VDPA.name());
                 updateVo.setVdpaName(buildVdpaName(nicId));
                 update(vf.getId(), updateVo);
                 vf.setState(State.ALLOCATED.name());
@@ -354,10 +389,12 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (vf == null) {
                     return false;
                 }
+                // createForUpdate() proxy demands String for enum-backed
+                // columns — see allocateForVdpa() for the failure mode.
                 SriovVfPoolVO updateVo = createForUpdate();
                 updateVo.setState(State.FREE.name());
                 updateVo.setAllocatedToNicId(null);
-                updateVo.setVdpaKind(VdpaKind.PASSTHROUGH);
+                updateVo.setVdpaKind(VdpaKind.PASSTHROUGH.name());
                 updateVo.setVdpaName(null);
                 updateVo.setVdpaDevice(null);
                 update(vf.getId(), updateVo);
@@ -409,6 +446,16 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
             @Override
             public Integer doInTransaction(TransactionStatus status) {
                 return executeUpdateWithCount(SQL_FORCE_RELEASE_BY_HOST_ID, hostId);
+            }
+        });
+    }
+
+    @Override
+    public int recoverByHostId(final long hostId) {
+        return Transaction.execute(new TransactionCallback<Integer>() {
+            @Override
+            public Integer doInTransaction(TransactionStatus status) {
+                return executeUpdateWithCount(SQL_RECOVER_BY_HOST_ID, hostId);
             }
         });
     }

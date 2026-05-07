@@ -231,6 +231,28 @@ public class SriovVfPoolVO implements InternalIdentity {
         this.updated = new Date();
     }
 
+    /**
+     * String overload — REQUIRED for {@code createForUpdate()} proxy usage.
+     *
+     * <p>The proxy returned by {@code createForUpdate()} (CGLib) intercepts
+     * setters and stores the raw argument in its diff map. When the diff is
+     * later flushed via {@code update(id, vo)}, {@code GenericDaoBase} feeds
+     * each captured value into a {@code PreparedStatement.setObject(...)}
+     * call. If we hand the proxy a {@code VdpaKind} enum, the JDBC driver
+     * falls back to Java object serialization and emits {@code \xAC\xED...}
+     * bytes that MySQL utf8mb4 rejects with "Incorrect string value" — same
+     * failure mode as the {@code state} column would have without its
+     * String overload.
+     *
+     * <p>Callers using a real VO instance keep using
+     * {@link #setVdpaKind(VdpaKind)}; callers using {@code createForUpdate()}
+     * MUST pass {@code VdpaKind.VDPA.name()} via this overload.
+     */
+    public void setVdpaKind(String kind) {
+        this.vdpaKind = kind;
+        this.updated = new Date();
+    }
+
     public String getVdpaName() {
         return vdpaName;
     }
