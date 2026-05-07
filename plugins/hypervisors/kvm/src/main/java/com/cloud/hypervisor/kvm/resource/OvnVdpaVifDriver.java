@@ -89,6 +89,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(mac)) {
             throw new InternalErrorException("OvnVdpaVifDriver requires a MAC on the NicTO");
         }
+        // Stamp the bridge-wide tc-policy on the first OVN-aware plug per
+        // JVM (idempotent latch).
+        OvnNicTunableApplier.applyTcPolicyOnce(nic.getOvsTcPolicy());
 
         final String pfName = StringUtils.isNotBlank(nic.getVfPfName())
                 ? nic.getVfPfName()
@@ -101,6 +104,11 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             // (1) PF-side VF identity: MAC + trust + spoofchk, NO VLAN.
             //     Switchdev mlx5 rejects PF-side VLAN; OVN owns segmentation.
             configureVfOnPfNoVlan(pfName, vfId, mac);
+            // Apply operator-resolved VF tunables (trust / spoofchk /
+            // link state / max_tx_rate / min_tx_rate / qos). On switchdev
+            // most kernels reject vlan/qos here; the helper logs and
+            // continues, so plug never aborts on operator typos.
+            OvnNicTunableApplier.applyVfTunables(nic, pfName, vfId);
             final String pfFinal = pfName;
             final Integer vfIdFinal = vfId;
             rollback.push(() -> {
@@ -110,12 +118,15 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 }
             });
 
-            // (2) Create the vDPA SF on top of the VF.
+            // (2) Create the vDPA SF on top of the VF. Append optional
+            //     vDPA feature flags resolved from OvnNicConfig: event_idx,
+            //     indirect_desc, iommu, packed. mlx5 accepts these as
+            //     {@code <feature> on/off} suffixes; older kernels ignore
+            //     unknown flags.
             final String vdpaName = VdpaVifDriver.buildVdpaName(nic);
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
-            Script.runSimpleBashScript(String.format(
-                "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqs %d",
-                vdpaName, pciAddress, mac, maxVqs), 5000);
+            final String vdpaAddCmd = buildVdpaAddCommand(vdpaName, pciAddress, mac, maxVqs, nic);
+            Script.runSimpleBashScript(vdpaAddCmd, 5000);
             rollback.push(() -> Script.runSimpleBashScript(
                     String.format("vdpa dev del %s 2>/dev/null", vdpaName)));
 
@@ -134,25 +145,81 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                     "OvnVdpaVifDriver: representor not found for VF %s; mlx5 switchdev required",
                     pciAddress));
             }
-            attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac);
+            attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin());
             final String repFinal = repName;
             rollback.push(() -> Script.runSimpleBashScript(String.format(
                 "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repFinal)));
 
-            // (4) Domain XML <interface type='vdpa'>; queues = max_vqs / 2.
+            // (4) Domain XML <interface type='vdpa'>. queues defaults to
+            //     max_vqs / 2 (TX+RX pair count); operator can override
+            //     with ovn.vdpa.queue_pairs. tx_queue_size / rx_queue_size
+            //     map to the libvirt <driver/> attributes.
             final InterfaceDef intf = new InterfaceDef();
-            final Integer queues = maxVqs > 1 ? maxVqs / 2 : null;
+            final Integer queues = resolveQueuePairs(nic, maxVqs);
             intf.defVdpaNet(vhostDev, mac, queues);
             intf.setLinkStateUp(nic.isEnabled());
+            // Stamp queue depth + packed vq + driver name on the InterfaceDef.
+            OvnNicTunableApplier.applyInterfaceDefTunables(nic, intf);
 
-            logger.info("OvnVdpaVifDriver.plug: name={} pci={} pf={} mac={} rep={} lsp={} vhost={} maxVqs={} bridge={}",
+            logger.info("OvnVdpaVifDriver.plug: name={} pci={} pf={} mac={} rep={} lsp={} vhost={} maxVqs={} queues={} bridge={}",
                     vdpaName, pciAddress, pfName, mac, repName, nic.getOvnLspName(),
-                    vhostDev, maxVqs, integrationBridge);
+                    vhostDev, maxVqs, queues, integrationBridge);
             return intf;
         } catch (RuntimeException | InternalErrorException ex) {
             drainRollback(rollback);
             throw ex;
         }
+    }
+
+    /**
+     * Build the {@code vdpa dev add} command line, appending optional
+     * feature flags (event_idx, indirect_desc, iommu, packed) when the
+     * caller provided non-null tunables on {@link NicTO}.
+     *
+     * <p>Linux 6.x mlx5_vdpa accepts these flags inline; older kernels
+     * may reject unknown tokens — caller is responsible for matching the
+     * tunable surface to deployed kernel support.
+     */
+    private static String buildVdpaAddCommand(final String vdpaName, final String pciAddress,
+                                              final String mac, final int maxVqs, final NicTO nic) {
+        // iproute2 vdpa CLI expects {@code max_vqp} (max queue PAIRS), NOT
+        // {@code max_vqs} (total virtqueues). Older fork code passed the
+        // raw total, which iproute2 rejects with
+        //   "Unknown option \"max_vqs\""
+        // and aborts the whole {@code vdpa dev add} call. Convert the
+        // canonical 33 (16 TX + 16 RX + 1 ctrl) to 16 queue pairs by
+        // dropping the ctrl_vq and halving. Cap at 1 so legacy configs
+        // (max_vqs=1 or 2) still produce a valid command.
+        final int maxVqp = Math.max(1, (maxVqs - 1) / 2);
+        final StringBuilder cmd = new StringBuilder()
+                .append("vdpa dev add name ").append(vdpaName)
+                .append(" mgmtdev pci/").append(pciAddress)
+                .append(" mac ").append(mac)
+                .append(" max_vqp ").append(maxVqp);
+        appendIfSet(cmd, "event_idx",     nic.getVdpaEventIdx());
+        appendIfSet(cmd, "indirect_desc", nic.getVdpaIndirectDesc());
+        appendIfSet(cmd, "iommu",         nic.getVdpaIommu());
+        appendIfSet(cmd, "packed",        nic.getVdpaPacked());
+        return cmd.toString();
+    }
+
+    private static void appendIfSet(final StringBuilder sb, final String token, final Boolean value) {
+        if (value == null) {
+            return;
+        }
+        sb.append(' ').append(token).append(' ').append(Boolean.TRUE.equals(value) ? "on" : "off");
+    }
+
+    /**
+     * Resolve the queue-pair count for the libvirt {@code <driver queues='N'/>}
+     * attribute. Operator override {@code ovn.vdpa.queue_pairs} wins; otherwise
+     * we default to {@code maxVqs / 2} (the historical CloudStack default).
+     */
+    private static Integer resolveQueuePairs(final NicTO nic, final int maxVqs) {
+        if (nic.getVdpaQueuePairs() != null && nic.getVdpaQueuePairs() > 0) {
+            return nic.getVdpaQueuePairs();
+        }
+        return maxVqs > 1 ? maxVqs / 2 : null;
     }
 
     @Override
@@ -235,6 +302,16 @@ public class OvnVdpaVifDriver extends VifDriverBase {
 
     /** Attach VF rep to br-int with OVN binding external_ids — same contract as B2. */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac) {
+        attachRepresentorToBrInt(repName, lspName, mac, null);
+    }
+
+    /**
+     * Attach the VF representor and stamp the per-port {@code hairpin} flag
+     * resolved from the OVN tunable chain. {@code hairpin=null} keeps the
+     * port untouched (wire compat with older mgmt).
+     */
+    private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
+                                          final Boolean hairpin) {
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -245,6 +322,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         }
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl set Interface %s external_ids:iface-status=active", repName));
+        OvnNicTunableApplier.applyHairpin(repName, hairpin);
     }
 
     /**

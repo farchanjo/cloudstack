@@ -117,9 +117,13 @@ public class VdpaVifDriver extends VifDriverBase {
             // entry from a previous boot does not pin /dev/vhost-vdpa-N to the
             // wrong VF.
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+            // iproute2 vdpa CLI expects {@code max_vqp} (queue PAIRS), not
+            // {@code max_vqs} (total VQs); see {@link OvnVdpaVifDriver} for
+            // the rationale. Convert: 33 total VQs -> 16 queue pairs.
+            int maxVqp = Math.max(1, (maxVqs - 1) / 2);
             String addCmd = String.format(
-                "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqs %d",
-                vdpaName, pciAddress, mac, maxVqs);
+                "vdpa dev add name %s mgmtdev pci/%s mac %s max_vqp %d",
+                vdpaName, pciAddress, mac, maxVqp);
             Script.runSimpleBashScript(addCmd, 5000);
             final String vdpaNameFinal = vdpaName;
             rollback.push(() -> Script.runSimpleBashScript(
@@ -309,8 +313,16 @@ public class VdpaVifDriver extends VifDriverBase {
     /**
      * Walk {@code /sys/bus/vdpa/devices/<vdpaName>} and return the
      * {@code /dev/vhost-vdpa-N} path matching the index encoded in the
-     * directory's child {@code vhost-vdpaN} entry (kernel-allocated). Returns
-     * null when no such entry exists.
+     * directory's child {@code vhost-vdpa-N} entry (kernel-allocated).
+     * Returns null when no such entry exists.
+     *
+     * <p>Kernel sysfs emits the child as {@code vhost-vdpa-<digits>}
+     * (with hyphen). The legacy implementation matched
+     * {@code vhost-vdpaN} (no hyphen) and rejected the real kernel
+     * shape via the {@code \\d+} regex, leaving every plug aborted with
+     * "could not resolve /dev/vhost-vdpa-N". Strip both prefixes
+     * ({@code vhost-vdpa-} and {@code vhost-vdpa}) so the resolver
+     * works against any iproute2/kernel combination.
      */
     static String readVhostDevFromSysfs(String vdpaName) {
         File devDir = new File("/sys/bus/vdpa/devices/" + vdpaName);
@@ -322,11 +334,21 @@ public class VdpaVifDriver extends VifDriverBase {
             return null;
         }
         for (String name : entries) {
-            if (name.startsWith("vhost-vdpa")) {
-                String idx = name.substring("vhost-vdpa".length());
-                if (idx.matches("\\d+")) {
-                    return "/dev/vhost-vdpa" + idx;
-                }
+            if (!name.startsWith("vhost-vdpa")) {
+                continue;
+            }
+            String idx = name.substring("vhost-vdpa".length());
+            if (idx.startsWith("-")) {
+                idx = idx.substring(1);
+            }
+            if (idx.matches("\\d+")) {
+                // Kernel cdev path is {@code /dev/vhost-vdpa-<idx>} (with
+                // hyphen). Older fork code emitted {@code /dev/vhost-vdpaN}
+                // (no hyphen) and libvirt would reject it with
+                //   "Unable to open '/dev/vhost-vdpaN' for vdpa device:
+                //    No such file or directory"
+                // even though the SF was correctly created.
+                return "/dev/vhost-vdpa-" + idx;
             }
         }
         return null;
