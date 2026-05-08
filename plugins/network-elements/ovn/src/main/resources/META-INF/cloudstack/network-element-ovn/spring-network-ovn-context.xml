@@ -26,10 +26,18 @@
                       http://www.springframework.org/schema/context
                       http://www.springframework.org/schema/context/spring-context.xsd">
 
+    <!-- NIC tunable ConfigKey registry + resolution chain. -->
+    <bean id="ovnNicConfig" class="com.cloud.network.ovn.config.OvnNicConfig"/>
+
+    <!-- Network-wide ConfigKey registry: public localnet VLAN auto + BGP /32 redistribute. -->
+    <bean id="ovnNetworkConfig" class="com.cloud.network.ovn.config.OvnNetworkConfig"/>
+
     <!-- Persistence (Phase I.2). -->
     <bean id="ovnControllerDaoImpl" class="com.cloud.network.ovn.dao.OvnControllerDaoImpl"/>
     <bean id="ovnChassisMapDaoImpl" class="com.cloud.network.ovn.dao.OvnChassisMapDaoImpl"/>
     <bean id="ovnLogicalIdMapDaoImpl" class="com.cloud.network.ovn.dao.OvnLogicalIdMapDaoImpl"/>
+    <!-- Phase H.2: persistent retry queue for failed OVN NB DB deletions. -->
+    <bean id="ovnPendingDeletionDaoImpl" class="com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl"/>
 
     <!-- Composition root + element/guru/services (Phase I.4). -->
     <bean id="ovnPluginManager" class="com.cloud.network.ovn.manager.OvnPluginManager"/>
@@ -77,5 +85,16 @@
     <bean id="ovnPortForwardingService" class="com.cloud.network.ovn.element.OvnPortForwardingService"/>
     <bean id="ovnQosService" class="com.cloud.network.ovn.element.OvnQosService"/>
     <bean id="ovnPublicNetworkManager" class="com.cloud.network.ovn.element.OvnPublicNetworkManager"/>
+
+    <!-- BGP /32 redistribute on the OVN gateway-chassis (opt-in via
+         ovn.bgp.redistribute.public_ips). -->
+    <bean id="ovnBgpRedistributeManager"
+          class="com.cloud.network.ovn.manager.OvnBgpRedistributeManager"/>
+    <bean id="ovnBgpReconcileTask"
+          class="com.cloud.network.ovn.manager.OvnBgpReconcileTask"/>
+
+    <!-- Phase H.2: background processor for the OVN pending-deletion retry queue. -->
+    <bean id="ovnPendingDeletionProcessor"
+          class="com.cloud.network.ovn.manager.OvnPendingDeletionProcessor"/>
 
 </beans>
