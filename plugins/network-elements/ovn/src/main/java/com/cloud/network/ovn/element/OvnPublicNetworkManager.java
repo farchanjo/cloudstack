@@ -16,6 +16,7 @@
 // under the License.
 package com.cloud.network.ovn.element;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -23,13 +24,22 @@ import java.util.Map;
 
 import javax.inject.Inject;
 
+import org.apache.cloudstack.resourcedetail.VpcDetailVO;
+import org.apache.cloudstack.resourcedetail.dao.VpcDetailsDao;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
+import com.cloud.dc.Vlan;
+import com.cloud.dc.VlanVO;
+import com.cloud.dc.dao.VlanDao;
+import com.cloud.network.Networks.TrafficType;
+import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -69,11 +79,32 @@ public class OvnPublicNetworkManager {
     private OvnLogicalIdMapDao logicalIdMapDao;
     @Inject
     private OvnChassisMapDao chassisMapDao;
+    @Inject
+    private NetworkDao networkDao;
+    @Inject
+    private VpcDetailsDao vpcDetailsDao;
+    @Inject
+    private VlanDao vlanDao;
 
     /**
      * Ensure the per-zone public LS + localnet LSP exist. Idempotent. Returns
      * the LS UUID. Optional VLAN tag carried as the localnet's
      * {@code tag} column when the public physnet is trunked.
+     *
+     * <p>VLAN tag resolution chain (highest wins):
+     * <ol>
+     *   <li>{@code publicVlanTag} argument (explicit caller override).</li>
+     *   <li>{@code ovn.public.vlan.override} global ConfigKey when non-zero.</li>
+     *   <li>Auto-detect from CloudStack Public network broadcastUri when
+     *       {@code ovn.public.vlan.auto} is on.</li>
+     *   <li>{@code null} (untagged localnet — operator handles VLAN externally).</li>
+     * </ol>
+     *
+     * <p>On the existing-row path the method also fixes VLAN drift: if the
+     * resolved tag differs from what is currently programmed on
+     * {@link #PUBLIC_LOCALNET_LSP}, the tag is rewritten in place. This
+     * keeps the public-side localnet aligned with operator config without
+     * forcing a destroy / recreate cycle.
      */
     public String ensurePublicLogicalSwitch(final long zoneId, final Integer publicVlanTag, final String physnetName) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
@@ -81,6 +112,7 @@ public class OvnPublicNetworkManager {
             throw new OvnException("OvnPublicNetworkManager: no OVN controller for zone " + zoneId);
         }
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        final Integer resolvedVlan = resolvePublicLocalnetVlan(zoneId, publicVlanTag);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PUBLIC_LS, zoneId, controller.getId());
         if (existing != null) {
             // Stale-mapping guard: the NB row may have been deleted
@@ -88,6 +120,7 @@ public class OvnPublicNetworkManager {
             // earlier failed transaction). Verify before returning the
             // cached UUID so we don't hand the caller a dead reference.
             if (nb.rowExistsByUuid("Logical_Switch", existing.getOvnUuid())) {
+                reconcilePublicLocalnetTag(nb, existing.getOvnUuid(), resolvedVlan);
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnPublicNetworkManager: PUBLIC_LS mapping {} -> {} stale (NB row gone); recreating",
@@ -104,10 +137,218 @@ public class OvnPublicNetworkManager {
         // Always attach the localnet bridge LSP — that's the contract that
         // forwards datapath frames to br-bond via ovn-bridge-mappings.
         final String physnet = StringUtils.isNotBlank(physnetName) ? physnetName : DEFAULT_PHYSNET;
-        nb.addLocalnetPort(lsUuid, PUBLIC_LOCALNET_LSP, publicVlanTag, physnet);
+        nb.addLocalnetPort(lsUuid, PUBLIC_LOCALNET_LSP, resolvedVlan, physnet);
         LOGGER.info("OvnPublicNetworkManager: created public LS {} (vlan={}, physnet={})",
-                lsUuid, publicVlanTag, physnet);
+                lsUuid, resolvedVlan, physnet);
         return lsUuid;
+    }
+
+    /**
+     * Resolve the VLAN tag that should be programmed on the per-zone public
+     * localnet LSP. Used by {@link #ensurePublicLogicalSwitch} on creation
+     * and by {@link com.cloud.network.ovn.manager.OvnReconcilerService} on
+     * drift detection.
+     *
+     * <p>Resolution order (highest wins):
+     * <ol>
+     *   <li>{@code explicitOverride} caller argument when non-null.</li>
+     *   <li>{@code ovn.public.vlan.override} global ConfigKey when non-zero.</li>
+     *   <li>Auto-detect from CloudStack Public network broadcastUri when
+     *       {@code ovn.public.vlan.auto} is true.</li>
+     *   <li>{@code null} (untagged localnet).</li>
+     * </ol>
+     */
+    public Integer resolvePublicLocalnetVlan(final long zoneId, final Integer explicitOverride) {
+        if (explicitOverride != null) {
+            return explicitOverride;
+        }
+        final Integer cfgOverride = OvnNetworkConfig.PublicVlanOverride.value();
+        if (cfgOverride != null && cfgOverride.intValue() > 0) {
+            return cfgOverride;
+        }
+        if (!Boolean.TRUE.equals(OvnNetworkConfig.PublicVlanAuto.value())) {
+            return null;
+        }
+        return autoDetectPublicVlan(zoneId);
+    }
+
+    /**
+     * Auto-detect helper — walks every {@link TrafficType#Public} network in
+     * the zone and resolves the first usable VLAN id. Two probes, in order:
+     *
+     * <ol>
+     *   <li>{@link NetworkVO#getBroadcastUri() broadcastUri} on the network
+     *       row itself ({@code vlan://<id>} encoding) — covers freshly
+     *       provisioned zones whose Public traffic type carries the URI on
+     *       the network record.</li>
+     *   <li>The {@code vlan} table joined to the network — the canonical CS
+     *       location for the public-IP VLAN when the network row leaves
+     *       {@code broadcast_uri NULL}. Iterates rows via
+     *       {@link VlanDao#listVlansByNetworkId(long)} and picks the first
+     *       row whose {@code vlan_id} parses as a numeric VLAN tag (rows like
+     *       {@code vlan://untagged} are skipped).</li>
+     * </ol>
+     *
+     * <p>Returns {@code null} when no public network carries a numeric VLAN
+     * id (fully untagged trunk deployment).
+     */
+    private Integer autoDetectPublicVlan(final long zoneId) {
+        final List<NetworkVO> publics = networkDao.listByZoneAndTrafficType(zoneId, TrafficType.Public);
+        if (publics == null || publics.isEmpty()) {
+            return null;
+        }
+        for (final NetworkVO net : publics) {
+            final Integer fromBroadcastUri = parseVlanFromBroadcastUri(net);
+            if (fromBroadcastUri != null) {
+                return fromBroadcastUri;
+            }
+            final Integer fromVlanTable = parseVlanFromVlanDao(net);
+            if (fromVlanTable != null) {
+                return fromVlanTable;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Probe #1 — network row's own {@code broadcastUri}. CloudStack encodes
+     * the VLAN as {@code vlan://<tag>} when present. Returns {@code null}
+     * when the URI is null or its scheme is not {@code vlan}.
+     */
+    private Integer parseVlanFromBroadcastUri(final NetworkVO net) {
+        final URI broadcast = net.getBroadcastUri();
+        if (broadcast == null) {
+            return null;
+        }
+        if (!"vlan".equalsIgnoreCase(broadcast.getScheme())) {
+            return null;
+        }
+        final String host = broadcast.getHost() != null ? broadcast.getHost() : broadcast.getSchemeSpecificPart();
+        final String trimmed = host == null ? null : host.replace("/", "").trim();
+        if (StringUtils.isBlank(trimmed)) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(trimmed);
+        } catch (NumberFormatException nfe) {
+            LOGGER.debug("OvnPublicNetworkManager: unparseable VLAN '{}' on Public network id={} broadcast={}",
+                    trimmed, net.getId(), broadcast);
+            return null;
+        }
+    }
+
+    /**
+     * Probe #2 — the {@code vlan} table. CS stores per-public-IP VLANs there
+     * with {@code vlan_id} encoded as {@code vlan://<tag>} or
+     * {@code vlan://untagged}. The first numeric tag wins.
+     *
+     * <p>Returns {@code null} when no row carries a numeric tag (every row is
+     * untagged) or when the {@link VlanDao} bean is unavailable (test seam —
+     * the legacy unit tests inject only the {@link NetworkDao}).
+     */
+    private Integer parseVlanFromVlanDao(final NetworkVO net) {
+        if (vlanDao == null) {
+            return null;
+        }
+        final List<VlanVO> rows;
+        try {
+            rows = vlanDao.listVlansByNetworkId(net.getId());
+        } catch (RuntimeException re) {
+            LOGGER.debug("OvnPublicNetworkManager: vlanDao.listVlansByNetworkId failed for network id={}: {}",
+                    net.getId(), re.getMessage());
+            return null;
+        }
+        if (rows == null || rows.isEmpty()) {
+            return null;
+        }
+        for (final VlanVO row : rows) {
+            // Only VirtualNetwork (= Public) rows can carry the public VLAN
+            // tag. DirectAttached / VirtualMachineRange are skipped as a
+            // safety net — they never apply to the OVN public localnet.
+            if (row.getVlanType() != null && row.getVlanType() != Vlan.VlanType.VirtualNetwork) {
+                continue;
+            }
+            final String vlanId = row.getVlanTag();
+            if (StringUtils.isBlank(vlanId)) {
+                continue;
+            }
+            // vlan_id column carries values like "vlan://2988" or
+            // "vlan://untagged"; strip the scheme then parse the integer.
+            final String stripped = vlanId.startsWith("vlan://") ? vlanId.substring("vlan://".length()) : vlanId;
+            final String trimmed = stripped.replace("/", "").trim();
+            if (StringUtils.isBlank(trimmed) || "untagged".equalsIgnoreCase(trimmed)) {
+                continue;
+            }
+            try {
+                return Integer.parseInt(trimmed);
+            } catch (NumberFormatException nfe) {
+                LOGGER.debug("OvnPublicNetworkManager: unparseable VLAN '{}' on vlan row id={} (network id={})",
+                        trimmed, row.getId(), net.getId());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Drift-fix helper: read the current {@code tag} on the public localnet
+     * LSP and rewrite it when it diverges from the resolved VLAN. No-op when
+     * the LSP cannot be located (operator-managed mode) or when the tag is
+     * already correct.
+     */
+    private void reconcilePublicLocalnetTag(final OvnNbClient nb, final String publicLsUuid,
+                                            final Integer desiredVlan) {
+        final String lspUuid = nb.findLogicalSwitchPortUuidByExactName(PUBLIC_LOCALNET_LSP);
+        if (lspUuid == null) {
+            LOGGER.debug("OvnPublicNetworkManager: no localnet LSP {} on public LS {}; skipping VLAN drift-fix",
+                    PUBLIC_LOCALNET_LSP, publicLsUuid);
+            return;
+        }
+        final Integer current = nb.getLogicalSwitchPortTag(lspUuid);
+        if (java.util.Objects.equals(current, desiredVlan)) {
+            return;
+        }
+        try {
+            nb.setLogicalSwitchPortTag(lspUuid, desiredVlan);
+            LOGGER.info("OvnPublicNetworkManager: public localnet vlan drift-fix {} -> {} (lsp={}, ls={})",
+                    current, desiredVlan, lspUuid, publicLsUuid);
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPublicNetworkManager: public localnet vlan drift-fix failed (lsp={}): {}",
+                    lspUuid, e.getMessage());
+        }
+    }
+
+    /** Convenience accessor for the per-zone public LSP name + UUID lookup,
+     *  used by the reconciler so tests can stub the seam without depending
+     *  on internal NB-client behaviour. */
+    public String findPublicLocalnetLspUuid(final long zoneId) {
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        return nb.findLogicalSwitchPortUuidByExactName(PUBLIC_LOCALNET_LSP);
+    }
+
+    /**
+     * Resolve whether BGP /32 redistribution is enabled for a given VPC. The
+     * VPC detail row {@code ovn.bgp.redistribute} (free-form string) wins
+     * over the global ConfigKey when present. Used by callers in the
+     * Source/Static/PortForward services and by the periodic gateway-chassis
+     * reconciler.
+     */
+    public boolean isBgpRedistributeEnabled(final long vpcId) {
+        if (vpcDetailsDao != null) {
+            final VpcDetailVO detail = vpcDetailsDao.findDetail(vpcId, OvnNetworkConfig.VPC_DETAIL_BGP_REDISTRIBUTE);
+            if (detail != null && StringUtils.isNotBlank(detail.getValue())) {
+                return parseBoolean(detail.getValue());
+            }
+        }
+        return Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value());
+    }
+
+    private static boolean parseBoolean(final String raw) {
+        if (raw == null) {
+            return false;
+        }
+        final String trimmed = raw.trim();
+        return "true".equalsIgnoreCase(trimmed) || "1".equals(trimmed)
+                || "yes".equalsIgnoreCase(trimmed) || "on".equalsIgnoreCase(trimmed);
     }
 
     /**
