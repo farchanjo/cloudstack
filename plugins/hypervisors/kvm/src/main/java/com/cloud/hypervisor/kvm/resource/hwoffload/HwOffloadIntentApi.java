@@ -21,7 +21,11 @@ package com.cloud.hypervisor.kvm.resource.hwoffload;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 
 import javax.crypto.Mac;
@@ -72,17 +76,54 @@ public class HwOffloadIntentApi {
         this.reconciler = reconciler;
     }
 
-    /** Start the HTTP server. Bound to cloud0 (link-local), single thread is enough. */
+    /**
+     * Start the HTTP server. Refuses to bind to anything other than a link-local
+     * address (IPv4 169.254.0.0/16 or IPv6 fe80::/10). Wildcard binds
+     * (null / blank / 0.0.0.0 / ::) and routable addresses are rejected so the
+     * intent endpoint cannot accidentally accept VR traffic from outside the
+     * local cloud0 link. Single thread is enough for the very low request rate
+     * (1 request per VR per configure pass).
+     */
     public synchronized void start(String bindIp, int port) throws IOException {
         if (server != null) {
             return;
         }
+        requireLinkLocal(bindIp);
         server = HttpServer.create(new InetSocketAddress(bindIp, port), 8);
         server.createContext("/v1/hwoffload/intent", new IntentHandler());
         server.createContext("/v1/hwoffload/state", new StateHandler());
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(2));
         server.start();
         LOGGER.info("HwOffloadIntentApi listening on {}:{}", bindIp, port);
+    }
+
+    /**
+     * Reject anything that is not a literal link-local IPv4 (169.254.0.0/16)
+     * or IPv6 (fe80::/10) address. Hostnames are NOT resolved on purpose —
+     * we want a literal address only, never something that could be poisoned
+     * via DNS at startup. Throws {@link IOException} so {@link #start} can
+     * surface the reason without wrapping.
+     */
+    static void requireLinkLocal(String bindIp) throws IOException {
+        if (bindIp == null || bindIp.isBlank()) {
+            throw new IOException("HwOffloadIntentApi refuses to bind: bindIp is null or blank");
+        }
+        String trimmed = bindIp.trim();
+        if ("0.0.0.0".equals(trimmed) || "::".equals(trimmed) || "[::]".equals(trimmed)) {
+            throw new IOException("HwOffloadIntentApi refuses to bind: wildcard address '" + trimmed + "' not allowed");
+        }
+        InetAddress addr;
+        try {
+            addr = InetAddress.getByName(trimmed);
+        } catch (UnknownHostException e) {
+            throw new IOException("HwOffloadIntentApi refuses to bind: '" + trimmed + "' is not a literal IP address", e);
+        }
+        boolean linkLocal = (addr instanceof Inet4Address && addr.isLinkLocalAddress())
+                || (addr instanceof Inet6Address && addr.isLinkLocalAddress());
+        if (!linkLocal) {
+            throw new IOException("HwOffloadIntentApi refuses to bind: '" + trimmed
+                    + "' is not link-local (must be 169.254.0.0/16 or fe80::/10)");
+        }
     }
 
     public synchronized void stop() {

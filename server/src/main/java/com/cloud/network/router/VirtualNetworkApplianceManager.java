@@ -42,6 +42,7 @@ public interface VirtualNetworkApplianceManager extends Manager, VirtualNetworkA
     String RouterTemplateHyperVCK = "router.template.hyperv";
     String RouterTemplateLxcCK = "router.template.lxc";
     String RouterTemplateOvm3CK = "router.template.ovm3";
+    String RouterTemplateKvmHwOffloadCK = "router.template.kvm.hwoffload";
     String SetServiceMonitorCK = "network.router.EnableServiceMonitoring";
     String RouterAlertsCheckIntervalCK = "router.alerts.check.interval";
     String VirtualRouterServiceOfferingCK = "router.service.offering";
@@ -63,6 +64,8 @@ public interface VirtualNetworkApplianceManager extends Manager, VirtualNetworkA
             "Name of the default router template on LXC.", true, ConfigKey.Scope.Zone, null);
     ConfigKey<String> RouterTemplateOvm3 = new ConfigKey<>(String.class, RouterTemplateOvm3CK, "Advanced", "SystemVM Template (Ovm3)",
             "Name of the default router template on Ovm3.", true, ConfigKey.Scope.Zone, null);
+    ConfigKey<String> RouterTemplateKvmHwOffload = new ConfigKey<>(String.class, RouterTemplateKvmHwOffloadCK, "Advanced", "SystemVM Template (KVM HW Offload)",
+            "Name of the router template used for VPCs whose network offerings have hwOffloadEnabled=true on KVM. Falls back to router.template.kvm when unset.", true, ConfigKey.Scope.Zone, null);
 
     ConfigKey<String> VirtualRouterUserData = new ConfigKey<>(String.class, "virtual.router.userdata",
             ConfigKey.CATEGORY_ADVANCED, "",
@@ -153,4 +156,21 @@ public interface VirtualNetworkApplianceManager extends Manager, VirtualNetworkA
     public boolean prepareAggregatedExecution(Network network, List<DomainRouterVO> routers) throws AgentUnavailableException, ResourceUnavailableException;
 
     public boolean completeAggregatedExecution(Network network, List<DomainRouterVO> routers) throws AgentUnavailableException, ResourceUnavailableException;
+
+    /**
+     * Refresh per-tier static FDB pin OF rules on every peer host of a given
+     * VPC. Called from non-VR lifecycle hooks (UserVm finalizeStart) so that
+     * VMs plugged AFTER the VR is already running get their MAC pinned on all
+     * peers — without this, peers fall back on OVS NORMAL FDB which can be
+     * polluted via cross-tunnel hairpin learning. Silent best-effort.
+     */
+    void dispatchVxlanFdbBindingsForVpc(Long vpcId);
+
+    /**
+     * Symmetric remove counterpart to {@link #dispatchVxlanFdbBindingsForVpc}:
+     * tells every peer host of every VPC tier the VM was on to delete the
+     * priority=400 OF rule for the VM's mac. Called from UserVm finalizeStop
+     * so peer rules don't accumulate as VMs come and go.
+     */
+    void dispatchVxlanFdbBindingRemoveForVm(long vmId, String vmMac);
 }

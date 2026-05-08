@@ -66,4 +66,94 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
 
     /** Counts of FREE/ALLOCATED/RESERVED/UNAVAILABLE per host (for capacity reporting). */
     int countByHostAndState(long hostId, State state);
+
+    /**
+     * Atomically take a free VF on the host, mark it as
+     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind#VDPA VDPA}, and
+     * record the requested vDPA name + MAC. Returns null when no FREE VF is
+     * available. The {@code allocated_to_nic_id} is set to {@code nicId} so
+     * the row is also reachable via {@link #releaseByNicId} for normal
+     * stop/migrate paths. {@code maxVqs} is captured separately on the
+     * server-side wrapper so the agent can pass it to {@code vdpa dev add}.
+     *
+     * <p>Idempotent: if {@code (hostId, nicId)} already has an entry whose
+     * vdpa_kind=VDPA, that row is returned unchanged.
+     */
+    SriovVfPoolVO allocateForVdpa(long hostId, long nicId, String mac, int maxVqs);
+
+    /**
+     * Find a FREE VF on the given host that is eligible for vDPA mgmt-device
+     * binding. The server uses this when pre-allocating a VF before the VR
+     * boots. Returns null when no FREE VF is available.
+     */
+    SriovVfPoolVO findFreeVdpaCapableVf(long hostId);
+
+    /**
+     * Release a vDPA-bound VF: clear vdpa_name / vdpa_device, flip
+     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind} back to
+     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind#PASSTHROUGH},
+     * and {@link #release} the row. Idempotent.
+     */
+    boolean releaseVdpa(long vfPoolId);
+
+    /**
+     * Stamp {@code last_seen=NOW()} on the row identified by
+     * {@code (hostId, pciAddress)}. Used by the mgmt-side reconciler when an
+     * agent inventory advertise confirms the VF is still present. Idempotent;
+     * returns {@code true} when the row was found and updated.
+     */
+    boolean touchLastSeen(long hostId, String pciAddress);
+
+    /**
+     * Flip every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * row on the host to {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT}.
+     * Used when the host disconnects: the operator decides whether to force-
+     * release. Idempotent. Returns the number of rows updated.
+     */
+    int markSuspectByHostId(long hostId);
+
+    /**
+     * Force every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * or {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT} row on the
+     * host back to {@link com.cloud.network.router.SriovVfPoolVO.State#FREE},
+     * clearing nic binding and vDPA fields. Used by the
+     * {@code forceReleaseHostVfs} admin API. Returns the number of rows
+     * released.
+     */
+    int forceReleaseByHostId(long hostId);
+
+    /**
+     * Re-bind every {@link com.cloud.network.router.SriovVfPoolVO.State#FREE}
+     * pool entry on the host to the live NIC that still references it via
+     * {@code nics.vf_pool_id}. Walks {@code nics} ⇒ {@code vm_instance}
+     * filtering on live VMs ({@code v.removed IS NULL AND v.state IN
+     * ('Running','Starting','Stopping','Migrating')}), flips the matching
+     * pool row to {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED},
+     * stamps {@code allocated_to_nic_id} from {@code nics.id}, and refreshes
+     * {@code last_seen=NOW()}. Idempotent (no-op for already-allocated
+     * rows).
+     *
+     * <p>Companion to {@link #forceReleaseByHostId(long)} — used by the
+     * {@code recoverHostVfs} admin API to undo an over-zealous force-
+     * release without bouncing live VMs / VRs.
+     *
+     * @return number of rows promoted from {@code FREE} to {@code ALLOCATED}.
+     */
+    int recoverByHostId(long hostId);
+
+    /**
+     * Find every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
+     * row whose {@code last_seen} is null or older than
+     * {@code (NOW() - thresholdSeconds)}. Caller flips them to
+     * {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT}.
+     */
+    List<SriovVfPoolVO> findStaleAllocated(int thresholdSeconds);
+
+    /**
+     * Lookup by {@code (hostId, vdpaName)}. Returns null when no row matches.
+     * Used by the reconciler when adopting a vDPA SF discovered on the host
+     * — if a row already exists, mark it VDPA; otherwise insert a synthetic
+     * {@link com.cloud.network.router.SriovVfPoolVO.State#ORPHAN_MANUAL} row.
+     */
+    SriovVfPoolVO findByHostAndVdpaName(long hostId, String vdpaName);
 }

@@ -21,11 +21,9 @@ import java.io.InputStream;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 /**
- * Schema upgrade 4.24.1.0 → 4.24.1.1. Drops the SR-IOV Sub-Function (SF)
- * pool and related artifacts (CX-6 Dx does not support SF+vDPA) and
- * renames {@code network_offerings.sf_vdpa_enabled} to {@code vdpa_enabled}
- * to reflect the surviving VF+vDPA path. Idempotent and safe on clusters
- * that never populated {@code sriov_sf_pool}.
+ * Schema upgrade 4.24.1.0 → 4.24.1.1. Drops all vDPA artifacts (SR-IOV
+ * Sub-Function pool, VF+vDPA columns, and offering flag). Idempotent and
+ * safe on clusters that never populated any of them.
  */
 public class Upgrade42410to42411 extends DbUpgradeAbstractImpl implements DbUpgrade {
 

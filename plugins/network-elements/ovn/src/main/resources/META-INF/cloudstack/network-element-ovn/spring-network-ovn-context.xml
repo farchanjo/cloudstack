@@ -1,0 +1,100 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements. See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership. The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License. You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied. See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xmlns:aop="http://www.springframework.org/schema/aop"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans
+                      http://www.springframework.org/schema/beans/spring-beans.xsd
+                      http://www.springframework.org/schema/aop http://www.springframework.org/schema/aop/spring-aop.xsd
+                      http://www.springframework.org/schema/context
+                      http://www.springframework.org/schema/context/spring-context.xsd">
+
+    <!-- NIC tunable ConfigKey registry + resolution chain. -->
+    <bean id="ovnNicConfig" class="com.cloud.network.ovn.config.OvnNicConfig"/>
+
+    <!-- Network-wide ConfigKey registry: public localnet VLAN auto + BGP /32 redistribute. -->
+    <bean id="ovnNetworkConfig" class="com.cloud.network.ovn.config.OvnNetworkConfig"/>
+
+    <!-- Persistence (Phase I.2). -->
+    <bean id="ovnControllerDaoImpl" class="com.cloud.network.ovn.dao.OvnControllerDaoImpl"/>
+    <bean id="ovnChassisMapDaoImpl" class="com.cloud.network.ovn.dao.OvnChassisMapDaoImpl"/>
+    <bean id="ovnLogicalIdMapDaoImpl" class="com.cloud.network.ovn.dao.OvnLogicalIdMapDaoImpl"/>
+    <!-- Phase H.2: persistent retry queue for failed OVN NB DB deletions. -->
+    <bean id="ovnPendingDeletionDaoImpl" class="com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl"/>
+
+    <!-- Composition root + element/guru/services (Phase I.4). -->
+    <bean id="ovnPluginManager" class="com.cloud.network.ovn.manager.OvnPluginManager"/>
+
+    <bean id="Ovn" class="com.cloud.network.ovn.element.OvnNetworkElement">
+        <property name="name" value="Ovn"/>
+    </bean>
+
+    <bean id="ovnGuestNetworkGuru" class="com.cloud.network.ovn.element.OvnGuestNetworkGuru">
+        <property name="name" value="OvnGuestNetworkGuru"/>
+    </bean>
+
+    <bean id="ovnVpcElement" class="com.cloud.network.ovn.element.OvnVpcElement"/>
+    <bean id="ovnSourceNatService" class="com.cloud.network.ovn.element.OvnSourceNatService"/>
+    <bean id="ovnStaticNatService" class="com.cloud.network.ovn.element.OvnStaticNatService"/>
+
+    <!-- Admin API service (Phase I.5). -->
+    <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
+
+    <!-- On-demand orphan / stale-mapping reaper (admin runOvnReconciler API). -->
+    <bean id="ovnReconcilerService" class="com.cloud.network.ovn.manager.OvnReconcilerService"/>
+
+    <!-- importOvnVpc adoption pipeline (Phase I.5). -->
+    <bean id="ovnVpcImporter" class="com.cloud.network.ovn.manager.OvnVpcImporter"/>
+
+    <!-- Chassis registration (Phase I.6). -->
+    <bean id="ovnChassisRegistrationService" class="com.cloud.network.ovn.manager.OvnChassisRegistrationService"/>
+
+    <!-- AgentManager host-event subscriber that drives the registration service. -->
+    <bean id="ovnChassisListener" class="com.cloud.network.ovn.manager.OvnChassisListener"/>
+
+    <!-- Phase 2 — NetworkACL programming (item 4). -->
+    <bean id="ovnFirewallService" class="com.cloud.network.ovn.element.OvnFirewallService">
+        <property name="name" value="OvnFirewallService"/>
+    </bean>
+
+    <!-- Phase 2 — Load balancer programming (item 5). -->
+    <bean id="ovnLoadBalancerService" class="com.cloud.network.ovn.element.OvnLoadBalancerService">
+        <property name="name" value="OvnLoadBalancerService"/>
+    </bean>
+
+    <!-- Phase 3 — DHCP / DNS / PF / QoS / Public network helpers. -->
+    <bean id="ovnDhcpService" class="com.cloud.network.ovn.element.OvnDhcpService"/>
+    <bean id="ovnDnsService" class="com.cloud.network.ovn.element.OvnDnsService"/>
+    <bean id="ovnPortForwardingService" class="com.cloud.network.ovn.element.OvnPortForwardingService"/>
+    <bean id="ovnQosService" class="com.cloud.network.ovn.element.OvnQosService"/>
+    <bean id="ovnPublicNetworkManager" class="com.cloud.network.ovn.element.OvnPublicNetworkManager"/>
+
+    <!-- BGP /32 redistribute on the OVN gateway-chassis (opt-in via
+         ovn.bgp.redistribute.public_ips). -->
+    <bean id="ovnBgpRedistributeManager"
+          class="com.cloud.network.ovn.manager.OvnBgpRedistributeManager"/>
+    <bean id="ovnBgpReconcileTask"
+          class="com.cloud.network.ovn.manager.OvnBgpReconcileTask"/>
+
+    <!-- Phase H.2: background processor for the OVN pending-deletion retry queue. -->
+    <bean id="ovnPendingDeletionProcessor"
+          class="com.cloud.network.ovn.manager.OvnPendingDeletionProcessor"/>
+
+</beans>

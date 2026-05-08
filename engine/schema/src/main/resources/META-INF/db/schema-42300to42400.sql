@@ -104,62 +104,15 @@ VALUES
    'vr.hw.offload.intent.api.port', '9999',
    'TCP port the host agent listens on (cloud0 link-local) for VR HW offload intent API.', '9999');
 
--- ============================================================
--- Feature: SR-IOV Sub-Function (SF) pool with vDPA support
--- SFs are dynamic (created/destroyed at runtime via devlink),
--- unlike VFs which are static (firmware-provisioned).
--- SFs support vDPA for live migration of the datapath.
--- All changes are strictly additive and backward-compatible.
--- ============================================================
 
--- SF pool inventory: tracks each Sub-Function on each host.
--- Lifecycle: FREE -> SF_CREATED -> VDPA_READY -> ALLOCATED -> DESTROYING
-CREATE TABLE IF NOT EXISTS `cloud`.`sriov_sf_pool` (
-  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(40) NOT NULL,
-  `host_id` bigint unsigned NOT NULL,
-  `pf_index` int NOT NULL COMMENT 'Physical Function index (0 or 1)',
-  `sf_index` int NOT NULL COMMENT 'SF number passed to devlink port function set',
-  `devlink_port_handle` varchar(64) NULL COMMENT 'devlink port handle, e.g. pci/0000:01:00.0/32768',
-  `sf_netdev_name` varchar(32) NULL COMMENT 'SF netdev name, e.g. dx6p0sf0',
-  `representor_name` varchar(32) NULL COMMENT 'SF representor name (same as netdev after udev rename)',
-  `vdpa_device` varchar(64) NULL COMMENT 'vDPA device path, e.g. /dev/vhost-vdpa-0. NULL until vDPA created.',
-  `state` varchar(32) NOT NULL DEFAULT 'FREE' COMMENT 'FREE | SF_CREATED | VDPA_READY | ALLOCATED | DESTROYING',
-  `allocated_to_nic_id` bigint unsigned NULL,
-  `created` datetime NOT NULL,
-  `updated` datetime NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_sriov_sf_pool__host_pf_sf` (`host_id`, `pf_index`, `sf_index`),
-  UNIQUE KEY `uk_sriov_sf_pool__uuid` (`uuid`),
-  KEY `idx_sriov_sf_pool__state` (`state`),
-  KEY `idx_sriov_sf_pool__host_state` (`host_id`, `state`),
-  CONSTRAINT `fk_sriov_sf_pool__host_id` FOREIGN KEY (`host_id`)
-    REFERENCES `cloud`.`host`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_sriov_sf_pool__nic_id` FOREIGN KEY (`allocated_to_nic_id`)
-    REFERENCES `cloud`.`nics`(`id`) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- NIC: optional binding to an SF pool entry and vDPA device.
-ALTER TABLE `cloud`.`nics`
-    ADD COLUMN IF NOT EXISTS `sf_pool_id` bigint unsigned NULL
-    COMMENT 'Soft reference to sriov_sf_pool.id. NULL when NIC does not use SF.';
 
-ALTER TABLE `cloud`.`nics`
-    ADD COLUMN IF NOT EXISTS `vdpa_device` varchar(64) NULL
-    COMMENT 'vDPA device path assigned to this NIC. NULL when NIC does not use vDPA.';
 
--- Network offering: opt-in flag for SF+vDPA.
-ALTER TABLE `cloud`.`network_offerings`
-    ADD COLUMN IF NOT EXISTS `sf_vdpa_enabled` tinyint(1) NOT NULL DEFAULT 0
-    COMMENT 'Enable SR-IOV Sub-Function with vDPA for live-migratable HW datapath. 0=disabled, 1=enabled.';
 
 -- Configuration entries for SF pool management.
 INSERT IGNORE INTO `cloud`.`configuration`
   (`category`, `instance`, `component`, `name`, `value`, `description`, `default_value`)
 VALUES
-  ('Advanced', 'DEFAULT', 'management-server',
-   'vm.sf.vdpa.enabled', 'false',
-   'Master toggle for SR-IOV Sub-Function with vDPA support. When false, all SF/vDPA code paths are inert.', 'false'),
   ('Advanced', 'DEFAULT', 'management-server',
    'vm.sf.pool.size.per.host', '128',
    'Maximum number of Sub-Functions to pre-provision per host via devlink.', '128');

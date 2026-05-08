@@ -161,6 +161,7 @@ public class NetworkOfferingVO implements NetworkOffering {
     @Column(name = "vdpa_enabled")
     boolean vdpaEnabled = false;
 
+
     @Override
     public String getDisplayText() {
         return displayText;
@@ -581,6 +582,7 @@ public class NetworkOfferingVO implements NetworkOffering {
         this.hwOffloadEnabled = hwOffloadEnabled;
     }
 
+    @Override
     public boolean isVdpaEnabled() {
         return vdpaEnabled;
     }
@@ -588,6 +590,7 @@ public class NetworkOfferingVO implements NetworkOffering {
     public void setVdpaEnabled(boolean vdpaEnabled) {
         this.vdpaEnabled = vdpaEnabled;
     }
+
 
     @Override
     public RoutingMode getRoutingMode() {

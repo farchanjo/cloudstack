@@ -1540,7 +1540,14 @@ public class LibvirtVMDef {
 
     public static class InterfaceDef {
         public enum GuestNetType {
-            BRIDGE("bridge"), DIRECT("direct"), NETWORK("network"), USER("user"), ETHERNET("ethernet"), INTERNAL("internal"), VHOSTUSER("vhostuser"), HOSTDEV("hostdev"), VDPA("vdpa");
+            BRIDGE("bridge"), DIRECT("direct"), NETWORK("network"), USER("user"), ETHERNET("ethernet"), INTERNAL("internal"), VHOSTUSER("vhostuser"), HOSTDEV("hostdev"),
+            /**
+             * vDPA mgmt-device passthrough. Generates {@code <interface type='vdpa'>}
+             * with a {@code <source dev='/dev/vhost-vdpa-N'/>} child. Guest sees a
+             * standard virtio NIC backed by the kernel's vhost-vdpa cdev, which is
+             * itself bound on top of an SR-IOV VF via {@code vdpa dev add ...}.
+             */
+            VDPA("vdpa");
             String _type;
 
             GuestNetType(String type) {
@@ -1602,8 +1609,6 @@ public class LibvirtVMDef {
         private Boolean _packedVirtQueues;
         private String _pciAddress; /* For HOSTDEV interface type (SR-IOV VF passthrough). Format: dddd:bb:ss.f */
         private boolean _hostdevManaged = true; /* libvirt 'managed' attr; true => libvirt detaches/reattaches the device */
-        private String _vdpaDevPath; /* For VDPA interface type (VF+vDPA passthrough). Path: /dev/vhost-vdpa-N */
-        private String _vdpaVfPciAddress; /* Underlying VF PCI for VDPA NIC — used by the HW-offload pipeline to resolve the representor. */
 
         public void defBridgeNet(String brName, String targetBrName, String macAddr, NicModel model) {
             defBridgeNet(brName, targetBrName, macAddr, model, 0);
@@ -1652,10 +1657,36 @@ public class LibvirtVMDef {
         }
 
         public String getPciAddress() {
-            if (_netType == GuestNetType.VDPA && _vdpaVfPciAddress != null) {
-                return _vdpaVfPciAddress;
-            }
             return _pciAddress;
+        }
+
+        /**
+         * vDPA mgmt-device passthrough. Generates libvirt XML of the form:
+         * <pre>
+         *   &lt;interface type='vdpa'&gt;
+         *     &lt;source dev='/dev/vhost-vdpa-N'/&gt;
+         *     &lt;mac address='aa:bb:...'/&gt;
+         *     &lt;model type='virtio'/&gt;
+         *     &lt;driver queues='Q'/&gt;
+         *   &lt;/interface&gt;
+         * </pre>
+         * The {@code /dev/vhost-vdpa-N} path is the host-side cdev created by
+         * {@code vdpa dev add ... mgmtdev pci/&lt;vfPci&gt;}; queues defaults to
+         * {@code maxVqs / 2} when {@code queues} is null (16 RX + 16 TX = 16
+         * pairs out of the canonical 33 max_vqs).
+         *
+         * @param vhostDevPath {@code /dev/vhost-vdpa-N} — must be an existing host cdev.
+         * @param macAddr      MAC to assign to the guest-visible NIC.
+         * @param queues       virtqueue pair count (one TX + one RX per pair); null = unset.
+         */
+        public void defVdpaNet(String vhostDevPath, String macAddr, Integer queues) {
+            _netType = GuestNetType.VDPA;
+            _sourceName = vhostDevPath;
+            _macAddr = macAddr;
+            _model = NicModel.VIRTIO;
+            if (queues != null && queues > 0) {
+                _multiQueueNumber = queues;
+            }
         }
 
         public boolean isHostdevManaged() {
@@ -1666,37 +1697,6 @@ public class LibvirtVMDef {
             this._hostdevManaged = managed;
         }
 
-        /**
-         * Define a vDPA network interface backed by a Mellanox SF.
-         * Generates: {@code <interface type='vdpa'><source dev='/dev/vhost-vdpa-N'/><mac address='...'/></interface>}
-         *
-         * @param vdpaDevPath vDPA character device path, e.g. "/dev/vhost-vdpa-0".
-         * @param macAddr     MAC address to assign to the guest-visible NIC.
-         */
-        public void defVdpaNet(String vdpaDevPath, String macAddr) {
-            defVdpaNet(vdpaDevPath, macAddr, null);
-        }
-
-        /**
-         * Variant of {@link #defVdpaNet(String, String)} that also records
-         * the underlying SR-IOV VF PCI bus address so the HW-offload pipeline
-         * can look up the representor and install TC flower rules (same path
-         * the HOSTDEV flow uses via {@link #getPciAddress()}).
-         */
-        public void defVdpaNet(String vdpaDevPath, String macAddr, String vfPciAddress) {
-            _netType = GuestNetType.VDPA;
-            _vdpaDevPath = vdpaDevPath;
-            _macAddr = macAddr;
-            _vdpaVfPciAddress = vfPciAddress;
-        }
-
-        public String getVdpaDevPath() {
-            return _vdpaDevPath;
-        }
-
-        public String getVdpaVfPciAddress() {
-            return _vdpaVfPciAddress;
-        }
 
         public void defDpdkNet(String dpdkSourcePath, String dpdkPort, String macAddress, NicModel model,
                                Integer networkRateKBps, String extra, String interfaceMode) {
@@ -1889,12 +1889,27 @@ public class LibvirtVMDef {
                 }
                 return netBuilder.toString();
             } else if (_netType == GuestNetType.VDPA) {
+                // <interface type='vdpa'>
+                //   <source dev='/dev/vhost-vdpa-N'/>
+                //   <mac address='aa:bb:cc:dd:ee:ff'/>
+                //   <model type='virtio'/>
+                //   <driver queues='Q'/>      (when set)
+                //   <link state='up|down'/>
+                // </interface>
+                // Order matters: model must precede driver so libvirt validates
+                // the queues attribute against the virtio model. Restored from
+                // fork prototype 9f82a585af.
+                netBuilder.append("<source dev='" + _sourceName + "'/>\n");
                 if (_macAddr != null) {
                     netBuilder.append("<mac address='" + _macAddr + "'/>\n");
                 }
-                netBuilder.append("<source dev='" + _vdpaDevPath + "'/>\n");
-                netBuilder.append("<model type='virtio'/>\n");
-                netBuilder.append("<driver queues='4'/>\n");
+                if (_model != null) {
+                    netBuilder.append("<model type='" + _model + "'/>\n");
+                }
+                if (_multiQueueNumber != null && _multiQueueNumber > 0) {
+                    netBuilder.append("<driver queues='" + _multiQueueNumber + "'/>\n");
+                }
+                netBuilder.append("<link state='" + (_linkStateUp ? "up" : "down") + "'/>\n");
                 return netBuilder.toString();
             }
 

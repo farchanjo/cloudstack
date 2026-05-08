@@ -1,0 +1,170 @@
+{
+  "lr": {
+    "_uuid": ["uuid", "11111111-0000-0000-0000-000000000001"],
+    "name": "lr-test",
+    "ports": ["set", [
+      ["uuid", "22222222-0000-0000-0000-000000000001"],
+      ["uuid", "22222222-0000-0000-0000-000000000002"],
+      ["uuid", "22222222-0000-0000-0000-000000000003"]
+    ]],
+    "nat": ["set", [
+      ["uuid", "44444444-0000-0000-0000-000000000001"],
+      ["uuid", "44444444-0000-0000-0000-000000000002"],
+      ["uuid", "44444444-0000-0000-0000-000000000003"],
+      ["uuid", "44444444-0000-0000-0000-000000000004"]
+    ]],
+    "external_ids": ["map", []]
+  },
+  "lrps": [
+    {
+      "_uuid": ["uuid", "22222222-0000-0000-0000-000000000001"],
+      "name": "lrp-A",
+      "mac": "02:00:00:01:01:01",
+      "networks": "10.101.0.1/24",
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "22222222-0000-0000-0000-000000000002"],
+      "name": "lrp-B",
+      "mac": "02:00:00:01:01:02",
+      "networks": "10.102.0.1/24",
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "22222222-0000-0000-0000-000000000003"],
+      "name": "lrp-public",
+      "mac": "02:00:00:01:01:03",
+      "networks": "192.168.100.1/24",
+      "external_ids": ["map", []]
+    }
+  ],
+  "lses": [
+    {
+      "_uuid": ["uuid", "33333333-0000-0000-0000-000000000001"],
+      "name": "ls-net-A",
+      "ports": ["set", [
+        ["uuid", "55555555-0000-0000-0000-0000000000a1"],
+        ["uuid", "55555555-0000-0000-0000-0000000000a2"],
+        ["uuid", "55555555-0000-0000-0000-00000000000A"]
+      ]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "33333333-0000-0000-0000-000000000002"],
+      "name": "ls-net-B",
+      "ports": ["set", [
+        ["uuid", "55555555-0000-0000-0000-0000000000b1"],
+        ["uuid", "55555555-0000-0000-0000-00000000000B"]
+      ]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "33333333-0000-0000-0000-000000000003"],
+      "name": "ls-public",
+      "ports": ["set", [
+        ["uuid", "55555555-0000-0000-0000-0000000000ff"],
+        ["uuid", "55555555-0000-0000-0000-00000000000C"]
+      ]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "33333333-0000-0000-0000-000000000099"],
+      "name": "ls-orphan",
+      "ports": ["set", []],
+      "external_ids": ["map", []]
+    }
+  ],
+  "lsps": [
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-0000000000a1"],
+      "name": "vmA1",
+      "type": "",
+      "addresses": "02:00:00:0a:01:01 10.101.0.10",
+      "options": ["map", []],
+      "external_ids": ["map", [["cloudstack:vmId", "10001"]]]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-0000000000a2"],
+      "name": "vmA2",
+      "type": "",
+      "addresses": "02:00:00:0a:01:02 10.101.0.11",
+      "options": ["map", []],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-00000000000A"],
+      "name": "rsp-net-A",
+      "type": "router",
+      "addresses": "router",
+      "options": ["map", [["router-port", "lrp-A"]]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-0000000000b1"],
+      "name": "vmB1",
+      "type": "",
+      "addresses": "02:00:00:0b:01:01 10.102.0.10",
+      "options": ["map", []],
+      "external_ids": ["map", [["cloudstack:vmId", "10002"]]]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-00000000000B"],
+      "name": "rsp-net-B",
+      "type": "router",
+      "addresses": "router",
+      "options": ["map", [["router-port", "lrp-B"]]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-0000000000ff"],
+      "name": "ln-public",
+      "type": "localnet",
+      "addresses": ["set", ["unknown"]],
+      "tag": 2988,
+      "options": ["map", [["network_name", "physnet1"]]],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "55555555-0000-0000-0000-00000000000C"],
+      "name": "rsp-public",
+      "type": "router",
+      "addresses": "router",
+      "options": ["map", [["router-port", "lrp-public"]]],
+      "external_ids": ["map", []]
+    }
+  ],
+  "nats": [
+    {
+      "_uuid": ["uuid", "44444444-0000-0000-0000-000000000001"],
+      "type": "snat",
+      "external_ip": "192.168.100.1",
+      "logical_ip": "10.101.0.0/24",
+      "logical_port": ["set", []],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "44444444-0000-0000-0000-000000000002"],
+      "type": "snat",
+      "external_ip": "192.168.100.1",
+      "logical_ip": "10.102.0.0/24",
+      "logical_port": ["set", []],
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "44444444-0000-0000-0000-000000000003"],
+      "type": "dnat_and_snat",
+      "external_ip": "192.168.100.20",
+      "logical_ip": "10.101.0.10",
+      "logical_port": "vmA1",
+      "external_ids": ["map", []]
+    },
+    {
+      "_uuid": ["uuid", "44444444-0000-0000-0000-000000000004"],
+      "type": "dnat_and_snat",
+      "external_ip": "192.168.100.30",
+      "logical_ip": "10.101.0.30",
+      "logical_port": ["set", []],
+      "external_ids": ["map", []]
+    }
+  ]
+}

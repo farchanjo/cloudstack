@@ -24,7 +24,7 @@
     <parent>
         <groupId>org.apache.cloudstack</groupId>
         <artifactId>cloudstack</artifactId>
-        <version>4.24.1.2-SNAPSHOT</version>
+        <version>4.24.1.26-SNAPSHOT</version>
     </parent>
     <build>
         <plugins>
@@ -107,6 +107,7 @@
         <module>network-elements/netscaler</module>
         <module>network-elements/nicira-nvp</module>
         <module>network-elements/opendaylight</module>
+        <module>network-elements/ovn</module>
         <module>network-elements/ovs</module>
         <module>network-elements/palo-alto</module>
         <module>network-elements/stratosphere-ssp</module>

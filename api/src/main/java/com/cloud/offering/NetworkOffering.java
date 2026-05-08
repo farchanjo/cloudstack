@@ -176,7 +176,14 @@ public interface NetworkOffering extends InfrastructureEntity, InternalIdentity,
         return false;
     }
 
+    /**
+     * Whether NICs created on this offering should be plumbed via vDPA
+     * (vhost-vdpa mgmt device on top of an SR-IOV VF, exposed to the guest
+     * as {@code <interface type='vdpa'>}). Defaults to false so existing
+     * implementations continue to compile unchanged.
+     */
     default boolean isVdpaEnabled() {
         return false;
     }
+
 }

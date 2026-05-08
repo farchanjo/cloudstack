@@ -97,6 +97,14 @@ import com.cloud.upgrade.dao.Upgrade42210to42300;
 import com.cloud.upgrade.dao.Upgrade42300to42400;
 import com.cloud.upgrade.dao.Upgrade42400to42410;
 import com.cloud.upgrade.dao.Upgrade42410to42411;
+import com.cloud.upgrade.dao.Upgrade42418to42419;
+import com.cloud.upgrade.dao.Upgrade42419to42420;
+import com.cloud.upgrade.dao.Upgrade42420to42421;
+import com.cloud.upgrade.dao.Upgrade42421to42422;
+import com.cloud.upgrade.dao.Upgrade42422to42423;
+import com.cloud.upgrade.dao.Upgrade42423to42424;
+import com.cloud.upgrade.dao.Upgrade42424to42425;
+import com.cloud.upgrade.dao.Upgrade42425to42426;
 import com.cloud.upgrade.dao.Upgrade430to440;
 import com.cloud.upgrade.dao.Upgrade431to440;
 import com.cloud.upgrade.dao.Upgrade432to440;
@@ -250,6 +258,22 @@ public class DatabaseUpgradeChecker implements SystemIntegrityChecker {
                 .next("4.23.0.0", new Upgrade42300to42400())
                 .next("4.24.0.0", new Upgrade42400to42410())
                 .next("4.24.1.0", new Upgrade42410to42411())
+                // Close the chain gap for fork-internal SNAPSHOT versions
+                // 4.24.1.{2..17} (never registered as standalone upgraders;
+                // see phase-b-schema-audit B-1). DB rows stamped at any of
+                // those versions resolve to this no-op upgrader, which simply
+                // bumps the version row to 4.24.1.19. getUpgradableVersionRange
+                // on Upgrade42418to42419 was widened to ["4.24.1.1","4.24.1.19"]
+                // to keep the logged range honest.
+                .next("4.24.1.1", new Upgrade42418to42419())
+                .next("4.24.1.18", new Upgrade42418to42419())
+                .next("4.24.1.19", new Upgrade42419to42420())
+                .next("4.24.1.20", new Upgrade42420to42421())
+                .next("4.24.1.21", new Upgrade42421to42422())
+                .next("4.24.1.22", new Upgrade42422to42423())
+                .next("4.24.1.23", new Upgrade42423to42424())
+                .next("4.24.1.24", new Upgrade42424to42425())
+                .next("4.24.1.25", new Upgrade42425to42426())
                 .build();
     }
 
@@ -526,6 +550,7 @@ public class DatabaseUpgradeChecker implements SystemIntegrityChecker {
 
             if (dbVersion.compareTo(currentVersion) == 0) {
                 LOGGER.info("DB version and code version matches so no upgrade needed.");
+                executeViewScripts();
                 return;
             }
 

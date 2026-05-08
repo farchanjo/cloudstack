@@ -18,6 +18,9 @@ package com.cloud.hypervisor.kvm.resource;
 
 import static com.cloud.host.Host.HOST_INSTANCE_CONVERSION;
 import static com.cloud.host.Host.HOST_OVFTOOL_VERSION;
+import static com.cloud.host.Host.HOST_VDDK_LIB_DIR;
+import static com.cloud.host.Host.HOST_VDDK_SUPPORT;
+import static com.cloud.host.Host.HOST_VDDK_VERSION;
 import static com.cloud.host.Host.HOST_VIRTV2V_VERSION;
 import static com.cloud.host.Host.HOST_VOLUME_ENCRYPTION;
 import static org.apache.cloudstack.utils.linux.KVMHostInfo.isHostS390x;
@@ -371,6 +374,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     public static final String WINDOWS_GUEST_CONVERSION_SUPPORTED_CHECK_CMD = "rpm -qa | grep -i virtio-win";
     public static final String UBUNTU_WINDOWS_GUEST_CONVERSION_SUPPORTED_CHECK_CMD = "dpkg -l virtio-win";
     public static final String UBUNTU_NBDKIT_PKG_CHECK_CMD = "dpkg -l nbdkit";
+    public static final String VDDK_AUTODETECT_PATH_CMD = "find / -type d -name 'vmware-vix-disklib-distrib' 2>/dev/null | head -n 1";
 
     public static final int LIBVIRT_CGROUP_CPU_SHARES_MIN = 2;
     public static final int LIBVIRT_CGROUP_CPU_SHARES_MAX = 262144;
@@ -445,8 +449,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     private VifDriver defaultVifDriver;
     private VifDriver tungstenVifDriver;
     private VifDriver vfPassthroughVifDriver;
+    /**
+     * Driver for the vDPA path (vhost-vdpa mgmt-device on top of an SR-IOV
+     * VF, exposed to the guest via {@code <interface type='vdpa'>}). Loaded
+     * best-effort: when the class is missing the agent still works, just
+     * with the existing passthrough/tap paths — vDPA requests fall back to
+     * a clear error at plug time rather than crashing the whole agent.
+     */
     private VifDriver vdpaVifDriver;
-    private VfVdpaLifecycleManager vfVdpaLifecycleManager;
+    /**
+     * VifDrivers for the OVN datapath. Selected when {@code NicTO.useOvn=true}
+     * via {@link #selectVifDriver(NicTO)}; orthogonal to HW-offload / vDPA
+     * (the OVN counterparts handle the combined cases). Loaded best-effort:
+     * when the OVN plugin / classes are missing the agent stays functional
+     * for the legacy paths, and OVN-tagged NICs fail loudly at plug time.
+     */
+    private VifDriver ovnVifDriver;
+    private VifDriver ovnVfPassthroughVifDriver;
+    private VifDriver ovnVdpaVifDriver;
     private com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler intentReconciler;
     private com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer tcRuleProgrammer;
     private com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper representorMapper;
@@ -457,9 +477,6 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         return vfPassthroughVifDriver;
     }
 
-    public VfVdpaLifecycleManager getVfVdpaLifecycleManager() {
-        return vfVdpaLifecycleManager;
-    }
 
     public com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler getIntentReconciler() {
         return intentReconciler;
@@ -973,10 +990,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     private boolean convertInstanceVerboseMode = false;
     private Map<String, String> convertInstanceEnv = null;
+    private String vddkLibDir = null;
+    private static final String libguestfsBackend = "direct";
     protected boolean dpdkSupport = false;
     protected String dpdkOvsPath;
     protected String directDownloadTemporaryDownloadPath;
     protected String cachePath;
+    private String vddkTransports = null;
+    private String vddkThumbprint = null;
+    private String vddkVersion = null;
+    private String detectedPasswordFileOption = null;
     protected String javaTempDir = System.getProperty("java.io.tmpdir");
 
     private String getEndIpFromStartIp(final String startIp, final int numIps) {
@@ -1039,6 +1062,26 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public Map<String, String> getConvertInstanceEnv() {
         return convertInstanceEnv;
+    }
+
+    public String getVddkLibDir() {
+        return vddkLibDir;
+    }
+
+    public String getLibguestfsBackend() {
+        return libguestfsBackend;
+    }
+
+    public String getVddkTransports() {
+        return vddkTransports;
+    }
+
+    public String getVddkThumbprint() {
+        return vddkThumbprint;
+    }
+
+    public String getVddkVersion() {
+        return vddkVersion;
     }
 
     /**
@@ -1240,6 +1283,37 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         String convertEnvVirtv2vTmpDir = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.CONVERT_ENV_VIRTV2V_TMPDIR);
 
         setConvertInstanceEnv(convertEnvTmpDir, convertEnvVirtv2vTmpDir);
+
+        vddkLibDir = StringUtils.trimToNull(AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VDDK_LIB_DIR));
+        if (StringUtils.isNotBlank(vddkLibDir) && !isVddkLibDirValid(vddkLibDir)) {
+            LOGGER.warn("Configured VDDK library dir [{}] is invalid (missing lib64/libvixDiskLib.so), attempting auto-detection", vddkLibDir);
+            vddkLibDir = null;
+        }
+        if (StringUtils.isBlank(vddkLibDir)) {
+            vddkLibDir = detectVddkLibDir();
+        }
+        if (StringUtils.isNotBlank(vddkLibDir)) {
+            LOGGER.info("Detected VDDK library dir: {}", vddkLibDir);
+        } else {
+            LOGGER.warn("Could not detect a valid VDDK library dir; VDDK conversion will be unavailable");
+        }
+
+        vddkVersion = detectVddkVersion();
+        if (StringUtils.isNotBlank(vddkVersion)) {
+            LOGGER.info("Detected nbdkit VDDK plugin version: {}", vddkVersion);
+        }
+
+        vddkTransports = StringUtils.trimToNull(
+                AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VDDK_TRANSPORTS));
+        vddkThumbprint = StringUtils.trimToNull(
+                AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VDDK_THUMBPRINT));
+
+        detectedPasswordFileOption = detectPasswordFileOption();
+        if (StringUtils.isNotBlank(detectedPasswordFileOption)) {
+            LOGGER.info("Detected virt-v2v password option: {}", detectedPasswordFileOption);
+        } else {
+            LOGGER.warn("Could not detect virt-v2v password option, VDDK conversions may fail");
+        }
 
         pool = (String)params.get("pool");
         if (pool == null) {
@@ -1822,9 +1896,26 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         try {
             vdpaVifDriver = getVifDriverClass(VdpaVifDriver.class.getName(), params);
         } catch (ConfigurationException e) {
-            LOGGER.warn("VdpaVifDriver not available; VF+vDPA requests will fail", e);
+            LOGGER.warn("VdpaVifDriver not available; vDPA requests will fail", e);
         }
-        vfVdpaLifecycleManager = new VfVdpaLifecycleManager();
+        // OVN datapath drivers — loaded best-effort. Skipping is fine for
+        // hosts that never serve an OVN-tagged NIC; the dispatch in
+        // selectVifDriver throws a clear error if mgmt later sends one.
+        try {
+            ovnVifDriver = getVifDriverClass(OvnVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVifDriver not available; OVN-tagged kernel-tap NICs will fail at plug time", e);
+        }
+        try {
+            ovnVfPassthroughVifDriver = getVifDriverClass(OvnVfPassthroughVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVfPassthroughVifDriver not available; OVN + HW-offload NICs will fail at plug time", e);
+        }
+        try {
+            ovnVdpaVifDriver = getVifDriverClass(OvnVdpaVifDriver.class.getName(), params);
+        } catch (ConfigurationException e) {
+            LOGGER.warn("OvnVdpaVifDriver not available; OVN + vDPA NICs will fail at plug time", e);
+        }
         representorMapper = new com.cloud.hypervisor.kvm.resource.hwoffload.RepresentorMapper();
         tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
         // HW offload uplink config is read directly from agent.properties because
@@ -1848,8 +1939,23 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         }
         boolean uplinkLag = Boolean.parseBoolean(hwOffloadProps.getProperty("hwoffload.uplink.lag", "false"));
         String uplinkNetdev = hwOffloadProps.getProperty("hwoffload.uplink.netdev");
+        // Pick HW offload backend per hwoffload.programmer (tc default; of = OVS-DPDK userspace).
+        // The cluster can run heterogeneous backends during a rolling migration; mlx5 wire encap
+        // is identical between TC and OF programmed reps, so cross-host VPC traffic stays compatible.
+        String programmerKind = hwOffloadProps.getProperty("hwoffload.programmer", "tc").trim().toLowerCase();
+        com.cloud.hypervisor.kvm.resource.hwoffload.RuleProgrammer hwOffloadProgrammer;
+        if ("of".equals(programmerKind)) {
+            hwOffloadProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.OfFlowProgrammer();
+            LOGGER.info("HW offload backend = of (OVS-DPDK userspace via ovs-ofctl).");
+        } else {
+            if (!"tc".equals(programmerKind)) {
+                LOGGER.warn("Unknown hwoffload.programmer={}, falling back to tc.", programmerKind);
+            }
+            hwOffloadProgrammer = tcRuleProgrammer;
+            LOGGER.info("HW offload backend = tc (kernel TC flower on switchdev VF reps).");
+        }
         intentReconciler = new com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler(
-                representorMapper, tcRuleProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
+                representorMapper, hwOffloadProgrammer, uplinkKind, uplinkLag, uplinkNetdev);
         // Auto-plumb VXLAN tunnel mesh between data nodes when a guest NIC
         // carries a VXLAN VNI. agent.properties legacy keys (vxlan.peers /
         // vxlan.local.ip) are kept only as a fallback — the management
@@ -1866,6 +1972,16 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             vxlanTunnelManager.bootstrapFromState(this::isLibvirtDomainRunning);
         } catch (RuntimeException e) {
             LOGGER.warn("VxlanTunnelManager.bootstrapFromState failed: {}", e.getMessage());
+        }
+        // L2 ghost reconciler: agent restarts can leave OVS vnet ports whose
+        // libvirt tap is gone (VR migrated, agent crash, OvsVifDriver.unplug
+        // missed). Sweep br-bond + cloud0 once at startup and del-port any
+        // vnet not present in a live domain XML.
+        try {
+            com.cloud.hypervisor.kvm.resource.ovs.OvsPortReconciler
+                    .reconcileGhostVnetPorts(LibvirtConnection.getConnection());
+        } catch (Exception ovsRecErr) {
+            LOGGER.warn("OvsPortReconciler invocation failed: {}", ovsRecErr.getMessage());
         }
 
         // Distributed Virtual Router (MVP). Installs intra-host cross-tier
@@ -1930,8 +2046,21 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     public VifDriver getVifDriver(final NicTO nic) {
-        if (nic.isUseVdpa() && vdpaVifDriver != null) {
-            return vdpaVifDriver;
+        // Diagnostics-only accessor (selectVifDriver(NicTO) is the
+        // authoritative path used at plug time). Mirrors the same priority
+        // matrix: OVN → vDPA → HW offload → traffic type. Falls back
+        // gracefully when an OVN driver is absent so callers (e.g.
+        // logging / state queries) never NPE.
+        if (nic.isUseOvn()) {
+            if (nic.isUseVdpa() && ovnVdpaVifDriver != null) {
+                return ovnVdpaVifDriver;
+            }
+            if (nic.isUseHwOffload() && ovnVfPassthroughVifDriver != null) {
+                return ovnVfPassthroughVifDriver;
+            }
+            if (ovnVifDriver != null) {
+                return ovnVifDriver;
+            }
         }
         if (nic.getUseHwOffload() != null && nic.getUseHwOffload() && vfPassthroughVifDriver != null) {
             return vfPassthroughVifDriver;
@@ -2700,6 +2829,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         vm = getDomain(conn, vmName);
         final List<InterfaceDef> pluggedNics = getInterfaces(conn, vmName);
         for (final InterfaceDef pluggedNic : pluggedNics) {
+            if (pluggedNic.getMacAddress() == null) {
+                continue;
+            }
             if (pluggedNic.getMacAddress().equalsIgnoreCase(macAddr)) {
                 vm.detachDevice(pluggedNic.toString());
                 // We don't know which "traffic type" is associated with
@@ -2725,6 +2857,15 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             for (final InterfaceDef pluggedNic : pluggedNics) {
                 LOGGER.info("SetupGuestNetwork: found interface type={} mac={} dev={} pciAddr={}",
                         pluggedNic.getNetType(), pluggedNic.getMacAddress(), pluggedNic.getDevName(), pluggedNic.getPciAddress());
+                // Phantom InterfaceDef entries with all-null fields can leak into
+                // the parsed list when libvirt domain XML carries an
+                // <interface> stub the parser does not recognise (e.g.
+                // type='hostdev' with the source PCI address stripped after a
+                // failed unplug). Skip nulls instead of crashing the whole
+                // SetupGuestNetwork path with NullPointerException.
+                if (pluggedNic.getMacAddress() == null) {
+                    continue;
+                }
                 if (pluggedNic.getMacAddress().equalsIgnoreCase(nic.getMac())) {
                     routerNic = pluggedNic;
                     break;
@@ -2809,20 +2950,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 for (int i = 0; i < pluggedNics.size(); i++) {
                     InterfaceDef nic = pluggedNics.get(i);
                     LibvirtVMDef.InterfaceDef.GuestNetType type = nic.getNetType();
-                    // HOSTDEV (VF passthrough) and VDPA (VF+vDPA) both expose the
-                    // underlying SR-IOV VF PCI via InterfaceDef.getPciAddress().
-                    if (type != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV &&
-                        type != LibvirtVMDef.InterfaceDef.GuestNetType.VDPA) {
+                    if (type != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
                         continue;
                     }
                     String pci = nic.getPciAddress();
-                    // VDPA InterfaceDefs re-parsed from libvirt XML don't carry the
-                    // underlying VF PCI (only /dev/vhost-vdpa-N is in the XML). Walk
-                    // sysfs to resolve it back.
-                    if (pci == null && type == LibvirtVMDef.InterfaceDef.GuestNetType.VDPA) {
-                        pci = com.cloud.hypervisor.kvm.resource.VfVdpaLifecycleManager
-                                .resolveVfPciFromVdpaDev(nic.getVdpaDevPath());
-                    }
                     if (pci == null) {
                         continue;
                     }
@@ -4656,10 +4787,42 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     private VifDriver selectVifDriver(NicTO nic) throws InternalErrorException {
+        // Branch order (mutually exclusive on the wire — mgmt enforces only
+        // ONE of useVdpa / useHwOffload / dpdkEnabled per NicTO; useOvn is
+        // orthogonal and combines with the offload flags through the OVN-
+        // specific driver variants below):
+        //
+        //   useOvn=true + useVdpa=true        -> OvnVdpaVifDriver
+        //   useOvn=true + useHwOffload=true   -> OvnVfPassthroughVifDriver
+        //   useOvn=true + (no offload)        -> OvnVifDriver (br-int kernel tap)
+        //   useOvn=false + useVdpa=true       -> VdpaVifDriver (legacy)
+        //   useOvn=false + useHwOffload=true  -> VfPassthroughVifDriver (legacy)
+        //   useOvn=false + (no offload)       -> default driver via traffic type
+        if (nic.isUseOvn()) {
+            if (nic.isUseVdpa()) {
+                if (ovnVdpaVifDriver == null) {
+                    throw new InternalErrorException(
+                        "NicTO requests OVN + vDPA (vfPciAddress=" + nic.getVfPciAddress() + ") but OvnVdpaVifDriver is not loaded");
+                }
+                return ovnVdpaVifDriver;
+            }
+            if (nic.isUseHwOffload()) {
+                if (ovnVfPassthroughVifDriver == null) {
+                    throw new InternalErrorException(
+                        "NicTO requests OVN + HW offload (vfPciAddress=" + nic.getVfPciAddress() + ") but OvnVfPassthroughVifDriver is not loaded");
+                }
+                return ovnVfPassthroughVifDriver;
+            }
+            if (ovnVifDriver == null) {
+                throw new InternalErrorException(
+                    "NicTO requests OVN (lsp=" + nic.getOvnLspName() + ") but OvnVifDriver is not loaded");
+            }
+            return ovnVifDriver;
+        }
         if (nic.isUseVdpa()) {
             if (vdpaVifDriver == null) {
                 throw new InternalErrorException(
-                    "NicTO requests VF+vDPA (vdpaDevice=" + nic.getVdpaDevice() + ") but VdpaVifDriver is not loaded");
+                    "NicTO requests vDPA (vfPciAddress=" + nic.getVfPciAddress() + ") but VdpaVifDriver is not loaded");
             }
             return vdpaVifDriver;
         }
@@ -4995,6 +5158,13 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         cmd.setHostTags(getHostTags());
         boolean instanceConversionSupported = hostSupportsInstanceConversion();
         cmd.getHostDetails().put(HOST_INSTANCE_CONVERSION, String.valueOf(instanceConversionSupported));
+        cmd.getHostDetails().put(HOST_VDDK_SUPPORT, String.valueOf(hostSupportsVddk()));
+        if (StringUtils.isNotBlank(vddkLibDir)) {
+            cmd.getHostDetails().put(HOST_VDDK_LIB_DIR, vddkLibDir);
+        }
+        if (StringUtils.isNotBlank(vddkVersion)) {
+            cmd.getHostDetails().put(HOST_VDDK_VERSION, vddkVersion);
+        }
         if (instanceConversionSupported) {
             cmd.getHostDetails().put(HOST_VIRTV2V_VERSION, getHostVirtV2vVersion());
         }
@@ -5622,7 +5792,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public InterfaceDef getInterface(final Connect conn, final String vmName, final String macAddress) {
         List<InterfaceDef> interfaces = getInterfaces(conn, vmName);
-        return interfaces.stream().filter(interfaceDef -> interfaceDef.getMacAddress().equals(macAddress))
+        return interfaces.stream()
+                .filter(interfaceDef -> interfaceDef.getMacAddress() != null
+                        && interfaceDef.getMacAddress().equals(macAddress))
                 .findFirst().orElseThrow(() -> new CloudRuntimeException(String.format("Unable to find NIC with MAC address %s.", macAddress)));
     }
 
@@ -6719,6 +6891,66 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         return exitValue == 0;
     }
 
+    public boolean hostSupportsVddk() {
+        return hostSupportsVddk(null);
+    }
+
+    public boolean hostSupportsVddk(String overriddenVddkLibDir) {
+        String effectiveVddkLibDir = StringUtils.trimToNull(overriddenVddkLibDir);
+        if (StringUtils.isBlank(effectiveVddkLibDir)) {
+            effectiveVddkLibDir = StringUtils.trimToNull(vddkLibDir);
+        }
+        if (StringUtils.isBlank(effectiveVddkLibDir) || !isVddkLibDirValid(effectiveVddkLibDir)) {
+            effectiveVddkLibDir = detectVddkLibDir();
+        }
+        return hostSupportsInstanceConversion() && isVddkLibDirValid(effectiveVddkLibDir) && StringUtils.isNotBlank(detectVddkVersion());
+    }
+
+    protected boolean isVddkLibDirValid(String path) {
+        if (StringUtils.isBlank(path)) {
+            return false;
+        }
+        File libDir = new File(path, "lib64");
+        if (!libDir.isDirectory()) {
+            return false;
+        }
+        File[] libs = libDir.listFiles((dir, name) -> name.startsWith("libvixDiskLib.so"));
+        return libs != null && libs.length > 0;
+    }
+
+    protected String detectVddkLibDir() {
+        String detectedPath = StringUtils.trimToNull(Script.runSimpleBashScript(VDDK_AUTODETECT_PATH_CMD));
+        if (StringUtils.isNotBlank(detectedPath) && isVddkLibDirValid(detectedPath)) {
+            return detectedPath;
+        }
+        return null;
+    }
+
+    protected String detectVddkVersion() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("nbdkit", "vddk", "--version");
+            Process process = pb.start();
+
+            String output = new String(process.getInputStream().readAllBytes());
+            process.waitFor();
+
+            if (StringUtils.isBlank(output)) {
+                return null;
+            }
+
+            for (String line : output.split("\\R")) {
+                String trimmed = StringUtils.trimToEmpty(line);
+                if (trimmed.startsWith("vddk ")) {
+                    return StringUtils.trimToNull(trimmed.substring("vddk ".length()));
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            LOGGER.error("Failed to detect vddk version: {}", e.getMessage());
+            return null;
+        }
+    }
+
     public boolean hostSupportsWindowsGuestConversion() {
         if (isUbuntuOrDebianHost()) {
             int exitValue = Script.runSimpleBashScriptForExitValue(UBUNTU_WINDOWS_GUEST_CONVERSION_SUPPORTED_CHECK_CMD);
@@ -6785,6 +7017,32 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     /**
+     * Detect which password option virt-v2v supports by examining its --help output
+     * @return "-ip" if supported (virt-v2v >= 2.8.1), "--password-file" if older version, or null if detection fails
+     */
+    protected String detectPasswordFileOption() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("virt-v2v", "--help");
+            Process process = pb.start();
+
+            String output = new String(process.getInputStream().readAllBytes());
+            process.waitFor();
+
+            if (output.contains("-ip <filename>")) {
+                return "-ip";
+            } else if (output.contains("--password-file")) {
+                return "--password-file";
+            } else {
+                LOGGER.error("virt-v2v does not support -ip or --password-file");
+                return null;
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to detect virt-v2v password option: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Resolve the PF netdev name for a representor: read the PCI parent's net dir
      * (the PF itself) and pick the first netdev entry.
      */
@@ -6838,6 +7096,14 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         } catch (java.io.IOException e) {
             return "";
         }
+    }
+
+    /**
+     * Get the detected password file option for virt-v2v
+     * @return the password option ("-ip" or "--password-file") or null if not detected
+     */
+    public String getDetectedPasswordFileOption() {
+        return detectedPasswordFileOption;
     }
 
     public String getHostVirtV2vVersion() {

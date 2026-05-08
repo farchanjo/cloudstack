@@ -43,12 +43,46 @@ public class NicTO extends NetworkTO {
     String vfPfName;           // Physical Function netdev name (e.g. "dx6p0")
     String vfRepName;          // VF representor netdev name on the host, e.g. "dx6p0vf20"
 
-    /* HW-offload via VF passthrough (hostdev). Mutually exclusive with useVdpa. */
+    /* HW-offload via VF passthrough (hostdev). */
     Boolean useHwOffload;      // wrapper Boolean → null preserves wire compat with older agents
 
-    /* HW-offload via VF+vDPA (vhost-vdpa chardev). Mutually exclusive with useHwOffload. */
-    String vdpaDevice;         // vhost-vdpa chardev path, e.g. "/dev/vhost-vdpa-0"
-    Boolean useVdpa;           // wrapper Boolean → null preserves wire compat with older agents
+    /*
+     * vDPA path (vhost-vdpa mgmt device on top of an SR-IOV VF). Mutually
+     * exclusive with the hostdev passthrough path above and with
+     * {@link #dpdkEnabled}; the agent picks vDPA first when {@link #useVdpa}
+     * is true. {@link #vdpaDevice} is populated by the agent at plug time
+     * after parsing {@code vdpa dev show -j}; mgmt only sets the request
+     * (useVdpa + maxVqs).
+     */
+    Boolean useVdpa;          // wrapper Boolean → null preserves wire compat
+    String vdpaDevice;        // host-side /dev/vhost-vdpa-N path, agent-populated
+    Integer vdpaMaxVqs;       // queues to request from `vdpa dev add ... max_vqs <N>`
+
+    /*
+     * OVN logical-switch binding for this NIC. When {@link #useOvn} is true the
+     * agent attaches the libvirt interface to the integration bridge
+     * ({@code br-int}) with {@code external_ids:iface-id=<ovnLspName>}; OVN's
+     * {@code ovn-controller} on the chassis claims the {@code Port_Binding} row
+     * and programs the OpenFlow pipeline. {@link #ovnLsName} carries the parent
+     * OVN logical switch name (e.g. {@code ls-<networkUuid>}) for diagnostics
+     * and is NOT consulted by the agent during plug — the LSP-side identity
+     * stored in OVN_Northbound is what matters. {@link #ovnDhcpOptionsUuid}
+     * lets the agent (rare path) re-pin the LSP's {@code dhcpv4_options}
+     * column when management has rotated the DHCP profile after plug.
+     *
+     * <p>Mutually compatible with {@link #useHwOffload} and {@link #useVdpa}:
+     * representor + br-int still works (TC flower offload via mlx5 switchdev),
+     * vDPA datapath + br-int still works (OVN programs flows; vhost-vdpa
+     * carries the data plane). Mutually exclusive with {@link #dpdkEnabled}
+     * for now (DPDK-managed ports skip the kernel datapath OVN expects).
+     *
+     * <p>Wire compat: a {@code null} value means the older mgmt didn't set
+     * the field; agent must fall back to its non-OVN path.
+     */
+    Boolean useOvn;
+    String ovnLsName;
+    String ovnLspName;
+    String ovnDhcpOptionsUuid;
 
     /**
      * Free-form String-keyed detail map propagated from the management server
@@ -227,14 +261,6 @@ public class NicTO extends NetworkTO {
         this.vfRepName = vfRepName;
     }
 
-    public String getVdpaDevice() {
-        return vdpaDevice;
-    }
-
-    public void setVdpaDevice(String vdpaDevice) {
-        this.vdpaDevice = vdpaDevice;
-    }
-
     public Boolean getUseVdpa() {
         return useVdpa;
     }
@@ -245,6 +271,63 @@ public class NicTO extends NetworkTO {
 
     public void setUseVdpa(Boolean useVdpa) {
         this.useVdpa = useVdpa;
+    }
+
+    public String getVdpaDevice() {
+        return vdpaDevice;
+    }
+
+    public void setVdpaDevice(String vdpaDevice) {
+        this.vdpaDevice = vdpaDevice;
+    }
+
+    public Integer getVdpaMaxVqs() {
+        return vdpaMaxVqs;
+    }
+
+    public void setVdpaMaxVqs(Integer vdpaMaxVqs) {
+        this.vdpaMaxVqs = vdpaMaxVqs;
+    }
+
+    public Boolean getUseOvn() {
+        return useOvn;
+    }
+
+    /**
+     * Convenience guard: returns {@code true} only when management explicitly
+     * opted this NIC into the OVN datapath. {@code null}/false means use the
+     * legacy bridge/OVS path and skip every OVN-specific code branch.
+     */
+    public boolean isUseOvn() {
+        return Boolean.TRUE.equals(useOvn);
+    }
+
+    public void setUseOvn(Boolean useOvn) {
+        this.useOvn = useOvn;
+    }
+
+    public String getOvnLsName() {
+        return ovnLsName;
+    }
+
+    public void setOvnLsName(String ovnLsName) {
+        this.ovnLsName = ovnLsName;
+    }
+
+    public String getOvnLspName() {
+        return ovnLspName;
+    }
+
+    public void setOvnLspName(String ovnLspName) {
+        this.ovnLspName = ovnLspName;
+    }
+
+    public String getOvnDhcpOptionsUuid() {
+        return ovnDhcpOptionsUuid;
+    }
+
+    public void setOvnDhcpOptionsUuid(String ovnDhcpOptionsUuid) {
+        this.ovnDhcpOptionsUuid = ovnDhcpOptionsUuid;
     }
 
     /**

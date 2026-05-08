@@ -1,0 +1,13 @@
+{
+  "lr": {
+    "_uuid": ["uuid", "11111111-0000-0000-0000-0000aaaaaaaa"],
+    "name": "lr-only",
+    "ports": ["set", []],
+    "nat": ["set", []],
+    "external_ids": ["map", []]
+  },
+  "lrps": [],
+  "lses": [],
+  "lsps": [],
+  "nats": []
+}

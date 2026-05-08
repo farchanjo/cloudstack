@@ -1,0 +1,1596 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.network.ovn.client;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import com.cloud.network.ovn.client.op.OvnNamedUuid;
+import com.cloud.network.ovn.client.op.OvnOpFactory;
+import com.cloud.network.ovn.client.op.OvnRowRef;
+import com.cloud.network.ovn.client.transport.OvsdbConnectionPool;
+import com.cloud.network.ovn.client.transport.OvsdbEndpoint;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+/**
+ * High-level OVN Northbound client. Wraps a multi-endpoint
+ * {@link OvsdbConnectionPool} and exposes the operations the network-element
+ * plugin needs (LR / LRP / LS / LSP / NAT and the patch pair that binds an
+ * LR to an LS).
+ *
+ * <p>All write operations land inside a single {@link OvnTransaction} so the
+ * NB DB never sees a half-applied state. The {@code external_ids} map on
+ * every entity carries the CloudStack source-of-truth ids
+ * ({@code cs_kind}, {@code cs_id}) so an {@code ImportOvnVpcCmd} can later
+ * adopt entities created out-of-band.
+ */
+public class OvnNbClient implements AutoCloseable {
+
+    /** OVN Northbound DB name. */
+    public static final String DB_NB = "OVN_Northbound";
+
+    /** Default OVSDB connect timeout (ms). */
+    public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+    /** Default socket read timeout (ms). */
+    public static final int DEFAULT_SO_TIMEOUT_MS = 30_000;
+
+    private final OvsdbConnectionPool pool;
+
+    public OvnNbClient(final OvsdbConnectionPool pool) {
+        this.pool = pool;
+    }
+
+    public static OvnNbClient fromCsv(final String csv) {
+        final List<OvsdbEndpoint> endpoints = OvsdbEndpoint.parseList(csv);
+        final OvsdbConnectionPool pool = new OvsdbConnectionPool(endpoints,
+                DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SO_TIMEOUT_MS);
+        return new OvnNbClient(pool);
+    }
+
+    /**
+     * Cheap probe: sends a {@code list_dbs} call and verifies the live
+     * endpoint advertises the OVN_Northbound database. Useful for the
+     * {@code AddOvnControllerCmd} happy path so the operator gets a fast
+     * error if the endpoint list is wrong.
+     */
+    public boolean ping() {
+        try {
+            final ArrayNode params = JsonNodeFactory.instance.arrayNode();
+            final var dbs = pool.call("list_dbs", params);
+            if (dbs == null) {
+                return false;
+            }
+            for (int i = 0; i < dbs.size(); i++) {
+                if (DB_NB.equals(dbs.get(i).asText())) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (final OvnException oe) {
+            return false;
+        }
+    }
+
+    public OvnTransaction newTransaction() {
+        return new OvnTransaction(pool, DB_NB);
+    }
+
+    // ------------------------------------------------------------------
+    // Logical Router operations.
+    // ------------------------------------------------------------------
+
+    public String createLogicalRouter(final String name, final Map<String, String> externalIds) {
+        final OvnTransaction tx = newTransaction();
+        final String namedUuid = OvnNamedUuid.next("lr");
+        tx.add(buildInsertLogicalRouter(name, externalIds, namedUuid));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildInsertLogicalRouter(final String name, final Map<String, String> externalIds,
+                                                final String namedUuid) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        return OvnOpFactory.insert("Logical_Router", namedUuid, row);
+    }
+
+    public void deleteLogicalRouter(final String uuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("Logical_Router", OvnOpFactory.whereUuid(uuid)));
+        tx.commit();
+    }
+
+    /**
+     * Replace {@code external_ids} on an existing Logical_Router in place.
+     * Used by the VPC rename re-sync hook: every {@code createLogicalRouterFor}
+     * invocation passes the current VPC name + cs_kind + cs_id so a CloudStack
+     * {@code updateVPC} that changed the VPC name eventually shows up in
+     * {@code LR.external_ids[cs_name]} on the next plugin touch (no
+     * dedicated rename callback exists in {@code VpcProvider}).
+     */
+    public void updateLogicalRouterExternalIds(final String uuid, final Map<String, String> externalIds) {
+        if (uuid == null || uuid.isEmpty() || externalIds == null) {
+            return;
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("external_ids", buildMap(externalIds));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(uuid), row));
+        tx.commit();
+    }
+
+    /**
+     * List every row UUID in the supplied NB table. Used by the reconciler
+     * to walk a table without an external_ids predicate (e.g. find rows
+     * whose external_ids map is empty / missing cs_kind).
+     */
+    public List<String> listAllUuids(final String table) {
+        final List<String> out = new ArrayList<>();
+        if (table == null || table.isEmpty()) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return out;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            final var uuidNode = row == null ? null : row.get("_uuid");
+            if (uuidNode != null && uuidNode.size() >= 2) {
+                out.add(uuidNode.get(1).asText());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * List UUIDs of every row in {@code table} whose {@code external_ids}
+     * map contains an entry {@code key=value}. Used by destroy paths to
+     * sweep orphan rows when the local mapping has already been wiped or
+     * was never persisted (e.g. earlier failed transaction). Implementation
+     * walks the table client-side because OVSDB's {@code includes} predicate
+     * over a typed map returns a column-indexed shape; iterating the rows
+     * is robust and the affected NB tables (DHCP_Options, DNS) hold a
+     * handful of rows per zone.
+     */
+    public List<String> findUuidsByExternalIds(final String table, final String key, final String value) {
+        final List<String> out = new ArrayList<>();
+        if (table == null || table.isEmpty() || key == null || value == null) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("external_ids");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return out;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ext = row.get("external_ids");
+            if (ext == null || ext.size() < 2 || !"map".equals(ext.get(0).asText())) {
+                continue;
+            }
+            final var pairs = ext.get(1);
+            if (pairs == null) {
+                continue;
+            }
+            for (int j = 0; j < pairs.size(); j++) {
+                final var pair = pairs.get(j);
+                if (pair != null && pair.size() >= 2
+                        && key.equals(pair.get(0).asText())
+                        && value.equals(pair.get(1).asText())) {
+                    final var uuidNode = row.get("_uuid");
+                    if (uuidNode != null && uuidNode.size() >= 2) {
+                        out.add(uuidNode.get(1).asText());
+                    }
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Check whether a row with the given UUID still lives in the supplied
+     * NB table. Used by ensure* idempotent helpers to detect stale mapping
+     * rows whose underlying NB DB entity was deleted out-of-band (admin
+     * intervention, prior bug, partial cleanup). When this returns false
+     * the caller should drop the local mapping row and re-create the NB
+     * entity so the cluster heals on the next reconcile pass.
+     *
+     * @param table OVN_Northbound table name (e.g. {@code Logical_Switch},
+     *              {@code Logical_Router}, {@code HA_Chassis_Group}).
+     * @param uuid  the row UUID to probe.
+     * @return {@code true} if the row exists, {@code false} when the table
+     *         lookup returns zero rows or the input is blank.
+     */
+    public boolean rowExistsByUuid(final String table, final String uuid) {
+        if (table == null || table.isEmpty() || uuid == null || uuid.isEmpty()) {
+            return false;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select(table, OvnOpFactory.whereUuid(uuid), columns));
+        try {
+            final OvnTransaction.Result r = tx.commit();
+            final ArrayNode arr = r.raw();
+            if (arr == null || arr.size() == 0) {
+                return false;
+            }
+            final var entry = arr.get(0);
+            final var rows = entry == null ? null : entry.get("rows");
+            return rows != null && rows.size() > 0;
+        } catch (OvnException e) {
+            // Treat transport / parse errors as "unknown" -> conservative
+            // false so the caller falls back to the recreate path. Logging
+            // is the caller's responsibility (we keep this surface silent
+            // to avoid double-logging on retries).
+            return false;
+        }
+    }
+
+    public String addLogicalRouterPort(final String lrUuid, final String name, final String mac, final List<String> networks) {
+        if (networks == null || networks.isEmpty()) {
+            throw new OvnException("addLogicalRouterPort requires at least one network");
+        }
+        final String lrpNamed = OvnNamedUuid.next("lrp");
+        final ObjectNode insert = buildInsertLrp(name, mac, networks, lrpNamed);
+        final ObjectNode mutate = OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(lrpNamed)));
+        final OvnTransaction tx = newTransaction();
+        tx.add(insert).add(mutate);
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildInsertLrp(final String name, final String mac, final List<String> networks,
+                                      final String namedUuid) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        row.put("mac", mac);
+        row.set("networks", stringSet(networks));
+        return OvnOpFactory.insert("Logical_Router_Port", namedUuid, row);
+    }
+
+    /**
+     * Replace {@code networks} (and optionally {@code mac}) of an existing
+     * LRP in place. Used when a tier's gateway IP / CIDR changes — the
+     * router-patch pair stays put, only the LRP's gateway prefix list is
+     * rewritten so OVN northd recomputes the L3 forwarding entries on the
+     * next tick. Pass {@code null} for {@code mac} to leave it untouched.
+     */
+    public void updateLogicalRouterPortNetworks(final String lrpUuid, final List<String> networks, final String mac) {
+        if (networks == null || networks.isEmpty()) {
+            throw new OvnException("updateLogicalRouterPortNetworks requires at least one network");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("networks", stringSet(networks));
+        if (mac != null && !mac.isEmpty()) {
+            row.put("mac", mac);
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
+        tx.commit();
+    }
+
+    public void deleteLogicalRouterPort(final String lrpUuid) {
+        // Detach from parent Logical_Router.ports before deleting the row;
+        // otherwise OVSDB rejects with "referential integrity violation".
+        // Mirrors the LSP detach pattern in deleteLogicalSwitchPort.
+        final String parentLrUuid = findLogicalRouterOwningPort(lrpUuid);
+        final OvnTransaction tx = newTransaction();
+        if (parentLrUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                    OvnOpFactory.whereUuid(parentLrUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(lrpUuid))));
+        }
+        tx.add(OvnOpFactory.delete("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid)));
+        tx.commit();
+    }
+
+    /** Locate the LR row holding the supplied LRP in its {@code ports} set. */
+    private String findLogicalRouterOwningPort(final String lrpUuid) {
+        if (lrpUuid == null || lrpUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("ports");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ports = row.get("ports");
+            if (ports == null || ports.size() < 2) {
+                continue;
+            }
+            if ("uuid".equals(ports.get(0).asText())) {
+                if (lrpUuid.equals(ports.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = ports.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && lrpUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Logical Switch operations.
+    // ------------------------------------------------------------------
+
+    public String createLogicalSwitch(final String name, final Map<String, String> externalIds) {
+        final OvnTransaction tx = newTransaction();
+        final String named = OvnNamedUuid.next("ls");
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        tx.add(OvnOpFactory.insert("Logical_Switch", named, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    public void deleteLogicalSwitch(final String uuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("Logical_Switch", OvnOpFactory.whereUuid(uuid)));
+        tx.commit();
+    }
+
+    public String addLogicalSwitchPort(final String lsUuid, final String name, final List<String> addresses,
+                                       final String type, final Map<String, String> options) {
+        // Idempotent insert: an LSP with the same name (NIC UUID-derived)
+        // can survive in OVN_Northbound when an earlier deploy attempt
+        // crashed between LSP create and CloudStack-side mapping persist.
+        // Pre-query by name and adopt the existing row instead of failing
+        // the new transaction with "constraint violation: identical name".
+        final String existing = findLogicalSwitchPortUuidByName(name);
+        if (existing != null) {
+            // Re-attach to the LS in case the orphan got detached
+            // somehow; mutateInsertSet on a set is idempotent (OVSDB
+            // semantics: adding a duplicate to a set is a no-op).
+            final OvnTransaction reAttach = newTransaction();
+            reAttach.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                    OvnOpFactory.whereUuid(lsUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(existing))));
+            reAttach.commit();
+            return existing;
+        }
+        final String namedLsp = OvnNamedUuid.next("lsp");
+        final ObjectNode lspRow = buildLspRow(name, addresses, type, options);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Logical_Switch_Port", namedLsp, lspRow));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(namedLsp))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Look up a Logical_Switch_Port UUID by its unique {@code name} column.
+     * Returns {@code null} when no row matches.
+     */
+    public String findLogicalSwitchPortUuidByName(final String name) {
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("name");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Switch_Port", OvnOpFactory.whereName(name), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final List<String> uuids = extractUuidSet(r.raw(), 0, "_uuid");
+        return uuids.isEmpty() ? null : uuids.get(0);
+    }
+
+    private ObjectNode buildLspRow(final String name, final List<String> addresses, final String type,
+                                   final Map<String, String> options) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        if (addresses != null && !addresses.isEmpty()) {
+            row.set("addresses", stringSet(addresses));
+        }
+        if (type != null && !type.isEmpty()) {
+            row.put("type", type);
+        }
+        if (options != null && !options.isEmpty()) {
+            row.set("options", buildMap(options));
+        }
+        return row;
+    }
+
+    /**
+     * Replace {@code addresses} (and {@code port_security}) of an existing
+     * LSP in place. Used when a NIC's IP changes without a release+prepare
+     * cycle (CloudStack {@code updateVmNicIp} surfaces this path). The LSP
+     * UUID, parent LS attachment, and external_ids stay the same.
+     */
+    public void updateLogicalSwitchPortAddresses(final String lspUuid, final List<String> addresses) {
+        if (addresses == null) {
+            throw new OvnException("updateLogicalSwitchPortAddresses requires non-null addresses");
+        }
+        final OvnTransaction tx = newTransaction();
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("addresses", stringSet(addresses));
+        // Keep port_security in lockstep with addresses (spoof-guard mirrors
+        // declared addresses; otherwise OVN drops legitimate traffic when
+        // the IP changes underneath the spoof rule).
+        row.set("port_security", stringSet(addresses));
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
+    public void deleteLogicalSwitchPort(final String lspUuid) {
+        // OVSDB rejects "delete LSP" while the parent Logical_Switch.ports
+        // set still references the row (referential integrity violation).
+        // Detach + delete in a single transaction to satisfy the strong-ref
+        // contract; if no LS owns the port (already detached / orphan) the
+        // mutate becomes a no-op since the set won't change.
+        final String parentLsUuid = findLogicalSwitchOwningPort(lspUuid);
+        final OvnTransaction tx = newTransaction();
+        if (parentLsUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                    OvnOpFactory.whereUuid(parentLsUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(lspUuid))));
+        }
+        tx.add(OvnOpFactory.delete("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Locate the Logical_Switch row that holds the supplied LSP in its
+     * {@code ports} set. Returns null when no LS references the LSP (an
+     * orphan or already-detached row). The select walks the LS table once
+     * — fine for typical deployments (tens of LSes per zone) and avoids
+     * forcing every caller to remember the parent UUID.
+     */
+    private String findLogicalSwitchOwningPort(final String lspUuid) {
+        if (lspUuid == null || lspUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("ports");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Switch", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var ports = row.get("ports");
+            if (ports == null || ports.size() < 2) {
+                continue;
+            }
+            // ports column is ["set", [["uuid", id1], ["uuid", id2]]] or
+            // ["uuid", id] when single. Walk both shapes.
+            if ("uuid".equals(ports.get(0).asText())) {
+                if (lspUuid.equals(ports.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = ports.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && lspUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Adds a {@code type=localnet} LSP to a logical switch (the public-side
+     * bridge into a physnet). {@code tag} maps to the VLAN id (omit for an
+     * untagged localnet).
+     */
+    public String addLocalnetPort(final String lsUuid, final String name, final Integer vlanTag, final String physnet) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        row.put("type", "localnet");
+        if (vlanTag != null) {
+            row.put("tag", vlanTag.intValue());
+        }
+        final ArrayNode addrSet = JsonNodeFactory.instance.arrayNode();
+        addrSet.add("set");
+        final ArrayNode unknown = JsonNodeFactory.instance.arrayNode();
+        unknown.add("unknown");
+        addrSet.add(unknown);
+        row.set("addresses", addrSet);
+        if (physnet != null && !physnet.isEmpty()) {
+            row.set("options", buildMap(Map.of("network_name", physnet)));
+        }
+        final String named = OvnNamedUuid.next("lnport");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Logical_Switch_Port", named, row));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    // ------------------------------------------------------------------
+    // ACL operations.
+    // ------------------------------------------------------------------
+
+    /** OVN ACL direction applied at ingress to the LSP / from the guest. */
+    public static final String ACL_DIRECTION_FROM_LPORT = "from-lport";
+    /** OVN ACL direction applied at egress towards the LSP / to the guest. */
+    public static final String ACL_DIRECTION_TO_LPORT = "to-lport";
+
+    /** OVN ACL action: allow but skip conntrack (rare; default-deny baseline). */
+    public static final String ACL_ACTION_ALLOW = "allow";
+    /** OVN ACL action: stateful allow; the canonical CloudStack default. */
+    public static final String ACL_ACTION_ALLOW_RELATED = "allow-related";
+    /** OVN ACL action: stateless allow (no conntrack entry created). */
+    public static final String ACL_ACTION_ALLOW_STATELESS = "allow-stateless";
+    /** OVN ACL action: silently drop. */
+    public static final String ACL_ACTION_DROP = "drop";
+    /** OVN ACL action: drop and emit ICMP unreachable / TCP RST. */
+    public static final String ACL_ACTION_REJECT = "reject";
+
+    /**
+     * Inserts one ACL row and links it to a logical switch in a single
+     * transaction. Returns the new ACL UUID.
+     *
+     * @param lsUuid       parent logical switch UUID
+     * @param direction    {@link #ACL_DIRECTION_FROM_LPORT} or
+     *                     {@link #ACL_DIRECTION_TO_LPORT}
+     * @param priority     OVN priority (0..32767, larger wins)
+     * @param match        OVN match expression (see ovn-sb(5) §15)
+     * @param action       OVN action (allow / allow-related /
+     *                     allow-stateless / drop / reject)
+     * @param externalIds  source-of-truth metadata (CloudStack rule id)
+     * @param log          when {@code true} the datapath emits a hit record
+     * @param severity     log severity (alert / warning / notice / info /
+     *                     debug); ignored when {@code log} is false
+     * @param name         optional human-readable label
+     */
+    public String addAclToLogicalSwitch(final String lsUuid, final String direction, final int priority,
+                                        final String match, final String action,
+                                        final Map<String, String> externalIds,
+                                        final boolean log, final String severity, final String name) {
+        final String namedAcl = OvnNamedUuid.next("acl");
+        final ObjectNode aclRow = buildAclRow(direction, priority, match, action, externalIds, log, severity, name);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("ACL", namedAcl, aclRow));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "acls",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(namedAcl))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildAclRow(final String direction, final int priority, final String match, final String action,
+                                   final Map<String, String> externalIds, final boolean log, final String severity,
+                                   final String name) {
+        if (direction == null || direction.isEmpty()) {
+            throw new OvnException("ACL direction is required");
+        }
+        if (action == null || action.isEmpty()) {
+            throw new OvnException("ACL action is required");
+        }
+        if (match == null || match.isEmpty()) {
+            throw new OvnException("ACL match is required");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("direction", direction);
+        row.put("priority", priority);
+        row.put("match", match);
+        row.put("action", action);
+        row.put("log", log);
+        if (severity != null && !severity.isEmpty()) {
+            row.put("severity", severity);
+        }
+        if (name != null && !name.isEmpty()) {
+            row.put("name", name);
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        return row;
+    }
+
+    /**
+     * Detaches an ACL row from the parent logical switch and deletes the row
+     * itself in a single transaction.
+     */
+    public void removeAclFromLogicalSwitch(final String lsUuid, final String aclUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "acls",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(aclUuid))));
+        tx.add(OvnOpFactory.delete("ACL", OvnOpFactory.whereUuid(aclUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Clears the {@code acls} set on the given logical switch (sets it to
+     * empty). Note that orphaned ACL rows are then garbage-collected by
+     * northd; for an explicit cascade delete the caller must list-then-delete.
+     */
+    public void clearAllAclsFromLogicalSwitch(final String lsUuid) {
+        final OvnTransaction tx = newTransaction();
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+        emptySet.add("set");
+        emptySet.add(JsonNodeFactory.instance.arrayNode());
+        row.set("acls", emptySet);
+        tx.add(OvnOpFactory.update("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Lists the ACL UUIDs currently attached to the given logical switch.
+     * Returns an empty list when the switch has no ACLs.
+     */
+    public List<String> listAclsOnLogicalSwitch(final String lsUuid) {
+        final OvnTransaction tx = newTransaction();
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("acls");
+        tx.add(OvnOpFactory.select("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        return extractUuidSet(r.raw(), 0, "acls");
+    }
+
+    private List<String> extractUuidSet(final ArrayNode replies, final int index, final String column) {
+        final List<String> out = new ArrayList<>();
+        if (replies == null || replies.size() <= index) {
+            return out;
+        }
+        final var entry = replies.get(index);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null || rows.size() == 0) {
+            return out;
+        }
+        final var col = rows.get(0).get(column);
+        if (col == null || col.size() < 2) {
+            return out;
+        }
+        // Either ["uuid", "<id>"] for a single value or ["set", [["uuid", id], ...]].
+        if (col.get(0).asText().equals("uuid")) {
+            out.add(col.get(1).asText());
+            return out;
+        }
+        final var elements = col.get(1);
+        if (elements == null) {
+            return out;
+        }
+        for (int i = 0; i < elements.size(); i++) {
+            final var ref = elements.get(i);
+            if (ref != null && ref.size() >= 2 && "uuid".equals(ref.get(0).asText())) {
+                out.add(ref.get(1).asText());
+            }
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // NAT operations.
+    // ------------------------------------------------------------------
+
+    public String addNatRule(final String lrUuid, final String type, final String externalIp, final String logicalIp,
+                             final String logicalPort) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("type", type);
+        row.put("external_ip", externalIp);
+        row.put("logical_ip", logicalIp);
+        if (logicalPort != null && !logicalPort.isEmpty()) {
+            row.set("logical_port", JsonNodeFactory.instance.textNode(logicalPort));
+        }
+        final String named = OvnNamedUuid.next("nat");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("NAT", named, row));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "nat",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Replace the {@code external_ip} (and optionally {@code logical_ip}) of
+     * an existing NAT row in place. Used by SourceNAT IP rotation
+     * ({@link com.cloud.network.element.VpcProvider#updateVpcSourceNatIp})
+     * so the SNAT row keeps the same UUID + parent reference; only the
+     * external IP changes. Pass {@code null} for {@code logicalIp} to leave
+     * the column untouched.
+     */
+    public void updateNatRule(final String natUuid, final String externalIp, final String logicalIp) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        if (externalIp != null && !externalIp.isEmpty()) {
+            row.put("external_ip", externalIp);
+        }
+        if (logicalIp != null && !logicalIp.isEmpty()) {
+            row.put("logical_ip", logicalIp);
+        }
+        if (row.size() == 0) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("NAT", OvnOpFactory.whereUuid(natUuid), row));
+        tx.commit();
+    }
+
+    public void deleteNatRule(final String natUuid) {
+        // OVSDB rejects "delete NAT" while the parent Logical_Router.nat set
+        // still references the row (referential integrity violation). Detach
+        // + delete in a single transaction to satisfy the strong-ref
+        // contract; if no LR owns the row (orphan / already detached) the
+        // mutate becomes a no-op.
+        final String parentLrUuid = findLogicalRouterOwningNat(natUuid);
+        final OvnTransaction tx = newTransaction();
+        if (parentLrUuid != null) {
+            tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                    OvnOpFactory.whereUuid(parentLrUuid), "nat",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(natUuid))));
+        }
+        tx.add(OvnOpFactory.delete("NAT", OvnOpFactory.whereUuid(natUuid)));
+        tx.commit();
+    }
+
+    /** Locate the LR row holding the supplied NAT in its {@code nat} set. */
+    private String findLogicalRouterOwningNat(final String natUuid) {
+        if (natUuid == null || natUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("nat");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return null;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var nat = row.get("nat");
+            if (nat == null || nat.size() < 2) {
+                continue;
+            }
+            if ("uuid".equals(nat.get(0).asText())) {
+                if (natUuid.equals(nat.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+                continue;
+            }
+            final var elements = nat.get(1);
+            if (elements == null) {
+                continue;
+            }
+            for (int j = 0; j < elements.size(); j++) {
+                final var ref = elements.get(j);
+                if (ref != null && ref.size() >= 2 && natUuid.equals(ref.get(1).asText())) {
+                    return row.get("_uuid").get(1).asText();
+                }
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Load_Balancer operations.
+    // ------------------------------------------------------------------
+
+    /** OVN load_balancer protocol values (per ovn-nb(5)). */
+    public static final String LB_PROTOCOL_TCP = "tcp";
+    public static final String LB_PROTOCOL_UDP = "udp";
+    public static final String LB_PROTOCOL_SCTP = "sctp";
+
+    /**
+     * Inserts one {@code load_balancer} row. Returns the new UUID. The caller
+     * is responsible for attaching the row to a Logical_Router or
+     * Logical_Switch via {@link #attachLoadBalancerToLogicalRouter} /
+     * {@link #attachLoadBalancerToLogicalSwitch}.
+     *
+     * @param name           human-readable name; CloudStack uses
+     *                       {@code cs-lb-<rule-id>}
+     * @param vips           map of {@code "vip:port"} ->
+     *                       {@code "ip1:port,ip2:port,..."} (OVN format)
+     * @param protocol       one of {@link #LB_PROTOCOL_TCP},
+     *                       {@link #LB_PROTOCOL_UDP},
+     *                       {@link #LB_PROTOCOL_SCTP}; {@code null} for
+     *                       protocol-agnostic
+     * @param selectionFields source-hash columns (e.g.
+     *                       {@code ip4_src,ip4_dst,tcp_src,tcp_dst}); empty
+     *                       or {@code null} for OVN's default round-robin
+     * @param externalIds    metadata; CloudStack records the rule id here
+     */
+    public String createLoadBalancer(final String name, final Map<String, String> vips, final String protocol,
+                                     final List<String> selectionFields, final Map<String, String> externalIds) {
+        return createLoadBalancer(name, vips, protocol, selectionFields, externalIds, null);
+    }
+
+    /**
+     * Overload that also writes the {@code options} column. Used to enable
+     * OVN load_balancer hairpin so that a backend hitting its own VIP gets
+     * SNAT'd to {@code options:hairpin_snat_ip} (typically the VIP itself),
+     * preventing the kernel-loopback short-circuit and forcing the reflected
+     * packet back through the LR datapath.
+     *
+     * @param options OVN load_balancer options (e.g.
+     *                {@code hairpin_snat_ip}, {@code hairpin_orig_tuple},
+     *                {@code skip_snat}); {@code null}/empty omits the column
+     */
+    public String createLoadBalancer(final String name, final Map<String, String> vips, final String protocol,
+                                     final List<String> selectionFields, final Map<String, String> externalIds,
+                                     final Map<String, String> options) {
+        if (vips == null || vips.isEmpty()) {
+            throw new OvnException("createLoadBalancer requires at least one VIP entry");
+        }
+        final String namedLb = OvnNamedUuid.next("lb");
+        final ObjectNode row = buildLbRow(name, vips, protocol, selectionFields, externalIds, options);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Load_Balancer", namedLb, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private ObjectNode buildLbRow(final String name, final Map<String, String> vips, final String protocol,
+                                  final List<String> selectionFields, final Map<String, String> externalIds,
+                                  final Map<String, String> options) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        if (name != null && !name.isEmpty()) {
+            row.put("name", name);
+        }
+        row.set("vips", buildMap(vips));
+        if (protocol != null && !protocol.isEmpty()) {
+            row.put("protocol", protocol);
+        }
+        if (selectionFields != null && !selectionFields.isEmpty()) {
+            row.set("selection_fields", stringSet(selectionFields));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        if (options != null && !options.isEmpty()) {
+            row.set("options", buildMap(options));
+        }
+        return row;
+    }
+
+    /**
+     * Attaches a load_balancer row to a Logical_Router (north-south LB on
+     * the VPC's gateway).
+     */
+    public void attachLoadBalancerToLogicalRouter(final String lrUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Lists Load_Balancer UUIDs currently attached to a Logical_Router.
+     * Used by the VPC delete cascade to detach LB weak refs before dropping
+     * the LR (OVSDB does not cascade weak refs on parent delete).
+     */
+    public List<String> listLoadBalancersOnLogicalRouter(final String lrUuid) {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("load_balancer");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereUuid(lrUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        return extractUuidSet(r.raw(), 0, "load_balancer");
+    }
+
+    /** Detaches a load_balancer row from a Logical_Router. */
+    public void detachLoadBalancerFromLogicalRouter(final String lrUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Attaches a load_balancer row to a Logical_Switch (east-west LB on a
+     * tier; not used by the MVP but exposed for completeness).
+     */
+    public void attachLoadBalancerToLogicalSwitch(final String lsUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Atomically replaces the backend list for a single VIP. Other VIPs on
+     * the same load_balancer are preserved by re-emitting the supplied
+     * {@code allVips} map: the caller is expected to compute the desired
+     * full state and pass it in (CloudStack drives the LB rule lifecycle so
+     * it knows the full state).
+     */
+    public void updateLoadBalancerBackends(final String lbUuid, final Map<String, String> allVips) {
+        if (allVips == null) {
+            throw new OvnException("updateLoadBalancerBackends requires a non-null vips map");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("vips", buildMap(allVips));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Deletes a load_balancer row. The caller is responsible for detaching
+     * it from any Logical_Router / Logical_Switch first; otherwise the OVSDB
+     * server emits a constraint violation.
+     */
+    public void deleteLoadBalancer(final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("Load_Balancer", OvnOpFactory.whereUuid(lbUuid)));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // LR <-> LS patch pair.
+    // ------------------------------------------------------------------
+
+    /**
+     * Connects a logical router to a logical switch via the OVN router-patch
+     * pair. The LRP holds the gateway IP/MAC; the LSP on the LS side has
+     * {@code type=router} and {@code addresses=router}.
+     */
+    public BindResult bindLrToLs(final BindRequest req) {
+        final String lrpNamed = OvnNamedUuid.next("lrp");
+        final String lspNamed = OvnNamedUuid.next("rsp");
+        final OvnTransaction tx = newTransaction();
+        tx.add(buildInsertLrp(req.lrpName, req.lrpMac, req.lrpNetworks, lrpNamed));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(req.lrUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(lrpNamed))));
+        tx.add(OvnOpFactory.insert("Logical_Switch_Port", lspNamed,
+                buildRouterTypeLspRow(req.lspName, req.lrpName)));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(req.lsUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(lspNamed))));
+        final OvnTransaction.Result r = tx.commit();
+        return new BindResult(r.insertedUuid(0), r.insertedUuid(2));
+    }
+
+    private ObjectNode buildRouterTypeLspRow(final String lspName, final String lrpName) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", lspName);
+        row.put("type", "router");
+        row.set("addresses", stringSet(List.of("router")));
+        row.set("options", buildMap(Map.of("router-port", lrpName)));
+        return row;
+    }
+
+    /** Plain-data input to {@link #bindLrToLs(BindRequest)}. */
+    public static class BindRequest {
+        public final String lrUuid;
+        public final String lsUuid;
+        public final String lrpName;
+        public final String lrpMac;
+        public final List<String> lrpNetworks;
+        public final String lspName;
+
+        public BindRequest(final String lrUuid, final String lsUuid, final String lrpName, final String lrpMac,
+                           final List<String> lrpNetworks, final String lspName) {
+            this.lrUuid = lrUuid;
+            this.lsUuid = lsUuid;
+            this.lrpName = lrpName;
+            this.lrpMac = lrpMac;
+            this.lrpNetworks = lrpNetworks;
+            this.lspName = lspName;
+        }
+    }
+
+    /** Plain-data output of {@link #bindLrToLs(BindRequest)}. */
+    public static class BindResult {
+        public final String lrpUuid;
+        public final String lspUuid;
+
+        public BindResult(final String lrpUuid, final String lspUuid) {
+            this.lrpUuid = lrpUuid;
+            this.lspUuid = lspUuid;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // DHCP_Options operations.
+    // ------------------------------------------------------------------
+
+    /**
+     * Creates a {@code DHCP_Options} row keyed by the tier CIDR. The
+     * {@code options} column carries DHCPv4 fields the
+     * {@code ovn-controller} agent injects directly into the OF pipeline
+     * (no dnsmasq/dhcpd; replies are stamped by OVN itself).
+     *
+     * <p>Required keys per ovn-nb(5) §DHCP_Options:
+     * <ul>
+     *   <li>{@code server_id}    — 4-byte IP shown as DHCP server identifier
+     *   <li>{@code server_mac}   — MAC OVN replies from
+     *   <li>{@code lease_time}   — seconds (string)
+     *   <li>{@code router}       — default gateway (option 3)
+     * </ul>
+     * Optional: {@code dns_server} (option 6), {@code mtu} (option 26),
+     * {@code domain_name} (option 15), {@code classless_static_route}
+     * (option 121).
+     *
+     * @param cidr        tier CIDR ({@code 10.101.0.0/24}) — used as the row key
+     * @param options     option map (string→string per OVN schema)
+     * @param externalIds CloudStack metadata
+     * @return new DHCP_Options UUID
+     */
+    public String createDhcpOptions(final String cidr, final Map<String, String> options,
+                                    final Map<String, String> externalIds) {
+        if (cidr == null || cidr.isEmpty()) {
+            throw new OvnException("createDhcpOptions requires a CIDR");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("cidr", cidr);
+        if (options != null && !options.isEmpty()) {
+            row.set("options", buildMap(options));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("dhcp");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("DHCP_Options", named, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Replaces the {@code options} map on a DHCP_Options row. Use to bump the
+     * lease time, change DNS, or add a new option without recreating the row.
+     */
+    public void updateDhcpOptions(final String dhcpOptUuid, final Map<String, String> options) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("options", buildMap(options == null ? Map.of() : options));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("DHCP_Options", OvnOpFactory.whereUuid(dhcpOptUuid), row));
+        tx.commit();
+    }
+
+    /** Removes a DHCP_Options row. Detach from any LSP first. */
+    public void deleteDhcpOptions(final String dhcpOptUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("DHCP_Options", OvnOpFactory.whereUuid(dhcpOptUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Pins a DHCP_Options row on an LSP's {@code dhcpv4_options} column.
+     * Replies for that NIC then come from OVN's distributed DHCP responder.
+     */
+    public void lspSetDhcpv4Options(final String lspUuid, final String dhcpOptUuid) {
+        setLspSingleUuidColumn(lspUuid, "dhcpv4_options", dhcpOptUuid);
+    }
+
+    /** IPv6 counterpart of {@link #lspSetDhcpv4Options}. */
+    public void lspSetDhcpv6Options(final String lspUuid, final String dhcpOptUuid) {
+        setLspSingleUuidColumn(lspUuid, "dhcpv6_options", dhcpOptUuid);
+    }
+
+    /** Clears the {@code dhcpv4_options} pin on an LSP. */
+    public void lspClearDhcpv4Options(final String lspUuid) {
+        clearLspSetColumn(lspUuid, "dhcpv4_options");
+    }
+
+    /** Clears the {@code dhcpv6_options} pin on an LSP. */
+    public void lspClearDhcpv6Options(final String lspUuid) {
+        clearLspSetColumn(lspUuid, "dhcpv6_options");
+    }
+
+    /**
+     * Stamps the {@code port_security} column on an LSP. OVN's pipeline
+     * filters traffic to/from the port to the supplied {@code "<mac> [<ip>]"}
+     * strings — the spoofing-protection contract that lets OVN safely export
+     * a tenant LSP straight onto the integration bridge.
+     */
+    public void lspSetPortSecurity(final String lspUuid, final List<String> portSecurity) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("port_security", stringSet(portSecurity == null ? List.of() : portSecurity));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
+    private void setLspSingleUuidColumn(final String lspUuid, final String column, final String targetUuid) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set(column, OvnRowRef.singletonSet(OvnRowRef.realUuid(targetUuid)));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
+    private void clearLspSetColumn(final String lspUuid, final String column) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+        emptySet.add("set");
+        emptySet.add(JsonNodeFactory.instance.arrayNode());
+        row.set(column, emptySet);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // DNS operations.
+    // ------------------------------------------------------------------
+
+    /**
+     * Inserts a {@code DNS} row and attaches it to the given Logical_Switch.
+     * The {@code records} map holds {@code hostname → "ip[ ip2 ...]"}; OVN's
+     * pipeline answers DNS queries for any local LSP from this map.
+     */
+    public String createDnsRecords(final String lsUuid, final Map<String, String> records,
+                                   final Map<String, String> externalIds) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("records", buildMap(records == null ? Map.of() : records));
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("dns");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("DNS", named, row));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "dns_records",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Replaces the {@code records} map on an existing DNS row. Useful when
+     * the manager-side aggregates all hostnames per tier and pushes a single
+     * authoritative snapshot.
+     */
+    public void updateDnsRecords(final String dnsUuid, final Map<String, String> records) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("records", buildMap(records == null ? Map.of() : records));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("DNS", OvnOpFactory.whereUuid(dnsUuid), row));
+        tx.commit();
+    }
+
+    /** Detaches a DNS row from a switch and deletes the row. */
+    public void deleteDnsRecords(final String lsUuid, final String dnsUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "dns_records",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(dnsUuid))));
+        tx.add(OvnOpFactory.delete("DNS", OvnOpFactory.whereUuid(dnsUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Direct delete of a DNS row when the owning Logical_Switch is unknown
+     * (typical orphan path: parent LS already cascaded out, the DNS row
+     * lingered with no remaining strong-ref). Skips the LS detach step in
+     * {@link #deleteDnsRecords} which would fail OVSDB without a live
+     * lsUuid.
+     */
+    public void deleteDnsRowDirect(final String dnsUuid) {
+        if (dnsUuid == null || dnsUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("DNS", OvnOpFactory.whereUuid(dnsUuid)));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // QoS operations (rate-limit / dscp).
+    // ------------------------------------------------------------------
+
+    /** OVN QoS direction towards the LSP's input (egress from the VM). */
+    public static final String QOS_DIRECTION_FROM_LPORT = "from-lport";
+    /** OVN QoS direction towards the LSP's output (ingress to the VM). */
+    public static final String QOS_DIRECTION_TO_LPORT = "to-lport";
+
+    /**
+     * Inserts a {@code QoS} row attached to a Logical_Switch and matched by
+     * an OVN match expression. {@code bandwidth} carries
+     * {@code rate} / {@code burst} (kbps); {@code action} carries
+     * {@code dscp} when DSCP marking is desired.
+     */
+    public String addQosToLogicalSwitch(final String lsUuid, final String direction, final int priority,
+                                        final String match, final Map<String, Integer> bandwidth,
+                                        final Map<String, Integer> action,
+                                        final Map<String, String> externalIds) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("direction", direction);
+        row.put("priority", priority);
+        row.put("match", match == null ? "1" : match);
+        if (bandwidth != null && !bandwidth.isEmpty()) {
+            row.set("bandwidth", buildIntMap(bandwidth));
+        }
+        if (action != null && !action.isEmpty()) {
+            row.set("action", buildIntMap(action));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("qos");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("QoS", named, row));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "qos_rules",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /** Detaches and deletes a QoS row. */
+    public void removeQosFromLogicalSwitch(final String lsUuid, final String qosUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "qos_rules",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(qosUuid))));
+        tx.add(OvnOpFactory.delete("QoS", OvnOpFactory.whereUuid(qosUuid)));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // Logical_Router_Static_Route operations.
+    // ------------------------------------------------------------------
+
+    /**
+     * Inserts a static route on an LR. {@code prefix} is the destination CIDR
+     * ({@code 0.0.0.0/0} for default), {@code nexthop} is the next-hop IP
+     * (or special token {@code "discard"} for a black-hole), and
+     * {@code outputPort} optionally pins egress to a specific LRP name.
+     *
+     * <p>{@code policy} can be {@code "src-ip"} or {@code "dst-ip"} to
+     * indicate which side OVN matches; default is {@code dst-ip}.
+     */
+    public String addLogicalRouterStaticRoute(final String lrUuid, final String prefix, final String nexthop,
+                                              final String outputPort, final String policy,
+                                              final Map<String, String> externalIds) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("ip_prefix", prefix);
+        row.put("nexthop", nexthop);
+        if (outputPort != null && !outputPort.isEmpty()) {
+            row.set("output_port", JsonNodeFactory.instance.textNode(outputPort));
+        }
+        if (policy != null && !policy.isEmpty()) {
+            row.put("policy", policy);
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("lrsr");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Logical_Router_Static_Route", named, row));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "static_routes",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /** Detach + delete a static route row. */
+    public void deleteLogicalRouterStaticRoute(final String lrUuid, final String routeUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Router",
+                OvnOpFactory.whereUuid(lrUuid), "static_routes",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(routeUuid))));
+        tx.add(OvnOpFactory.delete("Logical_Router_Static_Route", OvnOpFactory.whereUuid(routeUuid)));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // HA chassis group operations.
+    // ------------------------------------------------------------------
+
+    /**
+     * Inserts an {@code HA_Chassis} row referencing the named chassis with the
+     * given priority. Returns the new UUID; caller attaches it to a group.
+     */
+    public String createHaChassis(final String chassisName, final int priority) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("chassis_name", chassisName);
+        row.put("priority", priority);
+        final String named = OvnNamedUuid.next("hac");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("HA_Chassis", named, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Inserts an {@code HA_Chassis_Group} with a precomputed list of HA_Chassis
+     * UUIDs. The group can then be attached to a Logical_Router_Port to drive
+     * gateway-chassis failover for north-south traffic.
+     */
+    public String createHaChassisGroup(final String name, final List<String> haChassisUuids,
+                                       final Map<String, String> externalIds) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        if (haChassisUuids != null && !haChassisUuids.isEmpty()) {
+            row.set("ha_chassis", uuidSet(haChassisUuids));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("hag");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("HA_Chassis_Group", named, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    /**
+     * Atomic single-transaction variant: inserts every HA_Chassis row + the
+     * parent HA_Chassis_Group referencing them by named UUID, in one
+     * commit. Required because OVSDB GCs orphan HA_Chassis rows between
+     * transactions — the original {@link #createHaChassis} +
+     * {@link #createHaChassisGroup} pair fails referential integrity when
+     * the chassis rows get GC'd before the group references them.
+     *
+     * @param name           HA_Chassis_Group.name
+     * @param members        ordered list of (chassisName, priority) pairs
+     * @param externalIds    HA_Chassis_Group.external_ids
+     * @return the new HA_Chassis_Group UUID
+     */
+    public String createHaChassisGroupAtomic(final String name,
+                                             final List<Map.Entry<String, Integer>> members,
+                                             final Map<String, String> externalIds) {
+        if (members == null || members.isEmpty()) {
+            throw new OvnException("createHaChassisGroupAtomic requires at least one member");
+        }
+        final OvnTransaction tx = newTransaction();
+        final ArrayNode hacRefs = JsonNodeFactory.instance.arrayNode();
+        for (final Map.Entry<String, Integer> m : members) {
+            final ObjectNode hacRow = JsonNodeFactory.instance.objectNode();
+            hacRow.put("chassis_name", m.getKey());
+            hacRow.put("priority", m.getValue());
+            final String hacNamed = OvnNamedUuid.next("hac");
+            tx.add(OvnOpFactory.insert("HA_Chassis", hacNamed, hacRow));
+            hacRefs.add(OvnRowRef.namedUuid(hacNamed));
+        }
+        // Wrap the named-uuid array as a typed OVSDB set.
+        final ArrayNode hacSet = JsonNodeFactory.instance.arrayNode();
+        hacSet.add("set");
+        hacSet.add(hacRefs);
+        final ObjectNode hagRow = JsonNodeFactory.instance.objectNode();
+        hagRow.put("name", name);
+        hagRow.set("ha_chassis", hacSet);
+        if (externalIds != null && !externalIds.isEmpty()) {
+            hagRow.set("external_ids", buildMap(externalIds));
+        }
+        final String hagNamed = OvnNamedUuid.next("hag");
+        tx.add(OvnOpFactory.insert("HA_Chassis_Group", hagNamed, hagRow));
+        // The HA_Chassis_Group insert is the last op; its uuid is at index
+        // == members.size() (HA_Chassis inserts come first).
+        return tx.commit().insertedUuid(members.size());
+    }
+
+    /**
+     * Drop an HA_Chassis_Group row + its ha_chassis members in one
+     * transaction. The group's {@code ha_chassis} column is a strong-ref
+     * set, so we must blank it before delete; the embedded HA_Chassis rows
+     * then become orphans + are GC'd by ovsdb-server on next sync.
+     * Used by the reaper when a stale {@code hag-public-z<zone>} appears
+     * (chassis pool changed, prior plugin version pre-stale-guard).
+     */
+    public void destroyHaChassisGroup(final String hagUuid) {
+        if (hagUuid == null || hagUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        // Empty the ha_chassis set so ovsdb-server stops holding references.
+        final ObjectNode emptyRow = JsonNodeFactory.instance.objectNode();
+        final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+        emptySet.add("set");
+        emptySet.add(JsonNodeFactory.instance.arrayNode());
+        emptyRow.set("ha_chassis", emptySet);
+        tx.add(OvnOpFactory.update("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid), emptyRow));
+        tx.add(OvnOpFactory.delete("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid)));
+        tx.commit();
+    }
+
+    /** Pins an LRP to an HA_Chassis_Group (sets the {@code ha_chassis_group} column). */
+    public void lrpSetHaChassisGroup(final String lrpUuid, final String hagUuid) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("ha_chassis_group", OvnRowRef.singletonSet(OvnRowRef.realUuid(hagUuid)));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // IPv6 RA + LS multicast snooping.
+    // ------------------------------------------------------------------
+
+    /**
+     * Replaces the {@code ipv6_ra_configs} column on a Logical_Router_Port,
+     * driving SLAAC / Router Advertisements without needing radvd.
+     * Recommended keys: {@code address_mode=slaac|dhcpv6_stateful|dhcpv6_stateless},
+     * {@code mtu=<int>}, {@code dnssl=<domain>}, {@code rdnss=<ip>}.
+     */
+    public void lrpSetIpv6RaConfigs(final String lrpUuid, final Map<String, String> raConfigs) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("ipv6_ra_configs", buildMap(raConfigs == null ? Map.of() : raConfigs));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
+        tx.commit();
+    }
+
+    /** Toggles IGMP/MLD snooping on a Logical_Switch via the {@code other_config} column. */
+    public void lsSetMcastSnoop(final String lsUuid, final boolean enable) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        final Map<String, String> oc = new java.util.HashMap<>();
+        oc.put("mcast_snoop", Boolean.toString(enable));
+        oc.put("mcast_querier", Boolean.toString(enable));
+        row.set("other_config", buildMap(oc));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), row));
+        tx.commit();
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers.
+    // ------------------------------------------------------------------
+
+    private ArrayNode stringSet(final List<String> values) {
+        final ArrayNode set = JsonNodeFactory.instance.arrayNode();
+        set.add("set");
+        final ArrayNode elements = JsonNodeFactory.instance.arrayNode();
+        for (final String v : values) {
+            elements.add(v);
+        }
+        set.add(elements);
+        return set;
+    }
+
+    private ArrayNode buildMap(final Map<String, String> entries) {
+        final ArrayNode mapNode = JsonNodeFactory.instance.arrayNode();
+        mapNode.add("map");
+        final ArrayNode pairs = JsonNodeFactory.instance.arrayNode();
+        for (final Map.Entry<String, String> e : entries.entrySet()) {
+            final ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+            pair.add(e.getKey());
+            pair.add(e.getValue());
+            pairs.add(pair);
+        }
+        mapNode.add(pairs);
+        return mapNode;
+    }
+
+    /**
+     * Builds an OVSDB-format {@code ["map", [[k, v], ...]]} where values are
+     * integers. Required for QoS bandwidth / action columns whose schema type
+     * is {@code map of string-integer pairs}.
+     */
+    private ArrayNode buildIntMap(final Map<String, Integer> entries) {
+        final ArrayNode mapNode = JsonNodeFactory.instance.arrayNode();
+        mapNode.add("map");
+        final ArrayNode pairs = JsonNodeFactory.instance.arrayNode();
+        for (final Map.Entry<String, Integer> e : entries.entrySet()) {
+            final ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+            pair.add(e.getKey());
+            pair.add(e.getValue() == null ? 0 : e.getValue().intValue());
+            pairs.add(pair);
+        }
+        mapNode.add(pairs);
+        return mapNode;
+    }
+
+    /**
+     * Builds an OVSDB-format {@code ["set", [["uuid", uuid], ...]]} from a list
+     * of real UUIDs. Used by HA_Chassis_Group's {@code ha_chassis} column and
+     * any other multi-uuid set column.
+     */
+    private ArrayNode uuidSet(final List<String> uuids) {
+        final ArrayNode setNode = JsonNodeFactory.instance.arrayNode();
+        setNode.add("set");
+        final ArrayNode elements = JsonNodeFactory.instance.arrayNode();
+        for (final String u : uuids) {
+            final ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+            pair.add("uuid");
+            pair.add(u);
+            elements.add(pair);
+        }
+        setNode.add(elements);
+        return setNode;
+    }
+
+    public OvsdbConnectionPool getPool() {
+        return pool;
+    }
+
+    @Override
+    public void close() {
+        pool.close();
+    }
+}

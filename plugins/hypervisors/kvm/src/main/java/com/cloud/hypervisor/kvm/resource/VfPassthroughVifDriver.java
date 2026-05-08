@@ -20,7 +20,14 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.io.File;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.naming.ConfigurationException;
 
@@ -28,6 +35,8 @@ import org.apache.commons.lang3.StringUtils;
 import org.libvirt.LibvirtException;
 
 import com.cloud.agent.api.to.NicTO;
+import com.cloud.agent.properties.AgentProperties;
+import com.cloud.agent.properties.AgentPropertiesFileHandler;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.network.Networks;
 import com.cloud.utils.script.Script;
@@ -66,39 +75,82 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
 
-        // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
-        // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
-        // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
-        // VLAN config via the PF in switchdev fails with "Operation not
-        // supported" and prevents the VR from booting.
-        // Same for the libvirt hostdev <vlan> element — it triggers the same
-        // ip link command on libvirt's side and fails. So we pass vlanTag=0
-        // to defHostdevNet (no <vlan> element) and let the OVS rep tag handle
-        // VLAN push/pop on egress/ingress.
-        String repName = lookupRepresentor(pciAddress);
-        boolean switchdev = repName != null;
-        Integer pfVlanTag = switchdev ? null : vlanTag;
-        configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
+        // Phase H.1: every step that mutates host state pushes its inverse
+        // onto rollback. If a later step throws, rollback runs LIFO and the
+        // original exception is re-thrown so callers see the real failure
+        // cause and the VR isn't left straddling a partial plug.
+        Deque<Runnable> rollback = new ArrayDeque<>();
+        try {
+            // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
+            // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
+            // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
+            // VLAN config via the PF in switchdev fails with "Operation not
+            // supported" and prevents the VR from booting.
+            // Same for the libvirt hostdev <vlan> element — it triggers the same
+            // ip link command on libvirt's side and fails. So we pass vlanTag=0
+            // to defHostdevNet (no <vlan> element) and let the OVS rep tag handle
+            // VLAN push/pop on egress/ingress.
+            String repName = lookupRepresentor(pciAddress);
+            boolean switchdev = repName != null;
+            Integer pfVlanTag = switchdev ? null : vlanTag;
+            configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
+            final String pfNameFinal = pfName != null ? pfName : lookupPfFromVf(pciAddress);
+            final Integer vfIdFinal = lookupVfIdFromPci(pciAddress);
+            rollback.push(() -> {
+                if (pfNameFinal != null && vfIdFinal != null) {
+                    Script.runSimpleBashScript(String.format(
+                        "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfNameFinal, vfIdFinal));
+                }
+            });
 
-        if (repName != null) {
-            // Auto-plumb OVS VXLAN tunnels to peer data nodes before we drop
-            // the rep into the bridge; safe no-op for legacy VLAN segments.
-            ensureVxlanMeshIfNeeded(nic, vlanTag);
-            addRepresentorToOvs(repName, vlanTag);
-            // Register the tier / VM in DvrManager so OpenFlow cross-tier
-            // shortcut + ACL flows get installed on br-bond. Runs right after
-            // the representor is in the bridge. Silent no-op if missing data.
-            registerDvrIntent(nic, vlanTag, repName);
+            if (repName != null) {
+                // Auto-plumb OVS VXLAN tunnels to peer data nodes before we drop
+                // the rep into the bridge; safe no-op for legacy VLAN segments.
+                ensureVxlanMeshIfNeeded(nic, vlanTag);
+                addRepresentorToOvs(repName, vlanTag);
+                final String repNameFinal = repName;
+                rollback.push(() -> {
+                    Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
+                    Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repNameFinal));
+                });
+                // Register the tier / VM in DvrManager so OpenFlow cross-tier
+                // shortcut + ACL flows get installed on br-bond. Runs right after
+                // the representor is in the bridge. Silent no-op if missing data.
+                registerDvrIntent(nic, vlanTag, repName);
+                final String macForRollback = nic.getMac();
+                rollback.push(() -> notifyDvrUnregister(macForRollback));
+                installLocalVmFdbRule(repName, vlanTag, nic.getMac());
+                rollback.push(() -> removeLocalVmFdbRuleByMac(macForRollback));
+            }
+
+            LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
+            int xmlVlanTag = switchdev ? 0 : (vlanTag != null ? vlanTag : 0);
+            intf.defHostdevNet(pciAddress, nic.getMac(), xmlVlanTag);
+            intf.setLinkStateUp(nic.isEnabled());
+
+            logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={} switchdev={}",
+                    pciAddress, pfName, nic.getMac(), vlanTag, repName, switchdev);
+            return intf;
+        } catch (RuntimeException ex) {
+            drainRollback(rollback, "VfPassthroughVifDriver.plug");
+            throw ex;
         }
+    }
 
-        LibvirtVMDef.InterfaceDef intf = new LibvirtVMDef.InterfaceDef();
-        int xmlVlanTag = switchdev ? 0 : (vlanTag != null ? vlanTag : 0);
-        intf.defHostdevNet(pciAddress, nic.getMac(), xmlVlanTag);
-        intf.setLinkStateUp(nic.isEnabled());
-
-        logger.info("VF passthrough plug: pci={} pf={} mac={} vlan={} rep={} switchdev={}",
-                pciAddress, pfName, nic.getMac(), vlanTag, repName, switchdev);
-        return intf;
+    /**
+     * Run every queued rollback step in LIFO order. Each step's failure is
+     * logged but does not abort subsequent steps — best-effort cleanup is the
+     * goal so we leave host state as close to "pre-plug" as possible.
+     */
+    private void drainRollback(Deque<Runnable> rollback, String label) {
+        while (!rollback.isEmpty()) {
+            Runnable step = rollback.pop();
+            try {
+                step.run();
+            } catch (RuntimeException e) {
+                logger.warn("{}: rollback step failed: {}", label, e.getMessage());
+            }
+        }
     }
 
     @Override
@@ -129,6 +181,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repName));
             logger.info("VF unplug: removed rep {} from OVS and cleared TC", repName);
         }
+        // Clear the static FDB pin OF rule installed at plug time. Match by
+        // dl_dst alone (no --strict) so we don't need to know the access tag
+        // — that info is already gone from the rep we just deleted.
+        removeLocalVmFdbRuleByMac(mac);
         // Notify DvrManager so it reaps the VM entry + shortcut flows.
         notifyDvrUnregister(mac);
         String pfName = lookupPfFromVf(pciAddress);
@@ -150,16 +206,30 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     /**
      * Resolve the VF PCI BDF (e.g. {@code 0000:01:00.2}) that currently
-     * carries the given MAC, scanning both physical functions. Returns null
-     * when no VF matches — caller falls back to skipping the PCI-scoped
-     * teardown steps.
+     * carries the given MAC, scanning every PF the kernel exposes in
+     * {@code /sys/class/net} whose {@code phys_port_name} matches
+     * {@code p<digits>} (the canonical mlx5 marker for PF uplinks in
+     * switchdev mode). The PF list is cached at first call; the cache holds
+     * an ordered map of PF netdev → PF PCI BDF so repeat lookups stay cheap.
+     * Returns null when no VF matches — caller falls back to skipping the
+     * PCI-scoped teardown steps.
      */
     private String lookupVfPciByMac(String mac) {
         if (StringUtils.isBlank(mac)) {
             return null;
         }
         String norm = mac.trim().toLowerCase();
-        for (String pf : new String[]{"dx6p0", "dx6p1"}) {
+        Map<String, String> pfs = pfCache();
+        if (pfs.isEmpty()) {
+            logger.warn("lookupVfPciByMac: no PFs found in sysfs (phys_port_name=p<N>); cannot resolve VF for mac={}", mac);
+            return null;
+        }
+        for (Map.Entry<String, String> e : pfs.entrySet()) {
+            String pf = e.getKey();
+            String pfBdf = e.getValue();
+            if (StringUtils.isBlank(pfBdf)) {
+                continue;
+            }
             String cmd = String.format("ip link show dev %s 2>/dev/null | awk -v m=\"%s\" "
                             + "'/vf / {split($0,a,\" \"); for(i=1;i<=NF;i++) if(a[i]==\"link/ether\"||a[i]==\"MAC\") "
                             + "{if(tolower(a[i+1])==m) print $2}'", pf, norm);
@@ -169,8 +239,6 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                     continue;
                 }
                 int vfIdx = Integer.parseInt(out.trim());
-                // Map vfIdx -> PCI BDF via /sys/bus/pci/devices/<pf_bdf>/virtfn<N>
-                String pfBdf = pf.equals("dx6p0") ? "0000:01:00.0" : "0000:01:00.1";
                 String bdfCmd = String.format("readlink /sys/bus/pci/devices/%s/virtfn%d 2>/dev/null | awk -F/ '{print $NF}'",
                         pfBdf, vfIdx);
                 String bdf = Script.runSimpleBashScript(bdfCmd, 5000);
@@ -182,6 +250,86 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             }
         }
         return null;
+    }
+
+    /**
+     * Lazily-populated cache of PF netdev to PF PCI BDF pairs discovered via
+     * each entry's phys_port_name attribute under sysfs. Order is preserved
+     * (LinkedHashMap) so PF index 0 is scanned before 1, etc. The cache is
+     * computed once per driver instance because sysfs PF topology does not
+     * change after host boot in the deployment models this driver targets.
+     */
+    private final AtomicReference<Map<String, String>> pfCacheRef = new AtomicReference<>();
+
+    Map<String, String> pfCache() {
+        Map<String, String> cached = pfCacheRef.get();
+        if (cached != null) {
+            return cached;
+        }
+        Map<String, String> scanned = scanPfsFromSysfs();
+        // Compare-and-set so concurrent first-callers converge on the same map.
+        if (pfCacheRef.compareAndSet(null, scanned)) {
+            return scanned;
+        }
+        return pfCacheRef.get();
+    }
+
+    /**
+     * Enumerate {@code /sys/class/net/*} and keep entries whose
+     * {@code phys_port_name} matches {@code p<digits>} (the mlx5 PF marker).
+     * Resolve each PF's PCI BDF by canonicalising
+     * {@code /sys/class/net/<pf>/device}. Returns an ordered map keyed by PF
+     * physical port index (so p0, p1, ...) for deterministic iteration.
+     */
+    public static Map<String, String> scanPfsFromSysfs() {
+        File netDir = new File("/sys/class/net");
+        String[] ifaces = netDir.list();
+        if (ifaces == null) {
+            return Collections.emptyMap();
+        }
+        // Collect (pfIdx, name) pairs first so we can sort by index before
+        // resolving BDFs.
+        List<int[]> indices = new ArrayList<>();
+        Map<Integer, String> byIndex = new java.util.HashMap<>();
+        for (String iface : ifaces) {
+            String port = readPhysPortName(iface);
+            if (port == null || !port.matches("p\\d+")) {
+                continue;
+            }
+            try {
+                int idx = Integer.parseInt(port.substring(1));
+                if (byIndex.put(idx, iface) == null) {
+                    indices.add(new int[]{idx});
+                }
+            } catch (NumberFormatException ignore) {
+                // skip; not a numeric phys_port_name index
+            }
+        }
+        indices.sort((a, b) -> Integer.compare(a[0], b[0]));
+        Map<String, String> out = new LinkedHashMap<>();
+        for (int[] idx : indices) {
+            String pf = byIndex.get(idx[0]);
+            String bdf = resolvePfPciBdf(pf);
+            out.put(pf, bdf);
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    /**
+     * Resolve a PF netdev's PCI BDF by canonicalising its
+     * {@code /sys/class/net/<pf>/device} symlink (e.g. {@code 0000:01:00.0}).
+     * Returns null on any I/O error.
+     */
+    static String resolvePfPciBdf(String pfName) {
+        if (StringUtils.isBlank(pfName)) {
+            return null;
+        }
+        try {
+            File devLink = new File("/sys/class/net/" + pfName + "/device");
+            return devLink.getCanonicalFile().getName();
+        } catch (java.io.IOException e) {
+            return null;
+        }
     }
 
     private void notifyDvrUnregister(String mac) {
@@ -380,32 +528,107 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         return null;
     }
 
+    private static final java.util.regex.Pattern PF_VF_PHYS_PORT =
+            java.util.regex.Pattern.compile("pf(\\d+)vf(\\d+)");
+
     private void addRepresentorToOvs(String repName, Integer vlanTag) {
-        // Ensure the rep is in br-bond. The boot-time mlx-switchdev.sh script may
-        // already have added it (untagged trunk); we need to (re)apply the VLAN tag.
+        // OVS-DOCA HW offload path: when openvswitch.dpdk.enabled=true the rep is
+        // added as type=doca (NOT type=dpdk). dv_flow_en=2,dv_xmeta_en=4 MUST be
+        // passed explicitly in dpdk-devargs to match the shared mlx5_bond_0 LAG
+        // context created by bond1 type=doca; mlx5 PMD rejects re-probe with
+        // mismatched params (see feedback_doca_vf_rep_runtime_add). Programs flows
+        // via DOCA Flow API into the e-switch HW table with LAG offload.
+        // Falls back to kernel netdev (linux_tc) on any resolution failure.
+        boolean dpdkMode = Boolean.TRUE.equals(
+                AgentPropertiesFileHandler.getPropertyValue(AgentProperties.OPENVSWITCH_DPDK_ENABLED));
+        if (dpdkMode) {
+            String physPort = readPhysPortName(repName);
+            java.util.regex.Matcher m = physPort != null ? PF_VF_PHYS_PORT.matcher(physPort) : null;
+            if (m != null && m.matches()) {
+                int pfIdx = Integer.parseInt(m.group(1));
+                int vfIdx = Integer.parseInt(m.group(2));
+                String pfNet = findPfByPhysPortIndex(pfIdx);
+                String pfPci = pfNet != null ? resolvePfPciAddress(pfNet) : null;
+                if (pfPci != null) {
+                    // OVS-DOCA expects type=doca (NOT type=dpdk) for HW offload via DOCA Flow.
+                    // dpdk-lsc-interrupt=true enables LSC events for representor link state.
+                    // representor=vf[N] is the canonical syntax for switchdev VF representors.
+                    Script.runSimpleBashScript(String.format(
+                        "ovs-vsctl --may-exist add-port br-bond %s -- set Interface %s type=doca options:dpdk-devargs=\"%s,representor=vf[%d],dv_flow_en=2,dv_xmeta_en=4\" options:dpdk-lsc-interrupt=true",
+                        repName, repName, pfPci, vfIdx));
+                    applyAccessTagOnRep(repName, vlanTag, true);
+                    logger.info("Added VF representor {} as DOCA port (pf={} vf={} segment={})",
+                            repName, pfPci, vfIdx, vlanTag);
+                    return;
+                }
+                logger.warn("DOCA rep add: failed to resolve PF PCI for rep={} physPort={}; falling back to kernel netdev path",
+                        repName, physPort);
+            } else {
+                logger.warn("DOCA rep add: rep={} has unexpected phys_port_name={}; falling back to kernel netdev path",
+                        repName, physPort);
+            }
+        }
+        // Kernel netdev path (default / fallback). The boot-time mlx-switchdev.sh
+        // script may already have added the rep (untagged trunk); we (re)apply
+        // the VLAN tag below.
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port br-bond %s", repName));
-        // For VLAN-tagged networks (e.g. public VLAN 2988), set tag=N so OVS pops
-        // VLAN on egress to the VF and pushes VLAN on ingress from the VF — same
-        // semantics as a virtio tap on a VLAN access port. Without this tag, the
-        // rep is treated as a trunk port and packets reach the VF still tagged,
-        // which the guest doesn't strip → silent drops.
-        // NOTE: --may-exist add-port doesn't update tag of existing ports, so we
-        // run a separate set/clear to enforce the desired state on every plug.
+        applyAccessTagOnRep(repName, vlanTag, false);
+        Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
+        logger.info("Added VF representor {} to OVS br-bond (segment={}) with clsact qdisc", repName, vlanTag);
+    }
+
+    /**
+     * Apply an OVS access tag on a representor port. Runs separately from add-port
+     * because --may-exist add-port doesn't update tag of an existing port, so we
+     * always re-enforce the desired state on every plug.
+     */
+    private void applyAccessTagOnRep(String repName, Integer vlanTag, boolean dpdkMode) {
         if (vlanTag != null && vlanTag > 0) {
             int ovsTag = toOvsAccessTag(vlanTag);
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set port %s tag=%d", repName, ovsTag));
             if (ovsTag != vlanTag) {
-                logger.info("Mapped network segment {} → internal OVS tag {} (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)",
-                    vlanTag, ovsTag);
+                String suffix = dpdkMode
+                    ? " (DOCA port; segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)"
+                    : " (segment > 4094 = VXLAN VNI; deterministic mod-4094 mapping ensures all VFs of the same network share the tag)";
+                logger.info("Mapped network segment {} → internal OVS tag {}{}", vlanTag, ovsTag, suffix);
             }
         } else {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl clear port %s tag", repName));
         }
-        Script.runSimpleBashScript(String.format("tc qdisc add dev %s clsact 2>/dev/null", repName));
-        logger.info("Added VF representor {} to OVS br-bond (segment={}) with clsact qdisc", repName, vlanTag);
+    }
+
+    /**
+     * Find PF netdev by phys_port_name index (eg. pfIdx=0 -> netdev with phys_port_name=p0).
+     */
+    private String findPfByPhysPortIndex(int pfIdx) {
+        String expected = "p" + pfIdx;
+        File netDir = new File("/sys/class/net");
+        String[] ifaces = netDir.list();
+        if (ifaces == null) {
+            return null;
+        }
+        for (String iface : ifaces) {
+            if (expected.equals(readPhysPortName(iface))) {
+                return iface;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the PCI bus address (eg. 0000:01:00.0) of a PF netdev via the
+     * /sys/class/net/&lt;pf&gt;/device symlink. Delegates to the static helper
+     * shared with {@link #scanPfsFromSysfs()}.
+     */
+    private String resolvePfPciAddress(String pfName) {
+        String bdf = resolvePfPciBdf(pfName);
+        if (bdf == null) {
+            logger.warn("resolvePfPciAddress failed for {}", pfName);
+        }
+        return bdf;
     }
 
     /**
@@ -610,4 +833,89 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             return null;
         }
     }
+    /**
+     * Install a high-priority static FDB OF rule that pins {@code vmMac} on
+     * {@code repName}'s ofport for the given access tag. This short-circuits
+     * the OVS NORMAL FDB lookup, so even if FDB gets polluted (e.g. by mesh
+     * hairpin loops), packets destined to this VM are always delivered to the
+     * correct local representor.
+     *
+     * <p>Idempotent: re-installs (replaces) the rule on every plug. Cleaned up
+     * by {@link #removeLocalVmFdbRule}.
+     */
+    private void installLocalVmFdbRule(String repName, Integer vlanTag, String vmMac) {
+        if (repName == null || vmMac == null || vlanTag == null) {
+            return;
+        }
+        try {
+            int ovsTag = toOvsAccessTag(vlanTag);
+            String ofportStr = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl get interface %s ofport 2>/dev/null", repName));
+            if (StringUtils.isBlank(ofportStr) || "-1".equals(ofportStr.trim())) {
+                logger.warn("installLocalVmFdbRule: rep {} has no ofport yet; skipping",
+                    repName);
+                return;
+            }
+            int ofport = Integer.parseInt(ofportStr.trim());
+            // Delete any stale rule for this (tag, mac) before adding the fresh one.
+            // NOTE: must NOT use --strict — strict assumes priority=0 for unspecified
+            // fields and won't match the priority=400 rule we want to clear.
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" 2>/dev/null",
+                ovsTag, vmMac));
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl add-flow br-bond \"table=0,priority=400,dl_vlan=%d,dl_dst=%s,actions=output:%d\"",
+                ovsTag, vmMac, ofport));
+            logger.info("installLocalVmFdbRule: pinned mac={} tag={} -> ofport={} ({})",
+                vmMac, ovsTag, ofport, repName);
+        } catch (RuntimeException e) {
+            logger.warn("installLocalVmFdbRule failed: rep={} tag={} mac={} err={}",
+                repName, vlanTag, vmMac, e.getMessage());
+        }
+    }
+
+    /**
+     * Remove the static FDB rule installed by
+     * {@link #installLocalVmFdbRule}. Called on unplug. Safe to call when the
+     * rule never existed.
+     */
+    private void removeLocalVmFdbRule(Integer vlanTag, String vmMac) {
+        if (vmMac == null || vlanTag == null) {
+            return;
+        }
+        try {
+            int ovsTag = toOvsAccessTag(vlanTag);
+            // NOTE: must NOT use --strict here either — strict mode treats
+            // unspecified fields as priority=0 and won't match the priority=400
+            // pin we're trying to clear.
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_vlan=%d,dl_dst=%s\" 2>/dev/null",
+                ovsTag, vmMac));
+            logger.debug("removeLocalVmFdbRule: cleared mac={} tag={}", vmMac, ovsTag);
+        } catch (RuntimeException e) {
+            logger.debug("removeLocalVmFdbRule: cleanup failed mac={} tag={}: {}",
+                vmMac, vlanTag, e.getMessage());
+        }
+    }
+
+    /**
+     * Remove the static FDB pin OF rule by MAC alone — used from unplug when
+     * we no longer have the access tag (the rep is already gone). Non-strict
+     * del-flows wildcards everything except dl_dst so any priority=400 entry
+     * for this VM mac is wiped, regardless of which tier vlan tag it had.
+     */
+    private void removeLocalVmFdbRuleByMac(String vmMac) {
+        if (org.apache.commons.lang3.StringUtils.isBlank(vmMac)) {
+            return;
+        }
+        try {
+            Script.runSimpleBashScript(String.format(
+                "ovs-ofctl del-flows br-bond \"table=0,dl_dst=%s\" 2>/dev/null", vmMac));
+            logger.debug("removeLocalVmFdbRuleByMac: cleared mac={}", vmMac);
+        } catch (RuntimeException e) {
+            logger.debug("removeLocalVmFdbRuleByMac: cleanup failed mac={}: {}",
+                vmMac, e.getMessage());
+        }
+    }
+
 }

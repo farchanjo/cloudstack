@@ -105,6 +105,8 @@ import org.apache.cloudstack.api.command.admin.guest.UpdateGuestOsMappingCmd;
 import org.apache.cloudstack.api.command.admin.host.AddHostCmd;
 import org.apache.cloudstack.api.command.admin.host.AddSecondaryStorageCmd;
 import org.apache.cloudstack.api.command.admin.host.CancelHostAsDegradedCmd;
+import org.apache.cloudstack.api.command.admin.host.ForceReleaseHostVfsCmd;
+import org.apache.cloudstack.api.command.admin.host.RecoverHostVfsCmd;
 import org.apache.cloudstack.api.command.admin.host.CancelHostMaintenanceCmd;
 import org.apache.cloudstack.api.command.admin.host.DeclareHostAsDegradedCmd;
 import org.apache.cloudstack.api.command.admin.host.DeleteHostCmd;
@@ -3044,7 +3046,7 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         final String hypervisor = cmd.getHypervisor();
         final String hypervisorVersion = cmd.getHypervisorVersion();
 
-        //throw exception if hypervisor name is not passed, but version is
+        //throw exception if hypervisor name is not passed, but a version is
         if (hypervisorVersion != null && (hypervisor == null || hypervisor.isEmpty())) {
             throw new InvalidParameterValueException("Hypervisor version parameter cannot be used without specifying a hypervisor : XenServer, KVM or VMware");
         }
@@ -3062,7 +3064,7 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         final SearchCriteria<GuestOSHypervisorVO> sc = sb.create();
 
         if (id != null) {
-            sc.setParameters("id", SearchCriteria.Op.EQ, id);
+            sc.setParameters("id", id);
         }
 
         if (osTypeId != null) {
@@ -3866,6 +3868,8 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         cmdList.add(AddSecondaryStorageCmd.class);
         cmdList.add(CancelHostMaintenanceCmd.class);
         cmdList.add(CancelHostAsDegradedCmd.class);
+        cmdList.add(ForceReleaseHostVfsCmd.class);
+        cmdList.add(RecoverHostVfsCmd.class);
         cmdList.add(DeclareHostAsDegradedCmd.class);
         cmdList.add(DeleteHostCmd.class);
         cmdList.add(ListHostsCmd.class);

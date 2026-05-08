@@ -130,8 +130,13 @@ public class OvsVifDriver extends VifDriverBase {
         } else if (nic.getBroadcastType() == Networks.BroadcastDomainType.Vxlan) {
             // VNI (possibly > 4094). toOvsAccessTag() folds to 12-bit OVS tag.
             vlanId = Networks.BroadcastDomainType.getValue(nic.getBroadcastUri());
-            ensureVxlanMesh(nic, vlanId);
-            registerDvrIntent(nic, vlanId);
+            String bcScheme = nic.getBroadcastUri() != null ? nic.getBroadcastUri().getScheme() : null;
+            if ("vxlan".equalsIgnoreCase(bcScheme)) {
+                ensureVxlanMesh(nic, vlanId);
+                registerDvrIntent(nic, vlanId);
+            } else {
+                logger.info("OvsVifDriver: nic broadcastType=Vxlan but URI scheme='{}' (vlanId={}), skipping VXLAN mesh+DVR (treating as plain VLAN trunked - L2 loop guard)", bcScheme, vlanId);
+            }
         } else {
             vlanId = getVlanIdFromUri(nic);
         }
@@ -426,18 +431,31 @@ public class OvsVifDriver extends VifDriverBase {
 
     @Override
     public void unplug(InterfaceDef iface, boolean deleteBr) {
-        // Libvirt apparently takes care of this, see BridgeVifDriver unplug
+        // DPDK port cleanup (libvirt cannot teardown DPDK-owned ports).
         if (_libvirtComputingResource.dpdkSupport && StringUtils.isNotBlank(iface.getDpdkSourcePort())) {
-            // If DPDK is enabled, we'll need to cleanup the port as libvirt won't
             String dpdkPort = iface.getDpdkSourcePort();
-            String cmd = String.format("ovs-vsctl del-port %s", dpdkPort);
+            String cmd = String.format("ovs-vsctl --if-exists del-port %s", dpdkPort);
             logger.debug("Removing DPDK port: " + dpdkPort);
             Script.runSimpleBashScript(cmd);
         }
+        // OVSDB port reference persists independently of the libvirt tap teardown:
+        // libvirt removes the kernel netdev, but the OVS port (added in attach())
+        // stays in conf.db with ofport=-1 and external_ids intact, becoming a
+        // ghost that can still be referenced by FDB/flooding paths and survives
+        // reboots through OVSDB persistence. Always del-port explicitly.
+        String dev = iface.getDevName();
+        String br = iface.getBrName();
+        if (StringUtils.isNotBlank(dev) && StringUtils.isNotBlank(br)) {
+            try {
+                String cmd = String.format("ovs-vsctl --if-exists del-port %s %s", br, dev);
+                Script.runSimpleBashScript(cmd);
+                logger.info("OvsVifDriver.unplug: del-port br={} dev={}", br, dev);
+            } catch (RuntimeException e) {
+                logger.warn("OvsVifDriver.unplug: del-port {}/{} failed: {}", br, dev, e.getMessage());
+            }
+        }
         // Local tap is going away: rebuild every split-horizon group on this
-        // host so its bucket list drops the now-stale ofport. Tag-level refresh
-        // would require us to know which tag the iface had; full-refresh is
-        // cheap and idempotent for any number of tags.
+        // host so its bucket list drops the now-stale ofport.
         if (_libvirtComputingResource != null && _libvirtComputingResource.vxlanTunnelManager != null) {
             try {
                 _libvirtComputingResource.vxlanTunnelManager.refreshAllLocalFlood();

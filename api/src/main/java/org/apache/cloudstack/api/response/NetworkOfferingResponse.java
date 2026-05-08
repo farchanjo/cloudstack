@@ -104,7 +104,7 @@ public class NetworkOfferingResponse extends BaseResponseWithAnnotations {
     private Boolean hwOffloadEnabled;
 
     @SerializedName("vdpaenabled")
-    @Param(description = "True if VRs from this offering use VF+vDPA on the guest NIC (vhost-vdpa; enables hot-plug and future live-migration).", since = "4.24.1")
+    @Param(description = "True if NICs created on this offering are plumbed via vDPA (vhost-vdpa mgmt device on top of an SR-IOV VF, exposed to the guest as <interface type='vdpa'>). Mutually exclusive with the legacy passthrough path; the agent picks vDPA first when this flag is set.", since = "4.24.1.23")
     private Boolean vdpaEnabled;
 
     @SerializedName(ApiConstants.FOR_NSX)

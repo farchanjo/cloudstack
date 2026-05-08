@@ -312,4 +312,14 @@ public class MockVpcVirtualNetworkApplianceManager extends ManagerBase implement
         // TODO Auto-generated method stub
         return;
     }
+
+    @Override
+    public void dispatchVxlanFdbBindingsForVpc(Long vpcId) {
+    }
+
+
+    @Override
+    public void dispatchVxlanFdbBindingRemoveForVm(long vmId, String vmMac) {
+    }
+
 }

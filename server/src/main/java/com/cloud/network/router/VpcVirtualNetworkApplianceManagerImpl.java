@@ -55,6 +55,7 @@ import com.cloud.exception.OperationTimedoutException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.hypervisor.HypervisorGuru;
+import com.cloud.hypervisor.HypervisorGuruBase;
 import com.cloud.hypervisor.HypervisorGuruManager;
 import com.cloud.network.IpAddress;
 import com.cloud.network.MonitoringService;
@@ -1142,7 +1143,49 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         // Without this VirtualNetworkApplianceManagerImpl.postStateTransitionEvent() gets called twice as part of listeners -
         // once from VpcVirtualNetworkApplianceManagerImpl and once from VirtualNetworkApplianceManagerImpl itself
         releaseHwOffloadVfsOnExpunge(transition, vo);
+        releaseHwOffloadVfsOnBootFail(transition, vo);
         return true;
+    }
+
+    /**
+     * Phase H.1 (audit E4.2): release VFs when a VR fails to boot. The state
+     * machine transitions {@code Starting -> Stopped} via
+     * {@link VirtualMachine.Event#OperationFailed} and through
+     * {@link VirtualMachine.Event#AgentReportStopped} /
+     * {@link VirtualMachine.Event#AgentReportShutdowned}. Pre-allocated VFs
+     * stay {@code ALLOCATED} on the row, leaking pool capacity until orphan
+     * sweep catches up. The cheap defence is to release them as soon as the
+     * boot fails so the next deploy attempt has the same VFs available.
+     *
+     * <p>We do <em>not</em> release on a clean stop ({@code StopRequested})
+     * because the operator may restart the VR and want VF affinity preserved.
+     */
+    private void releaseHwOffloadVfsOnBootFail(final StateMachine2.Transition<State, VirtualMachine.Event> transition,
+                                               final VirtualMachine vo) {
+        if (_vfPoolManager == null || vo == null || vo.getType() != VirtualMachine.Type.DomainRouter) {
+            return;
+        }
+        final State from = transition.getCurrentState();
+        final State to = transition.getToState();
+        if (from != State.Starting || to != State.Stopped) {
+            return;
+        }
+        final VirtualMachine.Event event = transition.getEvent();
+        if (event != VirtualMachine.Event.OperationFailed
+                && event != VirtualMachine.Event.AgentReportStopped
+                && event != VirtualMachine.Event.AgentReportShutdowned) {
+            return;
+        }
+        try {
+            int swept = _vfPoolManager.releaseByVmId(vo.getId());
+            if (swept > 0) {
+                logger.warn("Phase H.1: VR {} boot failed (event={}) — released {} VF(s) (releaseByVmId)",
+                        vo.getInstanceName(), event, swept);
+            }
+        } catch (Exception e) {
+            logger.warn("Phase H.1: failed to release VFs after VR {} boot fail (event={}): {}",
+                    vo.getInstanceName(), event, e.getMessage());
+        }
     }
 
     /**
@@ -1260,10 +1303,16 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
                 return false;
             }
             com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
-            boolean result = offering != null && offering.isHwOffloadEnabled();
-            logger.info("isHwOffloadNetwork: network={} offeringId={} offeringName={} hwOffload={}",
+            // Treat vDPA offerings as HW-offload from the VR pre-alloc gate's
+            // perspective: both need a VF reserved on the destination host
+            // before the VR boots so we can patch the domain XML with either
+            // <interface type='hostdev'> or <interface type='vdpa'>.
+            boolean result = offering != null && (offering.isHwOffloadEnabled() || offering.isVdpaEnabled());
+            logger.info("isHwOffloadNetwork: network={} offeringId={} offeringName={} hwOffload={} vdpa={}",
                     networkId, network.getNetworkOfferingId(),
-                    offering != null ? offering.getName() : "null", result);
+                    offering != null ? offering.getName() : "null",
+                    offering != null && offering.isHwOffloadEnabled(),
+                    offering != null && offering.isVdpaEnabled());
             return result;
         } catch (Exception e) {
             logger.warn("isHwOffloadNetwork: exception for network {}", networkId, e);
@@ -1276,7 +1325,28 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             Network network = _networkDao.findById(networkId);
             if (network == null) return nicTo;
             com.cloud.offerings.NetworkOfferingVO offering = _networkOfferingDao2.findById(network.getNetworkOfferingId());
-            if (offering != null && offering.isHwOffloadEnabled() && _vfPoolManager != null) {
+            if (offering == null || _vfPoolManager == null) {
+                return nicTo;
+            }
+            // vDPA branch wins when both flags are set on a single offering
+            // (defensive: the API rejects that combo, but the DB allows it).
+            if (offering.isVdpaEnabled()) {
+                int maxVqs = HypervisorGuruBase.VmVdpaMaxVqs.value();
+                SriovVfPoolVO vf = _vfPoolManager.allocateForVdpa(hostId, nicId, nicTo.getMac(), maxVqs);
+                if (vf == null) {
+                    logger.warn("VPC PlugNic: no FREE VF for vDPA on host {} (network {}); bridge/TAP fallback",
+                            hostId, networkId);
+                    return nicTo;
+                }
+                nicTo.setVfPciAddress(vf.getPciAddress());
+                nicTo.setVfPfName(vf.getPfName());
+                nicTo.setUseVdpa(Boolean.TRUE);
+                nicTo.setVdpaMaxVqs(maxVqs);
+                logger.info("VPC PlugNic: allocated vDPA VF {} (PCI {}) for NIC on network {} host {}",
+                        vf.getUuid(), vf.getPciAddress(), networkId, hostId);
+                return nicTo;
+            }
+            if (offering.isHwOffloadEnabled()) {
                 SriovVfPoolVO vf = _vfPoolManager.allocate(hostId, nicId);
                 nicTo.setVfPciAddress(vf.getPciAddress());
                 nicTo.setVfPfName(vf.getPfName());

@@ -102,6 +102,8 @@ import com.cloud.agent.api.NetworkUsageCommand;
 import com.cloud.agent.api.StartupCommand;
 import com.cloud.agent.api.check.CheckSshCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand;
+import com.cloud.agent.api.routing.SetDvrGatewayMacCommand;
+import com.cloud.agent.api.routing.SetVxlanFdbBindingCommand;
 import com.cloud.agent.api.routing.AggregationControlCommand.Action;
 import com.cloud.agent.api.routing.GetRouterAlertsCommand;
 import com.cloud.agent.api.routing.GetRouterMonitorResultsAnswer;
@@ -259,6 +261,7 @@ import com.cloud.vm.Nic;
 import com.cloud.vm.NicIpAlias;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.NicVO;
+import com.cloud.vm.VMInstanceVO;
 import com.cloud.vm.ReservationContext;
 import com.cloud.vm.ReservationContextImpl;
 import com.cloud.vm.VirtualMachine;
@@ -326,6 +329,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
     @Inject protected MonitoringServiceDao _monitorServiceDao;
     @Inject AsyncJobManager _asyncMgr;
     @Inject protected VpcDao _vpcDao;
+    @Inject protected com.cloud.vm.dao.VMInstanceDao _vmDao;
     @Inject protected ApiAsyncJobDispatcher _asyncDispatcher;
     @Inject OpRouterMonitorServiceDao _opRouterMonitorServiceDao;
 
@@ -1690,7 +1694,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
                 } else {
                     loadBalancingData.append("maxconn=").append(offering.getConcurrentConnections());
                 }
-
+                loadBalancingData.append(",idletimeout=").append(NetworkOrchestrationService.NETWORK_LB_HAPROXY_IDLE_TIMEOUT.value());
                 loadBalancingData.append(",sourcePortStart=").append(firewallRuleVO.getSourcePortStart())
                         .append(",sourcePortEnd=").append(firewallRuleVO.getSourcePortEnd());
                 if (firewallRuleVO instanceof LoadBalancerVO) {
@@ -2790,7 +2794,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
 
             if (network.getTrafficType() == TrafficType.Guest) {
                 guestNetworks.add(network);
-                if (nic.getBroadcastUri().getScheme().equals("pvlan")) {
+                if (nic.getBroadcastUri() != null && nic.getBroadcastUri().getScheme().equals("pvlan")) {
                     final NicProfile nicProfile = new NicProfile(nic, network, nic.getBroadcastUri(), nic.getIsolationUri(), 0, false, "pvlan-nic");
 
                     final NetworkTopology networkTopology = _networkTopologyContext.retrieveNetworkTopology(dcVO);
@@ -2809,7 +2813,323 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
             }
         }
 
+        refreshDvrGatewayMacOnPeerHosts(router, routerNics);
+        dispatchVxlanFdbBindingsForVpcPeers(router, routerNics);
+
         return result;
+    }
+
+    /**
+     * After a VPC VR starts (possibly with a newly allocated VF and a new
+     * MAC), push the current guest-tier VR MAC to every data node hosting
+     * a VM in the same VPC so their DvrManager refreshes cross-tier
+     * shortcut flows. Silent best-effort: failure never blocks VR start.
+     */
+    private void refreshDvrGatewayMacOnPeerHosts(final DomainRouterVO router,
+                                                 final java.util.List<? extends Nic> routerNics) {
+        try {
+            final Long vpcId = router.getVpcId();
+            if (vpcId == null) {
+                return;
+            }
+            final Vpc vpc = _vpcDao.findById(vpcId);
+            if (vpc == null) {
+                return;
+            }
+            for (final Nic vrNic : routerNics) {
+                final Network network = _networkModel.getNetwork(vrNic.getNetworkId());
+                if (network == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (vrNic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String host = vrNic.getBroadcastUri().getHost();
+                    vni = host != null ? Integer.parseInt(host) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                final String gwMac = vrNic.getMacAddress();
+                if (gwMac == null) {
+                    continue;
+                }
+                final java.util.Set<Long> targetHostIds = new java.util.LinkedHashSet<>();
+                for (final NicVO tenantNic : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tenantNic.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO vm = _vmDao.findById(tenantNic.getInstanceId());
+                    if (vm == null) {
+                        continue;
+                    }
+                    final Long hostId = vm.getHostId() != null ? vm.getHostId() : vm.getLastHostId();
+                    if (hostId == null || hostId.equals(router.getHostId())) {
+                        continue;
+                    }
+                    targetHostIds.add(hostId);
+                }
+                if (targetHostIds.isEmpty()) {
+                    continue;
+                }
+                for (final Long hostId : targetHostIds) {
+                    try {
+                        _agentMgr.easySend(hostId, new SetDvrGatewayMacCommand(vpc.getUuid(), vni, gwMac));
+                    } catch (final RuntimeException ex) {
+                        logger.debug("refreshDvrGatewayMac: host {} vpc {} vni {} gw {} failed: {}",
+                                hostId, vpc.getUuid(), vni, gwMac, ex.getMessage());
+                    }
+                }
+                logger.info("refreshDvrGatewayMac: dispatched vpc={} vni={} gwMac={} to {} host(s)",
+                        vpc.getUuid(), vni, gwMac, targetHostIds.size());
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("refreshDvrGatewayMacOnPeerHosts: unexpected error {}", e.getMessage());
+        }
+    }
+
+
+    /**
+     * After a VPC VR start, walk every user VM in each guest tier of the VPC
+     * and tell every peer host (any data node hosting a user VM in this tier
+     * that is NOT the VM's own host) to install a static FDB OF rule pinning
+     * {@code dl_dst=vmMac} on the VXLAN tunnel to the VM's host's storage IP.
+     *
+     * <p>Symmetric to {@link #refreshDvrGatewayMacOnPeerHosts}: the VR-start
+     * event is the single re-convergence point that re-publishes per-tier
+     * topology to all peers. Subsequent user-VM plugs/unplugs are handled
+     * lazily — peers learn via OVS NORMAL until the next VR restart, then
+     * static rules are re-asserted.
+     *
+     * <p>Silent best-effort: never blocks VR start.
+     */
+    private void dispatchVxlanFdbBindingsForVpcPeers(final DomainRouterVO router,
+                                                     final java.util.List<? extends Nic> routerNics) {
+        try {
+            final Long vpcId = router.getVpcId();
+            if (vpcId == null) {
+                return;
+            }
+            final Vpc vpc = _vpcDao.findById(vpcId);
+            if (vpc == null) {
+                return;
+            }
+            for (final Nic vrNic : routerNics) {
+                final Network network = _networkModel.getNetwork(vrNic.getNetworkId());
+                if (network == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (vrNic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String host = vrNic.getBroadcastUri().getHost();
+                    vni = host != null ? Integer.parseInt(host) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                // Build map: vm mac -> vm host id (only for VMs that have a host placement)
+                final java.util.Map<String, Long> macToHost = new java.util.LinkedHashMap<>();
+                for (final NicVO tenantNic : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tenantNic.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO vm = _vmDao.findById(tenantNic.getInstanceId());
+                    if (vm == null) {
+                        continue;
+                    }
+                    final Long hostId = vm.getHostId() != null ? vm.getHostId() : vm.getLastHostId();
+                    if (hostId == null) {
+                        continue;
+                    }
+                    if (tenantNic.getMacAddress() == null) {
+                        continue;
+                    }
+                    macToHost.put(tenantNic.getMacAddress(), hostId);
+                }
+                if (macToHost.isEmpty()) {
+                    continue;
+                }
+                // For each (mac, hostId) tell every OTHER VM-hosting peer about it
+                // PLUS the VR's own host (so the centralized router learns where
+                // tier VMs live and doesn't fall back on its host's NORMAL FDB,
+                // which gets polluted via cross-tunnel hairpin learning).
+                final java.util.Set<Long> allPeerHosts = new java.util.LinkedHashSet<>(macToHost.values());
+                final Long vrHostId = router.getHostId() != null ? router.getHostId() : router.getLastHostId();
+                if (vrHostId != null) {
+                    allPeerHosts.add(vrHostId);
+                }
+                int dispatched = 0;
+                for (final java.util.Map.Entry<String, Long> entry : macToHost.entrySet()) {
+                    final String vmMac = entry.getKey();
+                    final Long vmHostId = entry.getValue();
+                    final HostVO vmHost = _hostDao.findById(vmHostId);
+                    if (vmHost == null) {
+                        continue;
+                    }
+                    final String remoteStorageIp = vmHost.getStorageIpAddress();
+                    if (remoteStorageIp == null) {
+                        continue;
+                    }
+                    for (final Long targetHostId : allPeerHosts) {
+                        if (targetHostId.equals(vmHostId)) {
+                            continue; // skip VM's own host (local FDB rule already installed by VifPassthroughVifDriver)
+                        }
+                        try {
+                            _agentMgr.easySend(targetHostId,
+                                    new SetVxlanFdbBindingCommand(vpc.getUuid(), vni, vmMac, remoteStorageIp, false));
+                            dispatched++;
+                        } catch (final RuntimeException ex) {
+                            logger.debug("dispatchVxlanFdbBindings: target {} mac {} -> {} failed: {}",
+                                    targetHostId, vmMac, remoteStorageIp, ex.getMessage());
+                        }
+                    }
+                }
+                if (dispatched > 0) {
+                    logger.info("dispatchVxlanFdbBindings: vpc={} vni={} sent {} binding(s) across {} VM(s) on {} peer host(s)",
+                            vpc.getUuid(), vni, dispatched, macToHost.size(), allPeerHosts.size());
+                }
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingsForVpcPeers: unexpected error {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Public entry point for non-VR lifecycle hooks (e.g. UserVmManagerImpl
+     * .finalizeStart) to refresh per-tier FDB pins on every peer host whenever
+     * a tier user VM finishes starting. Without this, Part B only fires on VR
+     * finalizeStart — VMs that plug AFTER the VR is already running don't get
+     * their MAC pinned on peer hosts and rely on OVS NORMAL FDB which gets
+     * polluted via cross-tunnel hairpin learning.
+     *
+     * <p>Resolves the VPC's VR(s) and runs the existing per-router dispatch
+     * logic. Multi-VR (redundant) VPCs trigger one dispatch per VR — both
+     * produce the same set of bindings (same user VM topology), so the agent
+     * just receives duplicates which are idempotent.
+     *
+     * <p>Silent best-effort: any error logged at debug, never blocks caller.
+     */
+    public void dispatchVxlanFdbBindingsForVpc(final Long vpcId) {
+        if (vpcId == null) {
+            return;
+        }
+        try {
+            final java.util.List<DomainRouterVO> routers = _routerDao.listByVpcId(vpcId);
+            if (routers == null || routers.isEmpty()) {
+                return;
+            }
+            for (final DomainRouterVO router : routers) {
+                if (router == null) {
+                    continue;
+                }
+                final java.util.List<? extends Nic> routerNics = _nicDao.listByVmId(router.getId());
+                if (routerNics == null || routerNics.isEmpty()) {
+                    continue;
+                }
+                dispatchVxlanFdbBindingsForVpcPeers(router, routerNics);
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingsForVpc({}): unexpected error {}", vpcId, e.getMessage());
+        }
+    }
+
+    /**
+     * Symmetric counterpart to {@link #dispatchVxlanFdbBindingsForVpc} for the
+     * stop/destroy path: tells every peer host of every VPC tier the VM was on
+     * to delete the priority=400 OF rule pinning the VM's mac. Without this,
+     * stale rules accumulate on peers as VMs get destroyed (local rule on the
+     * VM's own host is already cleared by VifPassthroughVifDriver.unplug).
+     *
+     * <p>Called from UserVmManagerImpl.finalizeStop. Idempotent — sending the
+     * remove command for an already-cleared rule is a no-op on the agent.
+     * Best-effort: never blocks the stop path.
+     */
+    public void dispatchVxlanFdbBindingRemoveForVm(final long vmId, final String vmMac) {
+        if (vmMac == null || vmMac.isEmpty()) {
+            return;
+        }
+        try {
+            for (final NicVO nic : _nicDao.listByVmId(vmId)) {
+                if (nic.getRemoved() != null) {
+                    continue;
+                }
+                final NetworkVO network = _networkDao.findById(nic.getNetworkId());
+                if (network == null || network.getVpcId() == null || network.getTrafficType() != TrafficType.Guest) {
+                    continue;
+                }
+                if (nic.getBroadcastUri() == null) {
+                    continue;
+                }
+                final int vni;
+                try {
+                    final String h = nic.getBroadcastUri().getHost();
+                    vni = h != null ? Integer.parseInt(h) : -1;
+                } catch (final NumberFormatException ignored) {
+                    continue;
+                }
+                if (vni < 0) {
+                    continue;
+                }
+                final Vpc vpc = _vpcDao.findById(network.getVpcId());
+                if (vpc == null) {
+                    continue;
+                }
+                // Build allHosts set: every host that currently has either a user-VM
+                // tier NIC OR a VR for this VPC. Mirrors the add-side dispatch so
+                // the same set of peers receives the remove.
+                final java.util.Set<Long> allHosts = new java.util.LinkedHashSet<>();
+                for (final NicVO tn : _nicDao.listByNetworkIdAndType(network.getId(), VirtualMachine.Type.User)) {
+                    if (tn.getRemoved() != null) {
+                        continue;
+                    }
+                    final VMInstanceVO ovm = _vmDao.findById(tn.getInstanceId());
+                    if (ovm == null) {
+                        continue;
+                    }
+                    final Long h = ovm.getHostId() != null ? ovm.getHostId() : ovm.getLastHostId();
+                    if (h != null) {
+                        allHosts.add(h);
+                    }
+                }
+                // Use listIncludingRemovedByVpcId so we also catch the lastHostId of
+                // routers destroyed during a recent restart-vpc-cleanup cycle. Without
+                // this, a VR-migration leaves an orphan pin on the original VR's host
+                // — that host is no longer in the active set and never receives the
+                // remove command (validated 2026-04-25 with 4.24.1.16 deploy+destroy).
+                for (final DomainRouterVO router : _routerDao.listIncludingRemovedByVpcId(vpc.getId())) {
+                    final Long h = router.getHostId() != null ? router.getHostId() : router.getLastHostId();
+                    if (h != null) {
+                        allHosts.add(h);
+                    }
+                }
+                int dispatched = 0;
+                for (final Long hostId : allHosts) {
+                    try {
+                        _agentMgr.easySend(hostId,
+                                new SetVxlanFdbBindingCommand(vpc.getUuid(), vni, vmMac, "", true));
+                        dispatched++;
+                    } catch (final RuntimeException ex) {
+                        logger.debug("dispatchVxlanFdbBindingRemove: target {} mac {} failed: {}",
+                                hostId, vmMac, ex.getMessage());
+                    }
+                }
+                if (dispatched > 0) {
+                    logger.info("dispatchVxlanFdbBindingRemove: vpc={} vni={} mac={} sent {} remove(s) to {} peer(s)",
+                            vpc.getUuid(), vni, vmMac, dispatched, allHosts.size());
+                }
+            }
+        } catch (final RuntimeException e) {
+            logger.debug("dispatchVxlanFdbBindingRemoveForVm({}): unexpected error {}", vmId, e.getMessage());
+        }
     }
 
     @Override
@@ -2820,6 +3140,25 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
             processStopOrRebootAnswer(domR, answer);
             if (Boolean.TRUE.equals(RemoveControlIpOnStop.valueIn(profile.getVirtualMachine().getDataCenterId()))) {
                 removeNics(vm, domR);
+            }
+            // Symmetric remove for the VR's own macs (eth1 public hostdev,
+            // eth2 guest tier hostdev). Without this, when the VR is stopped
+            // or destroyed, peer hosts and the VR's own host keep stale
+            // priority=400 OF rules pinning the VR macs (Part A install on
+            // plug had no symmetric remove on full-VM stop — only hot-unplug
+            // calls removeLocalVmFdbRuleByMac via VifPassthroughVifDriver).
+            try {
+                if (vm != null && vm.getType() == VirtualMachine.Type.DomainRouter) {
+                    for (final NicVO nic : _nicDao.listByVmId(vm.getId())) {
+                        final NetworkVO net = _networkDao.findById(nic.getNetworkId());
+                        if (net != null && net.getVpcId() != null && nic.getMacAddress() != null) {
+                            dispatchVxlanFdbBindingRemoveForVm(vm.getId(), nic.getMacAddress());
+                        }
+                    }
+                }
+            } catch (final RuntimeException e) {
+                logger.debug("VR finalizeStop: dispatchVxlanFdbBindingRemove skipped for vm {}: {}",
+                        vm == null ? "?" : vm.getUuid(), e.getMessage());
             }
         }
     }
@@ -3360,6 +3699,7 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
     public ConfigKey<?>[] getConfigKeys() {
         return new ConfigKey<?>[] {
                 RouterTemplateKvm,
+                RouterTemplateKvmHwOffload,
                 RouterTemplateVmware,
                 RouterTemplateHyperV,
                 RouterTemplateLxc,

@@ -349,6 +349,15 @@ public class AgentProperties{
      */
     public static final Property<String> OPENVSWITCH_DPDK_OVS_PATH = new Property<>("openvswitch.dpdk.ovs.path", null, String.class);
 
+    /**
+     * Selects the HW-offload backend used by {@link com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler}.<br>
+     * Possible values: <code>tc</code> (kernel TC flower on switchdev VF reps; default, validated 4.24.1.x release train),
+     * <code>of</code> (ovs-ofctl on OVS-DPDK userspace bridges, requires {@code openvswitch.dpdk.enabled=true}).<br>
+     * Data type: String.<br>
+     * Default value: <code>tc</code>
+     */
+    public static final Property<String> HWOFFLOAD_PROGRAMMER = new Property<>("hwoffload.programmer", "tc");
+
     public static final Property<String> HEALTH_CHECK_SCRIPT_PATH =
             new Property<>("agent.health.check.script.path", null, String.class);
 
@@ -807,6 +816,30 @@ public class AgentProperties{
      * Default value: <code>null</code>
      */
     public static final Property<String> CONVERT_ENV_VIRTV2V_TMPDIR = new Property<>("convert.instance.env.virtv2v.tmpdir", null, String.class);
+
+    /**
+     * Path to the VDDK library directory on the KVM conversion host, used when converting VMs from VMware to KVM via VDDK.
+     * This directory is passed to virt-v2v as <code>-io vddk-libdir=&lt;path&gt;</code>.
+     * Data type: String.<br>
+     * Default value: <code>null</code>
+     */
+    public static final Property<String> VDDK_LIB_DIR = new Property<>("vddk.lib.dir", null, String.class);
+
+    /**
+     * Ordered list of VDDK transports for virt-v2v, passed as <code>-io vddk-transports=&lt;value&gt;</code>.
+     * Example: <code>nbd:nbdssl</code>.
+     * Data type: String.<br>
+     * Default value: <code>null</code>
+     */
+    public static final Property<String> VDDK_TRANSPORTS = new Property<>("vddk.transports", null, String.class);
+
+    /**
+     * vCenter TLS certificate thumbprint used by virt-v2v VDDK mode, passed as <code>-io vddk-thumbprint=&lt;value&gt;</code>.
+     * If unset, the KVM host computes it at runtime from the vCenter endpoint.
+     * Data type: String.<br>
+     * Default value: <code>null</code>
+     */
+    public static final Property<String> VDDK_THUMBPRINT = new Property<>("vddk.thumbprint", null, String.class);
 
     /**
      * BGP controll CIDR

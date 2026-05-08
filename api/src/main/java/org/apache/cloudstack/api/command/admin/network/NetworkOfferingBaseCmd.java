@@ -136,8 +136,11 @@ public abstract class NetworkOfferingBaseCmd extends BaseCmd {
 
     @Parameter(name = "vdpaenabled",
             type = CommandType.BOOLEAN,
-            description = "True if VRs created from this offering should use VF+vDPA on the guest NIC (vhost-vdpa; enables hot-plug and future live-migration). Requires hwoffloadenabled=true. Default: false.",
-            since = "4.24.1")
+            description = "True if NICs created on this offering should be plumbed via vDPA "
+                    + "(vhost-vdpa mgmt device on top of an SR-IOV VF, exposed to the guest as "
+                    + "<interface type='vdpa'>). Mutually exclusive with hwoffloadenabled passthrough; "
+                    + "the agent picks vDPA first when this flag is set. Default: false.",
+            since = "4.24.1.23")
     private Boolean vdpaEnabled;
 
     @Deprecated

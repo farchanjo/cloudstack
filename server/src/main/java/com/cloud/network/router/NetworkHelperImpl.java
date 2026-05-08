@@ -29,6 +29,7 @@ import javax.annotation.PostConstruct;
 import javax.inject.Inject;
 
 import com.cloud.network.vpc.VpcManager;
+import com.cloud.network.vpc.Vpc;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.validation.ChecksumUtil;
 import org.apache.cloudstack.api.ApiConstants;
@@ -79,6 +80,7 @@ import com.cloud.network.Networks.IsolationType;
 import com.cloud.network.addr.PublicIp;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.network.dao.NetworkDetailVO;
 import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.network.dao.RouterHealthCheckResultDao;
@@ -127,6 +129,8 @@ public class NetworkHelperImpl implements NetworkHelper {
     protected NicDao _nicDao;
     @Inject
     protected NetworkDao _networkDao;
+    @Inject
+    protected NetworkOfferingDao _networkOfferingDao;
     @Inject
     protected DomainRouterDao _routerDao;
     @Inject
@@ -489,11 +493,36 @@ public class NetworkHelperImpl implements NetworkHelper {
     }
 
     protected String retrieveTemplateName(final HypervisorType hType, final long datacenterId) {
+        return retrieveTemplateName(hType, datacenterId, null);
+    }
+
+    /**
+     * Picks {@link VirtualNetworkApplianceManager#RouterTemplateKvmHwOffload} when the
+     * VR being deployed belongs to a VPC that has at least one network offering with
+     * {@code isHwOffloadEnabled()=true}. Falls back to the per-hypervisor default when
+     * the hw-offload ConfigKey is unset or the deployment is not hw-offload.
+     */
+    protected String retrieveTemplateName(final HypervisorType hType, final long datacenterId,
+            final RouterDeploymentDefinition routerDeploymentDefinition) {
         String templateName = null;
 
         if (hType == HypervisorType.BareMetal) {
             final ConfigKey<String> hypervisorConfigKey = hypervisorsMap.get(HypervisorType.VMware);
             templateName = hypervisorConfigKey.valueIn(datacenterId);
+        } else if (hType == HypervisorType.KVM && isHwOffloadDeployment(routerDeploymentDefinition)) {
+            final String hwOffload = VirtualNetworkApplianceManager.RouterTemplateKvmHwOffload.valueIn(datacenterId);
+            if (hwOffload != null && !hwOffload.isEmpty()) {
+                templateName = hwOffload;
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Selected HW-offload router template \"{}\" for KVM VR deployment in zone={}",
+                            hwOffload, datacenterId);
+                }
+            } else {
+                final ConfigKey<String> hypervisorConfigKey = hypervisorsMap.get(hType);
+                if (hypervisorConfigKey != null) {
+                    templateName = hypervisorConfigKey.valueIn(datacenterId);
+                }
+            }
         } else {
             // Returning NULL is fine because the simulator will need it when
             // being used instead of a real hypervisor.
@@ -506,6 +535,27 @@ public class NetworkHelperImpl implements NetworkHelper {
         }
 
         return templateName;
+    }
+
+    private boolean isHwOffloadDeployment(final RouterDeploymentDefinition routerDeploymentDefinition) {
+        if (routerDeploymentDefinition == null) {
+            return false;
+        }
+        final Vpc vpc = routerDeploymentDefinition.getVpc();
+        if (vpc == null) {
+            return false;
+        }
+        try {
+            for (final Network net : _networkDao.listByVpc(vpc.getId())) {
+                final NetworkOffering off = _networkOfferingDao.findById(net.getNetworkOfferingId());
+                if (off != null && off.isHwOffloadEnabled()) {
+                    return true;
+                }
+            }
+        } catch (RuntimeException e) {
+            logger.debug("isHwOffloadDeployment lookup failed, defaulting to non-hwoffload template", e);
+        }
+        return false;
     }
 
     protected DomainRouterVO createOrUpdateDomainRouter(DomainRouterVO router, final long id,
@@ -591,7 +641,7 @@ public class NetworkHelperImpl implements NetworkHelper {
                             .getDataCenter(), hType));
                 }
                 final long zoneId = routerDeploymentDefinition.getDest().getDataCenter().getId();
-                final String templateName = retrieveTemplateName(hType, zoneId);
+                final String templateName = retrieveTemplateName(hType, zoneId, routerDeploymentDefinition);
                 final String preferredArch = ResourceManager.SystemVmPreferredArchitecture.valueIn(zoneId);
                 final List<VMTemplateVO> templates = _templateDao.findRoutingTemplates(hType, templateName,
                         preferredArch);

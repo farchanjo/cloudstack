@@ -295,6 +295,9 @@ public class NetUtils {
             return addrs;
         }
 
+        if (nic == null) {
+            return addrs;
+        }
         for (InterfaceAddress address : nic.getInterfaceAddresses()) {
             addrs.add(address.getAddress().getHostAddress().split("%")[0]);
         }
@@ -306,7 +309,7 @@ public class NetUtils {
             final String defDev = Script.runSimpleBashScript("/sbin/route -n get default 2> /dev/null | grep interface | awk '{print $2}'");
             return defDev;
         }
-        return Script.runSimpleBashScript("ip route show default 0.0.0.0/0 | head -1 | awk '{print $5}'");
+        return Script.runSimpleBashScript("ip route show default 0.0.0.0/0 | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") {print $(i+1); exit}}'");
     }
 
     public static String getLocalIPString() {
@@ -1265,7 +1268,7 @@ public class NetUtils {
             if (group == null && policyType.toLowerCase().matches("ike")) {
                 return false; // StrongSwan requires a DH group for the IKE policy
             }
-            if (group != null && !group.matches("modp1024|modp1536|modp2048|modp3072|modp4096|modp6144|modp8192")) {
+            if (group != null && !group.matches("modp1024|modp1536|modp2048|modp3072|modp4096|modp6144|modp8192|modp1024s160|modp2048s224|modp2048s256|curve25519")) {
                 return false;
             }
         }
