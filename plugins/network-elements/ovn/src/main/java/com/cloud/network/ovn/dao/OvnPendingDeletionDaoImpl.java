@@ -118,4 +118,15 @@ public class OvnPendingDeletionDaoImpl extends GenericDaoBase<OvnPendingDeletion
         sc.setParameters("kind", kind);
         return findOneBy(sc) != null;
     }
+
+    @Override
+    public void markSucceededByOvnUuid(final String ovnUuid, final String kind) {
+        final SearchCriteria<OvnPendingDeletionVO> sc = byOvnUuidKindSearch.create();
+        sc.setParameters("ovnUuid", ovnUuid);
+        sc.setParameters("kind", kind);
+        final OvnPendingDeletionVO vo = findOneBy(sc);
+        if (vo != null) {
+            markSucceeded(vo.getId());
+        }
+    }
 }

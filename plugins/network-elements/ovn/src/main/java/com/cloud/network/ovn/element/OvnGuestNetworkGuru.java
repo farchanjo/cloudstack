@@ -18,6 +18,7 @@ package com.cloud.network.ovn.element;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.inject.Inject;
 
@@ -38,6 +39,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
@@ -67,6 +70,8 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
     protected OvnPluginManager pluginManager;
     @Inject
     protected OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    protected OvnPendingDeletionDao pendingDeletionDao;
 
     public OvnGuestNetworkGuru() {
         // OVN encap is always Geneve regardless of CloudStack isolation label.
@@ -166,6 +171,11 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
 
     /**
      * Removes the OVN logical switch backing the given CloudStack network.
+     *
+     * <p>Enqueues the LS UUID into {@code ovn_pending_deletion} BEFORE the
+     * synchronous NB call so the async retry queue holds the UUID even when
+     * the sync delete fails. If the sync delete succeeds, the row is marked
+     * succeeded so the processor does not retry a no-op.
      */
     public void deleteLogicalSwitchFor(final Network network) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
@@ -176,12 +186,33 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NETWORK,
+                mapping.getOvnUuid(), network.getId());
         try {
             pluginManager.nbClient(network.getDataCenterId()).deleteLogicalSwitch(mapping.getOvnUuid());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.NETWORK.name());
+            LOGGER.info("OVN LS {} removed for network id={}", mapping.getOvnUuid(), network.getId());
+        } catch (OvnException e) {
+            // Mapping survives so reconciler + processor can retry.
+            LOGGER.warn("OvnGuestNetworkGuru.deleteLogicalSwitchFor: LS {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            throw e;
         }
-        LOGGER.info("OVN LS {} removed for network id={}", mapping.getOvnUuid(), network.getId());
+    }
+
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final Kind kind,
+                                  final String ovnUuid, final Long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, kind.name())) {
+            return;
+        }
+        pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, kind, ovnUuid, csId));
+        LOGGER.info("OvnGuestNetworkGuru: enqueued pending deletion kind={} ovn_uuid={} cs_id={}", kind, ovnUuid, csId);
     }
 
     private String buildLsName(final Network network) {

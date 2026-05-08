@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.inject.Inject;
 
@@ -46,6 +47,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 
 /**
@@ -85,6 +88,8 @@ public class OvnPublicNetworkManager {
     private VpcDetailsDao vpcDetailsDao;
     @Inject
     private VlanDao vlanDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Ensure the per-zone public LS + localnet LSP exist. Idempotent. Returns
@@ -478,7 +483,13 @@ public class OvnPublicNetworkManager {
         return bound.lrpUuid;
     }
 
-    /** Drops the public LRP + default route for a VPC (called from VPC delete). */
+    /**
+     * Drops the public LRP + default route for a VPC (called from VPC delete).
+     *
+     * <p>Enqueues both OVN rows into {@code ovn_pending_deletion} BEFORE the
+     * synchronous NB calls so the async retry queue holds the UUIDs even when
+     * the sync delete fails.
+     */
     public void unbindVpcFromPublic(final long zoneId, final long vpcId, final String lrUuid) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
@@ -492,25 +503,42 @@ public class OvnPublicNetworkManager {
         // Drop default static route first (uses its own mapping row).
         final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
         if (routeMapping != null) {
+            // Enqueue first so async retry covers any sync failure mode.
+            enqueueIfAbsent(controller.getId(), zoneId, Kind.STATIC_ROUTE, routeMapping.getOvnUuid(), vpcId);
             try {
                 nb.deleteLogicalRouterStaticRoute(lrUuid, routeMapping.getOvnUuid());
-            } catch (OvnException e) {
-                LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed: {}",
-                        routeMapping.getOvnUuid(), e.getMessage());
-            } finally {
                 logicalIdMapDao.remove(routeMapping.getId());
+                pendingDeletionDao.markSucceededByOvnUuid(routeMapping.getOvnUuid(), Kind.STATIC_ROUTE.name());
+            } catch (OvnException e) {
+                LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed; mapping retained for retry: {}",
+                        routeMapping.getOvnUuid(), e.getMessage());
             }
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), zoneId, Kind.VPC_PUBLIC_LRP, mapping.getOvnUuid(), vpcId);
         try {
             nb.deleteLogicalRouterPort(mapping.getOvnUuid());
+            logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.VPC_PUBLIC_LRP.name());
             LOGGER.info("OvnPublicNetworkManager: unbound VPC {} from public LS (lrp={})",
                     vpcId, mapping.getOvnUuid());
         } catch (OvnException e) {
-            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: VPC {} unbind failed: {}",
+            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: VPC {} public LRP delete failed; mapping retained for retry: {}",
                     vpcId, e.getMessage());
-        } finally {
-            logicalIdMapDao.remove(mapping.getId());
         }
+    }
+
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final Kind kind,
+                                  final String ovnUuid, final long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, kind.name())) {
+            return;
+        }
+        pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, kind, ovnUuid, csId));
+        LOGGER.info("OvnPublicNetworkManager: enqueued pending deletion kind={} ovn_uuid={} cs_id={}", kind, ovnUuid, csId);
     }
 
     /**

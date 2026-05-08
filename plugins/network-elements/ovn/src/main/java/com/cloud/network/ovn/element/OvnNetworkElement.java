@@ -404,12 +404,18 @@ public class OvnNetworkElement extends AdapterBase
         if (mapping == null) {
             return true;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NIC,
+                mapping.getOvnUuid(), nic.getId());
         try {
             pluginManager.nbClient(network.getDataCenterId()).deleteLogicalSwitchPort(mapping.getOvnUuid());
-        } catch (OvnException e) {
-            LOGGER.warn("OvnNetworkElement.release: LSP {} delete failed: {}", mapping.getOvnUuid(), e.getMessage());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            if (pendingDeletionDao.isPendingByOvnUuid(mapping.getOvnUuid(), Kind.NIC.name())) {
+                pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.NIC.name());
+            }
+        } catch (OvnException e) {
+            LOGGER.warn("OvnNetworkElement.release: LSP {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
         }
         return true;
     }
@@ -435,13 +441,15 @@ public class OvnNetworkElement extends AdapterBase
             return true;
         }
         LOGGER.info("OvnNetworkElement.shutdown: rolling back LS {} for network id={}", lsMapping.getOvnUuid(), network.getId());
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NETWORK,
+                lsMapping.getOvnUuid(), network.getId());
         try {
             guru.deleteLogicalSwitchFor(network);
+            // guru already marks succeeded inside deleteLogicalSwitchFor.
         } catch (OvnException e) {
-            LOGGER.warn("OvnNetworkElement.shutdown: LS {} delete failed; queuing for retry: {}",
+            LOGGER.warn("OvnNetworkElement.shutdown: LS {} delete failed; queued for retry: {}",
                     lsMapping.getOvnUuid(), e.getMessage());
-            enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NETWORK,
-                    lsMapping.getOvnUuid(), network.getId());
         }
         return true;
     }
@@ -551,15 +559,18 @@ public class OvnNetworkElement extends AdapterBase
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.PUBLIC_LRP,
+                mapping.getOvnUuid(), network.getId());
         try {
             pluginManager.nbClient(network.getDataCenterId()).deleteLogicalRouterPort(mapping.getOvnUuid());
+            logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.PUBLIC_LRP.name());
             LOGGER.info("OvnNetworkElement.detachTier: LRP {} dropped (tier id={})",
                     mapping.getOvnUuid(), network.getId());
         } catch (OvnException e) {
-            LOGGER.warn("OvnNetworkElement.detachTier: LRP {} delete failed: {}",
+            LOGGER.warn("OvnNetworkElement.detachTier: LRP {} delete failed; mapping retained for retry: {}",
                     mapping.getOvnUuid(), e.getMessage());
-        } finally {
-            logicalIdMapDao.remove(mapping.getId());
         }
     }
 

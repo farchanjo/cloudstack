@@ -72,4 +72,11 @@ public interface OvnPendingDeletionDao extends GenericDao<OvnPendingDeletionVO, 
      * (i.e. exists with {@code removed IS NULL}). Prevents duplicate enqueue.
      */
     boolean isPendingByOvnUuid(String ovnUuid, String kind);
+
+    /**
+     * Soft-delete the pending row matched by OVN UUID + kind. Called after a
+     * synchronous NB delete succeeds so the processor does not retry a no-op.
+     * No-op when no pending row exists for the given UUID+kind.
+     */
+    void markSucceededByOvnUuid(String ovnUuid, String kind);
 }

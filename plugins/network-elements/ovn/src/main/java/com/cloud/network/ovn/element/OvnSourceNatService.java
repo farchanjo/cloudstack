@@ -16,6 +16,8 @@
 // under the License.
 package com.cloud.network.ovn.element;
 
+import java.util.UUID;
+
 import javax.inject.Inject;
 
 import org.apache.logging.log4j.LogManager;
@@ -27,6 +29,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 
 /**
@@ -50,6 +54,8 @@ public class OvnSourceNatService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Adds an SNAT rule for the given tier CIDR.
@@ -73,7 +79,13 @@ public class OvnSourceNatService {
         return natUuid;
     }
 
-    /** Removes the SNAT rule recorded for the given tier. */
+    /**
+     * Removes the SNAT rule recorded for the given tier.
+     *
+     * <p>Enqueues the NAT UUID into {@code ovn_pending_deletion} BEFORE the
+     * synchronous NB call so the async retry queue holds the UUID even when
+     * the sync delete fails.
+     */
     public void removeSnatForTier(final long zoneId, final long sourceTierId) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
@@ -83,10 +95,17 @@ public class OvnSourceNatService {
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), zoneId, Kind.SOURCE_NAT, mapping.getOvnUuid(), sourceTierId);
         try {
             pluginManager.nbClient(zoneId).deleteNatRule(mapping.getOvnUuid());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.SOURCE_NAT.name());
+        } catch (RuntimeException e) {
+            // Mapping survives so reconciler + processor can retry.
+            LOGGER.warn("OvnSourceNatService.removeSnatForTier: NAT {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            throw e;
         }
     }
 
@@ -136,9 +155,15 @@ public class OvnSourceNatService {
         return natUuid;
     }
 
-    /** Removes the VPC-level SNAT row when the VPC is shut down or its
-     *  source-NAT IP is released. Best-effort — caller already drops the
-     *  containing LR via cascade in most flows. */
+    /**
+     * Removes the VPC-level SNAT row when the VPC is shut down or its
+     * source-NAT IP is released. Best-effort — caller already drops the
+     * containing LR via cascade in most flows.
+     *
+     * <p>Enqueues the NAT UUID into {@code ovn_pending_deletion} BEFORE the
+     * synchronous NB call so the async retry queue holds the UUID even when
+     * the sync delete fails.
+     */
     public void removeVpcSourceNat(final long zoneId, final long vpcId) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
@@ -148,13 +173,28 @@ public class OvnSourceNatService {
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), zoneId, Kind.VPC_SOURCE_NAT, mapping.getOvnUuid(), vpcId);
         try {
             pluginManager.nbClient(zoneId).deleteNatRule(mapping.getOvnUuid());
-        } catch (RuntimeException e) {
-            LOGGER.warn("OvnSourceNatService.removeVpcSourceNat: NAT {} delete failed: {}",
-                    mapping.getOvnUuid(), e.getMessage());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.VPC_SOURCE_NAT.name());
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnSourceNatService.removeVpcSourceNat: NAT {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
         }
+    }
+
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final Kind kind,
+                                  final String ovnUuid, final long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, kind.name())) {
+            return;
+        }
+        pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, kind, ovnUuid, csId));
+        LOGGER.info("OvnSourceNatService: enqueued pending deletion kind={} ovn_uuid={} cs_id={}", kind, ovnUuid, csId);
     }
 }

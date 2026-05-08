@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
@@ -55,6 +56,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
@@ -119,6 +122,8 @@ public class OvnLoadBalancerService extends AdapterBase {
     private IPAddressDao ipAddressDao;
     @Inject
     private OvnBgpRedistributeManager bgpRedistributeManager;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
@@ -261,6 +266,14 @@ public class OvnLoadBalancerService extends AdapterBase {
                     rule.getId());
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        if (!pendingDeletionDao.isPendingByOvnUuid(mapping.getOvnUuid(), Kind.LOAD_BALANCER.name())) {
+            pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                    UUID.randomUUID().toString(), controller.getId(), network.getDataCenterId(),
+                    Kind.LOAD_BALANCER, mapping.getOvnUuid(), rule.getId()));
+            LOGGER.info("OvnLoadBalancerService: enqueued pending deletion kind=LOAD_BALANCER ovn_uuid={} cs_id={}",
+                    mapping.getOvnUuid(), rule.getId());
+        }
         try {
             nb.detachLoadBalancerFromLogicalRouter(lrUuid, mapping.getOvnUuid());
         } catch (final OvnException oe) {
@@ -269,8 +282,13 @@ public class OvnLoadBalancerService extends AdapterBase {
         }
         try {
             nb.deleteLoadBalancer(mapping.getOvnUuid());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.LOAD_BALANCER.name());
+        } catch (final OvnException oe) {
+            // Mapping survives so reconciler + processor can retry.
+            LOGGER.warn("OvnLoadBalancerService: LB {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), oe.getMessage());
+            throw oe;
         }
         LOGGER.info("OvnLoadBalancerService: LB {} revoked (rule id={})", mapping.getOvnUuid(), rule.getId());
         // Best-effort withdraw — if another LB or NAT rule shares the public

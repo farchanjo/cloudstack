@@ -114,6 +114,12 @@ public class OvnVpcElement {
      * ({@code controller_id = 0}) so the background processor retries as
      * soon as a controller becomes available.
      *
+     * <p>When a controller IS registered, the real OVN UUID is enqueued BEFORE
+     * the synchronous NB delete so the async retry queue always holds the UUID
+     * even when the sync delete fails or when the mapping row is wiped by a
+     * concurrent cleanup path. The processor's idempotent retry absorbs the
+     * success case (row already gone) gracefully.
+     *
      * <p>Mapping row for the VPC LR is removed ONLY after a successful NB
      * delete. If the NB delete throws, the mapping survives so the reconciler
      * can detect the stale pair on its next pass and the processor can retry
@@ -134,6 +140,8 @@ public class OvnVpcElement {
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), vpc.getZoneId(), Kind.VPC, mapping.getOvnUuid(), vpc.getId());
         detachLbsFromLr(mapping.getOvnUuid(), controller);
         deleteLrAndCleanup(vpc, mapping, controller);
     }
@@ -181,6 +189,8 @@ public class OvnVpcElement {
             // Only remove the mapping row after a confirmed successful NB delete
             // so the reconciler retains the stale-mapping evidence on failure.
             logicalIdMapDao.remove(mapping.getId());
+            // Mark pending-deletion row as succeeded so the processor does not retry a no-op.
+            markPendingSucceeded(mapping.getOvnUuid(), Kind.VPC);
             // Best-effort sweep child mapping rows; OVN cascade already dropped NB rows.
             sweepChildMappings(vpc.getId(), controller.getId(),
                     Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP, Kind.STATIC_ROUTE,
@@ -193,6 +203,36 @@ public class OvnVpcElement {
                     mapping.getOvnUuid(), e.getMessage());
             throw e;
         }
+    }
+
+    /**
+     * Enqueue a pending deletion if no live row for the same UUID+kind exists.
+     * Idempotency guard prevents double-enqueue on concurrent calls.
+     */
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final Kind kind,
+                                  final String ovnUuid, final Long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, kind.name())) {
+            return;
+        }
+        final OvnPendingDeletionVO entry = new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, kind, ovnUuid, csId);
+        pendingDeletionDao.persist(entry);
+        LOGGER.info("OvnVpcElement: enqueued pending deletion kind={} ovn_uuid={} cs_id={}", kind, ovnUuid, csId);
+    }
+
+    /**
+     * Marks the pending-deletion row for the given OVN UUID + kind as succeeded
+     * when the synchronous NB delete completed so the processor does not retry a no-op.
+     * Best-effort — if no row exists the call is a no-op.
+     */
+    private void markPendingSucceeded(final String ovnUuid, final Kind kind) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        pendingDeletionDao.markSucceededByOvnUuid(ovnUuid, kind.name());
     }
 
     /**

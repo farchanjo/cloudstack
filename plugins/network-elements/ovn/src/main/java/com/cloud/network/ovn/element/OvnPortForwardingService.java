@@ -19,6 +19,7 @@ package com.cloud.network.ovn.element;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.inject.Inject;
 
@@ -36,6 +37,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.PortForwardingRule;
@@ -84,6 +87,8 @@ public class OvnPortForwardingService {
     private NicDao nicDao;
     @Inject
     private com.cloud.network.ovn.manager.OvnBgpRedistributeManager bgpRedistributeManager;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Apply every supplied PF rule. Idempotent: an existing mapping for the
@@ -123,7 +128,7 @@ public class OvnPortForwardingService {
                           final Network network, final PortForwardingRule rule) {
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.PORT_FORWARDING, rule.getId(), controller.getId());
         if (rule.getState() == FirewallRule.State.Revoke) {
-            revokeOne(nb, lrUuid, existing, network, rule);
+            revokeOne(nb, controller, lrUuid, existing, network, rule);
             return;
         }
         if (rule.getState() != FirewallRule.State.Add && rule.getState() != FirewallRule.State.Active) {
@@ -206,10 +211,18 @@ public class OvnPortForwardingService {
         }
     }
 
-    private void revokeOne(final OvnNbClient nb, final String lrUuid, final OvnLogicalIdMapVO mapping,
-                           final Network network, final PortForwardingRule rule) {
+    private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
+                           final OvnLogicalIdMapVO mapping, final Network network, final PortForwardingRule rule) {
         if (mapping == null) {
             return;
+        }
+        // Enqueue first so async retry covers any sync failure mode.
+        if (!pendingDeletionDao.isPendingByOvnUuid(mapping.getOvnUuid(), Kind.PORT_FORWARDING.name())) {
+            pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                    UUID.randomUUID().toString(), controller.getId(), network.getDataCenterId(),
+                    Kind.PORT_FORWARDING, mapping.getOvnUuid(), rule.getId()));
+            LOGGER.info("OvnPortForwardingService: enqueued pending deletion kind=PORT_FORWARDING ovn_uuid={} cs_id={}",
+                    mapping.getOvnUuid(), rule.getId());
         }
         try {
             // Probe both tables — the row may still live in Load_Balancer
@@ -226,10 +239,11 @@ public class OvnPortForwardingService {
             } else {
                 LOGGER.debug("OvnPortForwardingService: revoke {} no-op (row already gone)", mapping.getOvnUuid());
             }
-        } catch (OvnException e) {
-            LOGGER.warn("OvnPortForwardingService: revoke {} failed: {}", mapping.getOvnUuid(), e.getMessage());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.PORT_FORWARDING.name());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPortForwardingService: revoke {} failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
         }
         // Withdraw /32 only when no other PF rule still claims this public
         // IP. The IP itself may also back a static-NAT or VPC source-NAT

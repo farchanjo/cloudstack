@@ -16,6 +16,8 @@
 // under the License.
 package com.cloud.network.ovn.element;
 
+import java.util.UUID;
+
 import javax.inject.Inject;
 
 import org.apache.logging.log4j.LogManager;
@@ -27,6 +29,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 
 /**
@@ -49,6 +53,8 @@ public class OvnStaticNatService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Adds a 1:1 NAT rule mapping {@code externalIp} to {@code logicalIp}.
@@ -74,7 +80,13 @@ public class OvnStaticNatService {
         return natUuid;
     }
 
-    /** Removes the floating-IP rule recorded for the given IP-address id. */
+    /**
+     * Removes the floating-IP rule recorded for the given IP-address id.
+     *
+     * <p>Enqueues the NAT UUID into {@code ovn_pending_deletion} BEFORE the
+     * synchronous NB call so the async retry queue holds the UUID even when
+     * the sync delete fails.
+     */
     public void removeStaticNat(final long zoneId, final long ipAddrId) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
@@ -84,10 +96,23 @@ public class OvnStaticNatService {
         if (mapping == null) {
             return;
         }
+        // Enqueue first so async retry covers any sync failure mode.
+        if (!pendingDeletionDao.isPendingByOvnUuid(mapping.getOvnUuid(), Kind.STATIC_NAT.name())) {
+            pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                    UUID.randomUUID().toString(), controller.getId(), zoneId,
+                    Kind.STATIC_NAT, mapping.getOvnUuid(), ipAddrId));
+            LOGGER.info("OvnStaticNatService: enqueued pending deletion kind=STATIC_NAT ovn_uuid={} cs_id={}",
+                    mapping.getOvnUuid(), ipAddrId);
+        }
         try {
             pluginManager.nbClient(zoneId).deleteNatRule(mapping.getOvnUuid());
-        } finally {
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.STATIC_NAT.name());
+        } catch (RuntimeException e) {
+            // Mapping survives so reconciler + processor can retry.
+            LOGGER.warn("OvnStaticNatService.removeStaticNat: NAT {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            throw e;
         }
     }
 }

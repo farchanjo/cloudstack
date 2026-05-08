@@ -1493,6 +1493,22 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Delete a {@code Logical_Router_Static_Route} row directly by UUID without
+     * requiring the parent LR UUID. Used by the pending-deletion processor
+     * when it only has the route UUID (the parent LR may already be gone or
+     * unknown). OVSDB will GC any dangling {@code Logical_Router.static_routes}
+     * reference on the next northd sync.
+     */
+    public void deleteLogicalRouterStaticRouteDirect(final String routeUuid) {
+        if (routeUuid == null || routeUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("Logical_Router_Static_Route", OvnOpFactory.whereUuid(routeUuid)));
+        tx.commit();
+    }
+
     // ------------------------------------------------------------------
     // HA chassis group operations.
     // ------------------------------------------------------------------
