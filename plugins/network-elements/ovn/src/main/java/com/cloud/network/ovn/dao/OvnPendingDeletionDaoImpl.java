@@ -40,26 +40,37 @@ public class OvnPendingDeletionDaoImpl extends GenericDaoBase<OvnPendingDeletion
     private final SearchBuilder<OvnPendingDeletionVO> byOvnUuidKindSearch;
 
     public OvnPendingDeletionDaoImpl() {
+        // Do NOT add explicit "removed IS NULL" predicates in any SearchBuilder.
+        // GenericDaoBase.search() / findOneBy() already append "AND removed IS NULL"
+        // automatically via checkAndSetRemovedIsNull() for every call that goes through
+        // the non-includingRemoved path (i.e., the standard search() / findOneBy()).
+        // Registering it explicitly in the SearchBuilder causes a duplicate predicate:
+        //   AND ovn_pending_deletion.removed IS NULL  AND ovn_pending_deletion.removed IS NULL
+        // which is redundant SQL (though harmless for the removed predicate itself).
+        // The same applies to the "kind" predicate: it must use entity().getKind() (fieldName
+        // "kind") rather than entity().getKindRaw() (fieldName "kindRaw"). The CGLib
+        // interceptor maps getter name → Java field name by stripping the "get" prefix and
+        // lowercasing. "kindRaw" does not exist as a declared field, so _attrs.get("kindRaw")
+        // returns null, producing a null Attribute that is stored in the Condition. The null
+        // Attribute causes Condition.toSql() to emit "AND " (empty predicate — the "AND  AND"
+        // in the error SQL), and causes NullPointerException in prepareAttribute() when the
+        // PreparedStatement is executed (Attribute.is(Flag) on null).
         pendingByControllerSearch = createSearchBuilder();
         pendingByControllerSearch.and("controllerId", pendingByControllerSearch.entity().getControllerId(), Op.EQ);
-        pendingByControllerSearch.and("removed", pendingByControllerSearch.entity().getRemoved(), Op.NULL);
         pendingByControllerSearch.done();
 
         pendingSentinelByZoneSearch = createSearchBuilder();
         pendingSentinelByZoneSearch.and("controllerId", pendingSentinelByZoneSearch.entity().getControllerId(), Op.EQ);
         pendingSentinelByZoneSearch.and("zoneId", pendingSentinelByZoneSearch.entity().getZoneId(), Op.EQ);
-        pendingSentinelByZoneSearch.and("removed", pendingSentinelByZoneSearch.entity().getRemoved(), Op.NULL);
         pendingSentinelByZoneSearch.done();
 
         allSentinelsSearch = createSearchBuilder();
         allSentinelsSearch.and("controllerId", allSentinelsSearch.entity().getControllerId(), Op.EQ);
-        allSentinelsSearch.and("removed", allSentinelsSearch.entity().getRemoved(), Op.NULL);
         allSentinelsSearch.done();
 
         byOvnUuidKindSearch = createSearchBuilder();
         byOvnUuidKindSearch.and("ovnUuid", byOvnUuidKindSearch.entity().getOvnUuid(), Op.EQ);
-        byOvnUuidKindSearch.and("kind", byOvnUuidKindSearch.entity().getKindRaw(), Op.EQ);
-        byOvnUuidKindSearch.and("removed", byOvnUuidKindSearch.entity().getRemoved(), Op.NULL);
+        byOvnUuidKindSearch.and("kind", byOvnUuidKindSearch.entity().getKind(), Op.EQ);
         byOvnUuidKindSearch.done();
     }
 
