@@ -79,6 +79,7 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkDetailVO;
 import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offering.ServiceOffering;
 import com.cloud.offerings.dao.NetworkOfferingDetailsDao;
@@ -335,6 +336,12 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                         if (StringUtils.isNotBlank(nicVO.getUuid())) {
                             to.setOvnLspName("lsp-" + nicVO.getUuid());
                         }
+                        // Resolve all OVN-managed NIC tunables only when this NIC
+                        // sits on the OVN datapath. Non-OVN paths (legacy bridge,
+                        // OvsVifDriver, DPDK-only) are intentionally untouched —
+                        // wire compat is preserved by leaving the wrapper fields
+                        // null on NicTO.
+                        populateOvnTunables(to, profile, nicVO, network);
                     }
                 }
             } catch (Exception e) {
@@ -417,6 +424,245 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                         vrNic.getMacAddress(), router.getInstanceName());
                 return;
             }
+        }
+    }
+
+    /**
+     * Resolve every OVN-managed NIC tunable (vDPA / SR-IOV VF / multiqueue /
+     * generic NIC ethtool / TC-offload / OVN binding / BFD / conntrack /
+     * SubFunction) using the four-layer chain
+     * <pre>VM detail &gt; Network detail &gt; NetworkOffering detail &gt; global ConfigKey</pre>
+     * and stamp the resolved values into {@link NicTO} as wrapper-typed fields.
+     *
+     * <p>Inputs read once from the DB to keep the hot {@code toNicTO} path cheap:
+     * <ul>
+     *   <li>{@code user_vm_details} / {@code vm_instance_details} via
+     *       {@link VMInstanceDetailsDao#listDetailsKeyPairs(long)}</li>
+     *   <li>{@code network_details} via
+     *       {@link NetworkDetailsDao#listDetailsKeyPairs(long)}</li>
+     *   <li>{@code network_offering_details} via
+     *       {@link NetworkOfferingDetailsDao#getNtwkOffDetails(long)}</li>
+     * </ul>
+     *
+     * <p>Each ConfigKey default lives in
+     * {@code com.cloud.network.ovn.config.OvnNicConfig} (plugin module);
+     * we look it up via reflection on the literal class name to avoid a
+     * server -&gt; OVN plugin compile-time dependency. The resolution
+     * algorithm itself lives in
+     * {@link com.cloud.network.ovn.config.OvnNicTunables} (api module) so
+     * both server and OVN plugin share the same canonical key strings.
+     *
+     * <p>Wire compatibility: every field on {@link NicTO} is a wrapper
+     * type, so older agents that don't know the field simply ignore the
+     * unknown JSON property. Older mgmt servers that don't call this
+     * method leave the field null and the agent falls back to its
+     * historical hardcoded behavior.
+     */
+    private void populateOvnTunables(final NicTO to,
+                                     final NicProfile profile,
+                                     final NicVO nicVO,
+                                     final NetworkVO network) {
+        if (to == null || profile == null || network == null) {
+            return;
+        }
+        if (!Boolean.TRUE.equals(to.getUseOvn())) {
+            return;
+        }
+        Map<String, String> vmDetails = null;
+        Map<String, String> netDetails = null;
+        Map<NetworkOffering.Detail, String> offeringDetails = null;
+        try {
+            if (_vmInstanceDetailsDao != null && profile.getVirtualMachineId() > 0) {
+                vmDetails = _vmInstanceDetailsDao.listDetailsKeyPairs(profile.getVirtualMachineId());
+            }
+        } catch (RuntimeException e) {
+            logger.debug("populateOvnTunables: VM details fetch failed for vm {}: {}",
+                    profile.getVirtualMachineId(), e.getMessage());
+        }
+        try {
+            if (networkDetailsDao != null) {
+                netDetails = networkDetailsDao.listDetailsKeyPairs(network.getId());
+            }
+        } catch (RuntimeException e) {
+            logger.debug("populateOvnTunables: network details fetch failed for net {}: {}",
+                    network.getId(), e.getMessage());
+        }
+        try {
+            if (networkOfferingDetailsDao != null) {
+                offeringDetails = networkOfferingDetailsDao.getNtwkOffDetails(network.getNetworkOfferingId());
+            }
+        } catch (RuntimeException e) {
+            logger.debug("populateOvnTunables: offering details fetch failed for offering {}: {}",
+                    network.getNetworkOfferingId(), e.getMessage());
+        }
+
+        // vDPA fine-grained.
+        Integer maxVqs = OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_MAX_VQS,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (maxVqs != null && OvnNicTunables.isValidQueueCount(maxVqs)) {
+            to.setVdpaMaxVqs(maxVqs);
+        }
+        Integer queuePairs = OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_QUEUE_PAIRS,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (queuePairs != null && queuePairs > 0) {
+            to.setVdpaQueuePairs(queuePairs);
+        }
+        to.setVdpaEventIdx(OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_EVENT_IDX,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setVdpaIndirectDesc(OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_INDIRECT_DESC,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setVdpaIommu(OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_IOMMU,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setVdpaPacked(OvnNicTunables.resolve(OvnNicTunables.OVN_VDPA_PACKED,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+
+        // SR-IOV VF tunables.
+        to.setVfTrust(OvnNicTunables.resolve(OvnNicTunables.OVN_VF_TRUST,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setVfSpoofcheck(OvnNicTunables.resolve(OvnNicTunables.OVN_VF_SPOOFCHECK,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setVfLinkState(OvnNicTunables.resolve(OvnNicTunables.OVN_VF_LINK_STATE,
+                vmDetails, netDetails, offeringDetails, null, String.class));
+        Integer vfMaxRate = OvnNicTunables.resolve(OvnNicTunables.OVN_VF_MAX_TX_RATE,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (OvnNicTunables.isValidRate(vfMaxRate)) {
+            to.setVfMaxTxRate(vfMaxRate);
+        }
+        Integer vfMinRate = OvnNicTunables.resolve(OvnNicTunables.OVN_VF_MIN_TX_RATE,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (OvnNicTunables.isValidRate(vfMinRate)) {
+            to.setVfMinTxRate(vfMinRate);
+        }
+        Integer vfVlan = OvnNicTunables.resolve(OvnNicTunables.OVN_VF_VLAN,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (OvnNicTunables.isValidVlan(vfVlan)) {
+            to.setVfVlan(vfVlan);
+        }
+        Integer vfQos = OvnNicTunables.resolve(OvnNicTunables.OVN_VF_QOS,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (OvnNicTunables.isValidQos(vfQos)) {
+            to.setVfQos(vfQos);
+        }
+
+        // vhost / multiqueue.
+        Integer vhostQ = OvnNicTunables.resolve(OvnNicTunables.OVN_VHOST_QUEUES,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (vhostQ != null && vhostQ >= 0) {
+            to.setVhostQueues(vhostQ);
+        }
+        to.setVhostDriver(OvnNicTunables.resolve(OvnNicTunables.OVN_VHOST_DRIVER,
+                vmDetails, netDetails, offeringDetails, null, String.class));
+        Integer vhostTxQ = OvnNicTunables.resolve(OvnNicTunables.OVN_VHOST_TX_QUEUE_SIZE,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (vhostTxQ != null && vhostTxQ > 0) {
+            to.setVhostTxQueueSize(vhostTxQ);
+        }
+        Integer vhostRxQ = OvnNicTunables.resolve(OvnNicTunables.OVN_VHOST_RX_QUEUE_SIZE,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (vhostRxQ != null && vhostRxQ > 0) {
+            to.setVhostRxQueueSize(vhostRxQ);
+        }
+
+        // Generic NIC tunables.
+        Integer mtu = OvnNicTunables.resolve(OvnNicTunables.OVN_MTU,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (mtu != null && mtu > 0 && to.getMtu() == null) {
+            // Don't clobber an MTU already set from NicProfile (operator
+            // override on the NIC itself); the OVN tunable is a fallback.
+            to.setMtu(mtu);
+        }
+        to.setTso(OvnNicTunables.resolve(OvnNicTunables.OVN_TSO,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setGso(OvnNicTunables.resolve(OvnNicTunables.OVN_GSO,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setGro(OvnNicTunables.resolve(OvnNicTunables.OVN_GRO,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setLro(OvnNicTunables.resolve(OvnNicTunables.OVN_LRO,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setCsumOffload(OvnNicTunables.resolve(OvnNicTunables.OVN_CSUM_OFFLOAD,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        to.setDriverModel(OvnNicTunables.resolve(OvnNicTunables.OVN_DRIVER_MODEL,
+                vmDetails, netDetails, offeringDetails, null, String.class));
+
+        // OVS / TC offload.
+        to.setTcOffload(OvnNicTunables.resolve(OvnNicTunables.OVN_TC_OFFLOAD,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        // Per-port hairpin: applies to whichever port the OVN VifDriver attaches
+        // to br-int (VF rep, vDPA OVS port, virtio tap). Default-on at the
+        // ConfigKey layer so a fresh deployment immediately benefits from
+        // VF<->VF same-host hw-offload via TC flower / mlx5 eswitch.
+        to.setOvsHairpin(OvnNicTunables.resolve(OvnNicTunables.OVN_OVS_HAIRPIN,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        // Bridge-wide tc-policy. Agent applies via {@code ovs-vsctl set
+        // Open_vSwitch . other_config:tc-policy} once per JVM at the first
+        // OVN-aware plug.
+        to.setOvsTcPolicy(OvnNicTunables.resolve(OvnNicTunables.OVN_OVS_TC_POLICY,
+                vmDetails, netDetails, offeringDetails, null, String.class));
+
+        // OVN binding / chassis.
+        to.setRequestedChassis(OvnNicTunables.resolve(OvnNicTunables.OVN_REQUESTED_CHASSIS,
+                vmDetails, netDetails, offeringDetails, null, String.class));
+        Integer prio = OvnNicTunables.resolve(OvnNicTunables.OVN_HA_CHASSIS_PRIORITY,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (prio != null && prio >= 0) {
+            to.setHaChassisPriority(prio);
+        }
+
+        // BFD.
+        to.setBfdEnable(OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_ENABLE,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        Integer bfdMinRx = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MIN_RX,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (bfdMinRx != null && bfdMinRx > 0) {
+            to.setBfdMinRx(bfdMinRx);
+        }
+        Integer bfdMinTx = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MIN_TX,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (bfdMinTx != null && bfdMinTx > 0) {
+            to.setBfdMinTx(bfdMinTx);
+        }
+        Integer bfdMul = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MULTIPLIER,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (bfdMul != null && bfdMul > 0) {
+            to.setBfdMultiplier(bfdMul);
+        }
+
+        // Conntrack timeouts.
+        Integer ctSnat = OvnNicTunables.resolve(OvnNicTunables.OVN_CT_SNAT_INACTIVE_TIMEOUT,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (ctSnat != null && ctSnat > 0) {
+            to.setCtSnatTimeout(ctSnat);
+        }
+        Integer ctTcp = OvnNicTunables.resolve(OvnNicTunables.OVN_CT_TCP_INACTIVE_TIMEOUT,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (ctTcp != null && ctTcp > 0) {
+            to.setCtTcpTimeout(ctTcp);
+        }
+        Integer ctUdp = OvnNicTunables.resolve(OvnNicTunables.OVN_CT_UDP_INACTIVE_TIMEOUT,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (ctUdp != null && ctUdp > 0) {
+            to.setCtUdpTimeout(ctUdp);
+        }
+        Integer ctIcmp = OvnNicTunables.resolve(OvnNicTunables.OVN_CT_ICMP_INACTIVE_TIMEOUT,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (ctIcmp != null && ctIcmp > 0) {
+            to.setCtIcmpTimeout(ctIcmp);
+        }
+
+        // SubFunction (BlueField).
+        to.setSfEnabled(OvnNicTunables.resolve(OvnNicTunables.OVN_SF_ENABLED,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+        Integer sfNum = OvnNicTunables.resolve(OvnNicTunables.OVN_SF_NUM,
+                vmDetails, netDetails, offeringDetails, null, Integer.class);
+        if (sfNum != null && sfNum >= 0) {
+            to.setSfNum(sfNum);
+        }
+        to.setSfHpf(OvnNicTunables.resolve(OvnNicTunables.OVN_SF_HPF,
+                vmDetails, netDetails, offeringDetails, null, Boolean.class));
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("populateOvnTunables: nic={} ls={} lsp={} resolved tunables (non-null only): {}",
+                    profile.getId(), to.getOvnLsName(), to.getOvnLspName(), to);
         }
     }
 
