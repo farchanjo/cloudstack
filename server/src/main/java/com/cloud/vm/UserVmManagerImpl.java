@@ -297,6 +297,7 @@ import com.cloud.network.guru.NetworkGuru;
 import com.cloud.network.lb.LoadBalancingRulesManager;
 import com.cloud.network.router.CommandSetupHelper;
 import com.cloud.network.router.NetworkHelper;
+import com.cloud.network.router.VfPoolManager;
 import com.cloud.network.router.VpcVirtualNetworkApplianceManager;
 import com.cloud.network.rules.FirewallManager;
 import com.cloud.network.rules.FirewallRuleVO;
@@ -652,6 +653,9 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
 
     @Inject
     ExtensionHelper extensionHelper;
+
+    @Inject
+    private VfPoolManager vfPoolManager;
 
     private ScheduledExecutorService _executor = null;
     private ScheduledExecutorService _vmIpFetchExecutor = null;
@@ -5702,6 +5706,19 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
 
     @Override
     public void finalizeExpunge(VirtualMachine vm) {
+        try {
+            int released = vfPoolManager.releaseByVmId(vm.getId());
+            if (released > 0) {
+                logger.info("Released {} SR-IOV VF(s) from pool for expunged VM id={}", released, vm.getId());
+            }
+        } catch (Exception e) {
+            logger.warn("VF pool release failed during expunge for VM id={}: {}", vm.getId(), e.getMessage());
+        }
+        try {
+            vfPoolManager.sweepOrphans();
+        } catch (Exception e) {
+            logger.warn("VF pool sweepOrphans failed during expunge: {}", e.getMessage());
+        }
     }
 
     private void checkForceStopVmPermission(Account callingAccount) {
