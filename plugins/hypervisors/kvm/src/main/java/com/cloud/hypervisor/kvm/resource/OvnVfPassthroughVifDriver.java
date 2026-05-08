@@ -247,9 +247,23 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      * is gated to the resolved value for this NIC (default {@code true}
      * via {@link com.cloud.network.ovn.config.OvnNicConfig#OvsHairpin});
      * a {@code null} skips the stamp for wire compat with older mgmt.
+     *
+     * <p>Before adding the port, any OVS Interface already carrying
+     * {@code external_ids:iface-id=lspName} on a <em>different</em> representor
+     * is removed from the integration bridge. Without this guard a previous
+     * unclean shutdown (libvirt destroy that zeroed the VF MAC before unplug
+     * could resolve the rep) leaves a stale {@code iface-id} on a different
+     * VF representor, triggering the ovn-controller WARN:
+     * <pre>
+     *   binding|WARN|Invalid configuration: iface-id is configured on
+     *   interfaces: [dx6p1vf6] and [dx6p0vf4]. Ignoring the configuration
+     *   on interface [dx6p0vf4]
+     * </pre>
+     * which pushes one of the two reps out of the OVN dataplane.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
                                           final Boolean hairpin) {
+        clearOrphanRepsForLspName(lspName, repName);
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -263,6 +277,57 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
         logger.info("OvnVfPassthroughVifDriver: attached rep={} to {} with iface-id={} hairpin={}",
                 repName, integrationBridge, lspName, hairpin);
+    }
+
+    /**
+     * Clear any orphan OVS interface that already carries the target
+     * {@code iface-id} before we stamp it on {@code keepRepName}. Without
+     * this, a previous unclean shutdown that left a stale {@code iface-id}
+     * on a different VF representor would race with this stamp and trigger
+     * the {@code "iface-id is configured on interfaces"} WARN in
+     * {@code ovn-controller}, pushing one of the two reps out of the
+     * dataplane.
+     *
+     * <p>When {@code keepRepName} is {@code null} every interface carrying
+     * {@code lspName} is removed — useful for cleanup callers that do not
+     * own a specific target representor.
+     *
+     * <p>Idempotent — safe to call when no orphan exists.
+     */
+    private void clearOrphanRepsForLspName(final String lspName, final String keepRepName) {
+        if (StringUtils.isBlank(lspName)) {
+            return;
+        }
+        final String findCmd = String.format(
+            "ovs-vsctl --no-headings --columns=name find Interface external_ids:iface-id=%s 2>/dev/null",
+            lspName);
+        final String found = Script.runSimpleBashScript(findCmd);
+        if (StringUtils.isBlank(found)) {
+            return;
+        }
+        for (final String raw : found.split("\\R")) {
+            final String name = raw.trim().replaceAll("^\"|\"$", "");
+            if (StringUtils.isBlank(name) || name.equals(keepRepName)) {
+                continue;
+            }
+            Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, name));
+            logger.info("OvnVfPassthroughVifDriver: cleared orphan rep={} carrying stale iface-id={} (kept rep={})",
+                    name, lspName, keepRepName);
+        }
+    }
+
+    /**
+     * Cleanup stale OVS representors whose {@code external_ids:iface-id}
+     * matches the given OVN logical switch port name. Useful for cleanup
+     * paths where the VF MAC has already been zeroed by libvirt and the
+     * standard {@link #unplug} cannot resolve the rep via PCI/MAC reverse
+     * lookup.
+     *
+     * <p>Idempotent — safe to call when no orphan exists.
+     */
+    public void cleanupStaleRepsByLspName(final String lspName) {
+        clearOrphanRepsForLspName(lspName, null);
     }
 
     private void drainRollback(final Deque<Runnable> rollback) {
