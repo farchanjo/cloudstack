@@ -33,6 +33,7 @@ import java.util.List;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.Network;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
@@ -99,7 +100,7 @@ public class OvnFirewallServiceEnqueueTest {
      * Success path: enqueue fires, NB delete succeeds, row is marked succeeded.
      */
     @Test
-    public void revokeOne_enqueuesAclUuid_thenMarksSucceeded_onSyncSuccess() {
+    public void revokeOne_enqueuesAclUuid_thenMarksSucceeded_onSyncSuccess() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
         when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
                 .thenReturn(aclMapping);
@@ -116,7 +117,7 @@ public class OvnFirewallServiceEnqueueTest {
      * Failure path: enqueue fires, NB delete throws, mark-succeeded NOT called.
      */
     @Test
-    public void revokeOne_leavesQueueRow_onSyncFailure() {
+    public void revokeOne_leavesQueueRow_onSyncFailure() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
         when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
                 .thenReturn(aclMapping);
@@ -137,7 +138,7 @@ public class OvnFirewallServiceEnqueueTest {
      * Idempotency: if already pending, no second enqueue; sync delete still runs.
      */
     @Test
-    public void revokeOne_skipsEnqueue_whenAlreadyPending() {
+    public void revokeOne_skipsEnqueue_whenAlreadyPending() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
         when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
                 .thenReturn(aclMapping);
@@ -154,7 +155,7 @@ public class OvnFirewallServiceEnqueueTest {
      * No ACL mapping: revoke is a no-op — no enqueue, no NB call.
      */
     @Test
-    public void revokeOne_isNoOp_whenNoMapping() {
+    public void revokeOne_isNoOp_whenNoMapping() throws ResourceUnavailableException {
         when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
                 .thenReturn(null);
 
@@ -168,7 +169,7 @@ public class OvnFirewallServiceEnqueueTest {
      * Empty rule list: no enqueue, no NB call.
      */
     @Test
-    public void applyNetworkACLs_emptyRuleList_isNoOp() {
+    public void applyNetworkACLs_emptyRuleList_isNoOp() throws ResourceUnavailableException {
         service.applyNetworkACLs(network, List.of());
 
         verify(pendingDeletionDao, never()).persist(any(OvnPendingDeletionVO.class));
