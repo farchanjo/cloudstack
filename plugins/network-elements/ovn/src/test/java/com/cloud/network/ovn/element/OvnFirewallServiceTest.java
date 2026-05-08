@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -40,6 +41,7 @@ import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 
 import com.cloud.network.Network;
+import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
@@ -217,15 +219,49 @@ public class OvnFirewallServiceTest {
     }
 
     @Test
-    public void missingControllerSkipsAndReturnsFalse() throws Exception {
+    public void applyNetworkACLs_returnsTrue_whenControllerMissing() throws Exception {
+        // Zone 999 has no OVN controller registered — cleanup must be a no-op, not a failure.
         final Network strayNetwork = mock(Network.class);
         when(strayNetwork.getDataCenterId()).thenReturn(999L);
         when(strayNetwork.getId()).thenReturn(NETWORK_ID);
 
         final NetworkACLItem rule = aclRule(101L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
-                "tcp", 80, 80, List.of(), null, null, 1, NetworkACLItem.State.Add);
+                "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Add);
 
-        assertFalse(service.applyNetworkACLs(strayNetwork, List.of(rule)));
+        assertTrue("no-op cleanup must return true when controller is absent",
+                service.applyNetworkACLs(strayNetwork, List.of(rule)));
+        verify(nbClient, never()).addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(),
+                anyString(), anyMap(), anyBoolean(), any(), anyString());
+    }
+
+    @Test
+    public void applyNetworkACLs_returnsTrue_whenTierLsMissing() throws Exception {
+        // Controller is present but the tier has no OVN logical switch yet (Allocated state).
+        // cleanup must succeed as a no-op so NetworkOrchestrator can proceed with deletion.
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK), eq(NETWORK_ID), eq(CONTROLLER_ID))).thenReturn(null);
+
+        final NetworkACLItem rule = aclRule(202L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 443, 443, List.of("0.0.0.0/0"), null, null, 1, NetworkACLItem.State.Add);
+
+        assertTrue("no-op cleanup must return true when OVN logical switch is absent",
+                service.applyNetworkACLs(network, List.of(rule)));
+        verify(nbClient, never()).addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(),
+                anyString(), anyMap(), anyBoolean(), any(), anyString());
+    }
+
+    @Test
+    public void applyNetworkACLs_returnsFalse_whenRuleApplyThrowsOvnException() throws Exception {
+        // The OVN NB client throws on the actual rule apply — must propagate as false.
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(303L), eq(CONTROLLER_ID))).thenReturn(null);
+        doThrow(new OvnException("OVSDB transact failed"))
+                .when(nbClient).addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(),
+                        anyString(), anyMap(), anyBoolean(), any(), anyString());
+
+        final NetworkACLItem rule = aclRule(303L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 22, 22, List.of("192.168.0.0/16"), null, null, 1, NetworkACLItem.State.Add);
+
+        assertFalse("real apply failure must still propagate as false",
+                service.applyNetworkACLs(network, List.of(rule)));
     }
 
     @Test

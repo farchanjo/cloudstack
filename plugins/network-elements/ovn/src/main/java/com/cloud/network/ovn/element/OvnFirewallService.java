@@ -127,15 +127,19 @@ public class OvnFirewallService extends AdapterBase {
         final long zoneId = network.getDataCenterId();
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
-            LOGGER.warn("OvnFirewallService: no OVN controller for zone {} — skipping {} rule(s)",
-                    zoneId, rules.size());
-            return false;
+            // The zone's OVN controller has been deregistered or was never registered.
+            // There is no OVN state to clean up, so this is a successful no-op.
+            LOGGER.info("OvnFirewallService: no OVN controller registered for zone {} — ACL cleanup is a no-op",
+                    zoneId);
+            return true;
         }
         final String tierLsUuid = lookupTierLsUuid(network, controller);
         if (tierLsUuid == null) {
-            LOGGER.warn("OvnFirewallService: tier id={} has no OVN logical switch yet; skipping ACL apply",
+            // The tier is in Allocated state — its OVN logical switch was never provisioned.
+            // There is no ACL state to remove, so this is a successful no-op.
+            LOGGER.info("OvnFirewallService: tier id={} has no OVN logical switch — ACL cleanup is a no-op",
                     network.getId());
-            return false;
+            return true;
         }
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         boolean overall = true;
