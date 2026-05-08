@@ -1509,6 +1509,21 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Deletes an ACL row by UUID directly, without needing the parent
+     * {@code Logical_Switch} UUID. OVSDB set semantics ensure any dangling
+     * {@code Logical_Switch.acls} reference is garbage-collected by northd on
+     * the next sync. Idempotent: no-op when the UUID no longer exists.
+     */
+    public void deleteAclByUuid(final String aclUuid) {
+        if (aclUuid == null || aclUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.delete("ACL", OvnOpFactory.whereUuid(aclUuid)));
+        tx.commit();
+    }
+
     // ------------------------------------------------------------------
     // HA chassis group operations.
     // ------------------------------------------------------------------

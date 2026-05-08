@@ -369,6 +369,9 @@ public class OvnPendingDeletionProcessor implements Configurable {
             case STATIC_ROUTE:
                 nb.deleteLogicalRouterStaticRouteDirect(uuid);
                 break;
+            case NETWORK_ACL:
+                nb.deleteAclByUuid(uuid);
+                break;
             case LOAD_BALANCER:
                 nb.deleteLoadBalancer(uuid);
                 break;

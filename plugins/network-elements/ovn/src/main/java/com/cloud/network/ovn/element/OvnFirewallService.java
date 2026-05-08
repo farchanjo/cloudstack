@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
@@ -45,6 +46,9 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.Vpc;
@@ -106,6 +110,8 @@ public class OvnFirewallService extends AdapterBase {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
@@ -238,33 +244,37 @@ public class OvnFirewallService extends AdapterBase {
                     rule.getId());
             return;
         }
-        // We must address removal via the parent LS UUID. Resolve the tier LS
-        // from the rule's network id (NetworkACLItem only carries the ACL
-        // group id, not the tier; CloudStack drives applyNetworkACLs per
-        // network so the caller already knows; but the revoke path here is
-        // best-effort and walks the per-controller mapping rows).
+        final String aclUuid = mapping.getOvnUuid();
+        enqueueAclDeletionIfAbsent(controller, aclUuid, rule.getId());
         try {
-            // To detach we need the parent LS UUID — but we do not keep it on
-            // the mapping row (saves a column). The cheapest correct approach
-            // is to enumerate every NETWORK mapping for this controller and
-            // call removeAclFromLogicalSwitch on the LS that owns the ACL.
-            // Until per-rule LS bookkeeping is added, fall back to deleting
-            // the ACL row directly via clear-all on every NETWORK LS would be
-            // destructive — instead, leverage the OVSDB cascade: deleting the
-            // ACL row removes it from any set referencing it (set semantics).
-            // We mimic that here by issuing the ACL row delete + relying on
-            // northd to GC the dangling LS reference on the next sync.
-            for (final OvnLogicalIdMapVO ls : logicalIdMapDao.listByKind(Kind.NETWORK, controller.getId())) {
-                try {
-                    nb.removeAclFromLogicalSwitch(ls.getOvnUuid(), mapping.getOvnUuid());
-                } catch (final OvnException ignored) {
-                    // Not attached to this LS; try the next one.
-                }
-            }
-        } finally {
+            // deleteAclByUuid issues a direct ACL row delete; OVSDB set semantics
+            // ensure northd GCs any dangling Logical_Switch.acls reference.
+            nb.deleteAclByUuid(aclUuid);
             logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(aclUuid, Kind.NETWORK_ACL.name());
+            LOGGER.info("OvnFirewallService: ACL {} revoked (rule id={})", aclUuid, rule.getId());
+        } catch (final OvnException oe) {
+            // Leave the mapping and the queue row so the processor retries.
+            LOGGER.warn("OvnFirewallService: sync ACL delete failed for rule id={} uuid={}: {}",
+                    rule.getId(), aclUuid, oe.getMessage());
         }
-        LOGGER.info("OvnFirewallService: ACL {} revoked (rule id={})", mapping.getOvnUuid(), rule.getId());
+    }
+
+    /**
+     * Enqueues the ACL UUID into ovn_pending_deletion BEFORE the synchronous
+     * NB delete so an async retry covers any controller flap mid-delete.
+     * Idempotent: no-op when a live row for the same UUID+kind already exists.
+     */
+    private void enqueueAclDeletionIfAbsent(final OvnControllerVO controller,
+                                             final String aclUuid, final long csId) {
+        if (pendingDeletionDao.isPendingByOvnUuid(aclUuid, Kind.NETWORK_ACL.name())) {
+            return;
+        }
+        final long cid = controller != null ? controller.getId() : OvnPendingDeletionDaoImpl.CONTROLLER_SENTINEL;
+        final Long zoneId = controller != null ? controller.getZoneId() : null;
+        final OvnPendingDeletionVO entry = new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), cid, zoneId, Kind.NETWORK_ACL, aclUuid, csId);
+        pendingDeletionDao.persist(entry);
     }
 
     private String lookupTierLsUuid(final Network network, final OvnControllerVO controller) {
