@@ -25,6 +25,7 @@ import com.cloud.network.ovn.client.op.OvnOpFactory;
 import com.cloud.network.ovn.client.op.OvnRowRef;
 import com.cloud.network.ovn.client.transport.OvsdbConnectionPool;
 import com.cloud.network.ovn.client.transport.OvsdbEndpoint;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -599,6 +600,93 @@ public class OvnNbClient implements AutoCloseable {
         return tx.commit().insertedUuid(0);
     }
 
+    /**
+     * Set or clear the {@code tag} column on an existing Logical_Switch_Port
+     * (typically a {@code type=localnet} LSP). Pass a non-null
+     * {@code vlanTag} to set the VLAN; pass {@code null} to clear (encoded as
+     * {@code ["set", []]}, the OVSDB representation of an empty optional
+     * integer).
+     *
+     * <p>Used to retrofit a VLAN tag on the public-side localnet LSP after
+     * the row was created untagged — auto-detection drives this when the
+     * CloudStack Public network broadcastUri carries a VLAN id.
+     */
+    public void setLogicalSwitchPortTag(final String lspUuid, final Integer vlanTag) {
+        if (lspUuid == null || lspUuid.isEmpty()) {
+            throw new OvnException("setLogicalSwitchPortTag requires a non-empty LSP UUID");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        if (vlanTag == null) {
+            // Empty optional integer: ["set", []].
+            final ArrayNode emptySet = JsonNodeFactory.instance.arrayNode();
+            emptySet.add("set");
+            emptySet.add(JsonNodeFactory.instance.arrayNode());
+            row.set("tag", emptySet);
+        } else {
+            // OVSDB accepts a bare integer when the column is "set of integer"
+            // with at most 1 element and the value is present — this matches
+            // the encoding used by addLocalnetPort.
+            row.put("tag", vlanTag.intValue());
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Read the {@code tag} column of an existing Logical_Switch_Port. Returns
+     * {@code null} when the row has no tag (untagged localnet) or does not
+     * exist. Used by the reconciler to detect VLAN drift on the public
+     * localnet port without pulling the full LSP row through {@link OvnNbReader}.
+     */
+    public Integer getLogicalSwitchPortTag(final String lspUuid) {
+        if (lspUuid == null || lspUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("tag");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var rows = arr.get(0) == null ? null : arr.get(0).get("rows");
+        if (rows == null || rows.size() == 0) {
+            return null;
+        }
+        final var tag = rows.get(0).get("tag");
+        if (tag == null) {
+            return null;
+        }
+        if (tag.isInt()) {
+            return tag.asInt();
+        }
+        // ["set", []] empty / ["set", [N]] single-element. Walk both shapes.
+        if (tag.isArray() && tag.size() == 2) {
+            final var inner = tag.get(1);
+            if (inner != null && inner.isArray() && inner.size() == 1) {
+                final var first = inner.get(0);
+                if (first != null && first.isInt()) {
+                    return first.asInt();
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Read a Logical_Switch_Port's UUID by name. Used by the public-localnet
+     *  reconciler to look up the well-known {@code lsp-public-localnet} row
+     *  on a per-zone public LS. Returns {@code null} when no row matches. */
+    public String findLogicalSwitchPortUuidByExactName(final String name) {
+        // Delegates to the existing finder which already returns null for
+        // misses; kept as a separate method so tests targeting the public
+        // localnet path can stub a more specific seam.
+        return findLogicalSwitchPortUuidByName(name);
+    }
+
     // ------------------------------------------------------------------
     // ACL operations.
     // ------------------------------------------------------------------
@@ -760,12 +848,47 @@ public class OvnNbClient implements AutoCloseable {
 
     public String addNatRule(final String lrUuid, final String type, final String externalIp, final String logicalIp,
                              final String logicalPort) {
+        return addNatRule(lrUuid, type, externalIp, logicalIp, logicalPort, null, null, null);
+    }
+
+    /**
+     * Insert a NAT row with the full surface OVN exposes for hardware-friendly
+     * DNAT-and-SNAT (e.g. ConnectX-6 Dx TC flower CT-NAT 5-tuple offload):
+     *
+     * <ul>
+     *   <li>{@code external_port_range} — single port (e.g. {@code "22"}) or
+     *       a port range (e.g. {@code "8080-8090"}); empty/null leaves the
+     *       column unset (any-port match).</li>
+     *   <li>{@code external_mac} — MAC OVN uses for proxy ARP / GARP on the
+     *       distributed gateway port. Required for distributed
+     *       {@code dnat_and_snat} when {@code logical_port} is set so the
+     *       reply-side SNAT picks the right source MAC.</li>
+     *   <li>{@code externalIds} — CloudStack source-of-truth tags
+     *       ({@code cs_kind}, {@code cs_id}, {@code cs_zone_id}). Picked up
+     *       by the reconciler / import flow.</li>
+     * </ul>
+     *
+     * <p>All optional columns; {@code null} or empty leaves the corresponding
+     * OVSDB column unset (matches the {@code ovn-nbctl lr-nat-add} semantics).
+     */
+    public String addNatRule(final String lrUuid, final String type, final String externalIp, final String logicalIp,
+                             final String logicalPort, final String externalPortRange,
+                             final String externalMac, final Map<String, String> externalIds) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
         row.put("type", type);
         row.put("external_ip", externalIp);
         row.put("logical_ip", logicalIp);
         if (logicalPort != null && !logicalPort.isEmpty()) {
             row.set("logical_port", JsonNodeFactory.instance.textNode(logicalPort));
+        }
+        if (externalPortRange != null && !externalPortRange.isEmpty()) {
+            row.put("external_port_range", externalPortRange);
+        }
+        if (externalMac != null && !externalMac.isEmpty()) {
+            row.set("external_mac", JsonNodeFactory.instance.textNode(externalMac));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
         }
         final String named = OvnNamedUuid.next("nat");
         final OvnTransaction tx = newTransaction();
@@ -1486,6 +1609,115 @@ public class OvnNbClient implements AutoCloseable {
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
         tx.commit();
+    }
+
+    /**
+     * Look up the top-priority {@code chassis_name} inside a given
+     * {@code HA_Chassis_Group} (by UUID). Walks the
+     * {@code ha_chassis} set on the group, reads the {@code priority} +
+     * {@code chassis_name} of each member, and returns the {@code chassis_name}
+     * carrying the highest priority. Used by the BGP /32 redistributor to
+     * decide which agent host should announce the route — matches OVN's
+     * own selection algorithm modulo runtime liveness (which northd applies
+     * by also consulting the SB DB; this NB-only path is best-effort and
+     * reverts to the next reconcile cycle if the picked chassis is down).
+     *
+     * @return the {@code chassis_name} (system-id) of the top-priority
+     *         chassis, or {@code null} when the group is empty / missing.
+     */
+    public String findTopPriorityChassisName(final String hagUuid) {
+        if (hagUuid == null || hagUuid.isEmpty()) {
+            return null;
+        }
+        // Step 1: read the group's ha_chassis set.
+        final ArrayNode groupCols = JsonNodeFactory.instance.arrayNode();
+        groupCols.add("_uuid");
+        groupCols.add("ha_chassis");
+        final OvnTransaction txGroup = newTransaction();
+        txGroup.add(OvnOpFactory.select("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid), groupCols));
+        final OvnTransaction.Result rGroup;
+        try {
+            rGroup = txGroup.commit();
+        } catch (OvnException e) {
+            return null;
+        }
+        final ArrayNode gArr = rGroup.raw();
+        if (gArr == null || gArr.size() == 0) {
+            return null;
+        }
+        final var gRows = gArr.get(0) == null ? null : gArr.get(0).get("rows");
+        if (gRows == null || gRows.size() == 0) {
+            return null;
+        }
+        final List<String> memberUuids = decodeUuidSetColumn(gRows.get(0).get("ha_chassis"));
+        if (memberUuids.isEmpty()) {
+            return null;
+        }
+        // Step 2: read each HA_Chassis row to pick the highest priority.
+        final ArrayNode memberCols = JsonNodeFactory.instance.arrayNode();
+        memberCols.add("_uuid");
+        memberCols.add("chassis_name");
+        memberCols.add("priority");
+        String bestChassis = null;
+        int bestPriority = Integer.MIN_VALUE;
+        for (final String memberUuid : memberUuids) {
+            final OvnTransaction tx = newTransaction();
+            tx.add(OvnOpFactory.select("HA_Chassis", OvnOpFactory.whereUuid(memberUuid), memberCols));
+            final OvnTransaction.Result r;
+            try {
+                r = tx.commit();
+            } catch (OvnException e) {
+                continue;
+            }
+            final ArrayNode arr = r.raw();
+            if (arr == null || arr.size() == 0) {
+                continue;
+            }
+            final var rows = arr.get(0) == null ? null : arr.get(0).get("rows");
+            if (rows == null || rows.size() == 0) {
+                continue;
+            }
+            final var row = rows.get(0);
+            final var priorityNode = row.get("priority");
+            final var nameNode = row.get("chassis_name");
+            final int priority = priorityNode != null && priorityNode.isInt() ? priorityNode.asInt() : Integer.MIN_VALUE;
+            final String name = nameNode != null && nameNode.isTextual() ? nameNode.asText() : null;
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            if (priority > bestPriority) {
+                bestPriority = priority;
+                bestChassis = name;
+            }
+        }
+        return bestChassis;
+    }
+
+    /**
+     * Decode an OVSDB {@code set of uuid} column into a flat list of UUIDs.
+     * Tolerates both the single-element shape ({@code ["uuid", id]}) and the
+     * regular set shape ({@code ["set", [["uuid", id1], ["uuid", id2]]]}).
+     */
+    private static List<String> decodeUuidSetColumn(final JsonNode column) {
+        final List<String> out = new ArrayList<>();
+        if (column == null || !column.isArray() || column.size() < 2) {
+            return out;
+        }
+        if ("uuid".equals(column.get(0).asText())) {
+            out.add(column.get(1).asText());
+            return out;
+        }
+        final var inner = column.get(1);
+        if (inner == null || !inner.isArray()) {
+            return out;
+        }
+        for (int i = 0; i < inner.size(); i++) {
+            final var ref = inner.get(i);
+            if (ref != null && ref.size() >= 2 && "uuid".equals(ref.get(0).asText())) {
+                out.add(ref.get(1).asText());
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------

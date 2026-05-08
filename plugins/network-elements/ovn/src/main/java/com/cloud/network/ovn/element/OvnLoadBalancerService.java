@@ -41,6 +41,8 @@ import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
 import com.cloud.network.Network.Service;
 import com.cloud.network.PhysicalNetworkServiceProvider;
+import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.element.IpDeployer;
@@ -53,6 +55,7 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.offering.NetworkOffering;
@@ -112,6 +115,10 @@ public class OvnLoadBalancerService extends AdapterBase {
     private OvnLogicalIdMapDao logicalIdMapDao;
     @Inject
     private NetworkDao networkDao;
+    @Inject
+    private IPAddressDao ipAddressDao;
+    @Inject
+    private OvnBgpRedistributeManager bgpRedistributeManager;
 
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
@@ -147,7 +154,7 @@ public class OvnLoadBalancerService extends AdapterBase {
         boolean overall = true;
         for (final LoadBalancingRule rule : rules) {
             try {
-                applyOne(nb, controller, lrUuid, rule);
+                applyOne(nb, controller, lrUuid, network, rule);
             } catch (final OvnException oe) {
                 LOGGER.error("OvnLoadBalancerService: failed to apply LB rule id={}: {}", rule.getId(), oe.getMessage());
                 overall = false;
@@ -186,10 +193,10 @@ public class OvnLoadBalancerService extends AdapterBase {
     }
 
     private void applyOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
-                          final LoadBalancingRule rule) {
+                          final Network network, final LoadBalancingRule rule) {
         final FirewallRule.State state = rule.getState();
         if (state == FirewallRule.State.Revoke) {
-            revokeOne(nb, controller, lrUuid, rule);
+            revokeOne(nb, controller, lrUuid, network, rule);
             return;
         }
         if (state != FirewallRule.State.Add && state != FirewallRule.State.Active) {
@@ -240,10 +247,14 @@ public class OvnLoadBalancerService extends AdapterBase {
             LOGGER.warn("OvnLoadBalancerService: rule id={} has CloudStack health-check policies; "
                     + "OVN L4 health-check mapping is not implemented in MVP", rule.getId());
         }
+        // Announce /32 for the LB VIP. The manager is idempotent — multiple
+        // LB rules sharing the same source IP collapse to a single
+        // BGP_ANNOUNCE row (keyed by ip address id, not rule id).
+        announceLbVip(network, rule);
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
-                           final LoadBalancingRule rule) {
+                           final Network network, final LoadBalancingRule rule) {
         final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.LOAD_BALANCER, rule.getId(), controller.getId());
         if (mapping == null) {
             LOGGER.debug("OvnLoadBalancerService: no OVN LB mapping for rule id={}; revoke is a no-op",
@@ -262,6 +273,60 @@ public class OvnLoadBalancerService extends AdapterBase {
             logicalIdMapDao.remove(mapping.getId());
         }
         LOGGER.info("OvnLoadBalancerService: LB {} revoked (rule id={})", mapping.getOvnUuid(), rule.getId());
+        // Best-effort withdraw — if another LB or NAT rule shares the public
+        // IP, the announce path on its next applyOne() touch re-creates the
+        // BGP_ANNOUNCE row.
+        withdrawLbVip(network, rule);
+    }
+
+    /**
+     * Resolve the public IP backing the LB rule's source IP and announce a
+     * {@code /32} via the gateway-chassis FRR. Best-effort: a missing
+     * IPAddress row, missing VPC binding, or operator-disabled redistribute
+     * collapses to a no-op.
+     */
+    private void announceLbVip(final Network network, final LoadBalancingRule rule) {
+        if (network == null || rule == null || network.getVpcId() == null) {
+            return;
+        }
+        final IPAddressVO ipRow = lookupSourceIpRow(rule);
+        if (ipRow == null) {
+            return;
+        }
+        final String publicIp = ipRow.getAddress() == null ? null : ipRow.getAddress().addr();
+        if (publicIp == null || publicIp.isEmpty()) {
+            return;
+        }
+        bgpRedistributeManager.announce(publicIp, ipRow.getId(),
+                network.getVpcId(), network.getDataCenterId());
+    }
+
+    private void withdrawLbVip(final Network network, final LoadBalancingRule rule) {
+        if (network == null || rule == null || network.getVpcId() == null) {
+            return;
+        }
+        final IPAddressVO ipRow = lookupSourceIpRow(rule);
+        if (ipRow == null) {
+            return;
+        }
+        final String publicIp = ipRow.getAddress() == null ? null : ipRow.getAddress().addr();
+        if (publicIp == null || publicIp.isEmpty()) {
+            return;
+        }
+        bgpRedistributeManager.withdraw(publicIp, ipRow.getId(),
+                network.getVpcId(), network.getDataCenterId());
+    }
+
+    private IPAddressVO lookupSourceIpRow(final LoadBalancingRule rule) {
+        if (rule == null) {
+            return null;
+        }
+        // LoadBalancer extends FirewallRule -> getSourceIpAddressId().
+        final Long ipId = rule.getLb() == null ? null : rule.getLb().getSourceIpAddressId();
+        if (ipId == null) {
+            return null;
+        }
+        return ipAddressDao == null ? null : ipAddressDao.findById(ipId);
     }
 
     private String lookupVpcLrUuid(final Network network, final OvnControllerVO controller) {

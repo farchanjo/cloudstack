@@ -98,6 +98,87 @@ public class NicTO extends NetworkTO {
      */
     Map<String, String> nicDetails;
 
+    /*
+     * OVN NIC tunables, resolved by HypervisorGuruBase.populateOvnTunables
+     * via OvnNicConfig.resolve (VM detail > network detail > offering detail
+     * > global ConfigKey > hardcoded). All fields are wrapper types so {@code null}
+     * means "not configured": agents older than this build silently ignore
+     * the unknown JSON properties and keep their existing behavior.
+     */
+
+    /* SR-IOV VF tunables. */
+    Boolean vfTrust;
+    Boolean vfSpoofcheck;
+    String vfLinkState;
+    Integer vfMaxTxRate;
+    Integer vfMinTxRate;
+    Integer vfVlan;
+    Integer vfQos;
+
+    /* vhost / multiqueue tunables. */
+    Integer vhostQueues;
+    String vhostDriver;
+    Integer vhostTxQueueSize;
+    Integer vhostRxQueueSize;
+
+    /* Generic NIC tunables (libvirt XML / ethtool). */
+    Boolean tso;
+    Boolean gso;
+    Boolean gro;
+    Boolean lro;
+    Boolean csumOffload;
+    String driverModel;
+
+    /* OVS / TC offload. */
+    Boolean tcOffload;
+
+    /*
+     * Per-port OVS hairpin flag (other_config:hairpin=true). When non-null
+     * the agent stamps the freshly-attached br-int port with the resolved
+     * value. Required for VF<->VF same-host hardware offload via TC flower
+     * on mlx5 switchdev. Wire compat: null = older mgmt didn't resolve;
+     * agent skips the stamp.
+     */
+    Boolean ovsHairpin;
+
+    /*
+     * Bridge-wide OVS tc-policy. When non-null the agent applies
+     * {@code ovs-vsctl set Open_vSwitch . other_config:tc-policy=<value>}
+     * once per JVM at the first OVN-aware plug. Whitelist enforced
+     * mgmt-side; agent treats this as an opaque string and lets ovs-vsctl
+     * validate. Wire compat: null = older mgmt didn't resolve; agent
+     * leaves the existing tc-policy untouched.
+     */
+    String ovsTcPolicy;
+
+    /* OVN binding / chassis. */
+    String requestedChassis;
+    Integer haChassisPriority;
+
+    /* BFD. */
+    Boolean bfdEnable;
+    Integer bfdMinRx;
+    Integer bfdMinTx;
+    Integer bfdMultiplier;
+
+    /* Conntrack timeouts. */
+    Integer ctSnatTimeout;
+    Integer ctTcpTimeout;
+    Integer ctUdpTimeout;
+    Integer ctIcmpTimeout;
+
+    /* SubFunction (BlueField). */
+    Boolean sfEnabled;
+    Integer sfNum;
+    Boolean sfHpf;
+
+    /* vDPA fine-grained. */
+    Boolean vdpaEventIdx;
+    Boolean vdpaIndirectDesc;
+    Boolean vdpaIommu;
+    Boolean vdpaPacked;
+    Integer vdpaQueuePairs;
+
     public NicTO() {
         super();
     }
@@ -158,7 +239,58 @@ public class NicTO extends NetworkTO {
 
     @Override
     public String toString() {
-        return new StringBuilder("[Nic:").append(type).append("-").append(ip).append("-").append(broadcastUri).append("]").toString();
+        final StringBuilder sb = new StringBuilder("[Nic:")
+                .append(type).append("-").append(ip).append("-").append(broadcastUri);
+        appendIfSet(sb, "useOvn", useOvn);
+        appendIfSet(sb, "useVdpa", useVdpa);
+        appendIfSet(sb, "useHwOffload", useHwOffload);
+        appendIfSet(sb, "vfTrust", vfTrust);
+        appendIfSet(sb, "vfSpoofcheck", vfSpoofcheck);
+        appendIfSet(sb, "vfLinkState", vfLinkState);
+        appendIfSet(sb, "vfMaxTxRate", vfMaxTxRate);
+        appendIfSet(sb, "vfMinTxRate", vfMinTxRate);
+        appendIfSet(sb, "vfVlan", vfVlan);
+        appendIfSet(sb, "vfQos", vfQos);
+        appendIfSet(sb, "vhostQueues", vhostQueues);
+        appendIfSet(sb, "vhostDriver", vhostDriver);
+        appendIfSet(sb, "vhostTxQ", vhostTxQueueSize);
+        appendIfSet(sb, "vhostRxQ", vhostRxQueueSize);
+        appendIfSet(sb, "tso", tso);
+        appendIfSet(sb, "gso", gso);
+        appendIfSet(sb, "gro", gro);
+        appendIfSet(sb, "lro", lro);
+        appendIfSet(sb, "csumOffload", csumOffload);
+        appendIfSet(sb, "driverModel", driverModel);
+        appendIfSet(sb, "tcOffload", tcOffload);
+        appendIfSet(sb, "ovsHairpin", ovsHairpin);
+        appendIfSet(sb, "ovsTcPolicy", ovsTcPolicy);
+        appendIfSet(sb, "requestedChassis", requestedChassis);
+        appendIfSet(sb, "haChassisPriority", haChassisPriority);
+        appendIfSet(sb, "bfdEnable", bfdEnable);
+        appendIfSet(sb, "bfdMinRx", bfdMinRx);
+        appendIfSet(sb, "bfdMinTx", bfdMinTx);
+        appendIfSet(sb, "bfdMultiplier", bfdMultiplier);
+        appendIfSet(sb, "ctSnatTimeout", ctSnatTimeout);
+        appendIfSet(sb, "ctTcpTimeout", ctTcpTimeout);
+        appendIfSet(sb, "ctUdpTimeout", ctUdpTimeout);
+        appendIfSet(sb, "ctIcmpTimeout", ctIcmpTimeout);
+        appendIfSet(sb, "sfEnabled", sfEnabled);
+        appendIfSet(sb, "sfNum", sfNum);
+        appendIfSet(sb, "sfHpf", sfHpf);
+        appendIfSet(sb, "vdpaQueuePairs", vdpaQueuePairs);
+        appendIfSet(sb, "vdpaEventIdx", vdpaEventIdx);
+        appendIfSet(sb, "vdpaIndirectDesc", vdpaIndirectDesc);
+        appendIfSet(sb, "vdpaIommu", vdpaIommu);
+        appendIfSet(sb, "vdpaPacked", vdpaPacked);
+        return sb.append("]").toString();
+    }
+
+    /** Append {@code -name=value} only when {@code value} is not null. Keeps log lines short. */
+    private static void appendIfSet(final StringBuilder sb, final String name, final Object value) {
+        if (value == null) {
+            return;
+        }
+        sb.append("-").append(name).append("=").append(value);
     }
 
     public void setNicSecIps(List<String> secIps) {
@@ -371,4 +503,120 @@ public class NicTO extends NetworkTO {
         }
         return nicDetails.get(key);
     }
+
+    /* ---------- OVN tunable accessors (wrapper types: null = unset) ---------- */
+
+    public Boolean getVfTrust() { return vfTrust; }
+    public void setVfTrust(Boolean vfTrust) { this.vfTrust = vfTrust; }
+
+    public Boolean getVfSpoofcheck() { return vfSpoofcheck; }
+    public void setVfSpoofcheck(Boolean vfSpoofcheck) { this.vfSpoofcheck = vfSpoofcheck; }
+
+    public String getVfLinkState() { return vfLinkState; }
+    public void setVfLinkState(String vfLinkState) { this.vfLinkState = vfLinkState; }
+
+    public Integer getVfMaxTxRate() { return vfMaxTxRate; }
+    public void setVfMaxTxRate(Integer vfMaxTxRate) { this.vfMaxTxRate = vfMaxTxRate; }
+
+    public Integer getVfMinTxRate() { return vfMinTxRate; }
+    public void setVfMinTxRate(Integer vfMinTxRate) { this.vfMinTxRate = vfMinTxRate; }
+
+    public Integer getVfVlan() { return vfVlan; }
+    public void setVfVlan(Integer vfVlan) { this.vfVlan = vfVlan; }
+
+    public Integer getVfQos() { return vfQos; }
+    public void setVfQos(Integer vfQos) { this.vfQos = vfQos; }
+
+    public Integer getVhostQueues() { return vhostQueues; }
+    public void setVhostQueues(Integer vhostQueues) { this.vhostQueues = vhostQueues; }
+
+    public String getVhostDriver() { return vhostDriver; }
+    public void setVhostDriver(String vhostDriver) { this.vhostDriver = vhostDriver; }
+
+    public Integer getVhostTxQueueSize() { return vhostTxQueueSize; }
+    public void setVhostTxQueueSize(Integer vhostTxQueueSize) { this.vhostTxQueueSize = vhostTxQueueSize; }
+
+    public Integer getVhostRxQueueSize() { return vhostRxQueueSize; }
+    public void setVhostRxQueueSize(Integer vhostRxQueueSize) { this.vhostRxQueueSize = vhostRxQueueSize; }
+
+    public Boolean getTso() { return tso; }
+    public void setTso(Boolean tso) { this.tso = tso; }
+
+    public Boolean getGso() { return gso; }
+    public void setGso(Boolean gso) { this.gso = gso; }
+
+    public Boolean getGro() { return gro; }
+    public void setGro(Boolean gro) { this.gro = gro; }
+
+    public Boolean getLro() { return lro; }
+    public void setLro(Boolean lro) { this.lro = lro; }
+
+    public Boolean getCsumOffload() { return csumOffload; }
+    public void setCsumOffload(Boolean csumOffload) { this.csumOffload = csumOffload; }
+
+    public String getDriverModel() { return driverModel; }
+    public void setDriverModel(String driverModel) { this.driverModel = driverModel; }
+
+    public Boolean getTcOffload() { return tcOffload; }
+    public void setTcOffload(Boolean tcOffload) { this.tcOffload = tcOffload; }
+
+    public Boolean getOvsHairpin() { return ovsHairpin; }
+    public void setOvsHairpin(Boolean ovsHairpin) { this.ovsHairpin = ovsHairpin; }
+
+    public String getOvsTcPolicy() { return ovsTcPolicy; }
+    public void setOvsTcPolicy(String ovsTcPolicy) { this.ovsTcPolicy = ovsTcPolicy; }
+
+    public String getRequestedChassis() { return requestedChassis; }
+    public void setRequestedChassis(String requestedChassis) { this.requestedChassis = requestedChassis; }
+
+    public Integer getHaChassisPriority() { return haChassisPriority; }
+    public void setHaChassisPriority(Integer haChassisPriority) { this.haChassisPriority = haChassisPriority; }
+
+    public Boolean getBfdEnable() { return bfdEnable; }
+    public void setBfdEnable(Boolean bfdEnable) { this.bfdEnable = bfdEnable; }
+
+    public Integer getBfdMinRx() { return bfdMinRx; }
+    public void setBfdMinRx(Integer bfdMinRx) { this.bfdMinRx = bfdMinRx; }
+
+    public Integer getBfdMinTx() { return bfdMinTx; }
+    public void setBfdMinTx(Integer bfdMinTx) { this.bfdMinTx = bfdMinTx; }
+
+    public Integer getBfdMultiplier() { return bfdMultiplier; }
+    public void setBfdMultiplier(Integer bfdMultiplier) { this.bfdMultiplier = bfdMultiplier; }
+
+    public Integer getCtSnatTimeout() { return ctSnatTimeout; }
+    public void setCtSnatTimeout(Integer ctSnatTimeout) { this.ctSnatTimeout = ctSnatTimeout; }
+
+    public Integer getCtTcpTimeout() { return ctTcpTimeout; }
+    public void setCtTcpTimeout(Integer ctTcpTimeout) { this.ctTcpTimeout = ctTcpTimeout; }
+
+    public Integer getCtUdpTimeout() { return ctUdpTimeout; }
+    public void setCtUdpTimeout(Integer ctUdpTimeout) { this.ctUdpTimeout = ctUdpTimeout; }
+
+    public Integer getCtIcmpTimeout() { return ctIcmpTimeout; }
+    public void setCtIcmpTimeout(Integer ctIcmpTimeout) { this.ctIcmpTimeout = ctIcmpTimeout; }
+
+    public Boolean getSfEnabled() { return sfEnabled; }
+    public void setSfEnabled(Boolean sfEnabled) { this.sfEnabled = sfEnabled; }
+
+    public Integer getSfNum() { return sfNum; }
+    public void setSfNum(Integer sfNum) { this.sfNum = sfNum; }
+
+    public Boolean getSfHpf() { return sfHpf; }
+    public void setSfHpf(Boolean sfHpf) { this.sfHpf = sfHpf; }
+
+    public Boolean getVdpaEventIdx() { return vdpaEventIdx; }
+    public void setVdpaEventIdx(Boolean vdpaEventIdx) { this.vdpaEventIdx = vdpaEventIdx; }
+
+    public Boolean getVdpaIndirectDesc() { return vdpaIndirectDesc; }
+    public void setVdpaIndirectDesc(Boolean vdpaIndirectDesc) { this.vdpaIndirectDesc = vdpaIndirectDesc; }
+
+    public Boolean getVdpaIommu() { return vdpaIommu; }
+    public void setVdpaIommu(Boolean vdpaIommu) { this.vdpaIommu = vdpaIommu; }
+
+    public Boolean getVdpaPacked() { return vdpaPacked; }
+    public void setVdpaPacked(Boolean vdpaPacked) { this.vdpaPacked = vdpaPacked; }
+
+    public Integer getVdpaQueuePairs() { return vdpaQueuePairs; }
+    public void setVdpaQueuePairs(Integer vdpaQueuePairs) { this.vdpaQueuePairs = vdpaQueuePairs; }
 }
