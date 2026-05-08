@@ -21,6 +21,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Callable;
 
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
@@ -67,6 +69,10 @@ import com.cloud.network.ovn.api.command.admin.ListOvnControllersCmd;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
+import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.utils.component.PluggableService;
 import com.cloud.network.rules.PortForwardingRule;
@@ -158,6 +164,10 @@ public class OvnNetworkElement extends AdapterBase
     private VlanDao vlanDao;
     @Inject
     private OvnPublicNetworkManager publicNetworkManager;
+    @Inject
+    private OvnBgpRedistributeManager bgpRedistributeManager;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /** Default OVS bridge mapping name; must match {@code ovn-bridge-mappings}
      *  on every chassis. Aragog deployment uses {@code physnet1:br-bond}. */
@@ -404,31 +414,123 @@ public class OvnNetworkElement extends AdapterBase
         return true;
     }
 
+    /**
+     * Roll back a partially-implemented network. If the LS mapping row exists
+     * but no active VMs remain on the switch (CloudStack has already cleaned
+     * up any LSPs via {@code release()}), delete the Logical_Switch now so the
+     * NB DB does not accumulate ghost switches for networks stuck in
+     * {@code Shutdown} state.
+     *
+     * <p>Returns {@code true} in all cases: CloudStack lifecycle continues
+     * regardless of OVN cleanup success. Failed cleanups are queued for retry.
+     */
     @Override
     public boolean shutdown(final Network network, final ReservationContext context, final boolean cleanup) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return true;
+        }
+        final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        if (lsMapping == null) {
+            return true;
+        }
+        LOGGER.info("OvnNetworkElement.shutdown: rolling back LS {} for network id={}", lsMapping.getOvnUuid(), network.getId());
+        try {
+            guru.deleteLogicalSwitchFor(network);
+        } catch (OvnException e) {
+            LOGGER.warn("OvnNetworkElement.shutdown: LS {} delete failed; queuing for retry: {}",
+                    lsMapping.getOvnUuid(), e.getMessage());
+            enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NETWORK,
+                    lsMapping.getOvnUuid(), network.getId());
+        }
         return true;
     }
 
+    /**
+     * Each cleanup step runs in its own try/catch so that a failure in step N
+     * does not skip steps N+1..5. Failed steps are queued to
+     * {@code ovn_pending_deletion} for background retry instead of leaking.
+     *
+     * <p>Returns {@code true} regardless: CloudStack removes the network from
+     * its DB; the pending-deletion processor handles eventual OVN cleanup.
+     */
     @Override
     public boolean destroy(final Network network, final ReservationContext context) {
-        try {
-            //  1. Drop per-tier DHCP_Options + DNS rows.
-            //  2. Drop the SOURCE_NAT row for this tier (mapped under
-            //     Kind.SOURCE_NAT keyed by network id; safely no-op when
-            //     applyIps never ran for this tier).
-            //  3. Drop tier-LRP from VPC LR (OvnNbClient detach handles
-            //     ports set; LRP-side router-patch LSP gets cascade-dropped
-            //     when the parent LS goes away in step 4).
-            //  4. Drop the Logical_Switch (cascade kills any leftover LSPs).
-            dhcpService.removeTierDhcp(network);
-            dnsService.removeTierDns(network);
-            sourceNatService.removeSnatForTier(network.getDataCenterId(), network.getId());
-            detachTierFromVpcLr(network);
-            guru.deleteLogicalSwitchFor(network);
-        } catch (OvnException e) {
-            LOGGER.warn("OvnNetworkElement.destroy: failed network id={}: {}", network.getId(), e.getMessage());
+        final List<String> failures = new ArrayList<>();
+        //  1. Drop per-tier DHCP_Options + DNS rows.
+        runDestroyStep("removeTierDhcp", () -> { dhcpService.removeTierDhcp(network); return null; },
+                failures, network, Kind.DHCP_OPTIONS);
+        runDestroyStep("removeTierDns", () -> { dnsService.removeTierDns(network); return null; },
+                failures, network, Kind.DNS_RECORDS);
+        //  2. Drop the SOURCE_NAT row for this tier.
+        runDestroyStep("removeSnatForTier",
+                () -> { sourceNatService.removeSnatForTier(network.getDataCenterId(), network.getId()); return null; },
+                failures, network, Kind.SOURCE_NAT);
+        //  3. Drop tier-LRP from VPC LR.
+        runDestroyStep("detachTierFromVpcLr", () -> { detachTierFromVpcLr(network); return null; },
+                failures, network, Kind.PUBLIC_LRP);
+        //  4. Drop the Logical_Switch (cascade kills any leftover LSPs).
+        runDestroyStep("deleteLogicalSwitchFor", () -> { guru.deleteLogicalSwitchFor(network); return null; },
+                failures, network, Kind.NETWORK);
+        if (!failures.isEmpty()) {
+            LOGGER.warn("OvnNetworkElement.destroy: network id={} had {} step failure(s) queued for retry: {}",
+                    network.getId(), failures.size(), failures);
         }
         return true;
+    }
+
+    /**
+     * Execute one destroy step; on exception log + record failure + enqueue
+     * pending deletion so the background processor retries it.
+     */
+    private void runDestroyStep(final String stepName, final Callable<Void> step,
+                                final List<String> failures, final Network network, final Kind kindForRetry) {
+        try {
+            step.call();
+        } catch (Exception e) {
+            LOGGER.warn("OvnNetworkElement.destroy: step={} network id={} failed: {}",
+                    stepName, network.getId(), e.getMessage(), e);
+            failures.add(stepName);
+            enqueueMappingsForRetry(network, kindForRetry);
+        }
+    }
+
+    /**
+     * Enqueue every surviving mapping row of {@code kind} for {@code network}
+     * into the pending-deletion queue. Safe to call when the mapping was
+     * already wiped — the kind lookup returns null in that case and no row
+     * is added.
+     */
+    private void enqueueMappingsForRetry(final Network network, final Kind kind) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(kind, network.getId(), controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        enqueueIfAbsent(controller.getId(), network.getDataCenterId(), kind,
+                mapping.getOvnUuid(), network.getId());
+    }
+
+    /**
+     * Enqueue a pending deletion if no live row for the same UUID+kind exists.
+     * Uses controller_id=0 sentinel when controllerId matches the sentinel
+     * constant (e.g. called from shutdownVpc with no controller resolved).
+     */
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final Kind kind,
+                                  final String ovnUuid, final Long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, kind.name())) {
+            return;
+        }
+        final OvnPendingDeletionVO entry = new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, kind, ovnUuid, csId);
+        pendingDeletionDao.persist(entry);
+        LOGGER.info("OvnNetworkElement: queued pending deletion kind={} ovn_uuid={} cs_id={}", kind, ovnUuid, csId);
     }
 
     /**
@@ -640,6 +742,13 @@ public class OvnNetworkElement extends AdapterBase
             try {
                 if (rule.isForRevoke()) {
                     staticNatService.removeStaticNat(config.getDataCenterId(), rule.getSourceIpAddressId());
+                    final IPAddressVO removed = ipAddressDao.findById(rule.getSourceIpAddressId());
+                    final String removedAddr = removed == null || removed.getAddress() == null
+                            ? null : removed.getAddress().addr();
+                    if (StringUtils.isNotBlank(removedAddr)) {
+                        bgpRedistributeManager.withdraw(removedAddr, rule.getSourceIpAddressId(), vpcId,
+                                config.getDataCenterId());
+                    }
                     continue;
                 }
                 final IPAddressVO publicIp = ipAddressDao.findById(rule.getSourceIpAddressId());
@@ -653,6 +762,8 @@ public class OvnNetworkElement extends AdapterBase
                 }
                 staticNatService.addStaticNat(config.getDataCenterId(), rule.getSourceIpAddressId(),
                         lrMapping.getOvnUuid(), externalIpStr, rule.getDestIpAddress(), null);
+                bgpRedistributeManager.announce(externalIpStr, rule.getSourceIpAddressId(), vpcId,
+                        config.getDataCenterId());
             } catch (RuntimeException e) {
                 LOGGER.error("OvnNetworkElement.applyStaticNats: rule revoke={} src={} dst={} failed: {}",
                         rule.isForRevoke(), rule.getSourceIpAddressId(), rule.getDestIpAddress(), e.getMessage());
@@ -957,34 +1068,88 @@ public class OvnNetworkElement extends AdapterBase
         }
         try {
             sourceNatService.ensureVpcSourceNat(vpc.getZoneId(), vpc.getId(), lrUuid, externalIp, vpcCidr);
+            // BGP /32 redistribute is opt-in — the manager skips inside when
+            // the VPC / global toggle is off, so the call is unconditional.
+            bgpRedistributeManager.announce(externalIp, ip.getId(), vpc.getId(), vpc.getZoneId());
         } catch (RuntimeException e) {
             LOGGER.warn("OvnNetworkElement.ensureVpcSourceNat: VPC id={} SNAT add failed: {}",
                     vpc.getId(), e.getMessage());
         }
     }
 
+    /**
+     * Tear down the OVN LR and all public-side attachments for a VPC.
+     *
+     * <p>Each step is independent: a failure in public-unbind does not skip
+     * the LR delete, and vice versa. When the LR delete fails the mapping
+     * UUID is enqueued into {@code ovn_pending_deletion} BEFORE returning so
+     * the retry queue holds the OVN UUID even if the mapping row is
+     * subsequently wiped by other cleanup paths.
+     *
+     * <p>Returns {@code true} in all cases so CloudStack removes the VPC
+     * from its DB; the pending-deletion processor handles eventual LR cleanup.
+     */
     @Override
     public boolean shutdownVpc(final Vpc vpc, final ReservationContext context)
             throws ConcurrentOperationException, ResourceUnavailableException {
-        try {
-            // Phase II — drop the public-side LRP + default route + STATIC_ROUTE
-            // mapping row before the LR cascade. The cascade-on-LR-delete
-            // would also tear them down (strong refs), but explicit unbind
-            // keeps the CS-side mapping rows clean and avoids relying on
-            // OVSDB's cascade for our bookkeeping.
-            final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
-            if (controller != null) {
-                final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
-                if (lrMapping != null) {
-                    publicNetworkManager.unbindVpcFromPublic(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid());
-                }
+        // Step 1: withdraw BGP /32 announces (best-effort; surplus reaped by reconciler).
+        withdrawBgpForVpc(vpc);
+        // Step 2: unbind VPC LR from public LS.
+        final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
+        if (controller != null) {
+            unbindVpcPublicStep(vpc, controller);
+        }
+        // Step 3: delete VPC LR. Enqueue BEFORE calling deleteLogicalRouterFor
+        // so the OVN UUID is in the queue even if the call wipes the mapping row.
+        final OvnLogicalIdMapVO lrMapping = controller == null ? null
+                : logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping != null) {
+            try {
+                vpcElement.deleteLogicalRouterFor(vpc);
+            } catch (OvnException e) {
+                LOGGER.warn("OvnNetworkElement.shutdownVpc: VPC id={} LR delete failed; queuing for retry: {}",
+                        vpc.getId(), e.getMessage());
+                final long effControllerId = controller != null
+                        ? controller.getId() : OvnPendingDeletionDaoImpl.CONTROLLER_SENTINEL;
+                enqueueIfAbsent(effControllerId, vpc.getZoneId(), Kind.VPC,
+                        lrMapping.getOvnUuid(), vpc.getId());
             }
-            vpcElement.deleteLogicalRouterFor(vpc);
-            return true;
-        } catch (com.cloud.network.ovn.client.OvnException e) {
-            LOGGER.warn("OvnNetworkElement.shutdownVpc: VPC id={} OVN LR delete failed: {}", vpc.getId(), e.getMessage());
-            // Best-effort: OVN cleanup failure should not block CloudStack VPC delete.
-            return true;
+        } else {
+            // No mapping — either already cleaned or controller absent.
+            // Call deleteLogicalRouterFor anyway; it is a no-op when the mapping is missing.
+            try {
+                vpcElement.deleteLogicalRouterFor(vpc);
+            } catch (OvnException e) {
+                LOGGER.warn("OvnNetworkElement.shutdownVpc: VPC id={} LR delete (no-mapping path) failed: {}",
+                        vpc.getId(), e.getMessage());
+            }
+        }
+        return true;
+    }
+
+    private void withdrawBgpForVpc(final Vpc vpc) {
+        final List<IPAddressVO> publicIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), null);
+        if (publicIps == null) {
+            return;
+        }
+        for (final IPAddressVO ip : publicIps) {
+            final String addr = ip.getAddress() == null ? null : ip.getAddress().addr();
+            if (StringUtils.isNotBlank(addr)) {
+                bgpRedistributeManager.withdraw(addr, ip.getId(), vpc.getId(), vpc.getZoneId());
+            }
+        }
+    }
+
+    private void unbindVpcPublicStep(final Vpc vpc, final OvnControllerVO controller) {
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        try {
+            publicNetworkManager.unbindVpcFromPublic(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid());
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.shutdownVpc: VPC id={} public unbind failed (non-fatal): {}",
+                    vpc.getId(), e.getMessage());
         }
     }
 
@@ -1051,7 +1216,19 @@ public class OvnNetworkElement extends AdapterBase
             return true;
         }
         try {
+            // Capture the old source-NAT IP (if any) before we rewrite, so
+            // we can withdraw the /32 announce for it on the gateway-chassis.
+            final List<IPAddressVO> previousSourceNat = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
             sourceNatService.ensureVpcSourceNat(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid(), newExt, vpcCidr);
+            for (final IPAddressVO previous : previousSourceNat) {
+                final String prevAddr = previous.getAddress() == null ? null : previous.getAddress().addr();
+                if (StringUtils.isNotBlank(prevAddr) && !prevAddr.equals(newExt)) {
+                    bgpRedistributeManager.withdraw(prevAddr, previous.getId(), vpc.getId(), vpc.getZoneId());
+                }
+            }
+            if (address != null) {
+                bgpRedistributeManager.announce(newExt, address.getId(), vpc.getId(), vpc.getZoneId());
+            }
             LOGGER.info("OvnNetworkElement.updateVpcSourceNatIp: vpc id={} SNAT ext_ip rewritten to {}",
                     vpc.getId(), newExt);
         } catch (RuntimeException e) {
