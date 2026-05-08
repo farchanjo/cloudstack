@@ -67,6 +67,14 @@ public class VxlanGuestNetworkGuru extends GuestNetworkGuru {
 
     @Override
     public Network design(NetworkOffering offering, DeploymentPlan plan, Network userSpecified, String name, Long vpcId, Account owner) {
+        if (_networkModel.areServicesSupportedByNetworkOffering(offering.getId(), Network.Service.Connectivity)) {
+            // Defer to the Connectivity-providing guru (OVN, NSX, Netris, etc.).
+            // Without this guard, both VxlanGuestNetworkGuru and the Connectivity
+            // guru persist NetworkVO rows for the same VPC tier, leaving an orphan
+            // row that blocks deleteVPC with errorcode=431:
+            // "Can't delete VPC ... as its used by 1 networks".
+            return null;
+        }
         NetworkVO network = (NetworkVO)super.design(offering, plan, userSpecified, name, vpcId, owner);
         if (network == null) {
             return null;

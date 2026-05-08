@@ -17,12 +17,14 @@
 package com.cloud.network.guru;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -230,6 +232,58 @@ public class VxlanGuestNetworkGuruTest {
         assertTrue(implementednetwork != null);
         assertTrue(implementednetwork.getCidr().equals("10.1.1.0/24"));
         assertTrue(implementednetwork.getGateway().equals("10.1.1.1"));
+    }
+
+    @Test
+    public void design_returnsNull_whenOfferingSupportsConnectivityService() {
+        PhysicalNetworkVO physnet = mock(PhysicalNetworkVO.class);
+        when(physnetdao.findById(anyLong())).thenReturn(physnet);
+        when(physnet.getIsolationMethods()).thenReturn(Arrays.asList(new String[] {"VXLAN"}));
+        when(physnet.getId()).thenReturn(42L);
+
+        NetworkOffering offering = mock(NetworkOffering.class);
+        when(offering.getId()).thenReturn(42L);
+        when(offering.getTrafficType()).thenReturn(TrafficType.Guest);
+        when(offering.getGuestType()).thenReturn(GuestType.Isolated);
+
+        // Simulate an offering whose Connectivity service is provided by a non-VXLAN guru
+        // (e.g. OvnGuestNetworkGuru for an ovn-vpc-tier offering).
+        when(netmodel.areServicesSupportedByNetworkOffering(42L, Network.Service.Connectivity)).thenReturn(true);
+
+        DeploymentPlan plan = mock(DeploymentPlan.class);
+        Network network = mock(Network.class);
+        Account account = mock(Account.class);
+
+        Network result = guru.design(offering, plan, network, "", 1L, account);
+
+        assertNull("design() must return null when Connectivity service is provided by another guru", result);
+        // super.design() must not be called when we short-circuit
+        verify(guru, never()).updateNetworkDesignForIPv6IfNeeded(any(), any());
+    }
+
+    @Test
+    public void design_proceeds_whenOfferingDoesNotSupportConnectivityService() {
+        PhysicalNetworkVO physnet = mock(PhysicalNetworkVO.class);
+        when(physnetdao.findById(anyLong())).thenReturn(physnet);
+        when(physnet.getIsolationMethods()).thenReturn(Arrays.asList(new String[] {"VXLAN"}));
+        when(physnet.getId()).thenReturn(42L);
+
+        NetworkOffering offering = mock(NetworkOffering.class);
+        when(offering.getId()).thenReturn(42L);
+        when(offering.getTrafficType()).thenReturn(TrafficType.Guest);
+        when(offering.getGuestType()).thenReturn(GuestType.Isolated);
+
+        // No Connectivity provider configured — VxlanGuestNetworkGuru owns the design.
+        when(netmodel.areServicesSupportedByNetworkOffering(42L, Network.Service.Connectivity)).thenReturn(false);
+
+        DeploymentPlan plan = mock(DeploymentPlan.class);
+        Network network = mock(Network.class);
+        Account account = mock(Account.class);
+
+        Network result = guru.design(offering, plan, network, "", 1L, account);
+
+        assertTrue("design() must return a non-null NetworkVO when Connectivity is not delegated", result != null);
+        assertTrue("Designed network must use VXLAN broadcast domain", result.getBroadcastDomainType() == BroadcastDomainType.Vxlan);
     }
 
     @Test
