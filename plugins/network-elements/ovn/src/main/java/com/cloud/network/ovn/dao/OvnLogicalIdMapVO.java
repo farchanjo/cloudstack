@@ -81,7 +81,14 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  per-zone public Logical_Switch), keyed by VPC id. Distinct from
          *  {@link #PUBLIC_LRP} which is reused by tier-LRPs (per network
          *  id) — the names overlap historically but the key spaces differ. */
-        VPC_PUBLIC_LRP
+        VPC_PUBLIC_LRP,
+        /** BGP /32 announce bookkeeping. cs_id = IPAddressVO.id;
+         *  ovn_uuid column is reused to hold the agent host id (as string)
+         *  that last announced the route; ovn_name carries the bare public
+         *  IP for cheap reverse lookup. Holds no actual OVN UUID — the kind
+         *  exists to drive {@code OvnBgpRedistributeManager} reconciliation
+         *  on gateway-chassis migration. */
+        BGP_ANNOUNCE
     }
 
     @Id
