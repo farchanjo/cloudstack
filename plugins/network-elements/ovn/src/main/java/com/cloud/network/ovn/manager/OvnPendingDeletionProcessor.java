@@ -322,7 +322,7 @@ public class OvnPendingDeletionProcessor implements Configurable {
             removeCorrespondingMapping(row, resolvedControllerId);
             LOGGER.info("OvnPendingDeletionProcessor: deleted {} uuid={} (csId={}) after {} attempt(s)",
                     row.getKindRaw(), row.getOvnUuid(), row.getCsId(), row.getAttempts() + 1);
-        } catch (OvnException | RuntimeException e) {
+        } catch (RuntimeException e) {
             LOGGER.warn("OvnPendingDeletionProcessor: delete failed {} uuid={} attempt={}: {}",
                     row.getKindRaw(), row.getOvnUuid(), row.getAttempts() + 1, e.getMessage());
             pendingDeletionDao.markFailed(row.getId(), e.getMessage());
