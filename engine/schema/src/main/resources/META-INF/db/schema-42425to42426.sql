@@ -52,7 +52,7 @@ VALUES
     ('Network', 'DEFAULT', 'OvnPendingDeletionProcessor',
      'ovn.pending.deletion.interval.seconds', NULL,
      'Interval in seconds between pending-deletion processor runs.',
-     '60', NOW(), 'Global', 0)
+     '60', NOW(), 1, 0)
 ON DUPLICATE KEY UPDATE `description` = VALUES(`description`), `default_value` = VALUES(`default_value`);
 
 INSERT INTO `cloud`.`configuration`
@@ -61,7 +61,7 @@ VALUES
     ('Network', 'DEFAULT', 'OvnPendingDeletionProcessor',
      'ovn.pending.deletion.batch.size', NULL,
      'Maximum pending OVN deletions processed per controller per processor run.',
-     '50', NOW(), 'Global', 0)
+     '50', NOW(), 1, 0)
 ON DUPLICATE KEY UPDATE `description` = VALUES(`description`), `default_value` = VALUES(`default_value`);
 
 INSERT INTO `cloud`.`configuration`
@@ -70,5 +70,5 @@ VALUES
     ('Network', 'DEFAULT', 'OvnPendingDeletionProcessor',
      'ovn.pending.deletion.max.attempts', NULL,
      'Maximum deletion attempts before a pending-deletion row is abandoned with an ALERT.',
-     '20', NOW(), 'Global', 0)
+     '20', NOW(), 1, 0)
 ON DUPLICATE KEY UPDATE `description` = VALUES(`description`), `default_value` = VALUES(`default_value`);
