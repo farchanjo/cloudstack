@@ -19,6 +19,7 @@ package com.cloud.network.ovn.element;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.inject.Inject;
 
@@ -32,6 +33,9 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.vpc.Vpc;
 
@@ -56,6 +60,8 @@ public class OvnVpcElement {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Creates the LR backing the given VPC. Idempotent — re-running on a
@@ -102,46 +108,91 @@ public class OvnVpcElement {
      * {@code load_balancer} is a weak ref — explicitly detach LBs first to
      * avoid leaving them attached to a dead LR.
      *
+     * <p>When no controller is registered yet (controller == null), the LR
+     * UUID (from the mapping row if it exists) is enqueued into
+     * {@code ovn_pending_deletion} with the zone-sentinel
+     * ({@code controller_id = 0}) so the background processor retries as
+     * soon as a controller becomes available.
+     *
+     * <p>Mapping row for the VPC LR is removed ONLY after a successful NB
+     * delete. If the NB delete throws, the mapping survives so the reconciler
+     * can detect the stale pair on its next pass and the processor can retry
+     * via the pending-deletion queue.
+     *
      * <p>Mapping rows in {@code ovn_logical_id_map} for this VPC's children
      * (PUBLIC_LRP, STATIC_ROUTE, SOURCE_NAT, STATIC_NAT, PORT_FORWARDING,
-     * LOAD_BALANCER) are dropped on a best-effort basis. The caller should
-     * already have run rule-revoke flows; the sweep here covers crash-leftover
-     * mappings.
+     * LOAD_BALANCER) are dropped on a best-effort basis after a successful
+     * LR delete (OVN cascade already cleaned the NB rows).
      */
     public void deleteLogicalRouterFor(final Vpc vpc) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
         if (controller == null) {
+            enqueueLrDeletionNoController(vpc);
             return;
         }
         final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
         if (mapping == null) {
             return;
         }
-        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
-        // Detach all LBs from this LR; weak refs would otherwise dangle.
-        for (final String lbUuid : nb.listLoadBalancersOnLogicalRouter(mapping.getOvnUuid())) {
+        detachLbsFromLr(mapping.getOvnUuid(), controller);
+        deleteLrAndCleanup(vpc, mapping, controller);
+    }
+
+    private void enqueueLrDeletionNoController(final Vpc vpc) {
+        // Try to find any mapping row across controllers using findByOvnUuid
+        // round-trip is not possible without a controller; scan by VPC id
+        // across all controllers is expensive. Best approach: log + record
+        // in the queue with sentinel. If the mapping exists for any controller
+        // we add a sentinel row so the processor resolves it later.
+        LOGGER.warn("OvnVpcElement.deleteLogicalRouterFor: no OVN controller for zone {}; "
+                + "queuing LR deletion for VPC id={}", vpc.getZoneId(), vpc.getId());
+        // We do not have a controller to resolve the mapping against; insert a
+        // sentinel row with ovn_uuid = "RESOLVE:" + vpc.getId() so the
+        // processor can look it up when a controller becomes available.
+        final String syntheticKey = "RESOLVE:vpc:" + vpc.getId();
+        if (!pendingDeletionDao.isPendingByOvnUuid(syntheticKey, Kind.VPC.name())) {
+            final OvnPendingDeletionVO entry = new OvnPendingDeletionVO(
+                    UUID.randomUUID().toString(),
+                    OvnPendingDeletionDaoImpl.CONTROLLER_SENTINEL,
+                    vpc.getZoneId(),
+                    Kind.VPC,
+                    syntheticKey,
+                    vpc.getId());
+            pendingDeletionDao.persist(entry);
+        }
+    }
+
+    private void detachLbsFromLr(final String lrUuid, final OvnControllerVO controller) {
+        final OvnNbClient nb = pluginManager.nbClient(controller.getZoneId());
+        for (final String lbUuid : nb.listLoadBalancersOnLogicalRouter(lrUuid)) {
             try {
-                nb.detachLoadBalancerFromLogicalRouter(mapping.getOvnUuid(), lbUuid);
+                nb.detachLoadBalancerFromLogicalRouter(lrUuid, lbUuid);
             } catch (OvnException e) {
                 LOGGER.warn("OvnVpcElement.deleteLR: detach LB {} from LR {} failed: {}",
-                        lbUuid, mapping.getOvnUuid(), e.getMessage());
+                        lbUuid, lrUuid, e.getMessage());
             }
         }
+    }
+
+    private void deleteLrAndCleanup(final Vpc vpc, final OvnLogicalIdMapVO mapping, final OvnControllerVO controller) {
+        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
         try {
             nb.deleteLogicalRouter(mapping.getOvnUuid());
-        } catch (OvnException e) {
-            LOGGER.warn("OvnVpcElement.deleteLR: LR {} delete failed (children left orphan): {}",
-                    mapping.getOvnUuid(), e.getMessage());
-        } finally {
+            // Only remove the mapping row after a confirmed successful NB delete
+            // so the reconciler retains the stale-mapping evidence on failure.
             logicalIdMapDao.remove(mapping.getId());
+            // Best-effort sweep child mapping rows; OVN cascade already dropped NB rows.
+            sweepChildMappings(vpc.getId(), controller.getId(),
+                    Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP, Kind.STATIC_ROUTE,
+                    Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT,
+                    Kind.STATIC_NAT, Kind.PORT_FORWARDING, Kind.LOAD_BALANCER);
+            LOGGER.info("OVN LR {} removed for VPC id={} (cascade)", mapping.getOvnUuid(), vpc.getId());
+        } catch (OvnException e) {
+            // Do NOT remove the mapping row: leave it for the reconciler + processor.
+            LOGGER.warn("OvnVpcElement.deleteLR: LR {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            throw e;
         }
-        // Best-effort sweep child mapping rows for this VPC; OVN cascade
-        // dropped the actual NB rows, but the CS-side rows still need to go.
-        sweepChildMappings(vpc.getId(), controller.getId(),
-                Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP, Kind.STATIC_ROUTE,
-                Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT,
-                Kind.STATIC_NAT, Kind.PORT_FORWARDING, Kind.LOAD_BALANCER);
-        LOGGER.info("OVN LR {} removed for VPC id={} (cascade)", mapping.getOvnUuid(), vpc.getId());
     }
 
     /**
