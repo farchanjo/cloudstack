@@ -1610,6 +1610,21 @@ public class LibvirtVMDef {
         private String _pciAddress; /* For HOSTDEV interface type (SR-IOV VF passthrough). Format: dddd:bb:ss.f */
         private boolean _hostdevManaged = true; /* libvirt 'managed' attr; true => libvirt detaches/reattaches the device */
 
+        /*
+         * vhost backend tunables (OVN tunables, populated via NicTO from
+         * OvnNicConfig.resolve). All optional — null preserves the legacy
+         * behavior of emitting bare {@code <driver queues='N'/>}.
+         *
+         * <p>vhostDriverName maps to libvirt {@code <driver name='vhost'|'qemu'|'vhostuser'/>}.
+         * txQueueSize / rxQueueSize map to libvirt
+         * {@code <driver queues='N' tx_queue_size='256' rx_queue_size='256'/>}.
+         * libvirt accepts only powers of 2 between 256 and 1024 for queue sizes.
+         */
+        private String _vhostDriverName;
+        private Integer _txQueueSize;
+        private Integer _rxQueueSize;
+        private Integer _mtuSize;
+
         public void defBridgeNet(String brName, String targetBrName, String macAddr, NicModel model) {
             defBridgeNet(brName, targetBrName, macAddr, model, 0);
         }
@@ -1866,6 +1881,76 @@ public class LibvirtVMDef {
             this._packedVirtQueues = packedVirtQueues;
         }
 
+        /**
+         * Set the libvirt {@code <driver name='...'/>} attribute (e.g.
+         * {@code vhost} for kernel vhost-net, {@code qemu} for the QEMU
+         * userspace fallback). Null leaves the attribute absent — libvirt
+         * picks a default that matches the interface type.
+         */
+        public void setVhostDriverName(String name) {
+            this._vhostDriverName = name;
+        }
+
+        /**
+         * Set TX virtqueue depth (descriptors). libvirt accepts 256, 512, 1024
+         * for virtio. Null means "do not emit".
+         */
+        public void setTxQueueSize(Integer size) {
+            this._txQueueSize = size;
+        }
+
+        /**
+         * Set RX virtqueue depth (descriptors). libvirt accepts 256, 512, 1024
+         * for virtio. Null means "do not emit".
+         */
+        public void setRxQueueSize(Integer size) {
+            this._rxQueueSize = size;
+        }
+
+        /**
+         * Set the MTU exposed to the guest via libvirt {@code <mtu size='N'/>}.
+         * libvirt 5.1+ supports this on bridge / network / direct interface
+         * types. Null skips emission.
+         */
+        public void setMtuSize(Integer mtu) {
+            this._mtuSize = mtu;
+        }
+
+        /**
+         * Emit the {@code <driver .../>} element for virtio interfaces, merging
+         * legacy multiQueue/packed semantics with the OVN-managed tunables
+         * (vhost driver name, tx/rx queue size). Skips emission entirely when
+         * no attribute would be set.
+         */
+        private void appendDriverElement(StringBuilder netBuilder) {
+            boolean queues = _multiQueueNumber != null && _multiQueueNumber > 0;
+            boolean packed = _packedVirtQueues != null && _packedVirtQueues
+                    && s_qemuVersion >= 4200000 && s_libvirtVersion >= 6300000;
+            boolean txQ = _txQueueSize != null && _txQueueSize > 0;
+            boolean rxQ = _rxQueueSize != null && _rxQueueSize > 0;
+            boolean drv = StringUtils.isNotBlank(_vhostDriverName);
+            if (!queues && !packed && !txQ && !rxQ && !drv) {
+                return;
+            }
+            netBuilder.append("<driver");
+            if (drv) {
+                netBuilder.append(" name='" + _vhostDriverName + "'");
+            }
+            if (queues) {
+                netBuilder.append(" queues='" + _multiQueueNumber + "'");
+            }
+            if (txQ) {
+                netBuilder.append(" tx_queue_size='" + _txQueueSize + "'");
+            }
+            if (rxQ) {
+                netBuilder.append(" rx_queue_size='" + _rxQueueSize + "'");
+            }
+            if (packed) {
+                netBuilder.append(" packed='on'");
+            }
+            netBuilder.append("/>\n");
+        }
+
         public String getContent() {
             StringBuilder netBuilder = new StringBuilder();
             if (_netType == GuestNetType.BRIDGE) {
@@ -1906,9 +1991,7 @@ public class LibvirtVMDef {
                 if (_model != null) {
                     netBuilder.append("<model type='" + _model + "'/>\n");
                 }
-                if (_multiQueueNumber != null && _multiQueueNumber > 0) {
-                    netBuilder.append("<driver queues='" + _multiQueueNumber + "'/>\n");
-                }
+                appendDriverElement(netBuilder);
                 netBuilder.append("<link state='" + (_linkStateUp ? "up" : "down") + "'/>\n");
                 return netBuilder.toString();
             }
@@ -1923,19 +2006,10 @@ public class LibvirtVMDef {
                 netBuilder.append("<model type='" + _model + "'/>\n");
             }
             if (NicModel.VIRTIO.equals(_model)) {
-                boolean isMultiQueueNumberSpecified = _multiQueueNumber != null;
-                boolean isPackedVirtQueuesEnabled = _packedVirtQueues != null && _packedVirtQueues
-                        && s_qemuVersion >= 4200000 && s_libvirtVersion >= 6300000;
-                if (isMultiQueueNumberSpecified || isPackedVirtQueuesEnabled) {
-                    netBuilder.append("<driver");
-                    if (isMultiQueueNumberSpecified) {
-                        netBuilder.append(" queues='" + _multiQueueNumber + "'");
-                    }
-                    if (isPackedVirtQueuesEnabled) {
-                        netBuilder.append(" packed='on'");
-                    }
-                    netBuilder.append("/>\n");
-                }
+                appendDriverElement(netBuilder);
+            }
+            if (_mtuSize != null && _mtuSize > 0) {
+                netBuilder.append("<mtu size='" + _mtuSize + "'/>\n");
             }
             if ((s_libvirtVersion >= 9004) && (_networkRateKBps > 0)) { // supported from libvirt 0.9.4
                 netBuilder.append("<bandwidth>\n");

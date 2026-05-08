@@ -100,12 +100,20 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                 : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
 
+        // Stamp the bridge-wide tc-policy on the first OVN-aware plug per
+        // JVM (idempotent latch).
+        OvnNicTunableApplier.applyTcPolicyOnce(nic.getOvsTcPolicy());
         // Switchdev mlx5 PF refuses `ip link set vf vlan N` — OVN inserts
         // the Geneve VNI in its pipeline instead. Pass null to skip the
         // PF-side VLAN config and avoid "Operation not supported".
         final Deque<Runnable> rollback = new ArrayDeque<>();
         try {
             configureVfOnPfNoVlan(pfName, vfId, nic.getMac());
+            // Apply operator-resolved VF tunables (trust / spoofchk /
+            // link state / max/min tx_rate / qos) on top of the bare
+            // configureVfOnPfNoVlan baseline. Tunables that are null on
+            // NicTO are skipped — preserving the historical defaults.
+            OvnNicTunableApplier.applyVfTunables(nic, pfName, vfId);
             final String pfFinal = pfName;
             final Integer vfIdFinal = vfId;
             rollback.push(() -> {
@@ -121,7 +129,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                     "OvnVfPassthroughVifDriver: representor not found for VF %s; is mlx5 in switchdev mode?",
                     pciAddress));
             }
-            attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac());
+            attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin());
             final String repFinal = repName;
             rollback.push(() -> Script.runSimpleBashScript(String.format(
                 "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repFinal)));
@@ -230,6 +238,18 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      * {@code iface-status=active} surface the port to OVN diagnostics.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac) {
+        attachRepresentorToBrInt(repName, lspName, mac, null);
+    }
+
+    /**
+     * Add the VF representor to {@code br-int}, stamp the OVN binding
+     * external_ids and (when non-null) the per-port hairpin flag. Hairpin
+     * is gated to the resolved value for this NIC (default {@code true}
+     * via {@link com.cloud.network.ovn.config.OvnNicConfig#OvsHairpin});
+     * a {@code null} skips the stamp for wire compat with older mgmt.
+     */
+    private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
+                                          final Boolean hairpin) {
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -240,8 +260,9 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         }
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl set Interface %s external_ids:iface-status=active", repName));
-        logger.info("OvnVfPassthroughVifDriver: attached rep={} to {} with iface-id={}",
-                repName, integrationBridge, lspName);
+        OvnNicTunableApplier.applyHairpin(repName, hairpin);
+        logger.info("OvnVfPassthroughVifDriver: attached rep={} to {} with iface-id={} hairpin={}",
+                repName, integrationBridge, lspName, hairpin);
     }
 
     private void drainRollback(final Deque<Runnable> rollback) {
