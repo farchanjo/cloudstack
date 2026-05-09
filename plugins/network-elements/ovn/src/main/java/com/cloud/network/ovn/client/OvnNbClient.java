@@ -1510,18 +1510,50 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
-     * Deletes an ACL row by UUID directly, without needing the parent
-     * {@code Logical_Switch} UUID. OVSDB set semantics ensure any dangling
-     * {@code Logical_Switch.acls} reference is garbage-collected by northd on
-     * the next sync. Idempotent: no-op when the UUID no longer exists.
+     * Deletes an ACL row by UUID, first removing it from its parent
+     * {@code Logical_Switch.acls} strong-reference set to satisfy the OVSDB
+     * referential-integrity constraint.
+     *
+     * <p>The parent LS is discovered via an OVSDB select on
+     * {@code Logical_Switch} using the {@code includes} condition on the
+     * {@code acls} column. When the ACL is not referenced by any LS (already
+     * detached or already deleted), the single-op delete is issued directly.
+     * Idempotent: no-op when {@code aclUuid} no longer exists.
      */
     public void deleteAclByUuid(final String aclUuid) {
         if (aclUuid == null || aclUuid.isEmpty()) {
             return;
         }
+        final String lsUuid = findLsForAcl(aclUuid);
+        if (lsUuid != null) {
+            removeAclFromLogicalSwitch(lsUuid, aclUuid);
+        } else {
+            // ACL not referenced by any LS — delete directly (idempotent).
+            final OvnTransaction tx = newTransaction();
+            tx.add(OvnOpFactory.delete("ACL", OvnOpFactory.whereUuid(aclUuid)));
+            tx.commit();
+        }
+    }
+
+    /**
+     * Returns the UUID of the {@code Logical_Switch} that holds the given ACL
+     * UUID in its {@code acls} set, or {@code null} when no switch references
+     * it (already detached or the ACL itself does not exist).
+     */
+    String findLsForAcl(final String aclUuid) {
         final OvnTransaction tx = newTransaction();
-        tx.add(OvnOpFactory.delete("ACL", OvnOpFactory.whereUuid(aclUuid)));
-        tx.commit();
+        final ArrayNode where = JsonNodeFactory.instance.arrayNode();
+        final ArrayNode condition = JsonNodeFactory.instance.arrayNode();
+        condition.add("acls");
+        condition.add("includes");
+        condition.add(OvnRowRef.realUuid(aclUuid));
+        where.add(condition);
+        final ArrayNode cols = JsonNodeFactory.instance.arrayNode();
+        cols.add("_uuid");
+        tx.add(OvnOpFactory.select("Logical_Switch", where, cols));
+        final OvnTransaction.Result r = tx.commit();
+        final List<String> uuids = r.selectedUuids(0);
+        return uuids.isEmpty() ? null : uuids.get(0);
     }
 
     // ------------------------------------------------------------------

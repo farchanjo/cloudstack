@@ -203,7 +203,7 @@ public class OvnFirewallService extends AdapterBase {
                           final NetworkACLItem rule) {
         final NetworkACLItem.State state = rule.getState();
         if (state == NetworkACLItem.State.Revoke) {
-            revokeOne(nb, controller, rule);
+            revokeOne(nb, controller, tierLsUuid, rule);
             return;
         }
         if (state != NetworkACLItem.State.Add && state != NetworkACLItem.State.Active) {
@@ -237,7 +237,8 @@ public class OvnFirewallService extends AdapterBase {
         // No need to store it again.
     }
 
-    private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final NetworkACLItem rule) {
+    private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller,
+                           final String tierLsUuid, final NetworkACLItem rule) {
         final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId());
         if (mapping == null) {
             LOGGER.debug("OvnFirewallService: no OVN ACL mapping for rule id={}; revoke is a no-op",
@@ -247,12 +248,16 @@ public class OvnFirewallService extends AdapterBase {
         final String aclUuid = mapping.getOvnUuid();
         enqueueAclDeletionIfAbsent(controller, aclUuid, rule.getId());
         try {
-            // deleteAclByUuid issues a direct ACL row delete; OVSDB set semantics
-            // ensure northd GCs any dangling Logical_Switch.acls reference.
-            nb.deleteAclByUuid(aclUuid);
+            // removeAclFromLogicalSwitch issues a two-op transaction:
+            //   1. mutate Logical_Switch.acls to remove the UUID from the strong-ref set
+            //   2. delete the ACL row
+            // This ordering is mandatory: deleting the ACL row while it is still
+            // referenced by Logical_Switch.acls violates the OVSDB strong-reference
+            // constraint and leaves the ACL alive in OVN NB (DEF-2 root cause).
+            nb.removeAclFromLogicalSwitch(tierLsUuid, aclUuid);
             logicalIdMapDao.remove(mapping.getId());
             pendingDeletionDao.markSucceededByOvnUuid(aclUuid, Kind.NETWORK_ACL.name());
-            LOGGER.info("OvnFirewallService: ACL {} revoked (rule id={})", aclUuid, rule.getId());
+            LOGGER.info("OvnFirewallService: ACL {} propagated to OVN NB delete (rule id={})", aclUuid, rule.getId());
         } catch (final OvnException oe) {
             // Leave the mapping and the queue row so the processor retries.
             LOGGER.warn("OvnFirewallService: sync ACL delete failed for rule id={} uuid={}: {}",

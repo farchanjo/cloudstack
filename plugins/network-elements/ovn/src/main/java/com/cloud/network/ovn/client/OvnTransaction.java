@@ -118,6 +118,30 @@ public class OvnTransaction {
             return uuid.get(1).asText();
         }
 
+        /**
+         * Returns the list of {@code _uuid} values from the rows returned by
+         * the i-th select reply. Returns an empty list when the reply has no
+         * rows or the index is out of bounds.
+         */
+        public List<String> selectedUuids(final int index) {
+            final JsonNode entry = replies.get(index);
+            if (entry == null) {
+                return List.of();
+            }
+            final JsonNode rows = entry.get("rows");
+            if (rows == null || !rows.isArray()) {
+                return List.of();
+            }
+            final List<String> result = new ArrayList<>();
+            for (final JsonNode row : rows) {
+                final JsonNode uuidNode = row.get("_uuid");
+                if (uuidNode != null && uuidNode.isArray() && uuidNode.size() == 2) {
+                    result.add(uuidNode.get(1).asText());
+                }
+            }
+            return result;
+        }
+
         public ArrayNode raw() {
             return replies;
         }

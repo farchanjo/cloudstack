@@ -17,13 +17,16 @@
 package com.cloud.network.ovn.client;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.util.List;
 import java.util.Map;
 
 import org.junit.Before;
@@ -176,6 +179,97 @@ public class OvnNbClientAclTest {
         row.set("acls", setNode);
         rows.add(row);
         entry.set("rows", rows);
+        reply.add(entry);
+        return reply;
+    }
+
+    // ------------------------------------------------------------------
+    // findLsForAcl tests
+    // ------------------------------------------------------------------
+
+    @Test
+    public void findLsForAcl_returnsLsUuid_whenLsFound() {
+        when(pool.call(anyString(), any())).thenReturn(selectLsRowsReply("ls-uuid-found"));
+
+        final String result = client.findLsForAcl("acl-uuid-x");
+
+        assertEquals("ls-uuid-found", result);
+    }
+
+    @Test
+    public void findLsForAcl_returnsNull_whenNoLsFound() {
+        when(pool.call(anyString(), any())).thenReturn(emptyLsSelectReply());
+
+        final String result = client.findLsForAcl("acl-uuid-missing");
+
+        assertNull(result);
+    }
+
+    // ------------------------------------------------------------------
+    // deleteAclByUuid tests
+    // ------------------------------------------------------------------
+
+    @Test
+    public void deleteAclByUuid_doesMutateThenDelete_whenLsFound() {
+        // First call: select returns a LS row. Second call: mutate+delete transact.
+        when(pool.call(anyString(), any()))
+                .thenReturn(selectLsRowsReply("ls-uuid-parent"))
+                .thenReturn(emptyReply());
+
+        client.deleteAclByUuid("acl-uuid-z");
+
+        verify(pool, times(2)).call(anyString(), any());
+    }
+
+    @Test
+    public void deleteAclByUuid_doesDirectDelete_whenNoLsFound() {
+        // First call: select returns empty. Second call: single-op delete.
+        when(pool.call(anyString(), any()))
+                .thenReturn(emptyLsSelectReply())
+                .thenReturn(emptyReply());
+
+        client.deleteAclByUuid("acl-uuid-orphan");
+
+        verify(pool, times(2)).call(anyString(), any());
+    }
+
+    @Test
+    public void deleteAclByUuid_isNoOp_forNullUuid() {
+        client.deleteAclByUuid(null);
+        verify(pool, times(0)).call(anyString(), any());
+    }
+
+    @Test
+    public void deleteAclByUuid_isNoOp_forEmptyUuid() {
+        client.deleteAclByUuid("");
+        verify(pool, times(0)).call(anyString(), any());
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    /** Builds a select reply with a single Logical_Switch row. */
+    private ArrayNode selectLsRowsReply(final String lsUuid) {
+        final ArrayNode reply = mapper.createArrayNode();
+        final ObjectNode entry = mapper.createObjectNode();
+        final ArrayNode rows = mapper.createArrayNode();
+        final ObjectNode row = mapper.createObjectNode();
+        final ArrayNode uuidRef = mapper.createArrayNode();
+        uuidRef.add("uuid");
+        uuidRef.add(lsUuid);
+        row.set("_uuid", uuidRef);
+        rows.add(row);
+        entry.set("rows", rows);
+        reply.add(entry);
+        return reply;
+    }
+
+    /** Builds a select reply with zero rows. */
+    private ArrayNode emptyLsSelectReply() {
+        final ArrayNode reply = mapper.createArrayNode();
+        final ObjectNode entry = mapper.createObjectNode();
+        entry.set("rows", mapper.createArrayNode());
         reply.add(entry);
         return reply;
     }

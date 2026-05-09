@@ -109,7 +109,7 @@ public class OvnFirewallServiceEnqueueTest {
         service.applyNetworkACLs(network, List.of(revokeRule(RULE_ID)));
 
         verify(pendingDeletionDao, times(1)).persist(any(OvnPendingDeletionVO.class));
-        verify(nbClient, times(1)).deleteAclByUuid(ACL_UUID);
+        verify(nbClient, times(1)).removeAclFromLogicalSwitch(TIER_LS_UUID, ACL_UUID);
         verify(pendingDeletionDao, times(1)).markSucceededByOvnUuid(ACL_UUID, "NETWORK_ACL");
     }
 
@@ -122,13 +122,14 @@ public class OvnFirewallServiceEnqueueTest {
         when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
                 .thenReturn(aclMapping);
         when(pendingDeletionDao.isPendingByOvnUuid(ACL_UUID, "NETWORK_ACL")).thenReturn(false);
-        doThrow(new OvnException("ovsdb timeout")).when(nbClient).deleteAclByUuid(ACL_UUID);
+        doThrow(new OvnException("ovsdb timeout"))
+                .when(nbClient).removeAclFromLogicalSwitch(TIER_LS_UUID, ACL_UUID);
 
         // applyNetworkACLs swallows OvnException from revokeOne and returns false.
         service.applyNetworkACLs(network, List.of(revokeRule(RULE_ID)));
 
         verify(pendingDeletionDao, times(1)).persist(any(OvnPendingDeletionVO.class));
-        verify(nbClient, times(1)).deleteAclByUuid(ACL_UUID);
+        verify(nbClient, times(1)).removeAclFromLogicalSwitch(TIER_LS_UUID, ACL_UUID);
         verify(pendingDeletionDao, never()).markSucceededByOvnUuid(anyString(), anyString());
         // Mapping row must NOT be removed when sync delete fails.
         verify(logicalIdMapDao, never()).remove(anyLong());
@@ -147,7 +148,7 @@ public class OvnFirewallServiceEnqueueTest {
         service.applyNetworkACLs(network, List.of(revokeRule(RULE_ID)));
 
         verify(pendingDeletionDao, never()).persist(any(OvnPendingDeletionVO.class));
-        verify(nbClient, times(1)).deleteAclByUuid(ACL_UUID);
+        verify(nbClient, times(1)).removeAclFromLogicalSwitch(TIER_LS_UUID, ACL_UUID);
         verify(pendingDeletionDao, times(1)).markSucceededByOvnUuid(ACL_UUID, "NETWORK_ACL");
     }
 
@@ -162,7 +163,7 @@ public class OvnFirewallServiceEnqueueTest {
         service.applyNetworkACLs(network, List.of(revokeRule(RULE_ID)));
 
         verify(pendingDeletionDao, never()).persist(any(OvnPendingDeletionVO.class));
-        verify(nbClient, never()).deleteAclByUuid(anyString());
+        verify(nbClient, never()).removeAclFromLogicalSwitch(anyString(), anyString());
     }
 
     /**
@@ -173,7 +174,7 @@ public class OvnFirewallServiceEnqueueTest {
         service.applyNetworkACLs(network, List.of());
 
         verify(pendingDeletionDao, never()).persist(any(OvnPendingDeletionVO.class));
-        verify(nbClient, never()).deleteAclByUuid(anyString());
+        verify(nbClient, never()).removeAclFromLogicalSwitch(anyString(), anyString());
     }
 
     // ------------------------------------------------------------------
