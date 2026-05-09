@@ -85,7 +85,7 @@ import com.cloud.vm.VirtualMachineProfile;
  *   <li>{@code roundrobin} -> OVN default selection (no
  *       {@code selection_fields}).
  *   <li>{@code source} / {@code source-hash} ->
- *       {@code selection_fields=[ip4_src, ip4_dst, tcp_src, tcp_dst]}.
+ *       {@code selection_fields=[ip_src, ip_dst, tp_src, tp_dst]}.
  *   <li>{@code leastconn} / {@code least-connections} -> not supported by
  *       OVN; the rule is rejected with a clear error so the operator can
  *       pick a supported algorithm.
@@ -111,7 +111,7 @@ public class OvnLoadBalancerService extends AdapterBase {
     private static final Logger LOGGER = LogManager.getLogger(OvnLoadBalancerService.class);
 
     /** OVN selection_fields entries that emulate CloudStack's source-hash. */
-    private static final List<String> SOURCE_HASH_FIELDS = List.of("ip_src", "ip_dst", "tcp_src", "tcp_dst");
+    private static final List<String> SOURCE_HASH_FIELDS = List.of("ip_src", "ip_dst", "tp_src", "tp_dst");
 
     private static final Map<Service, Map<Capability, String>> CAPABILITIES = buildCapabilities();
 
