@@ -248,12 +248,22 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      * via {@link com.cloud.network.ovn.config.OvnNicConfig#OvsHairpin});
      * a {@code null} skips the stamp for wire compat with older mgmt.
      *
-     * <p>Before adding the port, any OVS Interface already carrying
-     * {@code external_ids:iface-id=lspName} on a <em>different</em> representor
-     * is removed from the integration bridge. Without this guard a previous
-     * unclean shutdown (libvirt destroy that zeroed the VF MAC before unplug
-     * could resolve the rep) leaves a stale {@code iface-id} on a different
-     * VF representor, triggering the ovn-controller WARN:
+     * <p>Before adding the port, two guards are applied to prevent duplicate
+     * {@code iface-id} conflicts in ovn-controller:
+     * <ol>
+     *   <li><b>Cross-rep guard</b> ({@link #clearOrphanRepsForLspName}): any
+     *       OVS Interface on a <em>different</em> representor that already
+     *       carries {@code external_ids:iface-id=lspName} is removed from
+     *       the integration bridge.</li>
+     *   <li><b>Same-rep guard (DEF-1)</b>: {@code external_ids} on the target
+     *       representor itself are cleared before stamping the new iface-id.
+     *       This handles the case where the same representor was previously used
+     *       by a different VM and still holds a stale iface-id from that prior
+     *       session — a stale that {@link #clearOrphanRepsForLspName} would not
+     *       find because the old lspName differs from the new one.</li>
+     * </ol>
+     * Without these guards an unclean shutdown (libvirt destroy that zeroed
+     * the VF MAC before unplug could resolve the rep) triggers:
      * <pre>
      *   binding|WARN|Invalid configuration: iface-id is configured on
      *   interfaces: [dx6p1vf6] and [dx6p0vf4]. Ignoring the configuration
@@ -264,6 +274,13 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
                                           final Boolean hairpin) {
         clearOrphanRepsForLspName(lspName, repName);
+        // DEF-1: pre-clear any stale external_ids on this specific representor
+        // before stamping the new iface-id. clearOrphanRepsForLspName only
+        // removes reps carrying the same lspName; if this rep was previously
+        // used by a different VM it may still hold an old iface-id that would
+        // create a duplicate-iface-id conflict in ovn-controller.
+        Script.runSimpleBashScript(String.format(
+            "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
