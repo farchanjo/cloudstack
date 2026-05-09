@@ -649,15 +649,8 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             to.setCtIcmpTimeout(ctIcmp);
         }
 
-        // SubFunction (BlueField).
-        to.setSfEnabled(OvnNicTunables.resolve(OvnNicTunables.OVN_SF_ENABLED,
-                vmDetails, netDetails, offeringDetails, null, Boolean.class));
-        Integer sfNum = OvnNicTunables.resolve(OvnNicTunables.OVN_SF_NUM,
-                vmDetails, netDetails, offeringDetails, null, Integer.class);
-        if (sfNum != null && sfNum >= 0) {
-            to.setSfNum(sfNum);
-        }
-        to.setSfHpf(OvnNicTunables.resolve(OvnNicTunables.OVN_SF_HPF,
+        // OVN LSP ARP proxy (ARP suppression per port).
+        to.setLspArpProxy(OvnNicTunables.resolve(OvnNicTunables.OVN_LSP_ARP_PROXY,
                 vmDetails, netDetails, offeringDetails, null, Boolean.class));
 
         if (logger.isDebugEnabled()) {

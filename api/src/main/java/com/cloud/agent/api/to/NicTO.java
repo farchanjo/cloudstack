@@ -167,10 +167,13 @@ public class NicTO extends NetworkTO {
     Integer ctUdpTimeout;
     Integer ctIcmpTimeout;
 
-    /* SubFunction (BlueField). */
-    Boolean sfEnabled;
-    Integer sfNum;
-    Boolean sfHpf;
+    /*
+     * OVN LSP ARP-proxy option. When true the management server sets
+     * {@code Logical_Switch_Port.options:arp_proxy=<ip>} so OVN answers
+     * ARP queries for this port's IP on the logical segment. Agent-side:
+     * null = older mgmt didn't set; ignore and leave existing LSP unchanged.
+     */
+    Boolean lspArpProxy;
 
     /* vDPA fine-grained. */
     Boolean vdpaEventIdx;
@@ -274,9 +277,7 @@ public class NicTO extends NetworkTO {
         appendIfSet(sb, "ctTcpTimeout", ctTcpTimeout);
         appendIfSet(sb, "ctUdpTimeout", ctUdpTimeout);
         appendIfSet(sb, "ctIcmpTimeout", ctIcmpTimeout);
-        appendIfSet(sb, "sfEnabled", sfEnabled);
-        appendIfSet(sb, "sfNum", sfNum);
-        appendIfSet(sb, "sfHpf", sfHpf);
+        appendIfSet(sb, "lspArpProxy", lspArpProxy);
         appendIfSet(sb, "vdpaQueuePairs", vdpaQueuePairs);
         appendIfSet(sb, "vdpaEventIdx", vdpaEventIdx);
         appendIfSet(sb, "vdpaIndirectDesc", vdpaIndirectDesc);
@@ -596,14 +597,8 @@ public class NicTO extends NetworkTO {
     public Integer getCtIcmpTimeout() { return ctIcmpTimeout; }
     public void setCtIcmpTimeout(Integer ctIcmpTimeout) { this.ctIcmpTimeout = ctIcmpTimeout; }
 
-    public Boolean getSfEnabled() { return sfEnabled; }
-    public void setSfEnabled(Boolean sfEnabled) { this.sfEnabled = sfEnabled; }
-
-    public Integer getSfNum() { return sfNum; }
-    public void setSfNum(Integer sfNum) { this.sfNum = sfNum; }
-
-    public Boolean getSfHpf() { return sfHpf; }
-    public void setSfHpf(Boolean sfHpf) { this.sfHpf = sfHpf; }
+    public Boolean getLspArpProxy() { return lspArpProxy; }
+    public void setLspArpProxy(Boolean lspArpProxy) { this.lspArpProxy = lspArpProxy; }
 
     public Boolean getVdpaEventIdx() { return vdpaEventIdx; }
     public void setVdpaEventIdx(Boolean vdpaEventIdx) { this.vdpaEventIdx = vdpaEventIdx; }

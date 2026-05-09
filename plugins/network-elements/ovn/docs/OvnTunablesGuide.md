@@ -71,9 +71,6 @@ coercion), the layer is skipped and the chain falls back to the next layer
 | `ovn.ct.tcp_inactive_timeout` | Integer s | 86400 | conntrack | TCP established inactive timeout |
 | `ovn.ct.udp_inactive_timeout` | Integer s | 60 | conntrack | UDP inactive timeout |
 | `ovn.ct.icmp_inactive_timeout` | Integer s | 30 | conntrack | ICMP inactive timeout |
-| `ovn.sf.enabled` | Boolean | false | BlueField SF | enable SubFunction creation |
-| `ovn.sf.num` | Integer | 0 | BlueField SF | SF index (sfnum) |
-| `ovn.sf.hpf` | Boolean | true | BlueField SF | bind SF to host-side function (HPF) |
 
 ## Validation rules
 
@@ -184,18 +181,7 @@ cmk updateNetwork id=<network-uuid> \
     details[0].key=ovn.ct.tcp_inactive_timeout details[0].value=3600
 ```
 
-### 8. BlueField SubFunction binding for a high-density VM
-
-Create one SF (sfnum=12) and bind it to the host-side function:
-
-```bash
-cmk updateVirtualMachine id=<vm-uuid> \
-    details[0].key=ovn.sf.enabled details[0].value=true \
-    details[1].key=ovn.sf.num     details[1].value=12 \
-    details[2].key=ovn.sf.hpf     details[2].value=true
-```
-
-### 9. Disable hw-offload globally (debug)
+### 8. Disable hw-offload globally (debug)
 
 Force every OVN-managed bridge to drop hw-offload (useful when chasing flow
 miss bugs):
@@ -245,16 +231,6 @@ ovn.tso                = true
 ovn.dpdk.enabled  = true
 ovn.tc.offload    = false
 ovn.vhost.driver  = vhost-user
-```
-
-### BlueField SF (high VM density on DPU)
-
-```
-ovn.sf.enabled  = true
-ovn.sf.num      = <unique per VM>
-ovn.sf.hpf      = true
-ovn.vf.trust    = true
-ovn.vf.spoofcheck = false
 ```
 
 ## Port forwarding and hardware offload

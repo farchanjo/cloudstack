@@ -1312,6 +1312,28 @@ public class OvnNbClient implements AutoCloseable {
         tx.commit();
     }
 
+    /**
+     * Merges the supplied key/value pairs into the {@code options} column of an
+     * existing {@code Logical_Switch_Port} row. Pre-existing options not present
+     * in the given map are left untouched (OVSDB map-mutate semantics). Use
+     * after {@link #addLogicalSwitchPort} to set {@code requested-chassis},
+     * {@code arp_proxy}, or other per-port options that are not known at row
+     * creation time.
+     *
+     * @param lspUuid LSP row UUID
+     * @param options entries to merge (must be non-null and non-empty)
+     */
+    public void lspSetOptions(final String lspUuid, final Map<String, String> options) {
+        if (lspUuid == null || lspUuid.isEmpty() || options == null || options.isEmpty()) {
+            return;
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("options", buildMap(options));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Switch_Port", OvnOpFactory.whereUuid(lspUuid), row));
+        tx.commit();
+    }
+
     private void setLspSingleUuidColumn(final String lspUuid, final String column, final String targetUuid) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
         row.set(column, OvnRowRef.singletonSet(OvnRowRef.realUuid(targetUuid)));
@@ -1799,6 +1821,127 @@ public class OvnNbClient implements AutoCloseable {
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.update("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), row));
         tx.commit();
+    }
+
+    /**
+     * Merges entries into {@code Logical_Router.options} for the given LR UUID.
+     * Used to push CT inactive-timeout values (e.g. {@code ct_tcp_idle_timeout},
+     * {@code ct_udp_idle_timeout}, {@code ct_snat_idle_timeout},
+     * {@code ct_icmp_idle_timeout}) supported by OVN >= 21.x. A no-op when
+     * {@code options} is null or empty, preserving the idempotency contract.
+     *
+     * @param lrUuid  Logical_Router row UUID (must be non-blank)
+     * @param options key=value pairs to write into the {@code options} column
+     */
+    public void lrSetOptions(final String lrUuid, final Map<String, String> options) {
+        if (lrUuid == null || lrUuid.isEmpty() || options == null || options.isEmpty()) {
+            return;
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("options", buildMap(options));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(lrUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Inserts a {@code BFD} table row that probes {@code dstIp} through the
+     * named logical port. If a BFD row for the same {@code logicalPort} already
+     * exists (detected by walking the table), the existing row is deleted first
+     * so the new parameters are always applied cleanly.
+     *
+     * <p>OVN BFD table (schema since OVN 21.x):
+     * <ul>
+     *   <li>{@code logical_port} — name of the Logical_Switch_Port</li>
+     *   <li>{@code dst_ip} — BFD peer IP to probe</li>
+     *   <li>{@code min_rx} — minimum receive interval (ms)</li>
+     *   <li>{@code min_tx} — minimum transmit interval (ms)</li>
+     *   <li>{@code detect_mult} — failure-detection multiplier</li>
+     * </ul>
+     *
+     * @param logicalPort LSP name (NOT UUID) as required by the BFD schema
+     * @param dstIp       BFD peer IP address string
+     * @param minRx       minimum RX interval in milliseconds
+     * @param minTx       minimum TX interval in milliseconds
+     * @param detectMult  detection multiplier
+     */
+    public void addBfdSession(final String logicalPort, final String dstIp,
+                              final int minRx, final int minTx, final int detectMult) {
+        if (logicalPort == null || logicalPort.isEmpty() || dstIp == null || dstIp.isEmpty()) {
+            return;
+        }
+        // Remove any existing BFD row for this port before inserting fresh parameters.
+        removeBfdSession(logicalPort);
+
+        final String named = OvnNamedUuid.next("bfd");
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("logical_port", logicalPort);
+        row.put("dst_ip", dstIp);
+        row.put("min_rx", minRx);
+        row.put("min_tx", minTx);
+        row.put("detect_mult", detectMult);
+
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("BFD", named, row));
+        tx.commit();
+    }
+
+    /**
+     * Deletes all {@code BFD} rows whose {@code logical_port} column matches
+     * {@code logicalPort}. Called on LSP release to avoid leaving orphaned
+     * BFD sessions in the NB DB after a VM is destroyed.
+     *
+     * @param logicalPort LSP name whose BFD sessions should be removed
+     */
+    public void removeBfdSession(final String logicalPort) {
+        if (logicalPort == null || logicalPort.isEmpty()) {
+            return;
+        }
+        // Walk the BFD table client-side (typically O(1) rows per port) and
+        // collect matching UUIDs, then delete each in a single transaction.
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("logical_port");
+        final OvnTransaction readTx = newTransaction();
+        readTx.add(OvnOpFactory.select("BFD", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = readTx.commit();
+        } catch (OvnException e) {
+            // BFD table may not exist on older OVN builds — treat as no-op.
+            return;
+        }
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return;
+        }
+        final var entry = arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null || rows.size() == 0) {
+            return;
+        }
+        final List<String> toDelete = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var portNode = row.get("logical_port");
+            if (portNode != null && logicalPort.equals(portNode.asText())) {
+                final var uuidNode = row.get("_uuid");
+                if (uuidNode != null && uuidNode.size() >= 2) {
+                    toDelete.add(uuidNode.get(1).asText());
+                }
+            }
+        }
+        if (toDelete.isEmpty()) {
+            return;
+        }
+        final OvnTransaction delTx = newTransaction();
+        for (final String uuid : toDelete) {
+            delTx.add(OvnOpFactory.delete("BFD", OvnOpFactory.whereUuid(uuid)));
+        }
+        delTx.commit();
     }
 
     /** Toggles IGMP/MLD snooping on a Logical_Switch via the {@code other_config} column. */

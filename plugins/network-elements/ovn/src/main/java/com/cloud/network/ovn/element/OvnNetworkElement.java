@@ -61,6 +61,8 @@ import com.cloud.network.element.VpcProvider;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnNicConfig;
+import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.api.command.admin.AddOvnControllerCmd;
 import com.cloud.network.ovn.api.command.admin.DeleteOvnControllerCmd;
@@ -339,6 +341,12 @@ public class OvnNetworkElement extends AdapterBase
                 final String lspUuid = nb.addLogicalSwitchPort(lsUuid, lspName, addresses, null, null);
                 // port_security mirrors addresses → spoof guard.
                 nb.lspSetPortSecurity(lspUuid, addresses);
+                // Feature: requested-chassis — pin LSP to specific OVN chassis.
+                // Feature: arp_proxy — suppress ARP flooding on the logical segment.
+                // Feature: ha-chassis-priority — combined with requested-chassis when set.
+                applyLspOptions(nb, lspUuid, nic, vm);
+                // Feature: BFD — liveness probing toward the tier gateway.
+                applyLspBfd(nb, lspName, nic, vm);
                 logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NIC, nic.getId(), controller.getId(), lspUuid, lspName));
                 LOGGER.info("OvnNetworkElement.prepare: LSP {} (name={}, addrs={}) for nic id={}",
                         lspUuid, lspName, addresses, nic.getId());
@@ -408,7 +416,16 @@ public class OvnNetworkElement extends AdapterBase
         enqueueIfAbsent(controller.getId(), network.getDataCenterId(), Kind.NIC,
                 mapping.getOvnUuid(), nic.getId());
         try {
-            pluginManager.nbClient(network.getDataCenterId()).deleteLogicalSwitchPort(mapping.getOvnUuid());
+            final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+            nb.deleteLogicalSwitchPort(mapping.getOvnUuid());
+            // Remove any BFD session that was installed for this LSP name.
+            // Best-effort: a failure here does not block the LSP deletion path.
+            try {
+                nb.removeBfdSession(mapping.getOvnName());
+            } catch (OvnException bfdEx) {
+                LOGGER.warn("OvnNetworkElement.release: BFD cleanup for LSP {} failed (non-fatal): {}",
+                        mapping.getOvnName(), bfdEx.getMessage());
+            }
             logicalIdMapDao.remove(mapping.getId());
             if (pendingDeletionDao.isPendingByOvnUuid(mapping.getOvnUuid(), Kind.NIC.name())) {
                 pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.NIC.name());
@@ -857,6 +874,160 @@ public class OvnNetworkElement extends AdapterBase
         return "lsp-nic-" + nic.getId();
     }
 
+    /**
+     * Resolve and apply per-LSP {@code options} entries that require mgmt-side
+     * NB programming:
+     * <ul>
+     *   <li>{@code requested-chassis} — pin the port to the VM's scheduled
+     *       hypervisor so OVN does not float the port binding to a different
+     *       chassis on a transient claim. Resolved from VM detail &gt; global
+     *       ConfigKey. Empty string = omit (any chassis, OVN default).</li>
+     *   <li>{@code arp_proxy} — suppress ARP flooding: OVN answers ARP queries
+     *       for the NIC's IPv4 (and IPv6 if present) on behalf of the port.
+     *       Resolved from VM detail &gt; global ConfigKey; only emitted when the
+     *       NIC has at least one IP assigned.</li>
+     * </ul>
+     *
+     * <p>Both features are backward-compatible: when neither knob produces a
+     * non-empty value, this method issues no OVSDB call and the LSP row is
+     * identical to what existed before this feature was added.
+     */
+    private void applyLspOptions(final OvnNbClient nb, final String lspUuid,
+                                 final NicProfile nic, final VirtualMachineProfile vm) {
+        final Map<String, String> opts = new HashMap<>();
+
+        // Feature 2: requested-chassis (+ optional HA chassis priority).
+        final Map<String, String> vmDetails = vm == null ? null
+                : (vm.getVirtualMachine() == null ? null : vm.getVirtualMachine().getDetails());
+        final String chassis = OvnNicTunables.resolve(OvnNicTunables.OVN_REQUESTED_CHASSIS,
+                vmDetails, null, null,
+                OvnNicConfig.RequestedChassis.value(), String.class);
+        if (StringUtils.isNotBlank(chassis)) {
+            final Integer haPriority = OvnNicTunables.resolve(OvnNicTunables.OVN_HA_CHASSIS_PRIORITY,
+                    vmDetails, null, null,
+                    OvnNicConfig.HaChassisPriority.value(), Integer.class);
+            if (haPriority != null && haPriority != 0) {
+                // OVN NB accepts "chassis=priority" for ha-chassis-group binding.
+                opts.put("requested-chassis", chassis + "=" + haPriority);
+            } else {
+                opts.put("requested-chassis", chassis);
+            }
+        }
+
+        // Feature 3: arp_proxy.
+        final Boolean arpProxy = OvnNicTunables.resolve(OvnNicTunables.OVN_LSP_ARP_PROXY,
+                vmDetails, null, null,
+                OvnNicConfig.LspArpProxy.value(), Boolean.class);
+        if (Boolean.TRUE.equals(arpProxy)) {
+            final StringBuilder ips = new StringBuilder();
+            if (StringUtils.isNotBlank(nic.getIPv4Address())) {
+                ips.append(nic.getIPv4Address());
+            }
+            if (StringUtils.isNotBlank(nic.getIPv6Address())) {
+                if (ips.length() > 0) {
+                    ips.append(',');
+                }
+                ips.append(nic.getIPv6Address());
+            }
+            if (ips.length() > 0) {
+                opts.put("arp_proxy", ips.toString());
+            }
+        }
+
+        if (!opts.isEmpty()) {
+            nb.lspSetOptions(lspUuid, opts);
+            LOGGER.debug("OvnNetworkElement.applyLspOptions: LSP {} options={}", lspUuid, opts);
+        }
+    }
+
+    /**
+     * Installs (or replaces) a BFD session for the named LSP when the
+     * {@code ovn.bfd.enable} knob resolves to {@code true} at any scope.
+     * The BFD peer IP is the tier gateway ({@link NicProfile#getGateway()});
+     * when the gateway is unavailable, the method logs a warning and skips
+     * BFD installation rather than failing the prepare path.
+     *
+     * <p>Backward-compat: when {@code bfd.enable} is false or absent, no
+     * OVSDB call is issued and any previously installed BFD row is left
+     * as-is (idempotent on the no-op path).
+     *
+     * @param nb      Northbound client to use for the BFD insert
+     * @param lspName LSP name string (NOT UUID) — BFD schema key
+     * @param nic     NicProfile carrying the tier gateway IP
+     * @param vm      VirtualMachineProfile for VM-scope detail resolution
+     */
+    private void applyLspBfd(final OvnNbClient nb, final String lspName,
+                             final NicProfile nic, final VirtualMachineProfile vm) {
+        final Map<String, String> vmDetails = vm == null ? null
+                : (vm.getVirtualMachine() == null ? null : vm.getVirtualMachine().getDetails());
+        final Boolean bfdEnable = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_ENABLE,
+                vmDetails, null, null,
+                OvnNicConfig.BfdEnable.value(), Boolean.class);
+        if (!Boolean.TRUE.equals(bfdEnable)) {
+            return;
+        }
+        final String dstIp = nic.getIPv4Gateway();
+        if (StringUtils.isBlank(dstIp)) {
+            LOGGER.warn("OvnNetworkElement.applyLspBfd: LSP {} BFD enabled but NIC has no gateway IP; skipping", lspName);
+            return;
+        }
+        final int minRx = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MIN_RX,
+                vmDetails, null, null,
+                OvnNicConfig.BfdMinRx.value(), Integer.class);
+        final int minTx = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MIN_TX,
+                vmDetails, null, null,
+                OvnNicConfig.BfdMinTx.value(), Integer.class);
+        final int mult = OvnNicTunables.resolve(OvnNicTunables.OVN_BFD_MULTIPLIER,
+                vmDetails, null, null,
+                OvnNicConfig.BfdMultiplier.value(), Integer.class);
+        nb.addBfdSession(lspName, dstIp, minRx, minTx, mult);
+        LOGGER.debug("OvnNetworkElement.applyLspBfd: LSP {} BFD session -> {} rx={} tx={} mult={}",
+                lspName, dstIp, minRx, minTx, mult);
+    }
+
+    /**
+     * Pushes conntrack inactive-timeout options onto the Logical_Router backing
+     * a VPC. The four OVN NB option keys written are:
+     * <ul>
+     *   <li>{@code ct_tcp_idle_timeout}</li>
+     *   <li>{@code ct_udp_idle_timeout}</li>
+     *   <li>{@code ct_snat_idle_timeout}</li>
+     *   <li>{@code ct_icmp_idle_timeout}</li>
+     * </ul>
+     *
+     * <p>All four are read from the global ConfigKey defaults (no per-VM /
+     * per-network scope for LR options — the LR is VPC-scoped). When all
+     * four values match the OVN built-in defaults the method is a no-op to
+     * avoid unnecessary OVSDB churn.
+     *
+     * <p>OVN supports these options since OVN 21.x. On older builds the
+     * update is silently ignored by the NB DB (unknown columns are rejected;
+     * the OVSDB error is swallowed by {@code OvnNbClient.lrSetOptions}).
+     *
+     * @param nb     Northbound client to use for the update
+     * @param lrUuid Logical_Router row UUID to update
+     */
+    private void applyLrCtTimeouts(final OvnNbClient nb, final String lrUuid) {
+        final int tcpTimeout = OvnNicConfig.CtTcpInactiveTimeout.value();
+        final int udpTimeout = OvnNicConfig.CtUdpInactiveTimeout.value();
+        final int snatTimeout = OvnNicConfig.CtSnatInactiveTimeout.value();
+        final int icmpTimeout = OvnNicConfig.CtIcmpInactiveTimeout.value();
+
+        // OVN built-in defaults; skip write if all values are at default.
+        final boolean allDefault = (tcpTimeout == 86400) && (udpTimeout == 60)
+                && (snatTimeout == 7440) && (icmpTimeout == 30);
+        if (allDefault) {
+            return;
+        }
+        final Map<String, String> opts = new HashMap<>();
+        opts.put("ct_tcp_idle_timeout", String.valueOf(tcpTimeout));
+        opts.put("ct_udp_idle_timeout", String.valueOf(udpTimeout));
+        opts.put("ct_snat_idle_timeout", String.valueOf(snatTimeout));
+        opts.put("ct_icmp_idle_timeout", String.valueOf(icmpTimeout));
+        nb.lrSetOptions(lrUuid, opts);
+        LOGGER.debug("OvnNetworkElement.applyLrCtTimeouts: LR {} options={}", lrUuid, opts);
+    }
+
     // ------------------------------------------------------------------
     // VpcProvider — delegate to OvnVpcElement.
     // ------------------------------------------------------------------
@@ -866,6 +1037,9 @@ public class OvnNetworkElement extends AdapterBase
             throws ConcurrentOperationException, ResourceUnavailableException, InsufficientCapacityException {
         try {
             final String lrUuid = vpcElement.createLogicalRouterFor(vpc);
+            // Feature: CT inactive timeouts — push per-LR conntrack timeout options
+            // when any of the four knobs is set to a non-default value.
+            applyLrCtTimeouts(pluginManager.nbClient(vpc.getZoneId()), lrUuid);
             // Idempotent: if VPC already has a source-NAT public IP allocated,
             // program the VPC-level SNAT row up front (parent CIDR -> ext IP)
             // instead of waiting for the per-tier applyIps lifecycle (which

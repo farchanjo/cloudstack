@@ -131,10 +131,24 @@ public final class OvnNicTunables {
     public static final String OVN_CT_UDP_INACTIVE_TIMEOUT = "ovn.ct.udp_inactive_timeout";
     public static final String OVN_CT_ICMP_INACTIVE_TIMEOUT = "ovn.ct.icmp_inactive_timeout";
 
-    /* SubFunction (BlueField) */
-    public static final String OVN_SF_ENABLED = "ovn.sf.enabled";
-    public static final String OVN_SF_NUM = "ovn.sf.num";
-    public static final String OVN_SF_HPF = "ovn.sf.hpf";
+    /* Load_Balancer options */
+    /**
+     * OVN {@code Load_Balancer.options:affinity_timeout} (seconds). 0 disables
+     * affinity (OVN default). When positive, OVN persists the client-to-backend
+     * mapping for at least this many seconds after the last packet, emulating
+     * session persistence without a conntrack entry.
+     */
+    public static final String OVN_LB_AFFINITY_TIMEOUT = "ovn.lb.affinity_timeout";
+
+    /* LSP binding options */
+    /**
+     * OVN {@code Logical_Switch_Port.options:arp_proxy}. When true and the LSP
+     * has a bound IPv4 (and optionally IPv6) address, the plugin writes
+     * {@code options:arp_proxy=<ip>} on the LSP so OVN's pipeline answers ARP
+     * queries for that IP on behalf of the port, preventing ARP flooding on the
+     * logical segment.
+     */
+    public static final String OVN_LSP_ARP_PROXY = "ovn.lsp.arp_proxy";
 
     /* ---------- Whitelists for enum-typed knobs ---------- */
 

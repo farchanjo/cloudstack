@@ -132,16 +132,17 @@ public class OvnNicConfig implements Configurable {
     public static final String OVN_BFD_MIN_TX = "ovn.bfd.min_tx";
     public static final String OVN_BFD_MULTIPLIER = "ovn.bfd.multiplier";
 
+    /* Load_Balancer options */
+    public static final String OVN_LB_AFFINITY_TIMEOUT = "ovn.lb.affinity_timeout";
+
+    /* LSP binding options */
+    public static final String OVN_LSP_ARP_PROXY = "ovn.lsp.arp_proxy";
+
     /* Conntrack timeouts */
     public static final String OVN_CT_SNAT_INACTIVE_TIMEOUT = "ovn.ct.snat_inactive_timeout";
     public static final String OVN_CT_TCP_INACTIVE_TIMEOUT = "ovn.ct.tcp_inactive_timeout";
     public static final String OVN_CT_UDP_INACTIVE_TIMEOUT = "ovn.ct.udp_inactive_timeout";
     public static final String OVN_CT_ICMP_INACTIVE_TIMEOUT = "ovn.ct.icmp_inactive_timeout";
-
-    /* SubFunction (BlueField) */
-    public static final String OVN_SF_ENABLED = "ovn.sf.enabled";
-    public static final String OVN_SF_NUM = "ovn.sf.num";
-    public static final String OVN_SF_HPF = "ovn.sf.hpf";
 
     /* ---------- Whitelists for enum-typed knobs ---------- */
 
@@ -352,19 +353,26 @@ public class OvnNicConfig implements Configurable {
             "Conntrack ICMP inactive timeout (seconds).",
             true);
 
-    public static final ConfigKey<Boolean> SfEnabled = new ConfigKey<>(CATEGORY, Boolean.class,
-            OVN_SF_ENABLED, "false",
-            "Enable BlueField SubFunction (SF) creation for this NIC.",
+    /**
+     * OVN {@code Load_Balancer.options:affinity_timeout} (seconds). 0 (default)
+     * disables client-to-backend affinity. When positive, OVN retains the
+     * client → backend mapping for at least this many seconds after the last
+     * packet, emulating session persistence without a conntrack entry.
+     */
+    public static final ConfigKey<Integer> LbAffinityTimeout = new ConfigKey<>(CATEGORY, Integer.class,
+            OVN_LB_AFFINITY_TIMEOUT, "0",
+            "OVN Load_Balancer affinity_timeout (seconds). 0 = disabled (OVN default).",
             true);
 
-    public static final ConfigKey<Integer> SfNum = new ConfigKey<>(CATEGORY, Integer.class,
-            OVN_SF_NUM, "0",
-            "BlueField SF index (sfnum) to allocate.",
-            true);
-
-    public static final ConfigKey<Boolean> SfHpf = new ConfigKey<>(CATEGORY, Boolean.class,
-            OVN_SF_HPF, "true",
-            "Bind the SF to the host-side function (HPF) instead of leaving it on the DPU ARM.",
+    /**
+     * OVN {@code Logical_Switch_Port.options:arp_proxy}. When true and the LSP
+     * has a bound IPv4 (and optionally IPv6) address, the plugin writes
+     * {@code options:arp_proxy=<ip>} so OVN's pipeline answers ARP queries on
+     * behalf of the port, preventing ARP flooding on the logical segment.
+     */
+    public static final ConfigKey<Boolean> LspArpProxy = new ConfigKey<>(CATEGORY, Boolean.class,
+            OVN_LSP_ARP_PROXY, "false",
+            "Enable OVN LSP arp_proxy option (ARP suppression per port). Default false.",
             true);
 
     /* ---------- ConfigKey lookup table ---------- */
@@ -389,7 +397,7 @@ public class OvnNicConfig implements Configurable {
                 RequestedChassis, HaChassisPriority,
                 BfdEnable, BfdMinRx, BfdMinTx, BfdMultiplier,
                 CtSnatInactiveTimeout, CtTcpInactiveTimeout, CtUdpInactiveTimeout, CtIcmpInactiveTimeout,
-                SfEnabled, SfNum, SfHpf
+                LbAffinityTimeout, LspArpProxy
         };
     }
 
