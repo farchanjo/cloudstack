@@ -37,7 +37,6 @@ import org.springframework.stereotype.Component;
 
 import com.cloud.alert.AlertManager;
 import org.apache.cloudstack.alert.AlertService;
-import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnControllerDao;
