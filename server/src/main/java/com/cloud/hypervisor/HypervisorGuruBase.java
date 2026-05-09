@@ -296,6 +296,12 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                     to.setUseHwOffload(Boolean.TRUE);
                 }
             } else {
+                /*
+                 * DPDK selection is tag-based (offering tags carry "dpdk" or "vhost-user"
+                 * tokens). The previous ovn.dpdk.enabled ConfigKey was removed as it was
+                 * never consulted by the resolution chain — keeping it would mislead
+                 * operators into thinking it had effect. Tags remain the source of truth.
+                 */
                 // NetworkOffering tag-based DPDK vhost-user enablement.
                 // Tag set is a comma-separated list. A NIC is routed through the OVS DPDK
                 // vhost-user PMD path (OvsVifDriver auto-creates dpdkvhostuserclient port —

@@ -98,7 +98,6 @@ public final class OvnNicTunables {
 
     /* OVS / TC offload */
     public static final String OVN_TC_OFFLOAD = "ovn.tc.offload";
-    public static final String OVN_DPDK_ENABLED = "ovn.dpdk.enabled";
 
     /**
      * OVS Port other_config:hairpin. Required for VF&lt;-&gt;VF same-host hardware

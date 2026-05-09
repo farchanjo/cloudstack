@@ -105,7 +105,6 @@ public class OvnNicConfig implements Configurable {
 
     /* OVS / TC offload */
     public static final String OVN_TC_OFFLOAD = "ovn.tc.offload";
-    public static final String OVN_DPDK_ENABLED = "ovn.dpdk.enabled";
 
     /**
      * Per-port {@code ovs-vsctl set Port <port> other_config:hairpin=true}
@@ -283,11 +282,6 @@ public class OvnNicConfig implements Configurable {
             "Enable OVS hw-offload (TC flower) for the integration bridge.",
             true);
 
-    public static final ConfigKey<Boolean> DpdkEnabled = new ConfigKey<>(CATEGORY, Boolean.class,
-            OVN_DPDK_ENABLED, "false",
-            "Enable OVS-DPDK userspace datapath (mutually exclusive with TC offload kernel datapath).",
-            true);
-
     public static final ConfigKey<Boolean> OvsHairpin = new ConfigKey<>(CATEGORY, Boolean.class,
             OVN_OVS_HAIRPIN, "true",
             "Apply OVS Port other_config:hairpin=true to every port (VF rep, vDPA, virtio tap) "
@@ -393,7 +387,7 @@ public class OvnNicConfig implements Configurable {
                 VfTrust, VfSpoofcheck, VfLinkState, VfMaxTxRate, VfMinTxRate, VfVlan, VfQos,
                 VhostQueues, VhostDriver, VhostTxQueueSize, VhostRxQueueSize,
                 Mtu, Tso, Gso, Gro, Lro, CsumOffload, DriverModel,
-                TcOffload, DpdkEnabled, OvsHairpin, OvsTcPolicy,
+                TcOffload, OvsHairpin, OvsTcPolicy,
                 RequestedChassis, HaChassisPriority,
                 BfdEnable, BfdMinRx, BfdMinTx, BfdMultiplier,
                 CtSnatInactiveTimeout, CtTcpInactiveTimeout, CtUdpInactiveTimeout, CtIcmpInactiveTimeout,
