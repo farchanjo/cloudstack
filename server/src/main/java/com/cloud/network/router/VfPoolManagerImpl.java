@@ -18,6 +18,7 @@ package com.cloud.network.router;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import javax.inject.Inject;
@@ -25,6 +26,9 @@ import javax.naming.ConfigurationException;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.cloudstack.managed.context.ManagedContextRunnable;
+import org.apache.cloudstack.poll.BackgroundPollManager;
+import org.apache.cloudstack.poll.BackgroundPollTask;
 import org.springframework.stereotype.Component;
 
 import com.cloud.agent.AgentManager;
@@ -45,15 +49,22 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     private static final Logger LOGGER = LogManager.getLogger(VfPoolManagerImpl.class);
 
+    /** Period between sweepOrphans() background ticks: 15 minutes in milliseconds. */
+    private static final long SWEEP_ORPHANS_PERIOD_MS = 15L * 60L * 1000L;
+
     @Inject
     private SriovVfPoolDao vfPoolDao;
 
     @Inject
     private AgentManager agentMgr;
 
+    @Inject
+    private BackgroundPollManager backgroundPollManager;
+
     @Override
-    public boolean configure(String name, java.util.Map<String, Object> params) throws ConfigurationException {
+    public boolean configure(String name, Map<String, Object> params) throws ConfigurationException {
         super.configure(name, params);
+        backgroundPollManager.submitTask(new SweepOrphansTask(this));
         return true;
     }
 
@@ -251,5 +262,41 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
             return null;
         }
         return pfName + "r" + vfIndex;
+    }
+
+    /**
+     * Periodic background task that invokes {@link VfPoolManager#sweepOrphans()} on a
+     * fixed schedule. Any ALLOCATED VF whose NIC or VM is already removed is
+     * reclaimed back to FREE so the pool does not silently shrink over time.
+     *
+     * <p>Fires every {@value #SWEEP_ORPHANS_PERIOD_MS} ms (15 minutes). Exceptions
+     * are logged and swallowed — a single failed tick must not crash the executor.
+     */
+    protected final class SweepOrphansTask extends ManagedContextRunnable implements BackgroundPollTask {
+
+        private final VfPoolManager manager;
+
+        SweepOrphansTask(final VfPoolManager manager) {
+            this.manager = manager;
+        }
+
+        @Override
+        protected void runInContext() {
+            try {
+                final int swept = manager.sweepOrphans();
+                if (swept > 0) {
+                    LOGGER.info("SweepOrphansTask: reclaimed {} orphan VF(s) back to FREE", swept);
+                } else {
+                    LOGGER.debug("SweepOrphansTask: no orphan VFs found");
+                }
+            } catch (final Exception e) {
+                LOGGER.warn("SweepOrphansTask: unexpected error during sweep (will retry next tick): {}", e.getMessage(), e);
+            }
+        }
+
+        @Override
+        public Long getDelay() {
+            return SWEEP_ORPHANS_PERIOD_MS;
+        }
     }
 }
