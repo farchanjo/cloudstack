@@ -197,6 +197,37 @@ A (wire 4-scope) and C (`@Deprecated` ConfigKey).
 api server plugins engine/src/main/` returns ZERO matches across the source
 tree. Tag-based DPDK detection still functional and documented inline.
 
+### Bug 9 — `SOURCE_HASH_FIELDS` used invalid OVN column names — `FIXED`
+
+**Symptom.** `OvnLoadBalancerService.SOURCE_HASH_FIELDS` defined the source-hash
+selection_fields as `["ip_src", "ip_dst", "tcp_src", "tcp_dst"]`. OVN's
+`Load_Balancer.selection_fields` schema only accepts `eth_dst`, `eth_src`,
+`ip_dst`, `ip_src`, `ipv6_dst`, `ipv6_src`, `tp_dst`, `tp_src`. Any LB rule
+with `algorithm=source` triggered an OVSDB constraint violation on insert and
+silently never wrote a `Load_Balancer` row to NB. CloudStack-side LB state
+read `Active`, OVN-side had no row.
+
+Surfaced 2026-05-09 22:25 UTC during E2E feature test:
+```
+ERROR OvnLoadBalancerService: failed to apply LB rule id=589:
+OVSDB op 0 (insert) failed: {"details":"tcp_src is not one of the allowed
+values ([eth_dst, eth_src, ip_dst, ip_src, ipv6_dst, ipv6_src, tp_dst,
+tp_src])","error":"constraint violation"}
+```
+
+**Fix commit.** `cda1af91c7` — `fix(ovn): use OVN tp_src/tp_dst not tcp_src/tcp_dst in selection_fields`.
+
+`OvnLoadBalancerService.java`:
+- Line 114: `SOURCE_HASH_FIELDS = List.of("ip_src", "ip_dst", "tp_src", "tp_dst");`
+- Line 88 (javadoc): `selection_fields=[ip_src, ip_dst, tp_src, tp_dst]`.
+
+**Verification.** Post-deploy E2E lifecycle test (Step 4 of audit dispatch
+log): LB rule `algorithm=source` now creates a `Load_Balancer` row in OVN NB
+with `selection_fields=[ip_dst ip_src tp_dst tp_src]`,
+`options.affinity_timeout=99` (also exercises Bug 7 4-scope chain), and
+`vips=217.179.89.35:80=10.99.1.28:80`. Algorithm=roundrobin produces same row
+shape with `selection_fields=[]`. Delete cascades cleanly.
+
 ## Commit chain
 
 | Order | Hash | Subject |
@@ -209,15 +240,36 @@ tree. Tag-based DPDK detection still functional and documented inline.
 | 6 | `9ce02e1727` | chore(ovn): remove dead DpdkEnabled ConfigKey |
 | 7 | `31f1df9c4f` | feat(ui): add vdpa/hwoffload toggles to network offering form |
 | 8 | `4a2de28177` | test(ovn): fix LbServiceTest after buildLbOptions sig change |
+| 9 | `cda1af91c7` | fix(ovn): use OVN tp_src/tp_dst not tcp_src/tcp_dst in selection_fields |
 
 Commits 1+2 carry the deployed-but-uncommitted Onda 1+2+3 wiring (already in
-production prior to this audit). Commits 3-8 carry the 8 bug fixes from this
-audit. The pre-existing Bug 4 fix landed in an earlier session and was
-captured by the rebuild without a new commit.
+production prior to this audit). Commits 3-8 carry the original 8 bug fixes
+from this audit. Commit 9 carries Bug 9 surfaced + fixed during the E2E
+feature test that followed the first deploy. The pre-existing Bug 4 fix
+landed in an earlier session and was captured by the first rebuild without a
+new commit.
+
+Post-fix uber-jar md5: `332f69b06a8001292f5e09a1a8aa6158` (replaces
+`fc3ddfed9114a35d88a134f687103c12` from the pre-Bug-9 deploy).
 
 ## Open / deferred items
 
-None. All 8 bugs reached `FIXED` + production verification.
+### Bug 10 — `updateLoadBalancerRule` algorithm change does not re-sync OVN — `OPEN` (LOW priority, pre-existing)
+
+Surfaced during 2026-05-09 E2E test Step 6. `cmk update loadbalancerrule
+algorithm=...` updates the CloudStack DB and returns success, but the OVN
+write path only fires when the LB transitions to `Active` (i.e., during a
+full apply with at least one reachable backend). After update, the
+`external_ids:cs_algo` and `selection_fields` in OVN NB still reflected the
+pre-update value. Behaviour is consistent with CloudStack's general
+`update*` state-machine semantics, not introduced by any of the 9 bugs in
+this audit, and does not block the LB algorithm working when the rule is
+re-applied via assign/remove backend or full network restart.
+
+Possible fix path: add a `forceApply` branch in `OvnLoadBalancerService` on
+`updateLoadBalancerRule` that re-walks `applyLBRules` for the network when
+algorithm or selection-affecting fields change. Out of scope for this audit;
+file as a follow-up if operators need hot algorithm changes.
 
 ## Skip list for future audits
 
@@ -234,3 +286,9 @@ relevant code surface has actually drifted since 2026-05-09. Specifically:
   `OvnLoadBalancerService.buildLbOptions`.
 - The absence of a live `ovn.dpdk.enabled` ConfigKey (intentionally dropped;
   DPDK is tag-based by design, documented inline at HypervisorGuruBase:300).
+- The `SOURCE_HASH_FIELDS` constant in `OvnLoadBalancerService` — must contain
+  exactly `["ip_src", "ip_dst", "tp_src", "tp_dst"]` (OVN-valid column names).
+  Do NOT introduce `tcp_src`/`tcp_dst`/`udp_src`/`udp_dst` — OVN rejects them
+  with `constraint violation` and the LB row never lands in NB.
+- `updateLoadBalancerRule` algorithm change is `OPEN` (Bug 10) — do not flag
+  re-application gap as new unless the fix landed and regressed.
