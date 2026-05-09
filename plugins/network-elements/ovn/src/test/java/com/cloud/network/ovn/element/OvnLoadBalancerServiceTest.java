@@ -252,7 +252,7 @@ public class OvnLoadBalancerServiceTest {
         final LoadBalancingRule rule = lbRule(420L, "203.0.113.42", 80, 80,
                 List.of(dest("10.0.0.5", 80, false)),
                 "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
-        final Map<String, String> opts = OvnLoadBalancerService.buildLbOptions(rule);
+        final Map<String, String> opts = service.buildLbOptions(rule, network);
         assertEquals("203.0.113.42", opts.get("hairpin_snat_ip"));
     }
 
