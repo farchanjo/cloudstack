@@ -45,13 +45,15 @@ import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.element.IpDeployer;
-import com.cloud.network.element.LoadBalancingServiceProvider;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.lb.LoadBalancingRule.LbDestination;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnNicConfig;
+import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
@@ -62,6 +64,7 @@ import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.offering.NetworkOffering;
+import com.cloud.offerings.dao.NetworkOfferingDetailsDao;
 import com.cloud.utils.component.AdapterBase;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.ReservationContext;
@@ -124,6 +127,10 @@ public class OvnLoadBalancerService extends AdapterBase {
     private OvnBgpRedistributeManager bgpRedistributeManager;
     @Inject
     private OvnPendingDeletionDao pendingDeletionDao;
+    @Inject
+    private NetworkDetailsDao networkDetailsDao;
+    @Inject
+    private NetworkOfferingDetailsDao networkOfferingDetailsDao;
 
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
@@ -232,7 +239,7 @@ public class OvnLoadBalancerService extends AdapterBase {
         final String protocol = protocolFor(rule);
         final String name = "cs-lb-" + rule.getId();
         final Map<String, String> ext = buildExternalIds(rule);
-        final Map<String, String> options = buildLbOptions(rule);
+        final Map<String, String> options = buildLbOptions(rule, network);
         final String lbUuid = nb.createLoadBalancer(name, vips, protocol, selectionFields, ext, options);
         try {
             nb.attachLoadBalancerToLogicalRouter(lrUuid, lbUuid);
@@ -437,15 +444,40 @@ public class OvnLoadBalancerService extends AdapterBase {
      * this, a backend client hitting its own VIP would see the request
      * arrive with src=its-own-IP, dst=its-own-IP and drop it as a martian.
      *
+     * <p>{@code affinity_timeout} is resolved through the 4-scope chain
+     * (vm_details not applicable here — LB is network-scoped):
+     * network_details &gt; network_offering_details &gt; global ConfigKey.
+     *
      * <p>Visible for testing.
      */
-    public static Map<String, String> buildLbOptions(final LoadBalancingRule rule) {
+    public Map<String, String> buildLbOptions(final LoadBalancingRule rule, final Network network) {
         final Map<String, String> opts = new HashMap<>();
         if (rule.getSourceIp() != null) {
             final String vip = rule.getSourceIp().addr();
             if (vip != null && !vip.isEmpty()) {
                 opts.put("hairpin_snat_ip", vip);
             }
+        }
+        // OVN client-to-backend affinity: resolved via 4-scope chain so that
+        // per-network and per-network-offering overrides are honoured.
+        // LB is network-scoped (no per-VM context here) — vmDetails is null.
+        // Value 0 (default) omits the key — OVN's default is no affinity.
+        final Map<String, String> netDetails = (networkDetailsDao != null && network != null)
+                ? networkDetailsDao.listDetailsKeyPairs(network.getId())
+                : null;
+        final Map<NetworkOffering.Detail, String> offeringDetails =
+                (networkOfferingDetailsDao != null && network != null)
+                ? networkOfferingDetailsDao.getNtwkOffDetails(network.getNetworkOfferingId())
+                : null;
+        final Integer affinityTimeout = OvnNicTunables.resolve(
+                OvnNicTunables.OVN_LB_AFFINITY_TIMEOUT,
+                /* vmDetails */ null,
+                netDetails,
+                offeringDetails,
+                OvnNicConfig.LbAffinityTimeout.value(),
+                Integer.class);
+        if (affinityTimeout != null && affinityTimeout > 0) {
+            opts.put("affinity_timeout", String.valueOf(affinityTimeout));
         }
         return opts;
     }
