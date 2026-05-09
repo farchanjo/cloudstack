@@ -475,6 +475,24 @@
           </template>
           <a-switch v-model:checked="form.conservemode" />
         </a-form-item>
+        <a-row :gutter="12">
+          <a-col :md="12" :lg="12">
+            <a-form-item name="hwoffloadenabled" ref="hwoffloadenabled">
+              <template #label>
+                <tooltip-label :title="$t('label.hwoffloadenabled')" :tooltip="$t('message.hwoffloadenabled')"/>
+              </template>
+              <a-switch v-model:checked="form.hwoffloadenabled" @change="onHwOffloadChange" />
+            </a-form-item>
+          </a-col>
+          <a-col :md="12" :lg="12">
+            <a-form-item name="vdpaenabled" ref="vdpaenabled">
+              <template #label>
+                <tooltip-label :title="$t('label.vdpaenabled')" :tooltip="$t('message.vdpaenabled')"/>
+              </template>
+              <a-switch v-model:checked="form.vdpaenabled" @change="onVdpaChange" />
+            </a-form-item>
+          </a-col>
+        </a-row>
         <a-form-item name="tags" ref="tags">
           <template #label>
             <tooltip-label :title="$t('label.tags')" :tooltip="apiParams.tags.description"/>
@@ -707,7 +725,9 @@ export default {
         egressdefaultpolicy: 'deny',
         ispublic: this.isPublic,
         nsxsupportlb: true,
-        routingmode: 'static'
+        routingmode: 'static',
+        hwoffloadenabled: false,
+        vdpaenabled: false
       })
       this.rules = reactive({
         name: [{ required: true, message: this.$t('message.error.name') }],
@@ -1222,6 +1242,12 @@ export default {
         if (values.enable) {
           params.enable = values.enable
         }
+        if (values.hwoffloadenabled) {
+          params.hwoffloadenabled = true
+        }
+        if (values.vdpaenabled) {
+          params.vdpaenabled = true
+        }
         params.traffictype = 'GUEST' // traffic type dropdown has been removed since it has only one option ('Guest'). Hardcode traffic type value here.
         postAPI('createNetworkOffering', params).then(json => {
           this.$message.success('Network offering created: ' + values.name)
@@ -1242,6 +1268,16 @@ export default {
         return Promise.reject(this.$t('message.error.number'))
       }
       return Promise.resolve()
+    },
+    onHwOffloadChange (checked) {
+      if (checked) {
+        this.form.vdpaenabled = false
+      }
+    },
+    onVdpaChange (checked) {
+      if (checked) {
+        this.form.hwoffloadenabled = false
+      }
     }
   }
 }
