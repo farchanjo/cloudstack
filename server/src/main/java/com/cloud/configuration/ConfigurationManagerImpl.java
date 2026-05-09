@@ -7112,6 +7112,10 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         String routingModeString = cmd.getRoutingMode();
         boolean hwOffloadEnabled = cmd.isHwOffloadEnabled();
         boolean vdpaEnabled = cmd.isVdpaEnabled();
+        if (hwOffloadEnabled && vdpaEnabled) {
+            throw new InvalidParameterValueException(
+                    "Parameters 'hwoffloadenabled' and 'vdpaenabled' are mutually exclusive; choose one.");
+        }
         // check if valid domain
         if (CollectionUtils.isNotEmpty(domainIds)) {
             for (final Long domainId: domainIds) {
