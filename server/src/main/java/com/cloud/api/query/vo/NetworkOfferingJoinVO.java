@@ -195,6 +195,9 @@ public class NetworkOfferingJoinVO extends BaseViewVO implements NetworkOffering
     @Column(name = "hw_offload_enabled")
     private boolean hwOffloadEnabled = false;
 
+    @Column(name = "vdpa_enabled")
+    private boolean vdpaEnabled = false;
+
     public NetworkOfferingJoinVO() {
     }
 
@@ -463,5 +466,14 @@ public class NetworkOfferingJoinVO extends BaseViewVO implements NetworkOffering
 
     public void setHwOffloadEnabled(boolean v) {
         this.hwOffloadEnabled = v;
+    }
+
+    @Override
+    public boolean isVdpaEnabled() {
+        return vdpaEnabled;
+    }
+
+    public void setVdpaEnabled(boolean vdpaEnabled) {
+        this.vdpaEnabled = vdpaEnabled;
     }
 }

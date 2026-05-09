@@ -105,6 +105,7 @@ import com.cloud.upgrade.dao.Upgrade42422to42423;
 import com.cloud.upgrade.dao.Upgrade42423to42424;
 import com.cloud.upgrade.dao.Upgrade42424to42425;
 import com.cloud.upgrade.dao.Upgrade42425to42426;
+import com.cloud.upgrade.dao.Upgrade42426to42427;
 import com.cloud.upgrade.dao.Upgrade430to440;
 import com.cloud.upgrade.dao.Upgrade431to440;
 import com.cloud.upgrade.dao.Upgrade432to440;
@@ -274,6 +275,7 @@ public class DatabaseUpgradeChecker implements SystemIntegrityChecker {
                 .next("4.24.1.23", new Upgrade42423to42424())
                 .next("4.24.1.24", new Upgrade42424to42425())
                 .next("4.24.1.25", new Upgrade42425to42426())
+                .next("4.24.1.26", new Upgrade42426to42427())
                 .build();
     }
 

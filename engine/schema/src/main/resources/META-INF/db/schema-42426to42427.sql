@@ -15,7 +15,16 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- VIEW `cloud`.`network_offering_view`;
+--;
+-- Schema upgrade 4.24.1.26 to 4.24.1.27.
+-- Fixes the vdpa_enabled API response gap: the column was re-added to
+-- network_offerings by schema-42422to42423.sql but was never projected
+-- through network_offering_view, so the JPA/join-VO layer never saw it and
+-- listNetworkOfferings responses always omitted vdpaenabled.
+--
+-- Fix: recreate the view with vdpa_enabled projected immediately after
+-- hw_offload_enabled (the two fork-specific flags stay side-by-side).
+--;
 
 DROP VIEW IF EXISTS `cloud`.`network_offering_view`;
 
