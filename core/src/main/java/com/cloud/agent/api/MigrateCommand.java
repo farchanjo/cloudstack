@@ -41,6 +41,17 @@ public class MigrateCommand extends Command {
     private List<MigrateDiskInfo> migrateDiskInfoList = new ArrayList<>();
     private Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
 
+    /**
+     * Destination-allocated {@code /dev/vhost-vdpa-N} paths keyed by guest NIC
+     * MAC address (lower-case).  Populated by the management server from
+     * {@code PrepareForMigrationAnswer#getVdpaInterfaceMapping()} before
+     * dispatching this command to the source agent.  The source agent's
+     * {@code LibvirtMigrateCommandWrapper} uses this map to rewrite
+     * {@code <interface type='vdpa'><source dev=...>} in the domain XML so
+     * libvirt opens the destination cdev, not the source path.
+     */
+    private Map<String, String> vdpaInterfaceMapping = new HashMap<>();
+
     private int newVmCpuShares;
 
     Map<String, Boolean> vlanToPersistenceMap = new HashMap<>();
@@ -51,6 +62,14 @@ public class MigrateCommand extends Command {
 
     public void setDpdkInterfaceMapping(Map<String, DpdkTO> dpdkInterfaceMapping) {
         this.dpdkInterfaceMapping = dpdkInterfaceMapping;
+    }
+
+    public Map<String, String> getVdpaInterfaceMapping() {
+        return vdpaInterfaceMapping;
+    }
+
+    public void setVdpaInterfaceMapping(final Map<String, String> vdpaInterfaceMapping) {
+        this.vdpaInterfaceMapping = vdpaInterfaceMapping != null ? vdpaInterfaceMapping : new HashMap<>();
     }
 
     public Map<String, Boolean> getVlanToPersistenceMap() {

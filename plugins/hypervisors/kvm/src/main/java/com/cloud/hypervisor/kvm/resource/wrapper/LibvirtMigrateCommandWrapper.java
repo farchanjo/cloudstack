@@ -229,6 +229,15 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
                 }
             }
 
+            Map<String, String> vdpaMapping = command.getVdpaInterfaceMapping();
+            if (MapUtils.isNotEmpty(vdpaMapping)) {
+                logger.debug("Rewriting vDPA source dev paths in domain XML for VM {} ({} NIC(s))", vmName, vdpaMapping.size());
+                xmlDesc = replaceVdpaInterfaces(xmlDesc, vdpaMapping);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Changed VM {} vDPA source paths. New XML: {}", vmName, maskSensitiveInfoInXML(xmlDesc));
+                }
+            }
+
             xmlDesc = updateVmSharesIfNeeded(command, xmlDesc, libvirtComputingResource);
 
             xmlDesc = updateGpuDevicesIfNeeded(command, xmlDesc, libvirtComputingResource);
@@ -674,6 +683,96 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
         }
 
         return LibvirtXMLParser.getXml(doc);
+    }
+
+    /**
+     * Rewrites the {@code <source dev='...'>} attribute of every
+     * {@code <interface type='vdpa'>} element in the migration domain XML,
+     * replacing the source-host {@code /dev/vhost-vdpa-N} path with the
+     * destination-allocated path supplied by the dest agent's
+     * {@code PrepareForMigrationAnswer#getVdpaInterfaceMapping()}.
+     *
+     * <p>The map is keyed by lower-case MAC address. If a vDPA interface has
+     * no matching entry (unexpected), it is left unchanged and a warning is
+     * logged.
+     *
+     * @param xmlDesc    the migratable domain XML from the source domain.
+     * @param vdpaMapping MAC (lower-case) → dest {@code /dev/vhost-vdpa-N} path.
+     * @return rewritten XML with destination vDPA device paths.
+     */
+    protected String replaceVdpaInterfaces(final String xmlDesc, final Map<String, String> vdpaMapping)
+            throws TransformerException, ParserConfigurationException, IOException, SAXException {
+        InputStream in = IOUtils.toInputStream(xmlDesc);
+        DocumentBuilderFactory docFactory = ParserUtils.getSaferDocumentBuilderFactory();
+        DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
+        Document doc = docBuilder.parse(in);
+
+        Node domainNode = doc.getFirstChild();
+        NodeList domainChildren = domainNode.getChildNodes();
+        for (int i = 0; i < domainChildren.getLength(); i++) {
+            Node child = domainChildren.item(i);
+            if (!"devices".equals(child.getNodeName())) {
+                continue;
+            }
+            rewriteVdpaDevicesNode(child, vdpaMapping);
+        }
+        return LibvirtXMLParser.getXml(doc);
+    }
+
+    private void rewriteVdpaDevicesNode(final Node devicesNode, final Map<String, String> vdpaMapping) {
+        NodeList devChildren = devicesNode.getChildNodes();
+        for (int x = 0; x < devChildren.getLength(); x++) {
+            Node devChild = devChildren.item(x);
+            if (!"interface".equals(devChild.getNodeName())) {
+                continue;
+            }
+            NamedNodeMap attrs = devChild.getAttributes();
+            Node typeAttr = attrs.getNamedItem("type");
+            if (typeAttr == null || !"vdpa".equals(typeAttr.getNodeValue())) {
+                continue;
+            }
+            rewriteSingleVdpaInterface(devChild, vdpaMapping);
+        }
+    }
+
+    private void rewriteSingleVdpaInterface(final Node ifaceNode, final Map<String, String> vdpaMapping) {
+        String mac = extractMacFromInterface(ifaceNode);
+        if (mac == null) {
+            logger.warn("replaceVdpaInterfaces: vDPA interface has no mac element; skipping");
+            return;
+        }
+        String destPath = vdpaMapping.get(mac.toLowerCase(java.util.Locale.ROOT));
+        if (destPath == null) {
+            logger.warn("replaceVdpaInterfaces: no dest vDPA path for mac {}; interface left unchanged", mac);
+            return;
+        }
+        NodeList ifaceChildren = ifaceNode.getChildNodes();
+        for (int z = 0; z < ifaceChildren.getLength(); z++) {
+            Node ifaceChild = ifaceChildren.item(z);
+            if ("source".equals(ifaceChild.getNodeName())) {
+                Node devAttr = ifaceChild.getAttributes().getNamedItem("dev");
+                if (devAttr != null) {
+                    logger.debug("replaceVdpaInterfaces: mac={} src={} -> dest={}", mac, devAttr.getNodeValue(), destPath);
+                    devAttr.setNodeValue(destPath);
+                }
+                return;
+            }
+        }
+        logger.warn("replaceVdpaInterfaces: no <source dev> child found for vDPA mac {}", mac);
+    }
+
+    private String extractMacFromInterface(final Node ifaceNode) {
+        NodeList children = ifaceNode.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if ("mac".equals(child.getNodeName())) {
+                Node addrAttr = child.getAttributes().getNamedItem("address");
+                if (addrAttr != null) {
+                    return addrAttr.getNodeValue();
+                }
+            }
+        }
+        return null;
     }
 
     /**

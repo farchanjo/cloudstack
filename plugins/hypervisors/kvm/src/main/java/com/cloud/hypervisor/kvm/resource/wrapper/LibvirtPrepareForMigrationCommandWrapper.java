@@ -67,6 +67,7 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         final NicTO[] nics = vm.getNics();
 
         Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
+        Map<String, String> vdpaInterfaceMapping = new HashMap<>();
 
         boolean skipDisconnect = false;
 
@@ -89,6 +90,14 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
                     DpdkTO to = new DpdkTO(interfaceDef.getDpdkOvsPath(), interfaceDef.getDpdkSourcePort(), interfaceDef.getInterfaceMode());
                     dpdkInterfaceMapping.put(nic.getMac(), to);
                     logger.debug("Configured DPDK interface for VM {}", vm.getName());
+                }
+                if (interfaceDef != null && interfaceDef.getNetType() == GuestNetType.VDPA) {
+                    // getBrName() returns _sourceName which holds /dev/vhost-vdpa-N for vDPA interfaces.
+                    final String destVhostDev = interfaceDef.getBrName();
+                    if (org.apache.commons.lang3.StringUtils.isNotBlank(destVhostDev)) {
+                        vdpaInterfaceMapping.put(nic.getMac().toLowerCase(java.util.Locale.ROOT), destVhostDev);
+                        logger.debug("Captured destination vDPA device {} for mac {} VM {}", destVhostDev, nic.getMac(), vm.getName());
+                    }
                 }
             }
 
@@ -129,7 +138,7 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             }
 
             logger.info("Successfully prepared destination host for migration of VM {}", vm.getName());
-            return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, libvirtComputingResource, vm);
+            return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, vdpaInterfaceMapping, libvirtComputingResource, vm);
         } catch (final LibvirtException | CloudRuntimeException | InternalErrorException | URISyntaxException e) {
             if (MapUtils.isNotEmpty(dpdkInterfaceMapping)) {
                 for (DpdkTO to : dpdkInterfaceMapping.values()) {
@@ -144,13 +153,19 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         }
     }
 
-    protected PrepareForMigrationAnswer createPrepareForMigrationAnswer(PrepareForMigrationCommand command, Map<String, DpdkTO> dpdkInterfaceMapping,
-                                                                        LibvirtComputingResource libvirtComputingResource, VirtualMachineTO vm) {
+    protected PrepareForMigrationAnswer createPrepareForMigrationAnswer(PrepareForMigrationCommand command,
+            Map<String, DpdkTO> dpdkInterfaceMapping, Map<String, String> vdpaInterfaceMapping,
+            LibvirtComputingResource libvirtComputingResource, VirtualMachineTO vm) {
         PrepareForMigrationAnswer answer = new PrepareForMigrationAnswer(command);
 
         if (MapUtils.isNotEmpty(dpdkInterfaceMapping)) {
             logger.debug(String.format("Setting DPDK interface for the migration of VM [%s].", vm));
             answer.setDpdkInterfaceMapping(dpdkInterfaceMapping);
+        }
+
+        if (MapUtils.isNotEmpty(vdpaInterfaceMapping)) {
+            logger.debug("Setting vDPA interface mapping for the migration of VM [{}]: {} NIC(s)", vm, vdpaInterfaceMapping.size());
+            answer.setVdpaInterfaceMapping(vdpaInterfaceMapping);
         }
 
         int newCpuShares = libvirtComputingResource.calculateCpuShares(vm);

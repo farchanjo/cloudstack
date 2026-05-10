@@ -28,6 +28,18 @@ public class PrepareForMigrationAnswer extends Answer {
 
     private Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
 
+    /**
+     * Maps guest NIC MAC address (lower-case) to the destination-allocated
+     * {@code /dev/vhost-vdpa-N} path for vDPA NICs.  Populated by
+     * {@code LibvirtPrepareForMigrationCommandWrapper} when
+     * {@code OvnVdpaVifDriver.plug()} allocates a VF on the destination host.
+     * The source agent's {@code LibvirtMigrateCommandWrapper} reads this map
+     * and rewrites each {@code <interface type='vdpa'><source dev=...>} in the
+     * migration domain XML before calling {@code virDomainMigrate*}, ensuring
+     * libvirt opens the correct destination cdev rather than the source path.
+     */
+    private Map<String, String> vdpaInterfaceMapping = new HashMap<>();
+
     private Integer newVmCpuShares = null;
 
     protected PrepareForMigrationAnswer() {
@@ -51,6 +63,14 @@ public class PrepareForMigrationAnswer extends Answer {
 
     public Map<String, DpdkTO> getDpdkInterfaceMapping() {
         return this.dpdkInterfaceMapping;
+    }
+
+    public Map<String, String> getVdpaInterfaceMapping() {
+        return vdpaInterfaceMapping;
+    }
+
+    public void setVdpaInterfaceMapping(final Map<String, String> vdpaInterfaceMapping) {
+        this.vdpaInterfaceMapping = vdpaInterfaceMapping != null ? vdpaInterfaceMapping : new HashMap<>();
     }
 
     public Integer getNewVmCpuShares() {
