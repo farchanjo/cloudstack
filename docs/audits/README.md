@@ -31,3 +31,4 @@ and scope its analysis to either:
 | Date | File | Scope | Bugs found | Bugs fixed | Bugs open |
 |---|---|---|---|---|---|
 | 2026-05-09 | `2026-05-09-ovn-fork-audit.md` | OVN fork DB + API + UI inconsistencies + LB selection_fields + LB update state-machine + vDPA user VM guard + VF pool concurrent allocation race | 12 | 11 | 1 (Bug 10 — `updateLoadBalancerRule` algo no re-sync, LOW) |
+| 2026-05-10 | `2026-05-10-bug-13-configkey-leak.md` | Bug 13 — `ovn.requested_chassis` + `ovn.ha_chassis_priority` ZONE-scope ConfigKeys left set from Phase B verification audit + never reverted; every new LSP carried `options:requested-chassis="norbert=42"`; HIGH severity; config-only revert (no source change, no rebuild); verified via Stage 2 rebuild (20 VMs, 0 contaminated LSPs) | 1 | 1 | 0 |
