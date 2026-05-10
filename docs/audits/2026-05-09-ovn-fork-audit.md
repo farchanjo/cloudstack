@@ -438,7 +438,72 @@ grep -n "lockOneRandomRow" SriovVfPoolDaoImpl.java
 
 Build and concurrent-wave smoke test deferred to coordinator per scope constraints.
 
-**Status.** FIXED — commit `0638eca2dd`, 2026-05-09. Build/deploy pending coordinator authorization.
+#### Production verification — 2026-05-10 00:50–01:00 UTC
+
+**Build.**
+- Commit: `0638eca2dd` — `fix(sriov): atomic VF pool allocation prevents concurrent race (Bug 12)`.
+- File synced to aragog via MCP SFTP: local md5 `cf188d3ab0f97d182546b2cb98fe0d0e` = remote md5 `cf188d3ab0f97d182546b2cb98fe0d0e`. Match confirmed.
+- `mvn -T 4 -Pdeveloper -pl client,plugins/network-elements/ovn -am package -DskipTests` on aragog — BUILD SUCCESS in 57.049 s.
+- New JAR: `client/target/cloud-client-ui-4.24.1.26-SNAPSHOT.jar` md5 `b878c25a5f356f9ed6d7f232a8a10035` (differs from prior Bug 11 deploy `e83cb29eb85b839c29e99163749fca53`).
+
+**Deploy — 3-control sequential rollout.**
+
+| Control | JAR md5 | is-active | Ports (8080+8250) | HTTP /client/ |
+|---|---|---|---|---|
+| voldemort | `b878c25a5f356f9ed6d7f232a8a10035` | active | 2 | HTTP 200 |
+| bellatrix | `b878c25a5f356f9ed6d7f232a8a10035` | active | 2 | HTTP 200 |
+| barty     | `b878c25a5f356f9ed6d7f232a8a10035` | active | 2 | HTTP 200 |
+
+All 3 controls running new JAR. No rollback triggered.
+
+**4-VM parallel start test.**
+
+| VM | UUID | Host | Instance | Pre-state | Post-state |
+|---|---|---|---|---|---|
+| test20-vdpa-3 | `9f2828a9-7564-4d4a-834c-14bc9e863fa3` | trevor | i-2-1118-VM | Stopped | Running |
+| test20-vdpa-4 | `a4cd2c21-2688-40f1-ae5d-7579d50bcdc2` | trevor | i-2-1115-VM | Stopped | Running |
+| test20-vdpa-5 | `2c5596e2-9244-4b71-b17a-3e184dbe3863` | trevor | i-2-1116-VM | Stopped | Running |
+| test20-vdpa-7 | `19ff10bc-6796-4e98-9a90-ab843082ab12` | aragog | i-2-1124-VM | Stopped | Running |
+
+**virsh dumpxml — OVN data NIC (interface block verbatim).**
+
+```xml
+<!-- trevor: i-2-1118-VM (test20-vdpa-3) -->
+<interface type='vdpa'>
+  <source dev='/dev/vhost-vdpa-8'/>
+</interface>
+
+<!-- trevor: i-2-1115-VM (test20-vdpa-4) -->
+<interface type='vdpa'>
+  <source dev='/dev/vhost-vdpa-9'/>
+</interface>
+
+<!-- trevor: i-2-1116-VM (test20-vdpa-5) -->
+<interface type='vdpa'>
+  <source dev='/dev/vhost-vdpa-10'/>
+</interface>
+
+<!-- aragog: i-2-1124-VM (test20-vdpa-7) -->
+<interface type='vdpa'>
+  <source dev='/dev/vhost-vdpa-4'/>
+</interface>
+```
+
+Result: **4/4 PASS** — all 4 VMs landed `<interface type='vdpa'>` with distinct `/dev/vhost-vdpa-N` paths. No bridge fallback observed.
+
+**DB ALLOCATED count (sriov_vf_pool, post-start).**
+
+| host | host_id | ALLOCATED | FREE |
+|---|---|---|---|
+| aragog  | 1   | 5  | 10 |
+| trevor  | 269 | 4  | 14 |
+| norbert | 10  | 3  | 10 |
+| scabbers| 16  | 2  | 12 |
+| nagini  | 13  | 1  | 13 |
+
+No double-allocation. Each ALLOCATED row has a distinct `allocated_to_nic_id` and distinct PCI address. Pool integrity confirmed.
+
+**Status.** FIXED — commit `0638eca2dd`, 2026-05-10. Production verified: 4/4 vdpa VMs, 3-control deploy, DB clean.
 
 ---
 
