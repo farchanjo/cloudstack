@@ -77,7 +77,11 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             final Connect conn = libvirtUtilitiesHelper.getConnectionByVmName(vm.getName());
 
             for (final NicTO nic : nics) {
-                LibvirtVMDef.InterfaceDef interfaceDef = libvirtComputingResource.getVifDriver(nic.getType(), nic.getName()).plug(nic, null, "", vm.getExtraConfig());
+                // Use selectVifDriverForNic (not the legacy getVifDriver traffic-type
+                // selector) so OVN / vDPA / HW-offload NICs land on their correct
+                // driver. getVifDriver only dispatches on TrafficType and falls back
+                // to BridgeVifDriver for all OVN-tagged NICs — Bug 14b root cause.
+                LibvirtVMDef.InterfaceDef interfaceDef = libvirtComputingResource.selectVifDriverForNic(nic).plug(nic, null, "", vm.getExtraConfig());
                 if (vm.getDetails() != null) {
                     libvirtComputingResource.setInterfaceDefQueueSettings(vm.getDetails(), vm.getCpus(), interfaceDef);
                 }

@@ -4836,6 +4836,25 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         return getVifDriver(nic.getType(), nic.getName());
     }
 
+    /**
+     * Public accessor so command wrappers can resolve the correct VifDriver
+     * for a NicTO without duplicating the OVN/vDPA/HW-offload selection
+     * matrix. Delegates to the private {@link #selectVifDriver(NicTO)} which
+     * is the single authoritative dispatch point.
+     *
+     * <p>Migration-destination wrappers MUST use this method instead of
+     * {@link #getVifDriver(com.cloud.vm.VirtualMachine.Type, String)} so that
+     * OVN-tagged NICs land on {@link OvnVifDriver} (or its vDPA / VF
+     * passthrough variants) and not on {@link BridgeVifDriver}.
+     *
+     * @param nic the NicTO whose flags drive driver selection.
+     * @return the appropriate VifDriver; never {@code null}.
+     * @throws InternalErrorException if the required driver is not loaded.
+     */
+    public VifDriver selectVifDriverForNic(final NicTO nic) throws InternalErrorException {
+        return selectVifDriver(nic);
+    }
+
     public boolean cleanupDisk(Map<String, String> volumeToDisconnect) {
         return storagePoolManager.disconnectPhysicalDisk(volumeToDisconnect);
     }
