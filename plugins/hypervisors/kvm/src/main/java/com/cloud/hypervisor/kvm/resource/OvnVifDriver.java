@@ -102,10 +102,15 @@ public class OvnVifDriver extends VifDriverBase {
         // {@code ovnLspName} (which carries the {@code lsp-} prefix) makes
         // libvirt reject the domain XML with
         //   "XML error: cannot parse interfaceid parameter as a uuid"
-        // Use the NIC UUID instead (same shape as {@link OvsVifDriver}); the
-        // OVN binding key {@code external_ids:iface-id=<lspName>} is set on
-        // the OVS Port row separately by the post-plug stamping logic in
-        // {@link OvnNicTunableApplier} and by ovn-controller itself.
+        // Use the NIC UUID here so libvirt's XML validator accepts it; libvirt
+        // then runs `ovs-vsctl add-port br-int <vnet> -- set Interface <vnet>
+        // external_ids:iface-id=<nic-uuid>` during domain start, which leaves
+        // the OVS Port row with the WRONG binding key for ovn-controller (NB
+        // {@code Logical_Switch_Port.name} is {@code lsp-<nic-uuid>}, not the
+        // raw UUID). The OVS row is rewritten with the correct prefixed value
+        // in {@link #applyPostPlugTunables} below — that callback fires after
+        // libvirt has spawned the tap, mirroring the contract used by
+        // {@link OvnVdpaVifDriver} and {@link OvnVfPassthroughVifDriver}.
         intf.setVirtualPortType("openvswitch");
         intf.setVirtualPortInterfaceId(nic.getUuid());
 
@@ -134,6 +139,28 @@ public class OvnVifDriver extends VifDriverBase {
     public void applyPostPlugTunables(final NicTO nic, final String hostNetdev) {
         if (nic == null || StringUtils.isBlank(hostNetdev)) {
             return;
+        }
+        // Override the libvirt-emitted iface-id (raw NIC UUID — required by
+        // libvirt XML schema; see plug() above) with the OVN logical-switch-
+        // port name. ovn-controller exact-matches OVS
+        // {@code external_ids:iface-id} against NB
+        // {@code Logical_Switch_Port.name}, which is {@code lsp-<nic-uuid>};
+        // without this stamp the Port_Binding is never claimed, no datapath
+        // flows are programmed, and DHCP / tenant traffic fails. Mirrors the
+        // pattern used by {@link OvnVdpaVifDriver} and
+        // {@link OvnVfPassthroughVifDriver}.
+        if (StringUtils.isNotBlank(nic.getOvnLspName())) {
+            final String stamp = String.format(
+                    "ovs-vsctl --if-exists set Interface %s external_ids:iface-id=%s",
+                    hostNetdev, nic.getOvnLspName());
+            try {
+                Script.runSimpleBashScript(stamp);
+                logger.info("OvnVifDriver.applyPostPlugTunables: iface-id stamped dev={} lsp={}",
+                        hostNetdev, nic.getOvnLspName());
+            } catch (RuntimeException e) {
+                logger.warn("OvnVifDriver.applyPostPlugTunables: iface-id stamp failed dev={} lsp={}: {}",
+                        hostNetdev, nic.getOvnLspName(), e.getMessage());
+            }
         }
         OvnNicTunableApplier.applyEthtoolOffloads(nic, hostNetdev);
         // Stamp hairpin on the OVS Port now that libvirt has spawned the
