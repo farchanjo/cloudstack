@@ -247,17 +247,28 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     return existing.get(0);
                 }
 
+                // Bug 12 fix: use lockOneRandomRow with exclusive=true (SELECT … FOR
+                // UPDATE) so only one concurrent caller obtains the row lock at a time.
+                // The previous lockRows(sc, null, false) used LOCK IN SHARE MODE, which
+                // allowed N parallel callers to see the same FREE row simultaneously;
+                // all N then issued separate UPDATE statements and all N appeared to
+                // succeed, but only 1 VF was truly consumed — the others overwrote each
+                // other's allocation, leaving N-1 VMs silently without a VF.
+                //
+                // With FOR UPDATE, the second concurrent caller blocks on the lock until
+                // the first transaction commits. After commit the FREE row is ALLOCATED,
+                // so the second caller's re-executed SELECT skips it and moves to the
+                // next FREE entry (or returns null on genuine exhaustion).
                 SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
                 sc.setParameters("hostId", hostId);
                 sc.setParameters("state", State.FREE.name());
-                List<SriovVfPoolVO> free = lockRows(sc, null, false);
-                if (free == null || free.isEmpty()) {
+                SriovVfPoolVO vf = lockOneRandomRow(sc, true);
+                if (vf == null) {
                     return null;
                 }
-                SriovVfPoolVO vf = free.get(0);
                 // createForUpdate() returns a clean VO (no CGLIB proxy) for partial update.
                 // This avoids the enum serialization issue that occurs when calling
-                // update() on the proxy object returned by lockRows().
+                // update() on the proxy object returned by lockOneRandomRow().
                 SriovVfPoolVO updateVo = createForUpdate();
                 updateVo.setState(State.ALLOCATED.name());
                 updateVo.setAllocatedToNicId(nicId);
@@ -395,14 +406,25 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     return row;
                 }
 
+                // Bug 12 fix (symmetric with allocate()): use lockOneRandomRow with
+                // exclusive=true (SELECT … FOR UPDATE). The previous lockRows(sc, null,
+                // false) used LOCK IN SHARE MODE, allowing N concurrent vDPA starters
+                // on the same host to all read the same FREE row. Only 1 VF was
+                // consumed; N-1 callers silently received the same PCI BDF and then
+                // fell through to the OvnVifDriver bridge path when the kernel rejected
+                // the duplicate mlx5_vdpa attach.
+                //
+                // FOR UPDATE serialises concurrent callers: the second caller blocks
+                // until the first transaction commits, then sees the now-ALLOCATED row
+                // and advances to the next FREE entry via lockOneRandomRow's ORDER BY
+                // RAND() / LIMIT 1 semantics.
                 SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
                 sc.setParameters("hostId", hostId);
                 sc.setParameters("state", State.FREE.name());
-                List<SriovVfPoolVO> free = lockRows(sc, null, false);
-                if (free == null || free.isEmpty()) {
+                SriovVfPoolVO vf = lockOneRandomRow(sc, true);
+                if (vf == null) {
                     return null;
                 }
-                SriovVfPoolVO vf = free.get(0);
                 // createForUpdate() returns a CGLib proxy that captures
                 // setter args verbatim into a diff map. Pass String for
                 // enum-backed columns (state, vdpa_kind) — the enum overload
