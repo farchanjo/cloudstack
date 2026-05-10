@@ -376,6 +376,72 @@ AFTER (scabbers, post-fix):
 
 ---
 
+### Bug 12 — Concurrent VF pool allocation race in `allocate()` and `allocateForVdpa()` — `FIXED`
+
+**Symptom.** When 4-6 VMs start in parallel on the same host, only 1-2 receive an
+`sriov_vf_pool` ALLOCATED row. The remaining VMs silently fall back to `OvnVifDriver`
+(bridge + OVS virtualport). The pool is not exhausted — pool capacity is unrelated to
+the outcome. The pattern is exactly 1 success per host per concurrent wave regardless
+of how many FREE VFs are available.
+
+**Evidence (2026-05-09 test, post-Bug-11-fix).** 6 parallel `cmk startVirtualMachine`:
+4 landed on trevor (16 FREE VFs at start), 2 on aragog (11 FREE). Only 1 of 4 trevor
+starts got a VF (nic 7249); only 1 of 2 aragog starts got a VF (nic 7252). Bug 11 fix
+(guard admission) was already deployed, so the silent fallback was now visible through
+correct `<interface type='bridge'>` vs `<interface type='vdpa'>` comparisons.
+
+**Root cause.** `SriovVfPoolDaoImpl.allocate()` (line 253) and `allocateForVdpa()`
+(line 401) both called `lockRows(sc, null, false)`. The third argument `exclusive=false`
+maps to `GenericDaoBase.search(..., lock=false)` which emits `LOCK IN SHARE MODE` — NOT
+`FOR UPDATE`. `LOCK IN SHARE MODE` allows N concurrent readers to all see the same FREE
+row simultaneously inside their respective transactions.
+
+Each caller then issued a separate `update(vf.getId(), updateVo)` stamping the same row
+with its own `nicId`. MySQL's row-level UPDATE serialises these writes at the engine
+level, but all N UPDATEs succeed — the last writer wins. From the DB perspective, the
+row is ALLOCATED to exactly 1 nicId (the last update), but the N-1 callers who arrived
+earlier each returned the VO with `allocatedToNicId = their own nicId` and proceeded.
+When the kernel received N `mlx5_vdpa_dev_add` calls for the same PCI BDF, all but 1
+returned `EEXIST`/`ENOSPACE`, and those VMs fell back through the vDPA-unavailable
+branch to `OvnVifDriver`.
+
+The idempotency guard at the top of each method only helps on re-fire of the *same*
+(hostId, nicId) pair — it does not protect concurrent callers each bringing a *different*
+nicId.
+
+**Fix commit.** `0638eca2dd` — `fix(sriov): atomic VF pool allocation prevents concurrent race (Bug 12)`.
+
+Both `allocate()` and `allocateForVdpa()` now call `lockOneRandomRow(sc, true)` with
+`exclusive=true`, which emits `SELECT … FOR UPDATE`. The DB engine grants the exclusive
+lock to exactly one caller at a time. The second concurrent caller blocks at the MySQL
+lock manager until the first transaction commits; it then re-executes its
+`lockOneRandomRow` and sees the now-ALLOCATED row excluded, advancing to the next FREE
+entry. On genuine pool exhaustion the method returns `null` as before.
+
+`lockOneRandomRow` is the standard CloudStack idiom for contended pool claims (used by
+IP address and network allocators). No schema change, no new index, and no application-
+level retry loop is required — the DB lock is the serialisation mechanism.
+
+**Files changed.**
+- `engine/schema/src/main/java/com/cloud/network/router/dao/SriovVfPoolDaoImpl.java`:
+  lines 265 and 424 (`lockRows(sc, null, false)` → `lockOneRandomRow(sc, true)` in
+  `allocate()` and `allocateForVdpa()` respectively). Diff: 29 insertions, 7 deletions.
+
+**Verification.** Post-commit grep confirms zero remaining `lockRows` calls in allocation
+paths:
+
+```
+grep -n "lockOneRandomRow" SriovVfPoolDaoImpl.java
+# 265: SriovVfPoolVO vf = lockOneRandomRow(sc, true);   // allocate()
+# 424: SriovVfPoolVO vf = lockOneRandomRow(sc, true);   // allocateForVdpa()
+```
+
+Build and concurrent-wave smoke test deferred to coordinator per scope constraints.
+
+**Status.** FIXED — commit `0638eca2dd`, 2026-05-09. Build/deploy pending coordinator authorization.
+
+---
+
 ### Bug 10 — `updateLoadBalancerRule` algorithm change does not re-sync OVN — `OPEN` (LOW priority, pre-existing)
 
 Surfaced during 2026-05-09 E2E test Step 6. `cmk update loadbalancerrule
@@ -417,3 +483,8 @@ relevant code surface has actually drifted since 2026-05-09. Specifically:
 - The `HypervisorGuruBase` non-VR guard at line 733 missing `isVdpaEnabled()` is `FIXED` (Bug 11,
   commit `44090601b22807c2ea4c791864a2c30d9426503f`, deployed 2026-05-10). Do not re-flag vDPA user
   VM silent fallback as a new finding unless the fix commit is post-dated by a touching diff.
+- The `SriovVfPoolDaoImpl` concurrent VF pool allocation race is `FIXED` (Bug 12,
+  commit `0638eca2dd`). `allocate()` and `allocateForVdpa()` now use
+  `lockOneRandomRow(sc, true)` (SELECT … FOR UPDATE). Do not re-flag the share-mode read
+  race as new unless a post-fix commit re-introduces `lockRows(sc, null, false)` in either
+  allocation method.

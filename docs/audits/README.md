@@ -30,4 +30,4 @@ and scope its analysis to either:
 
 | Date | File | Scope | Bugs found | Bugs fixed | Bugs open |
 |---|---|---|---|---|---|
-| 2026-05-09 | `2026-05-09-ovn-fork-audit.md` | OVN fork DB + API + UI inconsistencies + LB selection_fields + LB update state-machine + vDPA user VM guard | 11 | 10 | 1 (Bug 10 — `updateLoadBalancerRule` algo no re-sync, LOW) |
+| 2026-05-09 | `2026-05-09-ovn-fork-audit.md` | OVN fork DB + API + UI inconsistencies + LB selection_fields + LB update state-machine + vDPA user VM guard + VF pool concurrent allocation race | 12 | 11 | 1 (Bug 10 — `updateLoadBalancerRule` algo no re-sync, LOW) |
