@@ -507,22 +507,45 @@ No double-allocation. Each ALLOCATED row has a distinct `allocated_to_nic_id` an
 
 ---
 
-### Bug 10 — `updateLoadBalancerRule` algorithm change does not re-sync OVN — `OPEN` (LOW priority, pre-existing)
+### Bug 10 — `updateLoadBalancerRule` algorithm change does not re-sync OVN — `FIXED`
 
 Surfaced during 2026-05-09 E2E test Step 6. `cmk update loadbalancerrule
 algorithm=...` updates the CloudStack DB and returns success, but the OVN
-write path only fires when the LB transitions to `Active` (i.e., during a
+write path only fired when the LB transitioned to `Active` (i.e., during a
 full apply with at least one reachable backend). After update, the
 `external_ids:cs_algo` and `selection_fields` in OVN NB still reflected the
-pre-update value. Behaviour is consistent with CloudStack's general
+pre-update value. Behaviour was consistent with CloudStack's general
 `update*` state-machine semantics, not introduced by any of the 9 bugs in
-this audit, and does not block the LB algorithm working when the rule is
+this audit, and did not block the LB algorithm working when the rule was
 re-applied via assign/remove backend or full network restart.
 
-Possible fix path: add a `forceApply` branch in `OvnLoadBalancerService` on
-`updateLoadBalancerRule` that re-walks `applyLBRules` for the network when
-algorithm or selection-affecting fields change. Out of scope for this audit;
-file as a follow-up if operators need hot algorithm changes.
+**Root cause (confirmed 2026-05-10):**
+1. `OvnLoadBalancerService.applyOne()` lines 219-222 — empty-vips early-return
+   fired unconditionally, skipping the OVN write path entirely when no live
+   backends were present at update time.
+2. The existing-row branch (line 229) called `updateLoadBalancerBackends()`
+   which only mutated `vips`; `selection_fields` and `external_ids:cs_algo`
+   were only written at row creation, never on update.
+
+**Fix (commit `5a526ca38a`, 2026-05-10):**
+- `applyOne()` now checks `rowExistsByUuid` before the empty-vips guard.
+  When the OVN row exists and vips is empty, the vips write is skipped but
+  `updateLoadBalancerProperties()` still fires so the algorithm change
+  propagates. When no mapping exists and vips is empty, the original
+  skip-and-warn behaviour is retained.
+- New private helper `updateExistingLbRow()` always calls the new
+  `OvnNbClient.updateLoadBalancerProperties(lbUuid, selectionFields,
+  externalIds)` after the optional vips write.
+- `OvnNbClient.updateLoadBalancerProperties()` issues a single OVSDB Update
+  op targeting `selection_fields` and `external_ids`, mirroring the
+  transaction discipline of `updateLoadBalancerBackends()`.
+
+**Side-effect documented:** changing `selection_fields` flushes OVN conntrack
+state for the affected VIP, rescheduling in-flight connections. Acceptable for
+an admin-driven `cmk update loadbalancerrule algorithm=...` call.
+
+**Status.** FIXED — commit `5a526ca38a`, 2026-05-10. Pending next aragog build
+and smoke-test (cmk update loadbalancerrule + verify OVN NB selection_fields).
 
 ## Skip list for future audits
 
@@ -543,8 +566,12 @@ relevant code surface has actually drifted since 2026-05-09. Specifically:
   exactly `["ip_src", "ip_dst", "tp_src", "tp_dst"]` (OVN-valid column names).
   Do NOT introduce `tcp_src`/`tcp_dst`/`udp_src`/`udp_dst` — OVN rejects them
   with `constraint violation` and the LB row never lands in NB.
-- `updateLoadBalancerRule` algorithm change is `OPEN` (Bug 10) — do not flag
-  re-application gap as new unless the fix landed and regressed.
+- `updateLoadBalancerRule` algorithm change is `FIXED` (Bug 10, commit
+  `5a526ca38a`). `applyOne()` now always re-syncs `selection_fields` and
+  `external_ids:cs_algo` when the OVN row exists, regardless of whether live
+  backends are present. Do not re-flag the staleness gap as new unless a
+  post-fix commit modifies `applyOne()` or `updateExistingLbRow()` and
+  removes the `updateLoadBalancerProperties()` call.
 - The `HypervisorGuruBase` non-VR guard at line 733 missing `isVdpaEnabled()` is `FIXED` (Bug 11,
   commit `44090601b22807c2ea4c791864a2c30d9426503f`, deployed 2026-05-10). Do not re-flag vDPA user
   VM silent fallback as a new finding unless the fix commit is post-dated by a touching diff.
