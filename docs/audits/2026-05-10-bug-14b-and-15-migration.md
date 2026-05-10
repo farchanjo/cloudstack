@@ -146,7 +146,7 @@ outage only when `liveRestart` is attempted on a vDPA-tier VM.
 | `8e9b913cb1` | fix(kvm/ovn): wire OvnVifDriver post-plug stamping into startVM and VifDriver contract | Bug 14 verification gap (cold-start stamp now live) |
 | `0d91ba8a3f` | fix(kvm/ovn): stamp iface-id on live-migration destination via PostMigrateOvnStampCommand | Bug 14b Layer B — FIXED |
 | `f03d7cfbfa` | fix(kvm/ovn-vdpa): rewrite vdpa source dev path on migration to dest-allocated /dev/vhost-vdpaN | Bug 15 Layer B — FIXED |
-| TBD (Commit F in session 2026-05-10) | fix(kvm/ovn-vdpa): release dest VF allocation on migration rollback | Bug 15 Layer C — FIXED |
+| `3bfbf9e596` | fix(kvm/ovn-vdpa): release dest VF allocation on migration rollback | Bug 15 Layer C — FIXED |
 
 ---
 
