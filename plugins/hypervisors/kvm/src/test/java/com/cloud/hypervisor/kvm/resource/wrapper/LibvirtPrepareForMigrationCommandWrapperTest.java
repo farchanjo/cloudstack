@@ -57,7 +57,7 @@ public class LibvirtPrepareForMigrationCommandWrapperTest {
         Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
         dpdkInterfaceMapping.put("Interface", new DpdkTO());
 
-        PrepareForMigrationAnswer prepareForMigrationAnswer = libvirtPrepareForMigrationCommandWrapperSpy.createPrepareForMigrationAnswer(prepareForMigrationCommandMock, dpdkInterfaceMapping, libvirtComputingResourceMock,
+        PrepareForMigrationAnswer prepareForMigrationAnswer = libvirtPrepareForMigrationCommandWrapperSpy.createPrepareForMigrationAnswer(prepareForMigrationCommandMock, dpdkInterfaceMapping, new HashMap<>(), libvirtComputingResourceMock,
                 virtualMachineTOMock);
 
         Assert.assertEquals(prepareForMigrationAnswer.getDpdkInterfaceMapping(), dpdkInterfaceMapping);
@@ -67,7 +67,7 @@ public class LibvirtPrepareForMigrationCommandWrapperTest {
     public void createPrepareForMigrationAnswerTestVerifyThatCpuSharesIsSet() {
         int cpuShares = 1000;
         Mockito.doReturn(cpuShares).when(libvirtComputingResourceMock).calculateCpuShares(virtualMachineTOMock);
-        PrepareForMigrationAnswer prepareForMigrationAnswer = libvirtPrepareForMigrationCommandWrapperSpy.createPrepareForMigrationAnswer(prepareForMigrationCommandMock,null,
+        PrepareForMigrationAnswer prepareForMigrationAnswer = libvirtPrepareForMigrationCommandWrapperSpy.createPrepareForMigrationAnswer(prepareForMigrationCommandMock,null, null,
                 libvirtComputingResourceMock, virtualMachineTOMock);
 
         Assert.assertEquals(cpuShares, prepareForMigrationAnswer.getNewVmCpuShares().intValue());
