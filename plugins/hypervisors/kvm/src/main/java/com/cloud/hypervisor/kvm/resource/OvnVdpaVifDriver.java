@@ -139,12 +139,19 @@ public class OvnVdpaVifDriver extends VifDriverBase {
 
             // (3) Attach the VF representor to br-int with the OVN binding.
             //     ovn-controller picks it up and programs offloaded flows.
+            //     iface-status is set inactive here; the post-start hook in
+            //     LibvirtComputingResource.applyOvnPostPlugTunables cycles it
+            //     to active after vhost-vdpa queue negotiation completes, which
+            //     prevents the mlx5 TC chain-0/chain-1 race (Bug 16 + 17).
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName == null) {
                 throw new InternalErrorException(String.format(
                     "OvnVdpaVifDriver: representor not found for VF %s; mlx5 switchdev required",
                     pciAddress));
             }
+            // Cache rep name on the NicTO so applyOvnPostPlugTunables can
+            // retrieve it without re-deriving from PCI after VM start.
+            nic.setVfRepName(repName);
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin());
             final String repFinal = repName;
             rollback.push(() -> Script.runSimpleBashScript(String.format(
@@ -300,15 +307,34 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         Script.runSimpleBashScript(String.format("ip link set %s vf %d spoofchk off", pfName, vfId));
     }
 
-    /** Attach VF rep to br-int with OVN binding external_ids — same contract as B2. */
+    /** Delegates to the hairpin-aware overload with {@code hairpin=null}. */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac) {
         attachRepresentorToBrInt(repName, lspName, mac, null);
     }
 
     /**
-     * Attach the VF representor and stamp the per-port {@code hairpin} flag
-     * resolved from the OVN tunable chain. {@code hairpin=null} keeps the
-     * port untouched (wire compat with older mgmt).
+     * Attach the VF representor to the OVN integration bridge and stamp its
+     * OVN binding external_ids. {@code hairpin=null} keeps the port untouched.
+     *
+     * <p><b>TC offload chain-0/chain-1 race (Bug 16 + Bug 17)</b>: mlx5
+     * switchdev programs TC offload in two phases — chain&nbsp;0 (conntrack
+     * entry, NAT pipe + goto chain&nbsp;1) fires as soon as
+     * {@code iface-status=active} is observed by ovn-controller; chain&nbsp;1
+     * (packet-forward rules) fires only after the vhost-vdpa queues complete
+     * kernel-space negotiation (visible as {@code VF_VPORT_METADATA_ACTIVE}
+     * in the mlx5 e-switch). If {@code iface-status} is stamped active at
+     * {@code plug()} time (before the domain reaches running state), chain&nbsp;0
+     * installs successfully but chain&nbsp;1 stays empty — every
+     * TCP/UDP packet hits {@code goto chain 1} → hardware drop. Only ICMP
+     * escapes because it is not matched by chain&nbsp;0. DHCP broadcasts are
+     * also dropped (Bug&nbsp;16); TCP never establishes (Bug&nbsp;17).
+     *
+     * <p>The fix: stamp {@code iface-status=inactive} here and let
+     * {@link com.cloud.hypervisor.kvm.resource.LibvirtComputingResource#applyOvnPostPlugTunables}
+     * cycle it to {@code active} after the VM reaches the running state,
+     * mirroring the proven Bug-14 TAP pattern in {@link OvnVifDriver}.
+     * The representor name is cached on the NicTO ({@code setVfRepName}) by
+     * the caller so the post-start hook can retrieve it without a PCI scan.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
                                           final Boolean hairpin) {
@@ -320,8 +346,14 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set Interface %s external_ids:attached-mac=%s", repName, mac));
         }
+        // Deferred-active pattern: set inactive at plug time; post-start hook
+        // cycles to active after vhost-vdpa queue negotiation completes.
+        // This prevents mlx5 TC chain-0/chain-1 offload race (Bug 16 + 17).
         Script.runSimpleBashScript(String.format(
-            "ovs-vsctl set Interface %s external_ids:iface-status=active", repName));
+            "ovs-vsctl set Interface %s external_ids:iface-status=inactive", repName));
+        logger.info("OvnVdpaVifDriver.attachRepresentorToBrInt: rep={} lsp={} stamped inactive"
+                + " (deferred-active: post-start hook will cycle to active after vDPA queue negotiation)",
+                repName, lspName);
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
     }
 

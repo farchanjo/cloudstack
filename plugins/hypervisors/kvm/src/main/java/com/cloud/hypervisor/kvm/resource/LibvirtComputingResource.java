@@ -4882,7 +4882,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
      * @param nics    the NICs of the running VM (from {@link VirtualMachineTO}).
      */
     public void applyOvnPostPlugTunables(final String vmName, final NicTO[] nics) {
-        if (ovnVifDriver == null || nics == null || nics.length == 0) {
+        if (nics == null || nics.length == 0) {
             return;
         }
         try {
@@ -4891,19 +4891,53 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             final Map<String, String> macToTap = extractTapDevsByMac(dm.getXMLDesc(0));
             dm.free();
             for (final NicTO nic : nics) {
-                if (!nic.isUseOvn() || nic.isUseVdpa() || nic.isUseHwOffload()) {
+                if (!nic.isUseOvn()) {
                     continue;
                 }
-                final String tapDev = macToTap.get(nic.getMac().toLowerCase(java.util.Locale.ROOT));
-                if (tapDev != null) {
-                    ovnVifDriver.applyPostPlugTunables(nic, tapDev);
-                } else {
-                    LOGGER.warn("applyOvnPostPlugTunables: no tap found for OVN nic mac={} vm={}", nic.getMac(), vmName);
+                if (nic.isUseVdpa()) {
+                    applyVdpaPostPlugTunables(vmName, nic);
+                } else if (!nic.isUseHwOffload() && ovnVifDriver != null) {
+                    final String tapDev = macToTap.get(nic.getMac().toLowerCase(java.util.Locale.ROOT));
+                    if (tapDev != null) {
+                        ovnVifDriver.applyPostPlugTunables(nic, tapDev);
+                    } else {
+                        LOGGER.warn("applyOvnPostPlugTunables: no tap found for OVN nic mac={} vm={}", nic.getMac(), vmName);
+                    }
                 }
             }
         } catch (final Exception e) {
             LOGGER.warn("applyOvnPostPlugTunables: failed for vm={}: {}", vmName, e.getMessage());
         }
+    }
+
+    /**
+     * Cycle a vDPA VF representor's {@code iface-status} from
+     * {@code inactive} to {@code active} after the VM has reached the running
+     * state, completing the deferred-active pattern introduced to avoid the
+     * mlx5 TC chain-0/chain-1 offload race (Bug 16 + Bug 17).
+     *
+     * <p>The representor name was cached on the {@link NicTO} during
+     * {@link OvnVdpaVifDriver#plug} via {@code NicTO.setVfRepName(repName)}.
+     * Stamping active only after the VM is running ensures that vhost-vdpa
+     * queue negotiation has completed in the kernel before ovn-controller
+     * programs the e-switch, so both TC chain&nbsp;0 and chain&nbsp;1 are
+     * installed in the same e-switch programming cycle.
+     *
+     * @param vmName the libvirt domain name (for log context only).
+     * @param nic    the OVN + vDPA NicTO whose representor needs activation.
+     */
+    private void applyVdpaPostPlugTunables(final String vmName, final NicTO nic) {
+        final String repName = nic.getVfRepName();
+        if (org.apache.commons.lang3.StringUtils.isBlank(repName)) {
+            LOGGER.warn("applyVdpaPostPlugTunables: no repName on NicTO mac={} vm={}; skipping active stamp",
+                    nic.getMac(), vmName);
+            return;
+        }
+        final String cmd = String.format(
+                "ovs-vsctl --if-exists set Interface %s external_ids:iface-status=active", repName);
+        Script.runSimpleBashScript(cmd);
+        LOGGER.info("applyVdpaPostPlugTunables: rep={} mac={} vm={} iface-status cycled to active"
+                + " (TC chain-0+1 race window closed)", repName, nic.getMac(), vmName);
     }
 
     /**
