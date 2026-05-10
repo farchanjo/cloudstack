@@ -254,7 +254,7 @@ Post-fix uber-jar md5: `332f69b06a8001292f5e09a1a8aa6158` (replaces
 
 ## Open / deferred items
 
-### Bug 11 — Silent fallback when vDPA user VM guard rejects vDPA offering — `OPEN` (HIGH)
+### Bug 11 — Silent fallback when vDPA user VM guard rejects vDPA offering — `FIXED`
 
 **Symptom.** Operator deploys a VM on `tier-vdpa-ovn` (vdpaEnabled=true, hwOffloadEnabled=false)
 expecting `<interface type='vdpa'>` and live-migratable HW-offloaded NIC. The VM starts without
@@ -322,9 +322,57 @@ independently. A `forceVdpaFallback` detail flag on the offering (for operators 
 want soft-fallback for mixed clusters) is a stretch goal only if Option 1 proves operationally
 disruptive.
 
-**Status.** OPEN — fix not yet implemented. Guard bug at `HypervisorGuruBase.java:733` is
-confirmed; pool has ample FREE capacity. Next step: fix the guard, add the response field, rebuild
-+ redeploy, re-run the 7-VM vDPA coverage test.
+**Fix.** Commit `44090601b22807c2ea4c791864a2c30d9426503f` (`fix(ovn): allow vDPA path on user VMs (Bug 11)`).
+`HypervisorGuruBase.java:730-736` guard extended:
+
+```java
+// BEFORE (broken):
+if (off == null || !off.isHwOffloadEnabled()) {
+    return;
+}
+
+// AFTER (fixed):
+final boolean wantHwOffload = off != null && off.isHwOffloadEnabled();
+final boolean wantVdpa = off != null && off.isVdpaEnabled();
+if (!wantHwOffload && !wantVdpa) {
+    return;
+}
+```
+
+**Deploy evidence (2026-05-10 UTC).** New uber-jar md5: `e83cb29eb85b839c29e99163749fca53`.
+Deployed sequentially to voldemort, bellatrix, barty — all 3 returned `is-active=active`, port 8080
+listening, HTTP 200.
+
+**Verification.** VM `test20-vdpa-1` (instancename `i-2-1094-VM`, id `7de3b670-9fc1-4835-9627-bbda701d1631`)
+stopped and started via cmk. VM landed on scabbers.
+
+BEFORE (nagini, pre-fix):
+```xml
+<interface type='bridge'>
+  <mac address='02:04:02:53:00:01'/>
+  <source bridge='br-int'/>
+  <virtualport type='openvswitch'>
+    <parameters interfaceid='384a5dd8-8aa2-4599-924d-7cc1df3b2093'/>
+  </virtualport>
+  <target dev='vnet54'/>
+  <model type='virtio'/>
+</interface>
+```
+
+AFTER (scabbers, post-fix):
+```xml
+<interface type='vdpa'>
+  <mac address='02:04:02:53:00:01'/>
+  <source dev='/dev/vhost-vdpa-6'/>
+  <model type='virtio'/>
+  <driver queues='16'/>
+</interface>
+```
+
+`vdpa dev show` on scabbers confirms `vdpa-020402530001` bound to `pci/0000:01:04.3` (MAC matches NIC).
+`sriov_vf_pool` DB row for nic_id 7267 on host_id 10 (scabbers) transitioned to `state=ALLOCATED`.
+
+**Status.** FIXED — commit `44090601b22807c2ea4c791864a2c30d9426503f`, deployed 2026-05-10, verified.
 
 ---
 
@@ -366,6 +414,6 @@ relevant code surface has actually drifted since 2026-05-09. Specifically:
   with `constraint violation` and the LB row never lands in NB.
 - `updateLoadBalancerRule` algorithm change is `OPEN` (Bug 10) — do not flag
   re-application gap as new unless the fix landed and regressed.
-- The `HypervisorGuruBase` non-VR guard at line 733 missing `isVdpaEnabled()` is `OPEN` (Bug 11)
-  — do not re-flag vDPA user VM silent fallback as a new finding. Root cause is the guard logic,
-  not pool depletion; DB probe confirmed 77 FREE vDPA-capable VF rows at time of discovery.
+- The `HypervisorGuruBase` non-VR guard at line 733 missing `isVdpaEnabled()` is `FIXED` (Bug 11,
+  commit `44090601b22807c2ea4c791864a2c30d9426503f`, deployed 2026-05-10). Do not re-flag vDPA user
+  VM silent fallback as a new finding unless the fix commit is post-dated by a touching diff.
