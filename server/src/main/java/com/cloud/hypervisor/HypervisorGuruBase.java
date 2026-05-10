@@ -725,12 +725,15 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 network.getTrafficType() == com.cloud.network.Networks.TrafficType.Management) {
                 return;
             }
-            // Non-VRs (user VMs) only receive a VF when the offering has
-            // hwOffloadEnabled=1.
+            // Non-VRs (user VMs) receive a VF when the offering has hwOffloadEnabled=1
+            // OR vdpaEnabled=1.  The Bug 5 mutex means vDPA offerings always carry
+            // hwOffloadEnabled=false, so we must admit either flag independently.
             if (!isVr) {
                 com.cloud.offerings.NetworkOfferingVO off =
                         networkOfferingDao.findById(network.getNetworkOfferingId());
-                if (off == null || !off.isHwOffloadEnabled()) {
+                final boolean wantHwOffload = off != null && off.isHwOffloadEnabled();
+                final boolean wantVdpa = off != null && off.isVdpaEnabled();
+                if (!wantHwOffload && !wantVdpa) {
                     return;
                 }
             }
