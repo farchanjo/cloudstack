@@ -4856,6 +4856,17 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     /**
+     * Returns the {@link OvnVdpaVifDriver} instance if loaded, or {@code null}
+     * if OVN + vDPA is not configured on this host. Used by rollback paths
+     * (e.g., {@code LibvirtPrepareForMigrationCommandWrapper.handleRollback})
+     * that need to release a destination VF without going through a full
+     * NicTO-dispatch to avoid allocating another VF in error.
+     */
+    public OvnVdpaVifDriver getOvnVdpaVifDriver() {
+        return ovnVdpaVifDriver instanceof OvnVdpaVifDriver ? (OvnVdpaVifDriver) ovnVdpaVifDriver : null;
+    }
+
+    /**
      * Call {@link VifDriver#applyPostPlugTunables} for every OVN TAP NIC in
      * {@code nics} after the domain is running and libvirt has assigned the
      * kernel tap device names. This is the post-plug hook referenced in

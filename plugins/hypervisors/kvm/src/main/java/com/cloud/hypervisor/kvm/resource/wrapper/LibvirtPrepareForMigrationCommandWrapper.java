@@ -41,6 +41,7 @@ import com.cloud.exception.InternalErrorException;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef.GuestNetType;
+import com.cloud.hypervisor.kvm.resource.OvnVdpaVifDriver;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePoolManager;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
@@ -179,11 +180,40 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         KVMStoragePoolManager storagePoolMgr = libvirtComputingResource.getStoragePoolMgr();
         VirtualMachineTO vmTO = command.getVirtualMachine();
 
+        releaseVdpaVfsOnRollback(vmTO, libvirtComputingResource);
+
         logger.info("Rolling back PrepareForMigration for VM {}: disconnecting physical disks", vmTO.getName());
         if (!storagePoolMgr.disconnectPhysicalDisksViaVmSpec(vmTO)) {
             return new PrepareForMigrationAnswer(command, "failed to disconnect physical disks from host");
         }
 
         return new PrepareForMigrationAnswer(command);
+    }
+
+    /**
+     * For each vDPA NIC in the VM spec, release the destination VF that was
+     * allocated by {@link OvnVdpaVifDriver#plug} during the forward prepare.
+     * This prevents VF pool leaks and orphaned {@code vdpa dev} instances on
+     * the destination after a migration abort.
+     *
+     * <p>Called before physical-disk disconnect so that VF cleanup always runs
+     * even if the disk path throws.
+     */
+    private void releaseVdpaVfsOnRollback(VirtualMachineTO vm, LibvirtComputingResource libvirtComputingResource) {
+        final NicTO[] nics = vm.getNics();
+        if (nics == null || nics.length == 0) {
+            return;
+        }
+        final OvnVdpaVifDriver vdpaDriver = libvirtComputingResource.getOvnVdpaVifDriver();
+        if (vdpaDriver == null) {
+            return;
+        }
+        for (final NicTO nic : nics) {
+            if (!nic.isUseVdpa()) {
+                continue;
+            }
+            logger.info("PrepareForMigration rollback: releasing vDPA VF for mac={} vm={}", nic.getMac(), vm.getName());
+            vdpaDriver.releaseVdpaOnRollback(nic);
+        }
     }
 }

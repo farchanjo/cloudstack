@@ -144,16 +144,63 @@ outage only when `liveRestart` is attempted on a vDPA-tier VM.
 |---|---|---|
 | `ff59e27753` | fix(kvm): route migration destination through selectVifDriver(NicTO) | Bug 14b Layer A + Bug 15 Layer A |
 | `8e9b913cb1` | fix(kvm/ovn): wire OvnVifDriver post-plug stamping into startVM and VifDriver contract | Bug 14 verification gap (cold-start stamp now live) |
+| `0d91ba8a3f` | fix(kvm/ovn): stamp iface-id on live-migration destination via PostMigrateOvnStampCommand | Bug 14b Layer B — FIXED |
+| `f03d7cfbfa` | fix(kvm/ovn-vdpa): rewrite vdpa source dev path on migration to dest-allocated /dev/vhost-vdpaN | Bug 15 Layer B — FIXED |
+| TBD (Commit F in session 2026-05-10) | fix(kvm/ovn-vdpa): release dest VF allocation on migration rollback | Bug 15 Layer C — FIXED |
 
 ---
 
-## Deferred items
+### Bug 14b Layer B — FIXED (`0d91ba8a3f`)
+
+New files introduced:
+- `core/.../PostMigrateOvnStampCommand.java` — carries `vmName` + `NicTO[]`; sent by management server to dest agent after `MigrateCommand` succeeds.
+- `core/.../PostMigrateOvnStampAnswer.java` — boolean success + error detail.
+- `plugins/hypervisors/kvm/.../LibvirtPostMigrateOvnStampCommandWrapper.java` — `@ResourceWrapper(handles=PostMigrateOvnStampCommand.class)`; delegates to `applyOvnPostPlugTunables(vmName, nics)` on dest agent.
+
+#### Verification gap (2026-05-10)
+
+`PostMigrateOvnStampCommand` will NOT fire automatically until the management
+server wires `VirtualMachineManagerImpl` (or equivalent post-migrate hook) to
+dispatch it to the dest host ID after `MigrateCommand` returns success. The
+agent-side handler is complete and correct; the mgmt-server dispatch side is
+**stub awaiting full mgmt orchestration**. Manual dispatch via `cmk` or a
+targeted `AgentManager#send` call works correctly today.
+
+**Status: FIXED** (agent side); **OPEN** (mgmt orchestration wiring — tracked as follow-up).
+
+---
+
+### Bug 15 Layer B — FIXED (`f03d7cfbfa`)
+
+Changes:
+- `PrepareForMigrationAnswer` — new field `vdpaInterfaceMapping: Map<String,String>` (MAC → `/dev/vhost-vdpa-N`); getter/setter added.
+- `MigrateCommand` — same field added so management server can pass dest mapping to source agent.
+- `LibvirtPrepareForMigrationCommandWrapper` — captures `interfaceDef.getBrName()` for `GuestNetType.VDPA` NICs after plug and populates `vdpaInterfaceMapping` in the answer.
+- `LibvirtMigrateCommandWrapper` — calls `replaceVdpaInterfaces(xmlDesc, vdpaMapping)` after `replaceDpdkInterfaces`, before `virDomainMigrate*`. Rewrites `<source dev='...'>` on each `<interface type='vdpa'>` keyed by MAC. Four helpers extracted, all <30 lines.
+
+**Note:** Management-server wiring to transfer `PrepareForMigrationAnswer.vdpaInterfaceMapping` into `MigrateCommand.vdpaInterfaceMapping` is a follow-up. Field is present and serializable today.
+
+**Status: FIXED** (agent-side XML rewrite complete); **OPEN** (mgmt plumbing of mapping from PrepareForMigrationAnswer to MigrateCommand).
+
+---
+
+### Bug 15 Layer C — FIXED (Commit F, 2026-05-10 session)
+
+Changes:
+- `OvnVdpaVifDriver` — new `releaseVdpaOnRollback(NicTO)` method: derives vdpa-name from NIC MAC, runs `vdpa dev del`, removes representor from `br-int`, clears PF-side VF MAC/VLAN. Extracted `removeRepresentorAndClearVf(String pciAddress)` helper (<30 lines each).
+- `LibvirtComputingResource` — new `getOvnVdpaVifDriver()` public accessor for rollback path.
+- `LibvirtPrepareForMigrationCommandWrapper` — `handleRollback()` now calls `releaseVdpaVfsOnRollback(vm, lcr)` which iterates NICs, calls `vdpaDriver.releaseVdpaOnRollback(nic)` for each vDPA NIC. Extracted `releaseVdpaVfsOnRollback` helper (<30 lines).
+
+**Status: FIXED.**
+
+---
+
+## Deferred items (updated 2026-05-10)
 
 | Item | Scope | Priority |
 |---|---|---|
-| Bug 14b migration stamp — `PostMigrateOvnStampCommand` or equivalent hook on dest agent | New agent command + mgmt dispatch | HIGH |
-| Bug 15 Layer B — destination VF path splice into migration domain XML | `LibvirtMigrateCommandWrapper` XML rewrite | MED |
-| Bug 15 Layer C — vDPA VF rollback on migration failure | `LibvirtPrepareForMigrationCommandWrapper` rollback hook | MED |
+| Bug 14b mgmt dispatch wiring — `VirtualMachineManagerImpl` sends `PostMigrateOvnStampCommand` to dest after migrate success | `server/` `VirtualMachineManagerImpl` | HIGH |
+| Bug 15 B mgmt plumbing — transfer `PrepareForMigrationAnswer.vdpaInterfaceMapping` into `MigrateCommand` in mgmt-server | `server/` migration path | MED |
 | OP3 — Test A NAT/eBGP origin path (`external_mac=[]` on dnat_and_snat rows) | OVN NAT path forensic | HIGH |
 | HA chassis ERR `cr-lrp-public-vpc742` | OVN HA chassis group forensic | MED |
 

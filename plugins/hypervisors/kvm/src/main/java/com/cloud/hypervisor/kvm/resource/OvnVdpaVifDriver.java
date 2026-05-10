@@ -345,6 +345,51 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         }
     }
 
+    /**
+     * Release the destination VF allocation that was established during a
+     * {@code PrepareForMigration} call that subsequently failed (migration
+     * aborted before or during transfer).
+     *
+     * <p>Mirrors the cleanup in {@link #unplug} but operates from a NicTO
+     * alone, without requiring a live {@link InterfaceDef}: the vdpa-device
+     * name is re-derived from the NIC MAC (same algorithm as
+     * {@link VdpaVifDriver#buildVdpaName(NicTO)}), the vhost-vdpa cdev index
+     * is resolved via sysfs, the representor is removed from {@code br-int},
+     * and the PF-side VF identity is cleared.
+     *
+     * @param nic the NicTO whose VF was allocated on this host during prepare.
+     */
+    public void releaseVdpaOnRollback(final NicTO nic) {
+        if (nic == null || !nic.isUseVdpa()) {
+            return;
+        }
+        final String vdpaName = VdpaVifDriver.buildVdpaName(nic);
+        logger.info("OvnVdpaVifDriver.releaseVdpaOnRollback: releasing vdpa={} mac={}", vdpaName, nic.getMac());
+        Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+
+        final String pciAddress = nic.getVfPciAddress();
+        if (StringUtils.isNotBlank(pciAddress)) {
+            removeRepresentorAndClearVf(pciAddress);
+        } else {
+            logger.warn("OvnVdpaVifDriver.releaseVdpaOnRollback: no vfPciAddress on NicTO mac={}; rep not removed", nic.getMac());
+        }
+    }
+
+    private void removeRepresentorAndClearVf(final String pciAddress) {
+        final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+        if (repName != null) {
+            Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
+            logger.info("OvnVdpaVifDriver.releaseVdpaOnRollback: removed rep {} from {}", repName, integrationBridge);
+        }
+        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
+        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
+        if (pfName != null && vfId != null) {
+            Script.runSimpleBashScript(String.format(
+                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
+        }
+    }
+
     private void drainRollback(final Deque<Runnable> rollback) {
         while (!rollback.isEmpty()) {
             try {
