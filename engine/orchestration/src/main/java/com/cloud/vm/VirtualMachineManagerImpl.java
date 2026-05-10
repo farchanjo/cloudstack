@@ -3349,6 +3349,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             migrateCommand.setDpdkInterfaceMapping(dpdkInterfaceMapping);
         }
 
+        Map<String, String> answerVdpaInterfaceMapping = prepareForMigrationAnswer.getVdpaInterfaceMapping();
+        if (MapUtils.isNotEmpty(answerVdpaInterfaceMapping)) {
+            logger.debug("Setting vDPA interface mapping to [{}] as part of migrate command for VM [{}].",
+                    new Gson().toJson(answerVdpaInterfaceMapping), virtualMachineTO);
+            migrateCommand.setVdpaInterfaceMapping(answerVdpaInterfaceMapping);
+        }
+
         Integer newVmCpuShares = prepareForMigrationAnswer.getNewVmCpuShares();
         if (newVmCpuShares != null) {
             logger.debug("Setting CPU shares to [{}] as part of migrate command for VM [{}].", newVmCpuShares, virtualMachineTO);
