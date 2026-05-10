@@ -1135,6 +1135,36 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * Atomically updates {@code selection_fields} and {@code external_ids} on an
+     * existing {@code Load_Balancer} row without touching {@code vips}.
+     *
+     * <p>Called by {@link com.cloud.network.ovn.element.OvnLoadBalancerService}
+     * when an operator changes the load-balancing algorithm via
+     * {@code updateLoadBalancerRule} — a change that does not alter backends but
+     * must be reflected in OVN immediately. A {@code null} or empty
+     * {@code selectionFields} list signals "round-robin" (OVN default) and
+     * causes the column to be set to the empty OVSDB set.
+     *
+     * <p><b>Side-effect</b>: changing {@code selection_fields} flushes OVN
+     * conntrack state for that VIP, rescheduling any in-flight connections.
+     * This is acceptable for an admin-driven algorithm update.
+     */
+    public void updateLoadBalancerProperties(final String lbUuid, final List<String> selectionFields,
+                                             final Map<String, String> externalIds) {
+        if (lbUuid == null || lbUuid.isEmpty()) {
+            throw new OvnException("updateLoadBalancerProperties requires a non-null lbUuid");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("selection_fields", stringSet(selectionFields == null ? List.of() : selectionFields));
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), row));
+        tx.commit();
+    }
+
+    /**
      * Deletes a load_balancer row. The caller is responsible for detaching
      * it from any Logical_Router / Logical_Switch first; otherwise the OVSDB
      * server emits a constraint violation.

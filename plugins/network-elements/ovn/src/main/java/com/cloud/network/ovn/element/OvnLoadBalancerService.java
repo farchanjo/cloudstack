@@ -216,24 +216,21 @@ public class OvnLoadBalancerService extends AdapterBase {
             return;
         }
         final Map<String, String> vips = buildVipsMap(rule);
-        if (vips.isEmpty()) {
-            LOGGER.warn("OvnLoadBalancerService: rule id={} has no live destinations; LB row skipped",
-                    rule.getId());
-            return;
-        }
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.LOAD_BALANCER, rule.getId(), controller.getId());
         if (existing != null) {
             // Stale-mapping guard — recreate when LB row was deleted out-of-band.
             if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
-                // Backend pool change → atomic vips re-write.
-                nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
-                LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}",
-                        existing.getOvnUuid(), rule.getId());
+                updateExistingLbRow(nb, existing.getOvnUuid(), rule, vips);
                 return;
             }
             LOGGER.warn("OvnLoadBalancerService: LOAD_BALANCER mapping rule={} -> {} stale; recreating",
                     rule.getId(), existing.getOvnUuid());
             logicalIdMapDao.remove(existing.getId());
+        }
+        if (vips.isEmpty()) {
+            LOGGER.warn("OvnLoadBalancerService: rule id={} has no live destinations; LB row skipped",
+                    rule.getId());
+            return;
         }
         final List<String> selectionFields = selectionFieldsFor(rule);
         final String protocol = protocolFor(rule);
@@ -263,6 +260,37 @@ public class OvnLoadBalancerService extends AdapterBase {
         // LB rules sharing the same source IP collapse to a single
         // BGP_ANNOUNCE row (keyed by ip address id, not rule id).
         announceLbVip(network, rule);
+    }
+
+    /**
+     * Updates an OVN {@code Load_Balancer} row that already exists in the NB DB.
+     *
+     * <p>Two operations are issued atomically against the same OVSDB row:
+     * <ol>
+     *   <li>If {@code vips} is non-empty, rewrite the {@code vips} column via
+     *       {@link OvnNbClient#updateLoadBalancerBackends}.</li>
+     *   <li>Always rewrite {@code selection_fields} and {@code external_ids} via
+     *       {@link OvnNbClient#updateLoadBalancerProperties} so that an operator
+     *       algorithm change is reflected immediately, even when no backends are
+     *       live at the time of the update.</li>
+     * </ol>
+     *
+     * <p><b>Side-effect</b>: rewriting {@code selection_fields} flushes OVN
+     * conntrack state for the VIP, rescheduling in-flight connections.
+     * This is the intended behaviour for an admin-driven algorithm change.
+     */
+    private void updateExistingLbRow(final OvnNbClient nb, final String lbUuid,
+                                     final LoadBalancingRule rule, final Map<String, String> vips) {
+        if (!vips.isEmpty()) {
+            nb.updateLoadBalancerBackends(lbUuid, vips);
+            LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}", lbUuid, rule.getId());
+        } else {
+            LOGGER.info("OvnLoadBalancerService: LB {} has no live backends; skipping vips write for rule id={}",
+                    lbUuid, rule.getId());
+        }
+        nb.updateLoadBalancerProperties(lbUuid, selectionFieldsFor(rule), buildExternalIds(rule));
+        LOGGER.info("OvnLoadBalancerService: LB {} properties re-synced (algo={}) for rule id={}",
+                lbUuid, rule.getAlgorithm(), rule.getId());
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
