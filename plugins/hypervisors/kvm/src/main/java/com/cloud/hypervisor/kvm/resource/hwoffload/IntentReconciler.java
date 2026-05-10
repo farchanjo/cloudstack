@@ -18,7 +18,6 @@
  */
 package com.cloud.hypervisor.kvm.resource.hwoffload;
 
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;

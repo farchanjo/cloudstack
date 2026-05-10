@@ -20,7 +20,6 @@ package com.cloud.hypervisor.kvm.resource;
 
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
-import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -30,9 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.junit.Test;
-import org.mockito.InOrder;
 import org.mockito.MockedStatic;
-import org.mockito.Mockito;
 
 import com.cloud.utils.script.Script;
 
