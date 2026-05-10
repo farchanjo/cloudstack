@@ -257,3 +257,33 @@ relevant code surface has actually drifted. Specifically:
   `ovn-nbctl --bare --columns=name,up list logical_switch_port` and treat
   any TAP-tier `lsp-…` with `up=false` as a binding failure, drilling into
   the OVS-side `external_ids:iface-id` immediately.
+
+## Verification gap (appended 2026-05-10)
+
+The original Bug 14 commit (`ded44f0c1a`) added `OvnVifDriver.applyPostPlugTunables`
+with the correct `ovs-vsctl set Interface … external_ids:iface-id=<lspName>` stamp
+but **never wired a caller**. The method referenced `LibvirtComputingResource#postNicConfigure`
+in its Javadoc as the entry point — that method does not exist and was never
+implemented.
+
+Cold-start production "fix" observed this session worked because a manual
+`ovs-vsctl set Interface <vnet> external_ids:iface-id=lsp-<uuid>` was applied
+on fluffy + trevor **before the JAR containing commit `ded44f0c1a` was built and
+deployed**. The deployed JAR (`md5=db900b055c02d06b5fe4dbeeb705251a`) has dead code
+at `applyPostPlugTunables`: it correctly stamps the OVS Port but has no code path
+that ever calls it.
+
+**Remediation commit `8e9b913cb1`** (`fix(kvm/ovn): wire OvnVifDriver post-plug stamping
+into startVM and VifDriver contract`, 2026-05-10):
+- Adds `applyOvnPostPlugTunables(String vmName, NicTO[] nics)` on
+  `LibvirtComputingResource` — post-domain-start hook using `domain.getXMLDesc(0)`
+  XPath to resolve MAC → tap names, then calls `ovnVifDriver.applyPostPlugTunables`.
+- Wires the call into `LibvirtStartCommandWrapper` after `startVM()`.
+- Promotes `applyPostPlugTunables` to a `default` method on the `VifDriver` interface
+  (no-op for all non-OVN drivers); adds `@Override` in `OvnVifDriver`.
+
+**Status remains FIXED** but note the fix was not actually in effect at runtime until
+commit `8e9b913cb1` is built and deployed. The next aragog build cycle will include
+both `ded44f0c1a` and `8e9b913cb1`. See audit
+`2026-05-10-bug-14b-and-15-migration.md` for the migration-destination stamp gap
+(separate finding, separate commit).
