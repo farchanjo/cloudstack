@@ -5091,6 +5091,15 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 _networkMgr.setHypervisorHostname(profile, dest, true);
 
                 updateVmPod(vm, dstHostId);
+
+                // Bug 14b coverage on the scale-migrate path. orchestrateMigrate
+                // already dispatches PostMigrateOvnStampCommand on its own
+                // success branch (commit d34f9fe190); this mirrors the behavior
+                // for orchestrateMigrateForScale so OVN tap NICs on the
+                // destination receive the lsp- prefixed iface-id stamp on
+                // every successful live-migration, including vertical-scale
+                // migrations triggered by orchestrateScaleVm.
+                dispatchPostMigrateOvnStamp(vm, to, dstHostId);
             }
 
             work.setStep(Step.Done);
