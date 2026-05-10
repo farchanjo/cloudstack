@@ -254,6 +254,80 @@ Post-fix uber-jar md5: `332f69b06a8001292f5e09a1a8aa6158` (replaces
 
 ## Open / deferred items
 
+### Bug 11 — Silent fallback when vDPA user VM guard rejects vDPA offering — `OPEN` (HIGH)
+
+**Symptom.** Operator deploys a VM on `tier-vdpa-ovn` (vdpaEnabled=true, hwOffloadEnabled=false)
+expecting `<interface type='vdpa'>` and live-migratable HW-offloaded NIC. The VM starts without
+error, appears healthy via API, but actually runs with `<interface type='bridge'>` (OVN TAP path).
+No API error is surfaced; no `actualNicDriver` field exists in the `deployVirtualMachine` response.
+Operator only learns of the fallback via `virsh dumpxml <vm>` or by measuring NIC throughput and
+observing software-path latency.
+
+**Root cause.** `HypervisorGuruBase.java:730-735` contains a non-VR guard for user VMs:
+
+```java
+if (!isVr) {
+    NetworkOfferingVO off = networkOfferingDao.findById(network.getNetworkOfferingId());
+    if (off == null || !off.isHwOffloadEnabled()) {
+        return;   // <-- exits here for all vDPA offerings
+    }
+}
+```
+
+Because Bug 5 enforced the vDPA/hwOffload mutex (`hwOffloadEnabled` and `vdpaEnabled` are mutually
+exclusive), vDPA offerings always have `isHwOffloadEnabled() == false`. The guard therefore returns
+before reaching the `shouldVdpa` branch at line 740, which would have called
+`vfPoolManager.allocateForVdpa()` and set `nicTo.setUseVdpa(true)`. The NicTO leaves
+`allocateVfIfHwOffload()` with `useVdpa=false`, causing `OvnVifDriver` (bridge + OVS virtualport)
+to be selected instead of `OvnVdpaVifDriver`.
+
+**DB evidence (Phase A, 2026-05-09).** `sriov_vf_pool` has 640 rows total across 6 data nodes.
+FREE vDPA-capable VFs exist on every host at time of probe: aragog 11, fluffy 13, nagini 14,
+norbert 10, scabbers 13, trevor 16 (total 77 FREE). Pool is NOT depleted. The 7 VDPA-ALLOCATED
+rows belong to VMs on the `tier-vf-ovn` SR-IOV tier (not the vDPA tier) — those were promoted via
+the VR path in `VpcVirtualNetworkApplianceManagerImpl:1335`, which bypasses the non-VR guard.
+Verdict: guard logic bug, not capacity shortage.
+
+**Surfaced during.** 2026-05-09 20-VM driver coverage test (Slytherin cluster). 7/7 VMs deployed
+on `tier-vdpa-ovn` landed with `<interface type='bridge'>` instead of `<interface type='vdpa'>`.
+Kernel modules, `/dev/vhost-vdpa-N` devices, and sysfs vdpa entries confirmed present on all 6
+data nodes prior to the test. OVS `hw-offload=true` set cluster-wide.
+
+**Impact.** Operator picks `tier-vdpa-ovn` expecting live-migratable HW-offloaded NIC; receives
+kernel-TAP fallback with no indication from the API. Trust and observability: HIGH severity — an
+operator running production workloads on this offering unknowingly operates at degraded NIC
+performance and without the HW-datapath properties (live migration with vDPA semantics). The
+offering contract is silently broken. Performance impact: MEDIUM severity — VM remains functional
+but loses HW-accelerated data path.
+
+**Suggested fix path.**
+
+- **Option 1 (fail-fast — recommended primary):** In `HypervisorGuruBase.java:733`, extend the
+  guard to also allow vDPA offerings through:
+  `if (off == null || (!off.isHwOffloadEnabled() && !off.isVdpaEnabled())) { return; }`
+  Then the `shouldVdpa` branch at line 740 fires correctly for user VMs. Combined with Option 2
+  for observability.
+
+- **Option 2 (observability — recommended companion):** Add `actualNicDriver` (string enum:
+  `VDPA`, `VF`, `TAP`) to `DeployVirtualMachineResponse` / `VirtualMachineResponse`. Populated
+  by inspecting the NicTO state after `allocateVfIfHwOffload()` returns. Operator can detect
+  fallback without `virsh dumpxml`.
+
+- **Option 3 (preventive):** Capacity pre-check on offering create — refuse to enable
+  `tier-vdpa-ovn` in a zone where no host has `sriov_vf_pool` rows in state FREE. Guards against
+  offering creation on clusters with no HW inventory, but does not fix the guard logic itself.
+
+Recommend Option 1 + Option 2 as the primary fix. Option 3 is additive and can follow
+independently. A `forceVdpaFallback` detail flag on the offering (for operators who intentionally
+want soft-fallback for mixed clusters) is a stretch goal only if Option 1 proves operationally
+disruptive.
+
+**Status.** OPEN — fix not yet implemented. Guard bug at `HypervisorGuruBase.java:733` is
+confirmed; pool has ample FREE capacity. Next step: fix the guard, add the response field, rebuild
++ redeploy, re-run the 7-VM vDPA coverage test.
+
+---
+
 ### Bug 10 — `updateLoadBalancerRule` algorithm change does not re-sync OVN — `OPEN` (LOW priority, pre-existing)
 
 Surfaced during 2026-05-09 E2E test Step 6. `cmk update loadbalancerrule
@@ -292,3 +366,6 @@ relevant code surface has actually drifted since 2026-05-09. Specifically:
   with `constraint violation` and the LB row never lands in NB.
 - `updateLoadBalancerRule` algorithm change is `OPEN` (Bug 10) — do not flag
   re-application gap as new unless the fix landed and regressed.
+- The `HypervisorGuruBase` non-VR guard at line 733 missing `isVdpaEnabled()` is `OPEN` (Bug 11)
+  — do not re-flag vDPA user VM silent fallback as a new finding. Root cause is the guard logic,
+  not pool depletion; DB probe confirmed 77 FREE vDPA-capable VF rows at time of discovery.
