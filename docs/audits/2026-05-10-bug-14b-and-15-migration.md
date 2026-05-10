@@ -148,7 +148,7 @@ outage only when `liveRestart` is attempted on a vDPA-tier VM.
 | `f03d7cfbfa` | fix(kvm/ovn-vdpa): rewrite vdpa source dev path on migration to dest-allocated /dev/vhost-vdpaN | Bug 15 Layer B agent side — FIXED |
 | `3bfbf9e596` | fix(kvm/ovn-vdpa): release dest VF allocation on migration rollback | Bug 15 Layer C — FIXED |
 | `b540cbd183` | fix(server): plumb vdpa interface mapping from prepare-for-migration answer to migrate command | Bug 15 Layer B mgmt orchestration — FIXED |
-| (Commit H — this session) | fix(server): dispatch PostMigrateOvnStampCommand to destination after successful migrate | Bug 14b Layer B mgmt orchestration — FIXED |
+| d34f9fe190 | fix(server): dispatch PostMigrateOvnStampCommand to destination after successful migrate | Bug 14b Layer B mgmt orchestration — FIXED |
 
 ---
 
@@ -168,7 +168,7 @@ agent-side handler is complete and correct; the mgmt-server dispatch side is
 **stub awaiting full mgmt orchestration**. Manual dispatch via `cmk` or a
 targeted `AgentManager#send` call works correctly today.
 
-**Status: FIXED** (agent side — commit `0d91ba8a3f`); **FIXED** (mgmt orchestration wiring — Commit H this session; dispatches `PostMigrateOvnStampCommand` from `VirtualMachineManagerImpl.dispatchPostMigrateOvnStamp()` after `MigrateAnswer` success, KVM-guarded, best-effort/non-fatal).
+**Status: FIXED** (agent side — commit `0d91ba8a3f`); **FIXED** (mgmt orchestration wiring — commit `d34f9fe190`; dispatches `PostMigrateOvnStampCommand` from `VirtualMachineManagerImpl.dispatchPostMigrateOvnStamp()` after `MigrateAnswer` success, KVM-guarded, best-effort/non-fatal).
 
 ---
 
