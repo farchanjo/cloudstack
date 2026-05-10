@@ -34,6 +34,26 @@ public interface VifDriver {
 
     public LibvirtVMDef.InterfaceDef plug(NicTO nic, String guestOsType, String nicAdapter, Map<String, String> extraConfig) throws InternalErrorException, LibvirtException;
 
+    /**
+     * Apply host-side tunables (OVS port properties, ethtool offloads, MTU,
+     * hairpin) on the kernel tap/netdev after libvirt has spawned it.
+     *
+     * <p>Called by {@link
+     * com.cloud.hypervisor.kvm.resource.LibvirtComputingResource#applyOvnPostPlugTunables}
+     * after the domain is running and the actual tap dev name is known.
+     *
+     * <p>Default implementation is a no-op so drivers that do not require
+     * post-plug work (bridge, vhostuser, SR-IOV) compile without changes.
+     * Override in driver subclasses that need post-plug host configuration
+     * (currently only {@link OvnVifDriver}).
+     *
+     * @param nic         the NicTO describing the guest interface.
+     * @param hostNetdev  the kernel netdev name assigned by libvirt (e.g. {@code vnet54}).
+     */
+    default void applyPostPlugTunables(NicTO nic, String hostNetdev) {
+        // no-op for drivers that do not require post-plug host configuration
+    }
+
     public void unplug(LibvirtVMDef.InterfaceDef iface, boolean delete);
 
     void attach(LibvirtVMDef.InterfaceDef iface);

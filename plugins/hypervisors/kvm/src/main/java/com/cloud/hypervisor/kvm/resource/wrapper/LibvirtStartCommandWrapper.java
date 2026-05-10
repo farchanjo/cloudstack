@@ -90,6 +90,12 @@ public final class LibvirtStartCommandWrapper extends CommandWrapper<StartComman
             String vmInitialSpecification = vm.toString();
             String vmFinalSpecification = performXmlTransformHook(vmInitialSpecification, libvirtComputingResource);
             libvirtComputingResource.startVM(conn, vmName, vmFinalSpecification);
+            // Stamp OVN external_ids:iface-id=lsp-<uuid> on every OVN TAP port
+            // now that libvirt has spawned the tap devices and assigned their
+            // kernel names (vnetN). Must run AFTER startVM so the domain XML
+            // reflects actual <target dev='vnetN'/> values. vDPA and VF
+            // passthrough drivers already stamp inside their plug() calls.
+            libvirtComputingResource.applyOvnPostPlugTunables(vmName, vmSpec.getNics());
             performAgentStartHook(vmName, libvirtComputingResource);
 
             // Once libvirt has attached every tap to the OVS bridge, the

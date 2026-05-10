@@ -4855,6 +4855,79 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         return selectVifDriver(nic);
     }
 
+    /**
+     * Call {@link VifDriver#applyPostPlugTunables} for every OVN TAP NIC in
+     * {@code nics} after the domain is running and libvirt has assigned the
+     * kernel tap device names. This is the post-plug hook referenced in
+     * {@link OvnVifDriver#plug} — the tap dev name ({@code vnetN}) is only
+     * known from the live domain XML, not from the pre-start {@link
+     * LibvirtVMDef.InterfaceDef}.
+     *
+     * <p>Only applies to OVN TAP NICs ({@code useOvn=true}, no offload flags).
+     * vDPA and VF-passthrough drivers already stamp inside their own
+     * {@code plug()} implementations.
+     *
+     * @param vmName  the libvirt domain name.
+     * @param nics    the NICs of the running VM (from {@link VirtualMachineTO}).
+     */
+    public void applyOvnPostPlugTunables(final String vmName, final NicTO[] nics) {
+        if (ovnVifDriver == null || nics == null || nics.length == 0) {
+            return;
+        }
+        try {
+            final Connect conn = LibvirtConnection.getConnectionByVmName(vmName);
+            final Domain dm = conn.domainLookupByName(vmName);
+            final Map<String, String> macToTap = extractTapDevsByMac(dm.getXMLDesc(0));
+            dm.free();
+            for (final NicTO nic : nics) {
+                if (!nic.isUseOvn() || nic.isUseVdpa() || nic.isUseHwOffload()) {
+                    continue;
+                }
+                final String tapDev = macToTap.get(nic.getMac().toLowerCase(java.util.Locale.ROOT));
+                if (tapDev != null) {
+                    ovnVifDriver.applyPostPlugTunables(nic, tapDev);
+                } else {
+                    LOGGER.warn("applyOvnPostPlugTunables: no tap found for OVN nic mac={} vm={}", nic.getMac(), vmName);
+                }
+            }
+        } catch (final Exception e) {
+            LOGGER.warn("applyOvnPostPlugTunables: failed for vm={}: {}", vmName, e.getMessage());
+        }
+    }
+
+    /**
+     * Parse a libvirt domain XML string and return a map of lower-cased MAC
+     * address to {@code <target dev>} tap name for all bridge-type interfaces.
+     *
+     * @param domainXml  the full XML returned by {@code Domain.getXMLDesc(0)}.
+     * @return map of {@code mac → tapDevName}; empty if parsing fails.
+     */
+    Map<String, String> extractTapDevsByMac(final String domainXml) {
+        final Map<String, String> result = new java.util.HashMap<>();
+        if (org.apache.commons.lang3.StringUtils.isBlank(domainXml)) {
+            return result;
+        }
+        try {
+            final DocumentBuilder builder = ParserUtils.getSaferDocumentBuilderFactory().newDocumentBuilder();
+            final Document doc = builder.parse(new org.xml.sax.InputSource(new java.io.StringReader(domainXml)));
+            final XPath xpath = XPathFactory.newInstance().newXPath();
+            final NodeList ifaces = (NodeList) xpath.evaluate(
+                    "//devices/interface", doc, XPathConstants.NODESET);
+            for (int i = 0; i < ifaces.getLength(); i++) {
+                final Node iface = ifaces.item(i);
+                final String mac = xpath.evaluate("mac/@address", iface);
+                final String dev = xpath.evaluate("target/@dev", iface);
+                if (org.apache.commons.lang3.StringUtils.isNotBlank(mac)
+                        && org.apache.commons.lang3.StringUtils.isNotBlank(dev)) {
+                    result.put(mac.toLowerCase(java.util.Locale.ROOT), dev);
+                }
+            }
+        } catch (final Exception e) {
+            LOGGER.warn("extractTapDevsByMac: XML parse failed: {}", e.getMessage());
+        }
+        return result;
+    }
+
     public boolean cleanupDisk(Map<String, String> volumeToDisconnect) {
         return storagePoolManager.disconnectPhysicalDisk(volumeToDisconnect);
     }

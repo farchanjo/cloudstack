@@ -131,11 +131,20 @@ public class OvnVifDriver extends VifDriverBase {
     }
 
     /**
-     * Apply ethtool-style offload toggles + MTU on the freshly-created tap
-     * once libvirt has spawned it. Triggered by the agent post-plug callback
-     * (see {@link LibvirtComputingResource#postNicConfigure}); the vnet name
-     * is only known after libvirt allocates it.
+     * Apply OVS external_ids stamp + ethtool offload toggles on the
+     * freshly-created tap once libvirt has spawned it.
+     *
+     * <p>Called by {@link
+     * com.cloud.hypervisor.kvm.resource.LibvirtComputingResource#applyOvnPostPlugTunables}
+     * after the domain is running and the actual tap dev name ({@code vnetN})
+     * is known from the live domain XML. This is the only correct place to
+     * override the libvirt-emitted {@code external_ids:iface-id} (which uses
+     * the raw NIC UUID — required by libvirt XML schema) with the OVN
+     * logical-switch-port name ({@code lsp-<uuid>}) that ovn-controller
+     * exact-matches against {@code Logical_Switch_Port.name} to claim
+     * the {@code Port_Binding} row.
      */
+    @Override
     public void applyPostPlugTunables(final NicTO nic, final String hostNetdev) {
         if (nic == null || StringUtils.isBlank(hostNetdev)) {
             return;
