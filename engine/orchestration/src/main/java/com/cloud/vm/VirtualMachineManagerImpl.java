@@ -133,6 +133,8 @@ import com.cloud.agent.api.PlugNicAnswer;
 import com.cloud.agent.api.PlugNicCommand;
 import com.cloud.agent.api.PrepareExternalProvisioningAnswer;
 import com.cloud.agent.api.PrepareExternalProvisioningCommand;
+import com.cloud.agent.api.PostMigrateOvnStampAnswer;
+import com.cloud.agent.api.PostMigrateOvnStampCommand;
 import com.cloud.agent.api.PrepareForMigrationAnswer;
 import com.cloud.agent.api.PrepareForMigrationCommand;
 import com.cloud.agent.api.RebootAnswer;
@@ -3311,12 +3313,47 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), srcHostId);
                 _networkMgr.setHypervisorHostname(profile, dest, true);
                 recreateCheckpointsKvmOnVmAfterMigration(vm, dstHostId);
+                dispatchPostMigrateOvnStamp(vm, to, dstHostId);
 
                 updateVmPod(vm, dstHostId);
             }
 
             work.setStep(Step.Done);
             _workDao.update(work.getId(), work);
+        }
+    }
+
+    /**
+     * Dispatches {@link PostMigrateOvnStampCommand} to the destination KVM agent
+     * after a successful live migration.  The command triggers
+     * {@code applyOvnPostPlugTunables} on the destination, which stamps each OVN
+     * TAP NIC with {@code external_ids:iface-id=lsp-<uuid>} so ovn-controller
+     * claims the Port_Binding and restores offloaded flows.
+     *
+     * <p>This is a best-effort, non-fatal step: if the destination agent is
+     * transiently unavailable or the stamp fails, the migration is NOT rolled
+     * back.  A warning is logged so operators can apply the stamp manually via
+     * {@code ovs-vsctl set Interface <vnetN> external_ids:iface-id=lsp-<uuid>}.
+     *
+     * <p>No-op for non-KVM hypervisors.
+     */
+    protected void dispatchPostMigrateOvnStamp(final VMInstanceVO vm, final VirtualMachineTO to, final long destHostId) {
+        if (!HypervisorType.KVM.equals(vm.getHypervisorType())) {
+            return;
+        }
+        final PostMigrateOvnStampCommand cmd = new PostMigrateOvnStampCommand(vm.getInstanceName(), to.getNics());
+        try {
+            final Answer answer = _agentMgr.easySend(destHostId, cmd);
+            if (answer == null || !answer.getResult()) {
+                final String detail = answer != null ? answer.getDetails() : "null answer";
+                logger.warn("PostMigrateOvnStamp failed for VM {} on dest host {}: {}; OVN iface-id may need manual stamping.",
+                        vm.getInstanceName(), destHostId, detail);
+            } else {
+                logger.debug("PostMigrateOvnStamp succeeded for VM {} on dest host {}.", vm.getInstanceName(), destHostId);
+            }
+        } catch (final Exception e) {
+            logger.warn("Exception sending PostMigrateOvnStampCommand for VM {} to dest host {}: {}; OVN iface-id may need manual stamping.",
+                    vm.getInstanceName(), destHostId, e.getMessage(), e);
         }
     }
 

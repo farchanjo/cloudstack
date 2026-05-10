@@ -144,9 +144,11 @@ outage only when `liveRestart` is attempted on a vDPA-tier VM.
 |---|---|---|
 | `ff59e27753` | fix(kvm): route migration destination through selectVifDriver(NicTO) | Bug 14b Layer A + Bug 15 Layer A |
 | `8e9b913cb1` | fix(kvm/ovn): wire OvnVifDriver post-plug stamping into startVM and VifDriver contract | Bug 14 verification gap (cold-start stamp now live) |
-| `0d91ba8a3f` | fix(kvm/ovn): stamp iface-id on live-migration destination via PostMigrateOvnStampCommand | Bug 14b Layer B — FIXED |
-| `f03d7cfbfa` | fix(kvm/ovn-vdpa): rewrite vdpa source dev path on migration to dest-allocated /dev/vhost-vdpaN | Bug 15 Layer B — FIXED |
+| `0d91ba8a3f` | fix(kvm/ovn): stamp iface-id on live-migration destination via PostMigrateOvnStampCommand | Bug 14b Layer B agent side — FIXED |
+| `f03d7cfbfa` | fix(kvm/ovn-vdpa): rewrite vdpa source dev path on migration to dest-allocated /dev/vhost-vdpaN | Bug 15 Layer B agent side — FIXED |
 | `3bfbf9e596` | fix(kvm/ovn-vdpa): release dest VF allocation on migration rollback | Bug 15 Layer C — FIXED |
+| `b540cbd183` | fix(server): plumb vdpa interface mapping from prepare-for-migration answer to migrate command | Bug 15 Layer B mgmt orchestration — FIXED |
+| (Commit H — this session) | fix(server): dispatch PostMigrateOvnStampCommand to destination after successful migrate | Bug 14b Layer B mgmt orchestration — FIXED |
 
 ---
 
@@ -166,7 +168,7 @@ agent-side handler is complete and correct; the mgmt-server dispatch side is
 **stub awaiting full mgmt orchestration**. Manual dispatch via `cmk` or a
 targeted `AgentManager#send` call works correctly today.
 
-**Status: FIXED** (agent side); **OPEN** (mgmt orchestration wiring — tracked as follow-up).
+**Status: FIXED** (agent side — commit `0d91ba8a3f`); **FIXED** (mgmt orchestration wiring — Commit H this session; dispatches `PostMigrateOvnStampCommand` from `VirtualMachineManagerImpl.dispatchPostMigrateOvnStamp()` after `MigrateAnswer` success, KVM-guarded, best-effort/non-fatal).
 
 ---
 
@@ -178,9 +180,13 @@ Changes:
 - `LibvirtPrepareForMigrationCommandWrapper` — captures `interfaceDef.getBrName()` for `GuestNetType.VDPA` NICs after plug and populates `vdpaInterfaceMapping` in the answer.
 - `LibvirtMigrateCommandWrapper` — calls `replaceVdpaInterfaces(xmlDesc, vdpaMapping)` after `replaceDpdkInterfaces`, before `virDomainMigrate*`. Rewrites `<source dev='...'>` on each `<interface type='vdpa'>` keyed by MAC. Four helpers extracted, all <30 lines.
 
-**Note:** Management-server wiring to transfer `PrepareForMigrationAnswer.vdpaInterfaceMapping` into `MigrateCommand.vdpaInterfaceMapping` is a follow-up. Field is present and serializable today.
+**Note:** Management-server wiring (commit `b540cbd183`) reads
+`prepareForMigrationAnswer.getVdpaInterfaceMapping()` in
+`buildMigrateCommand()` and forwards the map to
+`migrateCommand.setVdpaInterfaceMapping()`, completing the end-to-end
+path: dest plug → answer → mgmt → source migrate command → XML rewrite.
 
-**Status: FIXED** (agent-side XML rewrite complete); **OPEN** (mgmt plumbing of mapping from PrepareForMigrationAnswer to MigrateCommand).
+**Status: FIXED** (agent-side XML rewrite — commit `f03d7cfbfa`; mgmt plumbing — commit `b540cbd183`).
 
 ---
 
@@ -195,14 +201,14 @@ Changes:
 
 ---
 
-## Deferred items (updated 2026-05-10)
+## Deferred items (updated 2026-05-10 session 2)
 
 | Item | Scope | Priority |
 |---|---|---|
-| Bug 14b mgmt dispatch wiring — `VirtualMachineManagerImpl` sends `PostMigrateOvnStampCommand` to dest after migrate success | `server/` `VirtualMachineManagerImpl` | HIGH |
-| Bug 15 B mgmt plumbing — transfer `PrepareForMigrationAnswer.vdpaInterfaceMapping` into `MigrateCommand` in mgmt-server | `server/` migration path | MED |
 | OP3 — Test A NAT/eBGP origin path (`external_mac=[]` on dnat_and_snat rows) | OVN NAT path forensic | HIGH |
 | HA chassis ERR `cr-lrp-public-vpc742` | OVN HA chassis group forensic | MED |
+
+Bug 14b mgmt dispatch wiring and Bug 15 Layer B mgmt plumbing are now CLOSED (commits `b540cbd183` and Commit H above).
 
 ---
 
