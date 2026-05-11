@@ -1588,7 +1588,136 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         setupMemoryBalloonStatsPeriod(conn);
 
+        // OVN iface stamp reconcile (Bug 25): on agent startup walk every OVS
+        // Interface that carries an iface-id matching ^lsp-<uuid> and re-stamp
+        // external_ids:ovn-installed=true + iface-status=active. The fresh-plug
+        // post-stamp (applyPostPlugTunables / applyVdpaPostPlugTunables /
+        // OvnVfPassthroughVifDriver) only fires when a NIC is newly plugged;
+        // pre-existing running VMs lose the flag when ovn-controller re-syncs
+        // on agent restart and decides no re-bind is needed (chassis owns the
+        // same Port_Binding from before the restart). Without ovn-installed=true
+        // the OpenFlow ingress action stays unset and east-west traffic from
+        // the VR silently drops. Reapplying the stamp here is idempotent on
+        // every Interface that already has it and load-bearing on every
+        // Interface that lost it after the agent recycle. The walk runs on
+        // a worker thread so a slow ovs-vsctl path does not delay the configure
+        // return.
+        try {
+            new Thread(this::reconcileOvnInstalledOnStartup,
+                    "ovn-installed-startup-reconcile").start();
+        } catch (RuntimeException reconcileErr) {
+            LOGGER.warn("reconcileOvnInstalledOnStartup: failed to spawn worker: {}",
+                    reconcileErr.getMessage());
+        }
+
         return true;
+    }
+
+    /**
+     * Re-stamp {@code external_ids:ovn-installed=true} +
+     * {@code iface-status=active} on every local OVS Interface whose
+     * {@code external_ids:iface-id} matches the OVN logical-switch-port pattern
+     * ({@code ^lsp-[0-9a-f-]+$}). Closes the agent-restart reconciliation gap
+     * documented in Bug 25 (`2026-05-11-bug-25-old-vm-unreachable-after-agent-restart.md`).
+     *
+     * <p>Idempotent: setting external_ids to the same value via
+     * {@code ovs-vsctl set} is a no-op when the key is already present with
+     * the same value, so re-running the reconcile imposes no penalty on
+     * healthy interfaces.
+     *
+     * <p>Runs once per agent startup. Failures of individual {@code ovs-vsctl}
+     * invocations are logged at WARN and do not propagate — the reconciler
+     * is best-effort.
+     */
+    void reconcileOvnInstalledOnStartup() {
+        try {
+            // ovs-vsctl predicate `external_ids:iface-id!=[]` matches every
+            // OVS Interface row whose iface-id has been set (the `[]` is
+            // OVSDB's empty-set sentinel, never glob-expanded by bash because
+            // an empty character class is treated as literal). The `--bare`
+            // flag emits `key=value` pairs with quotes stripped and shell
+            // metacharacters preserved — the output alternates a name line
+            // followed by an external_ids line, with a blank delimiter
+            // between rows.
+            //
+            // Note: must use `runSimpleBashScriptWithFullResult` rather than
+            // `runSimpleBashScript` — the latter wraps an `OneLineParser` and
+            // returns only the first line of multi-line stdout, which would
+            // hide every Interface row after the first and bypass the
+            // reconcile loop entirely.
+            final String listCmd = "ovs-vsctl --no-headings --bare "
+                    + "--columns=name,external_ids find Interface "
+                    + "external_ids:iface-id!=[]";
+            final String raw = org.apache.commons.lang3.StringUtils.defaultString(
+                    Script.runSimpleBashScriptWithFullResult(listCmd, 30));
+            final java.util.List<String> ovnReps = parseOvnReps(raw);
+            int stamped = 0;
+            for (final String repName : ovnReps) {
+                final String stampCmd = String.format(
+                        "ovs-vsctl --if-exists set Interface %s "
+                                + "external_ids:ovn-installed=true "
+                                + "external_ids:iface-status=active",
+                        repName);
+                try {
+                    Script.runSimpleBashScript(stampCmd);
+                    stamped++;
+                    LOGGER.debug("reconcileOvnInstalledOnStartup: stamped iface={}", repName);
+                } catch (final RuntimeException stampErr) {
+                    LOGGER.warn("reconcileOvnInstalledOnStartup: stamp failed iface={}: {}",
+                            repName, stampErr.getMessage());
+                }
+            }
+            LOGGER.info("reconcileOvnInstalledOnStartup: discovered {} OVN-managed ports; re-stamped {}",
+                    ovnReps.size(), stamped);
+        } catch (final Exception reconcileErr) {
+            LOGGER.warn("reconcileOvnInstalledOnStartup: failed: {}", reconcileErr.getMessage());
+        }
+    }
+
+    /**
+     * Parse the bare-format output of
+     * {@code ovs-vsctl --no-headings --bare --columns=name,external_ids find Interface external_ids:iface-id!=[]}
+     * into the list of representor names whose {@code iface-id} matches the
+     * OVN logical-switch-port pattern ({@code iface-id=lsp-...}). Non-OVN
+     * interfaces (e.g. Control NICs whose iface-id is a raw NIC UUID) are
+     * skipped.
+     *
+     * <p>Package-private + static + pure-input so unit tests can exercise the
+     * parser without invoking ovs-vsctl. Implementation is whitespace-tolerant
+     * and survives any future addition of columns (the bare format alternates
+     * one value per requested column on its own line, blank-line-delimited
+     * between rows).
+     *
+     * @param raw the {@code stdout} captured from the {@code ovs-vsctl find}.
+     * @return the list of OVS Interface names where {@code iface-id} starts
+     *         with {@code lsp-}; empty list if {@code raw} is blank.
+     */
+    static java.util.List<String> parseOvnReps(final String raw) {
+        final java.util.List<String> result = new java.util.ArrayList<>();
+        if (org.apache.commons.lang3.StringUtils.isBlank(raw)) {
+            return result;
+        }
+        String pendingName = null;
+        for (final String line : raw.split("\\R")) {
+            final String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                pendingName = null;
+                continue;
+            }
+            if (pendingName == null) {
+                pendingName = trimmed;
+                continue;
+            }
+            // trimmed is the external_ids value line for the rep captured
+            // in pendingName. We only re-stamp ports whose iface-id has the
+            // OVN logical-switch-port prefix; everything else (Control NICs,
+            // non-OVN bridges) is left untouched.
+            if (trimmed.contains("iface-id=lsp-")) {
+                result.add(pendingName);
+            }
+            pendingName = null;
+        }
+        return result;
     }
 
     private void setConvertInstanceEnv(String convertEnvTmpDir, String convertEnvVirtv2vTmpDir) {
