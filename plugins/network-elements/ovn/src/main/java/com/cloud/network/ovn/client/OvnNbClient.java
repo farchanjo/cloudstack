@@ -1210,6 +1210,48 @@ public class OvnNbClient implements AutoCloseable {
         return row;
     }
 
+    /**
+     * Self-healing helper: ensures a {@code type=router} LSP with
+     * {@code options:router-port=<lrpName>} exists on the given
+     * Logical_Switch and is listed in its {@code ports} set.
+     *
+     * <p>This closes the gap where a prior buggy deploy path (or manual
+     * {@code ovn-nbctl} edit) created the LRP on the router side but omitted
+     * or later lost the matching peer LSP on the switch side, leaving
+     * {@code Logical_Router_Port.peer = []} and breaking inter-tier L3
+     * forwarding for the VPC.
+     *
+     * <p>Idempotent: if an LSP whose {@code name} matches {@code lspName}
+     * already exists it is adopted (and re-attached to the LS when detached)
+     * without creating a duplicate row — identical to the pattern used by
+     * {@link #addLogicalSwitchPort}.
+     *
+     * @param lsUuid  UUID of the tier {@code Logical_Switch}
+     * @param lspName name for the peer LSP (convention: {@code rsp-<tierUUID>})
+     * @param lrpName name of the LRP this LSP must peer with
+     *                ({@code options:router-port})
+     * @return UUID of the (existing or newly created) peer LSP
+     */
+    public String ensureRouterPeerLsp(final String lsUuid, final String lspName, final String lrpName) {
+        final String existing = findLogicalSwitchPortUuidByName(lspName);
+        if (existing != null) {
+            final OvnTransaction reAttach = newTransaction();
+            reAttach.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                    OvnOpFactory.whereUuid(lsUuid), "ports",
+                    OvnRowRef.singletonSet(OvnRowRef.realUuid(existing))));
+            reAttach.commit();
+            return existing;
+        }
+        final String lspNamed = OvnNamedUuid.next("rsp");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Logical_Switch_Port", lspNamed,
+                buildRouterTypeLspRow(lspName, lrpName)));
+        tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "ports",
+                OvnRowRef.singletonSet(OvnRowRef.namedUuid(lspNamed))));
+        return tx.commit().insertedUuid(0);
+    }
+
     /** Plain-data input to {@link #bindLrToLs(BindRequest)}. */
     public static class BindRequest {
         public final String lrUuid;

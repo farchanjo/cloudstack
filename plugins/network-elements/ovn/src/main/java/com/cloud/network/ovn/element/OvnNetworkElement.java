@@ -267,10 +267,23 @@ public class OvnNetworkElement extends AdapterBase
                 // path: rewrite LRP.networks (and MAC) so a tier reconfigure
                 // (CloudStack updateNetwork on gateway/CIDR) propagates without
                 // tearing the patch pair down.
-                pluginManager.nbClient(network.getDataCenterId())
-                        .updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
+                final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+                nb.updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
                 LOGGER.debug("OvnNetworkElement.ensureTierBound: LRP {} reconciled (tier id={}, networks={})",
                         existing.getOvnUuid(), network.getId(), networks);
+                // Self-heal: verify the router-type peer LSP exists on the tier LS.
+                // The mapping stores only the LRP UUID, so a missing LSP (caused by
+                // a prior cleanup bug, partial LS rebuild, or manual ovn-nbctl edit)
+                // is invisible to the stale-mapping guard above. Without the LSP
+                // OVN cannot resolve the LRP.peer column and inter-tier L3 routing
+                // through the VPC LR is broken. ensureRouterPeerLsp is idempotent:
+                // if the LSP already exists the call is a no-op (reuses the row
+                // and re-attaches it to the LS if detached).
+                final String lspName = "rsp-" + tierName;
+                final String lrpName = "lrp-" + tierName;
+                final String lspUuid = nb.ensureRouterPeerLsp(tierLsUuid, lspName, lrpName);
+                LOGGER.info("OvnNetworkElement.ensureTierBound: peer LSP {} ensured (tier id={}, lrpName={})",
+                        lspUuid, network.getId(), lrpName);
                 return;
             }
             final OvnNbClient.BindResult bind = vpcElement.bindTierToVpc(vpc, tierLsUuid, tierName, gwMac, networks);
