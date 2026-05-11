@@ -269,6 +269,26 @@ public class LibvirtDomainXMLParser {
                             hSlot != null ? hSlot.replace("0x", "") : "00",
                             hFunc != null ? hFunc.replace("0x", "") : "0");
                     def.defHostdevNet(pciAddr, mac, 0);
+                } else if (type.equalsIgnoreCase("vdpa")) {
+                    // <interface type='vdpa'>
+                    //   <source dev='/dev/vhost-vdpa-N'/>
+                    //   <mac address='...'/>
+                    //   <model type='virtio'/>
+                    // </interface>
+                    // Without this branch the parser produces a phantom
+                    // InterfaceDef with mac=null, causing MAC-based lookups
+                    // (SetupGuestNetworkCommand, hot-plug correlation, OVN
+                    // VR tier resolution) to silently skip the NIC and fail
+                    // with "Can not find nic with mac ...".
+                    String vhostDevPath = getAttrValue("source", "dev", nic);
+                    def.defVdpaNet(vhostDevPath, mac, null);
+                } else {
+                    // Unknown <interface type='...'>. Skip the add so a
+                    // phantom InterfaceDef (mac=null, type=null) does not
+                    // leak into the parsed list and hide a real entry from
+                    // MAC-based lookups downstream.
+                    logger.warn("LibvirtDomainXMLParser: skipping unrecognized <interface type='{}'> (mac={}) - downstream lookups would miss this NIC", type, mac);
+                    continue;
                 }
                 String multiQueueNumber = getAttrValue("driver", "queues", nic);
                 if (StringUtils.isNotBlank(multiQueueNumber)) {
