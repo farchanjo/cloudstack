@@ -63,12 +63,28 @@ public final class LibvirtPlugNicCommandWrapper extends CommandWrapper<PlugNicCo
             // Note: VF passthrough (hostdev) cannot be hot-plugged via attachDevice.
             // For VPC VRs, guest NICs with HW offload must be included in the initial
             // StartCommand boot XML. This is a TODO for the next phase.
-            final VifDriver vifDriver = libvirtComputingResource.getVifDriver(nic.getType(), nic.getName());
+            //
+            // Use selectVifDriverForNic (not the legacy getVifDriver traffic-type
+            // selector) so OVN / vDPA / HW-offload NICs land on their correct
+            // driver. getVifDriver only dispatches on TrafficType and falls back
+            // to BridgeVifDriver for all OVN-tagged NICs -- Bug 24 root cause:
+            // VR non-HW-offload tier NIC was plugged to br-bond instead of
+            // br-int. Matches the dispatch contract used by
+            // LibvirtStartCommandWrapper and LibvirtPrepareForMigrationCommandWrapper.
+            final VifDriver vifDriver = libvirtComputingResource.selectVifDriverForNic(nic);
             final InterfaceDef interfaceDef = vifDriver.plug(nic, "Other PV", "", null);
             if (command.getDetails() != null) {
                 libvirtComputingResource.setInterfaceDefQueueSettings(command.getDetails(), null, interfaceDef);
             }
             vm.attachDevice(interfaceDef.toString());
+
+            // Fire the post-plug stamp so OVN-tagged NICs (TAP / vDPA) get the
+            // lsp-<uuid> iface-id rewrite once libvirt has spawned the tap.
+            // Without this the OVS Port row carries the raw NIC UUID and
+            // ovn-controller never claims the Port_Binding -- Bug 14 pattern
+            // re-emerging on the hot-plug path for VR Guest tier NICs.
+            // applyOvnPostPlugTunables is a no-op for non-OVN NICs.
+            libvirtComputingResource.applyOvnPostPlugTunables(vmName, new NicTO[]{nic});
 
             // apply default network rules on new nic
             if (vmType == VirtualMachine.Type.User && nic.isSecurityGroupEnabled()) {
