@@ -59,6 +59,14 @@ public class OvnStaticNatService {
     /**
      * Adds a 1:1 NAT rule mapping {@code externalIp} to {@code logicalIp}.
      *
+     * <p><b>Idempotent:</b> when called twice for the same {@code ipAddrId} (e.g.
+     * during {@code NetworkOrchestrator.restartNetwork} → {@code reprogramNetworkRules}
+     * → {@code applyStaticNats} re-entry), this method returns the existing OVN NAT
+     * UUID instead of issuing a duplicate {@code INSERT} that would violate the
+     * {@code uc_ovn_lim_cs} unique constraint on
+     * {@code ovn_logical_id_map(cs_kind, cs_id, controller_id)}.  Mirrors the
+     * {@code SOURCE_NAT} guard in {@code OvnNetworkElement.applyIps} (lines 745-752).
+     *
      * @param zoneId    CloudStack zone (selects the controller)
      * @param ipAddrId  CloudStack IP-address id (mapping key)
      * @param lrUuid    OVN LR UUID
@@ -66,11 +74,18 @@ public class OvnStaticNatService {
      * @param logicalIp tier-side IP (the VM nic IP)
      * @param logicalPort optional OVN logical port name; OVN uses it for ARP
      *                    proxy and reverse path resolution
+     * @return OVN NAT row UUID (new or existing)
      */
     public String addStaticNat(final long zoneId, final long ipAddrId, final String lrUuid,
                                final String externalIp, final String logicalIp, final String logicalPort) {
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller != null) {
+            final String existingUuid = handleExistingMapping(nb, ipAddrId, controller.getId());
+            if (existingUuid != null) {
+                return existingUuid;
+            }
+        }
         final String natUuid = nb.addNatRule(lrUuid, NAT_TYPE_DNAT_AND_SNAT, externalIp, logicalIp, logicalPort);
         if (controller != null) {
             logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.STATIC_NAT, ipAddrId, controller.getId(), natUuid,
@@ -78,6 +93,28 @@ public class OvnStaticNatService {
         }
         LOGGER.info("OVN dnat_and_snat {} added: {} <-> {} on LR {}", natUuid, externalIp, logicalIp, lrUuid);
         return natUuid;
+    }
+
+    /**
+     * Returns an existing OVN NAT UUID for {@code ipAddrId} when the mapping is
+     * valid (OVN row still present), or {@code null} when the caller should
+     * proceed to create a new NAT rule.  Removes stale mappings whose OVN row
+     * has been deleted out-of-band before returning {@code null}.
+     */
+    private String handleExistingMapping(final OvnNbClient nb, final long ipAddrId, final long controllerId) {
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.STATIC_NAT, ipAddrId, controllerId);
+        if (existing == null) {
+            return null;
+        }
+        if (nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
+            LOGGER.debug("OvnStaticNatService.addStaticNat: STATIC_NAT cs_id={} already mapped ({}); idempotent skip",
+                    ipAddrId, existing.getOvnUuid());
+            return existing.getOvnUuid();
+        }
+        LOGGER.warn("OvnStaticNatService.addStaticNat: STATIC_NAT cs_id={} -> {} stale (OVN row gone); recreating",
+                ipAddrId, existing.getOvnUuid());
+        logicalIdMapDao.remove(existing.getId());
+        return null;
     }
 
     /**
