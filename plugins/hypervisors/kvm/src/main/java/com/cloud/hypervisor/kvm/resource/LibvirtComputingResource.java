@@ -4933,11 +4933,24 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                     nic.getMac(), vmName);
             return;
         }
+        // Cycle iface-status to active AND stamp ovn-installed=true in a single
+        // ovs-vsctl call. The ovn-installed flag is the per-Interface contract
+        // ovn-controller normally sets after claiming a freshly-plugged
+        // Port_Binding; on live-migration the chassis owns the same binding
+        // and ovn-controller does NOT re-fire the bind path, so without
+        // explicit ovn-installed=true the OpenFlow ingress action stays unset
+        // and forwarding silently breaks (Bug 26). Stamping agent-side is
+        // idempotent on fresh plug (ovn-controller would set it anyway) and
+        // load-bearing on the post-migrate stamp dispatched by
+        // VirtualMachineManagerImpl.dispatchPostMigrateOvnStamp.
         final String cmd = String.format(
-                "ovs-vsctl --if-exists set Interface %s external_ids:iface-status=active", repName);
+                "ovs-vsctl --if-exists set Interface %s "
+                        + "external_ids:iface-status=active "
+                        + "external_ids:ovn-installed=true",
+                repName);
         Script.runSimpleBashScript(cmd);
-        LOGGER.info("applyVdpaPostPlugTunables: rep={} mac={} vm={} iface-status cycled to active"
-                + " (TC chain-0+1 race window closed)", repName, nic.getMac(), vmName);
+        LOGGER.info("applyVdpaPostPlugTunables: rep={} mac={} vm={} iface-status=active ovn-installed=true"
+                + " (TC chain-0+1 race window closed; Bug-26 flag stamped)", repName, nic.getMac(), vmName);
     }
 
     /**

@@ -159,15 +159,29 @@ public class OvnVifDriver extends VifDriverBase {
         // pattern used by {@link OvnVdpaVifDriver} and
         // {@link OvnVfPassthroughVifDriver}.
         if (StringUtils.isNotBlank(nic.getOvnLspName())) {
+            // Stamp iface-id together with ovn-installed=true and iface-status=active
+            // in a single ovs-vsctl call. The ovn-installed flag is the per-Interface
+            // contract ovn-controller normally sets after claiming the Port_Binding
+            // for a freshly-plugged port; the destination of a live-migration retains
+            // the same Port_Binding chassis and ovn-controller therefore does NOT
+            // re-trigger the bind sequence — only the timestamp is updated. Without
+            // ovn-installed=true the OpenFlow ingress action does not direct traffic
+            // into the logical port and forwarding silently breaks (Bug 26).
+            // Stamping it agent-side here is idempotent on the fresh-plug path
+            // (ovn-controller would set it anyway) and load-bearing on the
+            // post-migrate stamp path.
             final String stamp = String.format(
-                    "ovs-vsctl --if-exists set Interface %s external_ids:iface-id=%s",
+                    "ovs-vsctl --if-exists set Interface %s "
+                            + "external_ids:iface-id=%s "
+                            + "external_ids:iface-status=active "
+                            + "external_ids:ovn-installed=true",
                     hostNetdev, nic.getOvnLspName());
             try {
                 Script.runSimpleBashScript(stamp);
-                logger.info("OvnVifDriver.applyPostPlugTunables: iface-id stamped dev={} lsp={}",
+                logger.info("OvnVifDriver.applyPostPlugTunables: stamped dev={} lsp={} status=active ovn-installed=true",
                         hostNetdev, nic.getOvnLspName());
             } catch (RuntimeException e) {
-                logger.warn("OvnVifDriver.applyPostPlugTunables: iface-id stamp failed dev={} lsp={}: {}",
+                logger.warn("OvnVifDriver.applyPostPlugTunables: stamp failed dev={} lsp={}: {}",
                         hostNetdev, nic.getOvnLspName(), e.getMessage());
             }
         }

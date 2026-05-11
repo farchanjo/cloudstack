@@ -289,10 +289,21 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set Interface %s external_ids:attached-mac=%s", repName, mac));
         }
+        // Stamp iface-status=active AND ovn-installed=true together. The
+        // ovn-installed flag is the contract ovn-controller normally sets after
+        // it claims the Port_Binding for a freshly-plugged port; on live-
+        // migration the chassis owns the same binding and ovn-controller does
+        // NOT re-fire the bind path, so without explicit ovn-installed=true
+        // the OpenFlow ingress action stays unset and forwarding silently
+        // breaks (Bug 26). Stamping agent-side is idempotent on fresh plug.
         Script.runSimpleBashScript(String.format(
-            "ovs-vsctl set Interface %s external_ids:iface-status=active", repName));
+            "ovs-vsctl set Interface %s "
+                    + "external_ids:iface-status=active "
+                    + "external_ids:ovn-installed=true",
+            repName));
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
-        logger.info("OvnVfPassthroughVifDriver: attached rep={} to {} with iface-id={} hairpin={}",
+        logger.info("OvnVfPassthroughVifDriver: attached rep={} to {} with iface-id={} status=active "
+                        + "ovn-installed=true hairpin={}",
                 repName, integrationBridge, lspName, hairpin);
     }
 
