@@ -30,8 +30,10 @@ import java.util.List;
 import java.util.UUID;
 
 import org.apache.cloudstack.framework.ca.Certificate;
+import org.apache.cloudstack.framework.config.ConfigKey;
 import org.apache.cloudstack.utils.security.CertUtils;
 import org.bouncycastle.asn1.x509.GeneralName;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -54,17 +56,36 @@ public class OpenBaoCAProviderTest {
     private X509Certificate caCertificate;
     private X509Certificate intermediateCertificate;
     private X509Certificate leafCertificate;
+    private X509Certificate legacyCertificate;
+
+    private Object originalLegacyTrustPem;
 
     @Before
     public void setUp() throws Exception {
+        originalLegacyTrustPem = ReflectionTestUtils.getField(OpenBaoCAProvider.class, "openBaoLegacyTrustPem");
         caKeyPair = CertUtils.generateRandomKeyPair(1024);
         caCertificate = CertUtils.generateV3Certificate(null, caKeyPair, caKeyPair.getPublic(), "CN=Slytherin Root CA", "SHA256withRSA", 365, null, null);
         intermediateCertificate = CertUtils.generateV3Certificate(caCertificate, caKeyPair, caKeyPair.getPublic(), "CN=Slytherin Intermediate CA", "SHA256withRSA", 365, null, null);
         leafCertificate = CertUtils.generateV3Certificate(intermediateCertificate, caKeyPair, caKeyPair.getPublic(), "CN=host.slytherin", "SHA256withRSA", 365, null, null);
 
+        final KeyPair legacyKeyPair = CertUtils.generateRandomKeyPair(1024);
+        legacyCertificate = CertUtils.generateV3Certificate(null, legacyKeyPair, legacyKeyPair.getPublic(), "CN=ca.cloudstack.apache.org", "SHA256withRSA", 365, null, null);
+
         provider = new OpenBaoCAProvider();
         client = Mockito.mock(OpenBaoClient.class);
         ReflectionTestUtils.setField(provider, "client", client);
+    }
+
+    @After
+    public void tearDown() {
+        ReflectionTestUtils.setField(OpenBaoCAProvider.class, "openBaoLegacyTrustPem", originalLegacyTrustPem);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void setLegacyTrustPem(final String pem) {
+        final ConfigKey<String> key = (ConfigKey<String>) Mockito.mock(ConfigKey.class);
+        Mockito.when(key.value()).thenReturn(pem);
+        ReflectionTestUtils.setField(OpenBaoCAProvider.class, "openBaoLegacyTrustPem", key);
     }
 
     private JsonObject wrapData(final JsonObject data) {
@@ -98,6 +119,33 @@ public class OpenBaoCAProviderTest {
 
         final List<X509Certificate> chain = provider.getCaCertificate();
         Assert.assertEquals(2, chain.size());
+        Assert.assertEquals(intermediateCertificate.getSubjectDN(), chain.get(0).getSubjectDN());
+        Assert.assertEquals(caCertificate.getSubjectDN(), chain.get(1).getSubjectDN());
+    }
+
+    @Test
+    public void testGetCaCertificateAppendsLegacyTrust() throws Exception {
+        final JsonObject data = new JsonObject();
+        data.addProperty("ca_chain", CertUtils.x509CertificateToPem(intermediateCertificate) + CertUtils.x509CertificateToPem(caCertificate));
+        Mockito.when(client.get(ArgumentMatchers.contains("/cert/ca_chain"))).thenReturn(wrapData(data));
+        setLegacyTrustPem(CertUtils.x509CertificateToPem(legacyCertificate));
+
+        final List<X509Certificate> chain = provider.getCaCertificate();
+        Assert.assertEquals("OpenBao chain (2) plus legacy CA (1)", 3, chain.size());
+        Assert.assertEquals(intermediateCertificate.getSubjectDN(), chain.get(0).getSubjectDN());
+        Assert.assertEquals(caCertificate.getSubjectDN(), chain.get(1).getSubjectDN());
+        Assert.assertEquals(legacyCertificate.getSubjectDN(), chain.get(2).getSubjectDN());
+    }
+
+    @Test
+    public void testGetCaCertificateEmptyLegacyTrustUnchanged() throws Exception {
+        final JsonObject data = new JsonObject();
+        data.addProperty("ca_chain", CertUtils.x509CertificateToPem(intermediateCertificate) + CertUtils.x509CertificateToPem(caCertificate));
+        Mockito.when(client.get(ArgumentMatchers.contains("/cert/ca_chain"))).thenReturn(wrapData(data));
+        setLegacyTrustPem("");
+
+        final List<X509Certificate> chain = provider.getCaCertificate();
+        Assert.assertEquals("Empty legacy trust must not change the chain", 2, chain.size());
         Assert.assertEquals(intermediateCertificate.getSubjectDN(), chain.get(0).getSubjectDN());
         Assert.assertEquals(caCertificate.getSubjectDN(), chain.get(1).getSubjectDN());
     }

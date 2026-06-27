@@ -125,6 +125,12 @@ public final class OpenBaoCAProvider extends AdapterBase implements CAProvider, 
             "true",
             "When true, expired client certificates are allowed during the SSL handshake.", true);
 
+    private static ConfigKey<String> openBaoLegacyTrustPem = new ConfigKey<>("Advanced", String.class,
+            "ca.plugin.openbao.legacy.trust.pem",
+            "",
+            "Zero or more PEM CA certificates to additionally serve as trusted CAs during the migration "
+                    + "(e.g. the legacy CloudStack root CA). Appended to the OpenBao CA chain; empty disables it.", true);
+
     private static String managementCertificateCustomSAN;
 
     private OpenBaoClient client;
@@ -213,7 +219,13 @@ public final class OpenBaoCAProvider extends AdapterBase implements CAProvider, 
         if (data == null || !data.has("ca_chain")) {
             throw new CloudRuntimeException("OpenBao did not return a CA chain for mount " + openBaoMount.value());
         }
-        cachedCaChain = parseChain(data.get("ca_chain").getAsString());
+        final List<X509Certificate> chain = parseChain(data.get("ca_chain").getAsString());
+        final String legacyPem = openBaoLegacyTrustPem.value();
+        if (StringUtils.isNotEmpty(legacyPem)) {
+            // Additively trust the legacy CloudStack CA during migration until all leaves rotate.
+            chain.addAll(parseChain(legacyPem));
+        }
+        cachedCaChain = chain;
         cachedCaChainExpiry = now + (openBaoCaChainCacheTtl.value() * 1000L);
         return cachedCaChain;
     }
@@ -415,7 +427,8 @@ public final class OpenBaoCAProvider extends AdapterBase implements CAProvider, 
                 openBaoTlsSkipVerify,
                 openBaoCaChainCacheTtl,
                 openBaoAuthStrictness,
-                openBaoAllowExpiredCert
+                openBaoAllowExpiredCert,
+                openBaoLegacyTrustPem
         };
     }
 
