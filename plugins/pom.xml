@@ -66,6 +66,8 @@
 
         <module>ca/root-ca</module>
 
+        <module>ca/openbao-ca</module>
+
         <module>database/quota</module>
 
         <module>dedicated-resources</module>
