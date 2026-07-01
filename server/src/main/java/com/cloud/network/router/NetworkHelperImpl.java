@@ -105,6 +105,8 @@ import com.cloud.user.User;
 import com.cloud.user.UserVO;
 import com.cloud.user.dao.UserDao;
 import com.cloud.utils.Pair;
+import com.cloud.utils.db.Transaction;
+import com.cloud.utils.db.TransactionCallback;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.DomainRouterVO;
@@ -550,11 +552,18 @@ public class NetworkHelperImpl implements NetworkHelper {
      * <p>Fixed by: (1) checking the triggering network directly off
      * {@link RouterDeploymentDefinition#getGuestNetwork()} first — no DB round-trip, so it
      * can't lose this race — before falling back to the VPC-wide scan for the "sibling tier
-     * is hw-offload but this one isn't" case; (2) retrying the VPC-wide scan a couple of
-     * times with a short backoff when it comes back empty for a VPC that indisputably has an
-     * id (a VPC actively getting its first VR should essentially never have zero networks);
-     * (3) escalating the exception log from DEBUG to WARN so a future occurrence is visible
-     * without needing a live debugger session to catch it in the act.
+     * is hw-offload but this one isn't" case, and for the (empirically common — see below)
+     * path where {@code getGuestNetwork()} itself is null; (2) running the VPC-wide scan
+     * inside a brand-new {@link Transaction#execute(TransactionCallback)}, not the caller's
+     * ambient transaction. Retrying the same read on the *same* connection was verified live
+     * (via a `jdb` breakpoint session, see the audit doc) to keep coming back empty across
+     * every attempt for a network that had unquestionably already committed — consistent
+     * with the ambient transaction holding a REPEATABLE-READ (MySQL InnoDB default) snapshot
+     * taken before the sibling network-to-VPC commit, which no amount of re-querying *within
+     * that same transaction* can ever see. A fresh connection has no such snapshot and reads
+     * current committed state directly; (3) escalating the exception log from DEBUG to WARN
+     * so a future occurrence is visible without needing a live debugger session to catch it
+     * in the act.
      */
     private boolean isHwOffloadDeployment(final RouterDeploymentDefinition routerDeploymentDefinition) {
         if (routerDeploymentDefinition == null) {
@@ -568,37 +577,19 @@ public class NetworkHelperImpl implements NetworkHelper {
         if (vpc == null) {
             return false;
         }
-        final int maxAttempts = 3;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                final List<? extends Network> vpcNetworks = _networkDao.listByVpc(vpc.getId());
-                for (final Network net : vpcNetworks) {
+        try {
+            return Transaction.execute((TransactionCallback<Boolean>) status -> {
+                for (final Network net : _networkDao.listByVpc(vpc.getId())) {
                     if (isNetworkHwOffloadEnabled(net)) {
                         return true;
                     }
                 }
-                if (!vpcNetworks.isEmpty() || attempt == maxAttempts) {
-                    return false;
-                }
-                logger.warn("isHwOffloadDeployment: listByVpc(vpc={}) returned 0 networks on attempt {}/{} " +
-                        "while deploying its VR — retrying, likely a network-to-VPC commit race (Bug 29)",
-                        vpc.getId(), attempt, maxAttempts);
-            } catch (RuntimeException e) {
-                logger.warn("isHwOffloadDeployment lookup failed for vpc={} (attempt {}/{}), " +
-                        "defaulting to non-hwoffload template if retries are exhausted",
-                        vpc.getId(), attempt, maxAttempts, e);
-                if (attempt == maxAttempts) {
-                    return false;
-                }
-            }
-            try {
-                Thread.sleep(200L);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
                 return false;
-            }
+            });
+        } catch (RuntimeException e) {
+            logger.warn("isHwOffloadDeployment lookup failed for vpc={}, defaulting to non-hwoffload template", vpc.getId(), e);
+            return false;
         }
-        return false;
     }
 
     private boolean isNetworkHwOffloadEnabled(final Network net) {
