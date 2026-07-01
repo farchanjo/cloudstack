@@ -21,6 +21,7 @@ package org.apache.cloudstack.ca.provider;
 
 import java.math.BigInteger;
 import java.security.KeyPair;
+import java.security.KeyStore;
 import java.security.cert.CertificateParsingException;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
@@ -29,9 +30,12 @@ import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
+import javax.net.ssl.SSLEngine;
+
 import org.apache.cloudstack.framework.ca.Certificate;
 import org.apache.cloudstack.framework.config.ConfigKey;
 import org.apache.cloudstack.utils.security.CertUtils;
+import org.apache.cloudstack.utils.security.SSLUtils;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.junit.After;
 import org.junit.Assert;
@@ -42,6 +46,8 @@ import org.mockito.ArgumentMatchers;
 import org.mockito.Mockito;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.springframework.test.util.ReflectionTestUtils;
+
+import com.cloud.utils.exception.CloudRuntimeException;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -226,5 +232,77 @@ public class OpenBaoCAProviderTest {
         final Collection<List<?>> collection = new ArrayList<>(altNames);
         Mockito.when(certificate.getSubjectAlternativeNames()).thenReturn(collection);
         Assert.assertFalse(provider.isManagementCertificate(certificate));
+    }
+
+    private void stubManagementIssueAndChain() throws Exception {
+        final JsonObject issueData = new JsonObject();
+        issueData.addProperty("certificate", CertUtils.x509CertificateToPem(leafCertificate));
+        issueData.addProperty("private_key", CertUtils.privateKeyToPem(caKeyPair.getPrivate()));
+        issueData.add("ca_chain", caChainArray());
+        Mockito.when(client.post(ArgumentMatchers.contains("/issue/"), ArgumentMatchers.any(JsonObject.class))).thenReturn(wrapData(issueData));
+
+        final JsonObject chainData = new JsonObject();
+        chainData.addProperty("ca_chain", CertUtils.x509CertificateToPem(intermediateCertificate) + CertUtils.x509CertificateToPem(caCertificate));
+        Mockito.when(client.get(ArgumentMatchers.contains("/cert/ca_chain"))).thenReturn(wrapData(chainData));
+    }
+
+    @Test
+    public void testCreateSSLEngineWithoutAuthStrictness() throws Exception {
+        stubManagementIssueAndChain();
+        provider.openBaoAuthStrictness = Mockito.mock(ConfigKey.class);
+        Mockito.when(provider.openBaoAuthStrictness.value()).thenReturn(Boolean.FALSE);
+
+        final SSLEngine engine = provider.createSSLEngine(SSLUtils.getSSLContext(), "/1.2.3.4:5678", null);
+
+        Assert.assertTrue(engine.getWantClientAuth());
+        Assert.assertFalse(engine.getNeedClientAuth());
+    }
+
+    @Test
+    public void testCreateSSLEngineWithAuthStrictness() throws Exception {
+        stubManagementIssueAndChain();
+        provider.openBaoAuthStrictness = Mockito.mock(ConfigKey.class);
+        Mockito.when(provider.openBaoAuthStrictness.value()).thenReturn(Boolean.TRUE);
+
+        final SSLEngine engine = provider.createSSLEngine(SSLUtils.getSSLContext(), "/1.2.3.4:5678", null);
+
+        Assert.assertTrue(engine.getNeedClientAuth());
+    }
+
+    @Test
+    public void testGetManagementKeyStoreContainsManagementAndCaAliases() throws Exception {
+        stubManagementIssueAndChain();
+
+        final KeyStore keyStore = provider.getManagementKeyStore();
+
+        Assert.assertTrue(keyStore.containsAlias(OpenBaoCAProvider.managementAlias));
+        Assert.assertTrue(keyStore.containsAlias(OpenBaoCAProvider.caAlias));
+        Assert.assertTrue(keyStore.containsAlias(OpenBaoCAProvider.caAlias + "1"));
+    }
+
+    @Test
+    public void testGetManagementKeyStoreIsCachedAfterFirstBuild() throws Exception {
+        stubManagementIssueAndChain();
+
+        final KeyStore first = provider.getManagementKeyStore();
+        final KeyStore second = provider.getManagementKeyStore();
+
+        Assert.assertSame(first, second);
+        Mockito.verify(client, Mockito.times(1)).post(ArgumentMatchers.contains("/issue/"), ArgumentMatchers.any(JsonObject.class));
+    }
+
+    @Test
+    public void testGetManagementKeyStoreThrowsWhenPrivateKeyMissing() throws Exception {
+        final JsonObject issueData = new JsonObject();
+        issueData.addProperty("certificate", CertUtils.x509CertificateToPem(leafCertificate));
+        issueData.add("ca_chain", caChainArray());
+        Mockito.when(client.post(ArgumentMatchers.contains("/issue/"), ArgumentMatchers.any(JsonObject.class))).thenReturn(wrapData(issueData));
+
+        try {
+            provider.getManagementKeyStore();
+            Assert.fail("expected CloudRuntimeException when OpenBao does not return a private key");
+        } catch (final CloudRuntimeException e) {
+            Assert.assertTrue(e.getMessage().contains("management-server certificate"));
+        }
     }
 }
