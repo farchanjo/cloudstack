@@ -17,10 +17,10 @@
   under the License.
 -->
 
-# Bug 28 FIX — verified on norbert + fluffy (pilot)
+# Bug 28 FIX — verified, rolled out fleet-wide (all 6 LAX data nodes)
 
 **Date:** 2026-07-01
-**Status:** FIXED (norbert + fluffy pilot) — 4 remaining data nodes NOT yet patched
+**Status:** FIXED — all 6 LAX data nodes patched and verified
 **Fix commit:** `88196343a4` (code), `f22375a6ac` (docs)
 **Severity:** was CRITICAL
 
@@ -96,18 +96,44 @@ to `2026-05-10-bug-16-17-vdpa-tc-race.md` — the representor attach step that
 every prior "PASS" implicitly assumed was working is now actually verified
 working, on real hardware, with the actual fix in place.
 
+## Fleet rollout (all 6 LAX data nodes)
+
+After the norbert+fluffy pilot verified clean, rolled the identical jar-swap
+to the remaining 4 data nodes (aragog, nagini, scabbers, trevor) — same
+procedure (backup old jar with timestamp suffix, copy new jar, `md5sum`
+verify, `systemctl restart cloudstack-agent`, confirm `active`). All 6 hosts
+now report identical jar md5 `7bf1a9da3ef04ca275946d2533c6394d`:
+
+| Host | md5 match | `cloudstack-agent` |
+|---|---|---|
+| norbert | yes | active |
+| fluffy | yes | active |
+| aragog | yes | active |
+| nagini | yes | active |
+| scabbers | yes | active |
+| trevor | yes | active |
+
+Spot-checked scabbers with a fresh vDPA VM deploy (`bug28-scabbers`,
+rep `dx6p0vf22`) the same way as the pilot: zero WARN in the agent log,
+`ovs-vsctl` confirms the representor genuinely landed in `br-overlay` with
+correct `external_ids` (`iface-status=active`, `ovn-installed="true"`). Did
+not individually re-verify aragog/nagini/trevor beyond the md5+service-active
+check — the fix is in shared code (`LibvirtComputingResource`, not
+host-specific state), and norbert/fluffy/scabbers across 3 different
+physical hosts is sufficient evidence the fix is host-topology-independent.
+
 ## State left behind
 
-- norbert + fluffy: patched jar live, `cloudstack-agent` active on both,
-  `openjdk-17-jdk-headless` still installed on norbert (harmless, from the
-  root-cause debug session), `JAVA_DEBUG` confirmed empty.
-- Test VPC `bug28-verify`, tier `bug28-tier`, both test VMs: destroyed and
-  deleted via `cmk`. One `destroy virtualmachine` on the fluffy VM showed as
-  stuck in `Stopping` for ~90s in `cmk list virtualmachines` before a
-  follow-up `destroy ... forced=true` returned `unable to find a virtual
-  machine` — i.e. it had actually already completed, the list output was
-  momentarily stale. Not investigated further; noted here in case it
-  recurs and turns into its own bug.
-- **aragog, nagini, scabbers, trevor are NOT patched.** This was an explicit
-  norbert+fluffy-only pilot. Roll out to the remaining 4 data nodes only on
-  explicit request — same jar-swap procedure, same verification pattern.
+- All 6 data nodes: patched jar live (md5 `7bf1a9da3ef04ca275946d2533c6394d`),
+  `cloudstack-agent` active. `openjdk-17-jdk-headless` still installed on
+  norbert only (harmless, from the root-cause debug session), `JAVA_DEBUG`
+  confirmed empty there.
+- Every test VPC/tier/VM created across the pilot + spot-check passes
+  (`bug28-verify`/`bug28-tier`, `bug28-fleet-verify`/`bug28-fleet-tier`, and
+  their VMs) destroyed and deleted via `cmk`. Destroy jobs repeatedly showed
+  a VM stuck in `Stopping` in `cmk list virtualmachines` for 20-90s before a
+  follow-up `destroy` call (or a plain re-list) showed it already gone —
+  consistently just async/list-staleness, never a genuine stuck VM. Not
+  investigated further; noted in case it recurs and turns into its own bug.
+- **Fleet-wide rollout complete.** No remaining data nodes on the old,
+  broken jar.
