@@ -2002,6 +2002,35 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         trafficTypeVifDriverMap = new HashMap<TrafficType, VifDriver>();
 
+        // params only carries the small set of keys LibvirtComputingResource.configure()
+        // explicitly puts into it (libvirt.host.bridges, libvirt.computing.resource, etc.)
+        // — it is never a passthrough of agent.properties. Read the file directly here,
+        // same pattern already used below for the HW offload uplink config, and resolve
+        // the OVN integration bridge with the same precedence VxlanTunnelManager.resolveBridge()
+        // uses so every OVS-aware subsystem on the host agrees on one bridge name. Without
+        // this, OvnVifDriver/OvnVfPassthroughVifDriver/OvnVdpaVifDriver's own
+        // ovn.integration.bridge override in configure(params) can never see a value —
+        // params.get(...) is always null regardless of what's set in agent.properties.
+        Properties vifDriverProps = new Properties();
+        try {
+            File agentPropsFile = PropertiesUtil.findConfigFile("agent.properties");
+            if (agentPropsFile != null) {
+                vifDriverProps = PropertiesUtil.loadFromFile(agentPropsFile);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("Could not read agent.properties for OVN integration bridge config: {}", e.getMessage());
+        }
+        String ovnIntegrationBridge = vifDriverProps.getProperty("network.bridge.name");
+        if (StringUtils.isBlank(ovnIntegrationBridge)) {
+            ovnIntegrationBridge = vifDriverProps.getProperty("guest.bridge.name");
+        }
+        if (StringUtils.isBlank(ovnIntegrationBridge)) {
+            ovnIntegrationBridge = vifDriverProps.getProperty("guest.network.device");
+        }
+        if (StringUtils.isNotBlank(ovnIntegrationBridge)) {
+            params.put(OvnVifDriver.PROP_INTEGRATION_BRIDGE, ovnIntegrationBridge.trim());
+        }
+
         // Load the default vif driver
         String defaultVifDriverName = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.LIBVIRT_VIF_DRIVER);
         if (defaultVifDriverName == null) {
@@ -2049,15 +2078,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         tcRuleProgrammer = new com.cloud.hypervisor.kvm.resource.hwoffload.TcRuleProgrammer();
         // HW offload uplink config is read directly from agent.properties because
         // the params Map passed to configure() only carries command-line args.
-        Properties hwOffloadProps = new Properties();
-        try {
-            File agentPropsFile = PropertiesUtil.findConfigFile("agent.properties");
-            if (agentPropsFile != null) {
-                hwOffloadProps = PropertiesUtil.loadFromFile(agentPropsFile);
-            }
-        } catch (IOException e) {
-            LOGGER.warn("Could not read agent.properties for HW offload config: {}", e.getMessage());
-        }
+        // Reuses the same Properties already loaded above for the OVN integration
+        // bridge resolution — one file read, not two.
+        Properties hwOffloadProps = vifDriverProps;
         com.cloud.hypervisor.kvm.resource.hwoffload.IntentReconciler.UplinkKind uplinkKind;
         try {
             String kindStr = hwOffloadProps.getProperty("hwoffload.uplink.kind", "auto");
