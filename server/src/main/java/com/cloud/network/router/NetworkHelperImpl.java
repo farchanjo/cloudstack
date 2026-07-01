@@ -537,25 +537,73 @@ public class NetworkHelperImpl implements NetworkHelper {
         return templateName;
     }
 
+    /**
+     * Bug 29: {@code _networkDao.listByVpc(vpc.getId())} is a fresh DB read that can lose a
+     * race against the triggering tier's own network-to-VPC association commit when the VR
+     * is created in the same request wave as its first tier (or under contention from sibling
+     * concurrent deploys) — the scan silently returns an incomplete (sometimes empty) list,
+     * so a genuinely hw-offload VPC gets the generic {@link #RouterTemplateKvm} template
+     * instead of {@link VirtualNetworkApplianceManager#RouterTemplateKvmHwOffload}. No
+     * exception is thrown in that case (an empty iteration is not an error), so this is not
+     * just a logging gap — the DB read itself needs to be more resilient.
+     *
+     * <p>Fixed by: (1) checking the triggering network directly off
+     * {@link RouterDeploymentDefinition#getGuestNetwork()} first — no DB round-trip, so it
+     * can't lose this race — before falling back to the VPC-wide scan for the "sibling tier
+     * is hw-offload but this one isn't" case; (2) retrying the VPC-wide scan a couple of
+     * times with a short backoff when it comes back empty for a VPC that indisputably has an
+     * id (a VPC actively getting its first VR should essentially never have zero networks);
+     * (3) escalating the exception log from DEBUG to WARN so a future occurrence is visible
+     * without needing a live debugger session to catch it in the act.
+     */
     private boolean isHwOffloadDeployment(final RouterDeploymentDefinition routerDeploymentDefinition) {
         if (routerDeploymentDefinition == null) {
             return false;
+        }
+        final Network triggeringNetwork = routerDeploymentDefinition.getGuestNetwork();
+        if (triggeringNetwork != null && isNetworkHwOffloadEnabled(triggeringNetwork)) {
+            return true;
         }
         final Vpc vpc = routerDeploymentDefinition.getVpc();
         if (vpc == null) {
             return false;
         }
-        try {
-            for (final Network net : _networkDao.listByVpc(vpc.getId())) {
-                final NetworkOffering off = _networkOfferingDao.findById(net.getNetworkOfferingId());
-                if (off != null && off.isHwOffloadEnabled()) {
-                    return true;
+        final int maxAttempts = 3;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                final List<? extends Network> vpcNetworks = _networkDao.listByVpc(vpc.getId());
+                for (final Network net : vpcNetworks) {
+                    if (isNetworkHwOffloadEnabled(net)) {
+                        return true;
+                    }
+                }
+                if (!vpcNetworks.isEmpty() || attempt == maxAttempts) {
+                    return false;
+                }
+                logger.warn("isHwOffloadDeployment: listByVpc(vpc={}) returned 0 networks on attempt {}/{} " +
+                        "while deploying its VR — retrying, likely a network-to-VPC commit race (Bug 29)",
+                        vpc.getId(), attempt, maxAttempts);
+            } catch (RuntimeException e) {
+                logger.warn("isHwOffloadDeployment lookup failed for vpc={} (attempt {}/{}), " +
+                        "defaulting to non-hwoffload template if retries are exhausted",
+                        vpc.getId(), attempt, maxAttempts, e);
+                if (attempt == maxAttempts) {
+                    return false;
                 }
             }
-        } catch (RuntimeException e) {
-            logger.debug("isHwOffloadDeployment lookup failed, defaulting to non-hwoffload template", e);
+            try {
+                Thread.sleep(200L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
         }
         return false;
+    }
+
+    private boolean isNetworkHwOffloadEnabled(final Network net) {
+        final NetworkOffering off = _networkOfferingDao.findById(net.getNetworkOfferingId());
+        return off != null && off.isHwOffloadEnabled();
     }
 
     protected DomainRouterVO createOrUpdateDomainRouter(DomainRouterVO router, final long id,
