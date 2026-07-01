@@ -20,7 +20,8 @@
 # VF / vDPA / VR hardware-offload verification — mixed offerings, separate VPCs
 
 **Date:** 2026-07-01
-**Status:** MOSTLY PASS — one new bug found (Bug 29, below), one production incident (self-recovered)
+**Status:** PASS — all 4 offload scenarios verified, Bug 29 found AND fixed (confirmed under
+live concurrent load), one production incident during debugging (self-recovered)
 **Scope:** cross-VPC verification that VF passthrough, vDPA, and VR-side hostdev promotion
 all work correctly together, on the OVN family and the `VpcVirtualRouter`-based
 `Tier-Offload-*` family.
@@ -95,19 +96,48 @@ enabled — which it is not by default in this deployment. This is the same
 This confirms the bug is load-dependent, not deterministic — exactly the
 shape of a DB-visibility or lock-contention race.
 
-**Suggested fix (not applied — flagging only, per this session's read-only-analysis-first
-pattern for new bugs):**
-- Re-check `isHwOffloadDeployment()` inside the same transaction/connection
-  that will later be used to allocate the VR NICs, or move the check to run
-  strictly after the tier network's VPC association is guaranteed committed.
-- Escalate the `catch (RuntimeException e)` at line 555 to at least WARN
-  (matching the "silent DEBUG-only catch masks real failures" lesson from
-  Bug 28) so a future occurrence is visible without needing a live debugger
-  session to catch it in the act.
-- Consider a defensive re-check-and-recreate path: if a VR is later found to
-  be running the wrong template for a hw-offload VPC, flag it (similar to
-  how Bug 25/26 added `reconcileOvnInstalledOnStartup`-style self-healing
-  for the KVM agent side).
+## Bug 29 — FIXED (two attempts; the second is the real fix)
+
+**Attempt 1 (WRONG, disproved by live testing):** hypothesized a brief commit-latency
+race and shipped: (a) checking `RouterDeploymentDefinition.getGuestNetwork()` first as a
+DB-round-trip-free fast path, (b) retrying `listByVpc()` up to 3x with a 200ms backoff when
+it came back empty, (c) escalating the exception log to WARN. Built, unit-tested
+(`NetworkHelperImplTest`, 6/6 pass, no regression), deployed to all 3 control nodes
+(voldemort/bellatrix/barty), then **re-tested against the exact failure shape** — 3 VPCs,
+tiers, and VMs created concurrently again. **Attempt 1 did not fix it**: all 3 VRs still
+picked `systemvm-kvm-4.23.0-clean`. The management log showed why:
+`getGuestNetwork()` is null on this call path — `VpcVirtualRouterElement.java:162-163`
+builds the deployment definition with only `.setVpc().setDeployDestination().setAccountOwner().setParams()`,
+no `.setGuestNetwork()` (only 3 other call sites in that file set it, and none of them are
+the first-VR-creation path). And the retry loop's own WARN logs proved `listByVpc()` came
+back **empty on every one of the 3 attempts**, not just the first — that is not the
+signature of a race that resolves itself in milliseconds.
+
+**Root cause (confirmed):** the ambient transaction the VR-creation job (`ClusteredVirtualMachineManagerImpl`)
+runs inside almost certainly holds a MySQL InnoDB **REPEATABLE READ** snapshot taken
+*before* the sibling tier's network-to-VPC row committed. No amount of re-querying
+`_networkDao.listByVpc()` on that same connection can ever see a row committed after the
+snapshot was taken — that's what REPEATABLE READ means. `Thread.sleep()` + retry only helps
+races that resolve via a *different* connection eventually seeing the commit; it does
+nothing when the reader itself is pinned to a stale snapshot.
+
+**Attempt 2 (the fix):** replaced the retry loop with `Transaction.execute(...)`
+(`framework/db/.../Transaction.java`), which opens a genuinely new `TransactionLegacy` —
+new JDBC connection, no inherited snapshot — for the `listByVpc()` scan specifically. Kept
+the `getGuestNetwork()` fast path (harmless even though null on this path; helps other
+callers that do set it) and the WARN-level exception log. Built, deployed (rolling restart,
+all 3 control nodes), **re-tested against the identical 3-concurrent-VPC scenario**: all 3
+VMs came up `Running` (zero `Error` states, vs. all 3 `Error` before either fix), and all 3
+VRs picked `systemvm-hwoffload-backports-v3` correctly — no retries needed, right on the
+first read, every time. Commits: `f2d4d24806` (attempt 1, superseded), `ee2cfce9b1`
+(attempt 2, the actual fix).
+
+**Lesson:** don't assume "empty list where you expected results, under concurrent load"
+implies a transient commit-latency race fixable by retrying on the same connection —
+check what isolation level and transaction scope the read is actually running under first.
+A live breakpoint or, as here, an actual concurrent-load re-test after each attempt is what
+caught attempt 1 being wrong; a purely code-level fix without empirically re-triggering the
+original failure would have shipped a no-op.
 
 ## Incident — `cloudstack-management` on voldemort briefly went down during live debugging
 
@@ -154,12 +184,19 @@ was done here.
 
 ## State left behind
 
-- All 4 test VMs/VR from the verification matrix: not yet cleaned up as of this doc — still
-  running in `offload-mix` (2 VPC-1 VMs) and `offload-vf-direct` (1 VM + VR), available for
-  further inspection if needed.
-- `offload-race-check` VPC (Bug 29 repro): destroyed VM/VR from the failed first attempt,
-  redeployed clean VM+VR to confirm isolated-load success, then deleted entirely as part of
-  cleanup (empty VPC, no lasting resources).
+- All 4 test VMs/VR from the original verification matrix: still running in `offload-mix`
+  (2 VPC-1 VMs) and `offload-vf-direct` (1 VM + VR) as of this doc — not cleaned up yet,
+  available for further inspection if needed.
+- `offload-race-check` VPC (first Bug 29 repro, pre-fix): destroyed VM/VR from the failed
+  first attempt, redeployed clean VM+VR to confirm isolated-load success, then deleted
+  entirely as part of cleanup (empty VPC, no lasting resources).
+- `bug29-fix-verify-{1,2,3}` VPCs + `bug29-tier-{1,2,3}` networks + `bug29-fix-vm-{1,2,3}`
+  (attempt 1 re-test, all 3 came up `Error`/wrong template) and `bug29-fix2-vm-{1,2,3}`
+  (attempt 2 re-test, all 3 `Running`/correct template): all destroyed and deleted via `cmk`.
 - voldemort: `JAVA_DEBUG` reverted to commented-out, `cloudstack-management` restarted
   clean, confirmed healthy. `/etc/default/cloudstack-management.bak.<timestamp>` backup left
   in place (matches this session's established backup-before-edit convention).
+- All 3 control nodes (voldemort/bellatrix/barty): `cloudstack-management` running the
+  attempt-2-fixed jar, md5 `8ee21890df2e16ce6b7c0daa86829a70`, all confirmed `active` +
+  answering `HTTP 401` on `/client/api`. Old jars backed up with timestamp suffixes on each
+  node (two generations: pre-Bug-29 and attempt-1, both preserved).
