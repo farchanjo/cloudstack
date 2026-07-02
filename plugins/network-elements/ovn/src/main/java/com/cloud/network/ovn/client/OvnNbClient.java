@@ -1185,6 +1185,21 @@ public class OvnNbClient implements AutoCloseable {
      * {@code type=router} and {@code addresses=router}.
      */
     public BindResult bindLrToLs(final BindRequest req) {
+        return bindLrToLs(req, null);
+    }
+
+    /**
+     * Same as {@link #bindLrToLs(BindRequest)} but also tags the router-type
+     * peer LSP with {@code external_ids}, so a caller (e.g.
+     * {@link com.cloud.network.ovn.element.OvnPublicNetworkManager#bindVpcToPublic})
+     * can make the row classifiable by {@code OvnReconcilerService} instead of
+     * leaving it invisible to orphan detection.
+     *
+     * @param lspExternalIds external_ids map for the peer LSP row, or
+     *                       {@code null}/empty to omit the column entirely
+     *                       (identical to {@link #bindLrToLs(BindRequest)}).
+     */
+    public BindResult bindLrToLs(final BindRequest req, final Map<String, String> lspExternalIds) {
         final String lrpNamed = OvnNamedUuid.next("lrp");
         final String lspNamed = OvnNamedUuid.next("rsp");
         final OvnTransaction tx = newTransaction();
@@ -1193,7 +1208,7 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(req.lrUuid), "ports",
                 OvnRowRef.singletonSet(OvnRowRef.namedUuid(lrpNamed))));
         tx.add(OvnOpFactory.insert("Logical_Switch_Port", lspNamed,
-                buildRouterTypeLspRow(req.lspName, req.lrpName)));
+                buildRouterTypeLspRow(req.lspName, req.lrpName, lspExternalIds)));
         tx.add(OvnOpFactory.mutateInsertSet("Logical_Switch",
                 OvnOpFactory.whereUuid(req.lsUuid), "ports",
                 OvnRowRef.singletonSet(OvnRowRef.namedUuid(lspNamed))));
@@ -1202,11 +1217,19 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     private ObjectNode buildRouterTypeLspRow(final String lspName, final String lrpName) {
+        return buildRouterTypeLspRow(lspName, lrpName, null);
+    }
+
+    private ObjectNode buildRouterTypeLspRow(final String lspName, final String lrpName,
+                                             final Map<String, String> externalIds) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
         row.put("name", lspName);
         row.put("type", "router");
         row.set("addresses", stringSet(List.of("router")));
         row.set("options", buildMap(Map.of("router-port", lrpName)));
+        if (externalIds != null && !externalIds.isEmpty()) {
+            row.set("external_ids", buildMap(externalIds));
+        }
         return row;
     }
 
@@ -1536,6 +1559,23 @@ public class OvnNbClient implements AutoCloseable {
         tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
                 OvnOpFactory.whereUuid(lsUuid), "qos_rules",
                 OvnRowRef.singletonSet(OvnRowRef.realUuid(qosUuid))));
+        tx.add(OvnOpFactory.delete("QoS", OvnOpFactory.whereUuid(qosUuid)));
+        tx.commit();
+    }
+
+    /**
+     * Direct delete of a QoS row when the owning Logical_Switch mapping is
+     * unknown (typical orphan path: the tier LS mapping died first, so the
+     * parent {@code lsUuid} required by {@link #removeQosFromLogicalSwitch}
+     * is no longer resolvable). Skips the LS detach step; OVSDB GCs any
+     * dangling {@code Logical_Switch.qos_rules} reference on the next
+     * northd sync.
+     */
+    public void deleteQosRowDirect(final String qosUuid) {
+        if (qosUuid == null || qosUuid.isEmpty()) {
+            return;
+        }
+        final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.delete("QoS", OvnOpFactory.whereUuid(qosUuid)));
         tx.commit();
     }

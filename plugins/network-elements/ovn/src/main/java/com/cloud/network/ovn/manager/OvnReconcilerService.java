@@ -542,6 +542,7 @@ public class OvnReconcilerService {
         switch (kind) {
             case VPC:
             case VPC_PUBLIC_LRP:
+            case VPC_PUBLIC_RSP:
             case VPC_SOURCE_NAT:
                 return vpcDao.findById(csId) != null;
             case NETWORK:
@@ -602,6 +603,12 @@ public class OvnReconcilerService {
                     // row.
                     nb.deleteDnsRowDirect(uuid);
                     break;
+                case "QoS":
+                    // Same rationale as DNS above: the owning tier LS mapping
+                    // may already be gone, so a direct-by-UUID delete is the
+                    // only reachable path.
+                    nb.deleteQosRowDirect(uuid);
+                    break;
                 case "NAT":
                     nb.deleteNatRule(uuid);
                     break;
@@ -652,6 +659,9 @@ public class OvnReconcilerService {
         // satisfied without needing a multi-pass dependency walker.
         m.put("DHCP_Options", new Kind[]{Kind.DHCP_OPTIONS, Kind.DHCP_OPTIONS_V6});
         m.put("DNS", new Kind[]{Kind.DNS_RECORDS});
+        // QoS rows have no parent-set referential-integrity contract (unlike
+        // ACL/LB/LSP): they are deleted directly by UUID, same as DNS.
+        m.put("QoS", new Kind[]{Kind.QOS});
         // PORT_FORWARDING migrated from Load_Balancer (legacy) to NAT
         // (current). The kind is registered against NAT here — its post-
         // migration home — and sweepStaleMappings probes Load_Balancer as a
@@ -662,7 +672,7 @@ public class OvnReconcilerService {
         m.put("NAT", new Kind[]{Kind.STATIC_NAT, Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT, Kind.PORT_FORWARDING});
         m.put("ACL", new Kind[]{Kind.NETWORK_ACL});
         m.put("Load_Balancer", new Kind[]{Kind.LOAD_BALANCER});
-        m.put("Logical_Switch_Port", new Kind[]{Kind.NIC, Kind.ORPHAN_NIC});
+        m.put("Logical_Switch_Port", new Kind[]{Kind.NIC, Kind.ORPHAN_NIC, Kind.VPC_PUBLIC_RSP});
         m.put("Logical_Router_Port", new Kind[]{Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP});
         m.put("Logical_Switch", new Kind[]{Kind.NETWORK, Kind.PUBLIC_LS});
         m.put("Logical_Router", new Kind[]{Kind.VPC});

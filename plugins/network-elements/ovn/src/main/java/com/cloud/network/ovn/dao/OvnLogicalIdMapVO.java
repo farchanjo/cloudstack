@@ -82,6 +82,15 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  {@link #PUBLIC_LRP} which is reused by tier-LRPs (per network
          *  id) — the names overlap historically but the key spaces differ. */
         VPC_PUBLIC_LRP,
+        /** Router-type Logical_Switch_Port peer of {@link #VPC_PUBLIC_LRP}
+         *  (named {@code rsp-public-vpc<id>}), inserted into the shared
+         *  per-zone public Logical_Switch's {@code ports} set, keyed by VPC
+         *  id. Tracked separately from the LRP because
+         *  {@code deleteLogicalRouterPort} does not cascade to this peer
+         *  port — there is no OVSDB strong reference between an LRP and its
+         *  peer LSP, only the {@code options:router-port} string, so the
+         *  plugin must delete both rows explicitly on VPC unbind. */
+        VPC_PUBLIC_RSP,
         /** BGP /32 announce bookkeeping. cs_id = IPAddressVO.id;
          *  ovn_uuid column is reused to hold the agent host id (as string)
          *  that last announced the route; ovn_name carries the bare public

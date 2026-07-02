@@ -365,8 +365,14 @@ public class OvnPendingDeletionProcessor implements Configurable {
             case VPC_PUBLIC_LRP:
                 nb.deleteLogicalRouterPort(uuid);
                 break;
+            case VPC_PUBLIC_RSP:
+                nb.deleteLogicalSwitchPort(uuid);
+                break;
             case STATIC_ROUTE:
                 nb.deleteLogicalRouterStaticRouteDirect(uuid);
+                break;
+            case QOS:
+                nb.deleteQosRowDirect(uuid);
                 break;
             case NETWORK_ACL:
                 nb.deleteAclByUuid(uuid);

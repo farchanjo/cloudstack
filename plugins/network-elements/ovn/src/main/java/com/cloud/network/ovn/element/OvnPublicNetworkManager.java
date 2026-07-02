@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import javax.inject.Inject;
 
@@ -425,24 +426,49 @@ public class OvnPublicNetworkManager {
                 publicMac,
                 publicNetworks,
                 "rsp-public-vpc" + vpcId);
-        final OvnNbClient.BindResult result = nb.bindLrToLs(req);
+        // Tag the peer LSP so OvnReconcilerService can classify it as a
+        // VPC_PUBLIC_RSP row instead of an untaggable, invisible orphan.
+        final OvnNbClient.BindResult result = nb.bindLrToLs(req, rspExternalIds(zoneId, vpcId));
         nb.lrpSetHaChassisGroup(result.lrpUuid, hagUuid);
+        persistVpcPublicBind(controller, zoneId, vpcId, lrUuid, req, result);
+        LOGGER.info("OvnPublicNetworkManager: bound VPC LR {} to public LS {} (lrp={} hag={})",
+                lrUuid, publicLsUuid, result.lrpUuid, hagUuid);
+        return result;
+    }
+
+    /** {@code external_ids} tag for the VPC public peer LSP (rsp-public-vpc&lt;id&gt;). */
+    private Map<String, String> rspExternalIds(final long zoneId, final long vpcId) {
+        final Map<String, String> ext = new HashMap<>();
+        ext.put(OvnConstants.EXT_ID_KIND, Kind.VPC_PUBLIC_RSP.name());
+        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(vpcId));
+        ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(zoneId));
+        return ext;
+    }
+
+    /**
+     * Persists the default route plus the VPC_PUBLIC_LRP / VPC_PUBLIC_RSP
+     * mapping rows created by {@link #bindVpcToPublic} so
+     * {@link #unbindVpcFromPublic} can resolve and drop all three cleanly.
+     */
+    private void persistVpcPublicBind(final OvnControllerVO controller, final long zoneId, final long vpcId,
+                                      final String lrUuid, final OvnNbClient.BindRequest req,
+                                      final OvnNbClient.BindResult result) {
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
         // Default route so VPC traffic reaches upstream BGP fabric. The
         // nexthop is the first IP on the public network — caller controls.
         final String routeUuid = nb.addLogicalRouterStaticRoute(lrUuid, "0.0.0.0/0",
-                pickGatewayFromNetworks(publicNetworks),
+                pickGatewayFromNetworks(req.lrpNetworks),
                 req.lrpName, "dst-ip",
                 Map.of(OvnConstants.EXT_ID_KIND, Kind.STATIC_ROUTE.name(),
                         OvnConstants.EXT_ID_ID, String.valueOf(vpcId)));
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId(),
                 result.lrpUuid, req.lrpName));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_PUBLIC_RSP, vpcId, controller.getId(),
+                result.lspUuid, req.lspName));
         // Persist the static-route mapping so unbind can drop it cleanly.
         // Uses Kind.STATIC_ROUTE keyed by vpcId — one default route per VPC.
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.STATIC_ROUTE, vpcId, controller.getId(),
                 routeUuid, "default-vpc" + vpcId));
-        LOGGER.info("OvnPublicNetworkManager: bound VPC LR {} to public LS {} (lrp={} hag={})",
-                lrUuid, publicLsUuid, result.lrpUuid, hagUuid);
-        return result;
     }
 
     /**
@@ -467,12 +493,10 @@ public class OvnPublicNetworkManager {
             LOGGER.warn("OvnPublicNetworkManager: VPC_PUBLIC_LRP mapping vpc={} -> {} stale; recreating",
                     vpcId, existing.getOvnUuid());
             logicalIdMapDao.remove(existing.getId());
-            // Drop the paired STATIC_ROUTE mapping too — a stale public LRP
-            // implies the default route may also have been GC'd by cascade.
-            final OvnLogicalIdMapVO staleRoute = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
-            if (staleRoute != null) {
-                logicalIdMapDao.remove(staleRoute.getId());
-            }
+            // A stale public LRP implies the paired default route + peer RSP
+            // may also have been GC'd by cascade.
+            dropStaleMapping(controller, Kind.STATIC_ROUTE, vpcId);
+            dropStaleMapping(controller, Kind.VPC_PUBLIC_RSP, vpcId);
         }
         // Pre-create public LS with the supplied vlan/physnet so the localnet
         // port is correctly tagged on first creation. Subsequent calls hit the
@@ -484,47 +508,88 @@ public class OvnPublicNetworkManager {
     }
 
     /**
-     * Drops the public LRP + default route for a VPC (called from VPC delete).
+     * Drops the public RSP peer port, public LRP, and default route for a VPC
+     * (called from VPC delete).
      *
-     * <p>Enqueues both OVN rows into {@code ovn_pending_deletion} BEFORE the
+     * <p>Enqueues every OVN row into {@code ovn_pending_deletion} BEFORE the
      * synchronous NB calls so the async retry queue holds the UUIDs even when
      * the sync delete fails.
+     *
+     * <p>Delete order is the reverse of {@link #bindVpcToPublic}: the RSP peer
+     * LSP is dropped before the LRP it patches into, because
+     * {@code deleteLogicalRouterPort} does not cascade to the peer port (no
+     * OVSDB strong reference between an LRP and its peer LSP).
      */
     public void unbindVpcFromPublic(final long zoneId, final long vpcId, final String lrUuid) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             return;
         }
-        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
-        if (mapping == null) {
-            return;
-        }
+        // Route and RSP are reaped independently of the LRP mapping so a
+        // half-torn-down bind (LRP mapping already gone, peers surviving)
+        // is still fully cleaned synchronously instead of waiting for the
+        // reconciler sweep. Every helper below is a no-op on a null mapping.
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
-        // Drop default static route first (uses its own mapping row).
-        final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
-        if (routeMapping != null) {
-            // Enqueue first so async retry covers any sync failure mode.
-            enqueueIfAbsent(controller.getId(), zoneId, Kind.STATIC_ROUTE, routeMapping.getOvnUuid(), vpcId);
-            try {
-                nb.deleteLogicalRouterStaticRoute(lrUuid, routeMapping.getOvnUuid());
-                logicalIdMapDao.remove(routeMapping.getId());
-                pendingDeletionDao.markSucceededByOvnUuid(routeMapping.getOvnUuid(), Kind.STATIC_ROUTE.name());
-            } catch (OvnException e) {
-                LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed; mapping retained for retry: {}",
-                        routeMapping.getOvnUuid(), e.getMessage());
-            }
-        }
-        // Enqueue first so async retry covers any sync failure mode.
-        enqueueIfAbsent(controller.getId(), zoneId, Kind.VPC_PUBLIC_LRP, mapping.getOvnUuid(), vpcId);
-        try {
-            nb.deleteLogicalRouterPort(mapping.getOvnUuid());
-            logicalIdMapDao.remove(mapping.getId());
-            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.VPC_PUBLIC_LRP.name());
+        dropStaticRoute(nb, controller, zoneId, vpcId, lrUuid);
+        final OvnLogicalIdMapVO rspMapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_RSP, vpcId, controller.getId());
+        dropMappedRow(nb::deleteLogicalSwitchPort, controller, zoneId, vpcId, Kind.VPC_PUBLIC_RSP, rspMapping);
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (dropMappedRow(nb::deleteLogicalRouterPort, controller, zoneId, vpcId, Kind.VPC_PUBLIC_LRP, mapping)) {
             LOGGER.info("OvnPublicNetworkManager: unbound VPC {} from public LS (lrp={})",
                     vpcId, mapping.getOvnUuid());
+        }
+    }
+
+    /** Drops the default static route mapping for a VPC (its own NB delete signature needs {@code lrUuid}). */
+    private void dropStaticRoute(final OvnNbClient nb, final OvnControllerVO controller, final long zoneId,
+                                 final long vpcId, final String lrUuid) {
+        final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
+        if (routeMapping == null) {
+            return;
+        }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), zoneId, Kind.STATIC_ROUTE, routeMapping.getOvnUuid(), vpcId);
+        try {
+            nb.deleteLogicalRouterStaticRoute(lrUuid, routeMapping.getOvnUuid());
+            logicalIdMapDao.remove(routeMapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(routeMapping.getOvnUuid(), Kind.STATIC_ROUTE.name());
         } catch (OvnException e) {
-            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: VPC {} public LRP delete failed; mapping retained for retry: {}",
-                    vpcId, e.getMessage());
+            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed; mapping retained for retry: {}",
+                    routeMapping.getOvnUuid(), e.getMessage());
+        }
+    }
+
+    /**
+     * Enqueues then deletes a single mapped OVN row via {@code nbDelete},
+     * mirroring the enqueue-before-sync-delete contract shared by every
+     * {@code unbind*} / {@code remove*} path in the plugin.
+     *
+     * @return {@code true} when the row existed and the NB delete succeeded.
+     */
+    private boolean dropMappedRow(final Consumer<String> nbDelete,
+                                  final OvnControllerVO controller, final long zoneId, final long vpcId,
+                                  final Kind kind, final OvnLogicalIdMapVO row) {
+        if (row == null) {
+            return false;
+        }
+        enqueueIfAbsent(controller.getId(), zoneId, kind, row.getOvnUuid(), vpcId);
+        try {
+            nbDelete.accept(row.getOvnUuid());
+            logicalIdMapDao.remove(row.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(row.getOvnUuid(), kind.name());
+            return true;
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: {} {} delete failed; mapping retained for retry: {}",
+                    kind, row.getOvnUuid(), e.getMessage());
+            return false;
+        }
+    }
+
+    /** Drops a stale paired mapping row (no NB call — the NB row is already gone). */
+    private void dropStaleMapping(final OvnControllerVO controller, final Kind kind, final long vpcId) {
+        final OvnLogicalIdMapVO stale = logicalIdMapDao.findByCsId(kind, vpcId, controller.getId());
+        if (stale != null) {
+            logicalIdMapDao.remove(stale.getId());
         }
     }
 

@@ -18,6 +18,7 @@ package com.cloud.network.ovn.element;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.inject.Inject;
 
@@ -32,6 +33,8 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
+import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.vm.NicProfile;
 
@@ -56,6 +59,8 @@ public class OvnQosService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
      * Apply (or replace) a QoS row for this NIC capped at the offering's
@@ -129,7 +134,7 @@ public class OvnQosService {
         }
         final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
         if (lsMapping == null) {
-            logicalIdMapDao.remove(mapping.getId());
+            removeOrphanQosRow(network.getDataCenterId(), controller, mapping);
             return;
         }
         try {
@@ -140,5 +145,40 @@ public class OvnQosService {
         } finally {
             logicalIdMapDao.remove(mapping.getId());
         }
+    }
+
+    /**
+     * Direct-by-UUID cleanup for a QoS row whose owning tier LS mapping is
+     * already gone. {@link OvnNbClient#removeQosFromLogicalSwitch} requires a
+     * live {@code lsUuid} to detach the row from {@code Logical_Switch.qos_rules}
+     * first; with the parent mapping dead there is no other reachable NB
+     * delete path, so without this direct route the QoS row (and its
+     * mapping) would linger forever. Enqueued into {@code ovn_pending_deletion}
+     * BEFORE the sync attempt so async retry covers a failed direct delete
+     * too — the mapping row is retained (not removed) on failure so the
+     * retry queue and the DAO stay consistent.
+     */
+    private void removeOrphanQosRow(final long zoneId, final OvnControllerVO controller, final OvnLogicalIdMapVO mapping) {
+        enqueueIfAbsent(controller.getId(), zoneId, mapping.getOvnUuid(), mapping.getCsId());
+        try {
+            pluginManager.nbClient(zoneId).deleteQosRowDirect(mapping.getOvnUuid());
+            logicalIdMapDao.remove(mapping.getId());
+            pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.QOS.name());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnQosService.removeQosForNic: orphan QoS {} direct delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+        }
+    }
+
+    private void enqueueIfAbsent(final long controllerId, final long zoneId, final String ovnUuid, final long csId) {
+        if (ovnUuid == null || ovnUuid.isEmpty()) {
+            return;
+        }
+        if (pendingDeletionDao.isPendingByOvnUuid(ovnUuid, Kind.QOS.name())) {
+            return;
+        }
+        pendingDeletionDao.persist(new OvnPendingDeletionVO(
+                UUID.randomUUID().toString(), controllerId, zoneId, Kind.QOS, ovnUuid, csId));
+        LOGGER.info("OvnQosService: enqueued pending deletion kind={} ovn_uuid={} cs_id={}", Kind.QOS, ovnUuid, csId);
     }
 }
