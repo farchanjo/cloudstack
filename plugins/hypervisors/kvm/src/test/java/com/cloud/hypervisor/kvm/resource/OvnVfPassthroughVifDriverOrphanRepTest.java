@@ -20,6 +20,7 @@ package com.cloud.hypervisor.kvm.resource;
 
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.matches;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -92,7 +93,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(1));
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p0vf4")), times(1));
             scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("del-port") + anyString() + contains("dx6p1vf6")), never());
+                    matches(".*del-port.*dx6p1vf6.*")), never());
         }
     }
 
