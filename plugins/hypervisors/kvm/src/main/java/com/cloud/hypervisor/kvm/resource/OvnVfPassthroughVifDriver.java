@@ -185,7 +185,9 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
         } else {
-            logger.warn("OvnVfPassthroughVifDriver.unplug: could not resolve VF PCI for mac={}; skipping rep teardown", mac);
+            logger.warn("OvnVfPassthroughVifDriver.unplug: could not resolve VF PCI for mac={}; "
+                    + "falling back to attached-mac rep lookup", mac);
+            OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVfPassthroughVifDriver.unplug", integrationBridge, mac);
         }
     }
 

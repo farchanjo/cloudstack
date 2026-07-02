@@ -219,4 +219,55 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
                     findIndex >= 0 && addPortIndex >= 0 && findIndex < addPortIndex);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // unplug() attached-mac fallback tests (FIX D — orphan rep after unplug)
+    // -----------------------------------------------------------------------
+
+    /**
+     * libvirt zeroes the VF MAC during managed hostdev detach / domain
+     * destroy BEFORE unplug() runs, so the VF-PCI reverse lookup by guest MAC
+     * comes back null in this environment (no real sysfs PF/VF topology).
+     * unplug() must then fall back to the OVSDB {@code attached-mac} lookup
+     * and remove every representor it finds from the integration bridge.
+     */
+    @Test
+    public void unplug_failedPciLookup_attachedMacHit_removesOrphanRep() {
+        final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
+        final LibvirtVMDef.InterfaceDef iface = new LibvirtVMDef.InterfaceDef();
+        iface.defHostdevNet(null, "fa:16:3e:00:01:02", 0);
+
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+                    .thenReturn("dx6p0vf4");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
+                    .thenReturn("");
+
+            driver.unplug(iface, true);
+
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p0vf4")), times(1));
+        }
+    }
+
+    /**
+     * When the attached-mac fallback finds no matching representor either
+     * (no orphan exists), unplug() must be a clean no-op: no del-port call
+     * is issued.
+     */
+    @Test
+    public void unplug_failedPciLookup_noAttachedMacHit_isNoOp() {
+        final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
+        final LibvirtVMDef.InterfaceDef iface = new LibvirtVMDef.InterfaceDef();
+        iface.defHostdevNet(null, "fa:16:3e:00:01:03", 0);
+
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+                    .thenReturn("");
+
+            driver.unplug(iface, true);
+
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), never());
+        }
+    }
 }

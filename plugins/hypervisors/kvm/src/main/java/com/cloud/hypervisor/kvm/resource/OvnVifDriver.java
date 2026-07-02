@@ -19,10 +19,13 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.naming.ConfigurationException;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.Logger;
 import org.libvirt.LibvirtException;
 
 import com.cloud.agent.api.to.NicTO;
@@ -246,5 +249,93 @@ public class OvnVifDriver extends VifDriverBase {
     /** Returns the integration bridge name currently in effect (test hook). */
     public String getIntegrationBridge() {
         return integrationBridge;
+    }
+
+    /** Matches a VF representor's {@code phys_port_name} (eg. {@code pf0vf4}). */
+    private static final Pattern REP_PHYS_PORT_PATTERN = Pattern.compile("pf(\\d+)vf(\\d+)");
+
+    /**
+     * Fallback representor teardown shared by {@link OvnVfPassthroughVifDriver#unplug}
+     * and {@link OvnVdpaVifDriver#unplug} for when their VF-PCI reverse lookup
+     * by guest MAC fails. libvirt zeroes the VF MAC during managed hostdev
+     * detach / domain destroy BEFORE {@code unplug} runs, so that lookup
+     * routinely returns null on the VM-expunge path and the primary rep
+     * teardown is skipped — leaving the representor attached to the
+     * integration bridge with its stale {@code external_ids}.
+     *
+     * <p>Both drivers stamp {@code external_ids:attached-mac=<guest mac>} on
+     * the representor at plug time (see {@code attachRepresentorToBrInt} in
+     * each class); that stamp lives in OVSDB, not on the netdev, so it
+     * survives the MAC zeroing and is used here as the fallback lookup key.
+     *
+     * <p>For every representor OVS returns, the port is removed from
+     * {@code integrationBridge} and a best-effort attempt is made to also
+     * clear the VF identity (MAC + VLAN) on the parent PF — see
+     * {@link #clearVfIdentityForRepBestEffort}. Idempotent — safe to call
+     * when no representor carries the given {@code attached-mac}.
+     *
+     * @param log the calling driver's own logger instance, so log lines carry
+     *            that driver's class name.
+     * @param callerLabel short label identifying the calling driver + method
+     *                    (eg. {@code "OvnVdpaVifDriver.unplug"}), used as a
+     *                    log-line prefix.
+     * @param integrationBridge the OVS bridge the orphan representor(s) are
+     *                          attached to.
+     * @param mac the guest MAC stamped as {@code attached-mac} at plug time.
+     */
+    static void clearOrphanRepsByAttachedMac(final Logger log, final String callerLabel,
+                                              final String integrationBridge, final String mac) {
+        if (StringUtils.isBlank(mac)) {
+            return;
+        }
+        final String findCmd = String.format(
+            "ovs-vsctl --no-headings --columns=name find Interface external_ids:attached-mac=%s 2>/dev/null",
+            mac);
+        final String found = Script.runSimpleBashScript(findCmd);
+        if (StringUtils.isBlank(found)) {
+            return;
+        }
+        for (final String raw : found.split("\\R")) {
+            final String repName = raw.trim().replaceAll("^\"|\"$", "");
+            if (StringUtils.isBlank(repName)) {
+                continue;
+            }
+            Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
+            log.info("{}: attached-mac fallback removed orphan rep={} from {} (mac={})",
+                    callerLabel, repName, integrationBridge, mac);
+            clearVfIdentityForRepBestEffort(log, callerLabel, repName);
+        }
+    }
+
+    /**
+     * Best-effort VF identity clear (MAC zero + VLAN 0) on the parent PF of a
+     * representor that was just removed from the bridge, derived solely from
+     * the representor's own netdev name — the PCI-scoped lookup path is
+     * exactly what was unavailable when {@link #clearOrphanRepsByAttachedMac}
+     * fired. Any resolution miss (missing/unexpected {@code phys_port_name},
+     * PF netdev not found) is logged at DEBUG and silently skipped; the rep
+     * removal already performed by the caller is the load-bearing half of
+     * this cleanup and must not be undone by a failure here.
+     */
+    private static void clearVfIdentityForRepBestEffort(final Logger log, final String callerLabel, final String repName) {
+        final String physPort = VfPassthroughVifDriver.readPhysPortName(repName);
+        final Matcher matcher = physPort == null ? null : REP_PHYS_PORT_PATTERN.matcher(physPort);
+        if (matcher == null || !matcher.matches()) {
+            log.debug("{}: cannot derive VF identity for rep={} (phys_port_name={}); skipping PF-side clear",
+                    callerLabel, repName, physPort);
+            return;
+        }
+        final int pfIdx = Integer.parseInt(matcher.group(1));
+        final int vfId = Integer.parseInt(matcher.group(2));
+        final String pfName = VfPassthroughVifDriver.findPfByPhysPortIndex(pfIdx);
+        if (pfName == null) {
+            log.debug("{}: no PF netdev found for phys_port_name index p{}; skipping PF-side clear for rep={}",
+                    callerLabel, pfIdx, repName);
+            return;
+        }
+        Script.runSimpleBashScript(String.format(
+            "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
+        log.info("{}: cleared VF identity pf={} vf={} (derived from rep={})", callerLabel, pfName, vfId, repName);
     }
 }

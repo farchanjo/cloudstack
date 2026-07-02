@@ -602,8 +602,14 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     /**
      * Find PF netdev by phys_port_name index (eg. pfIdx=0 -> netdev with phys_port_name=p0).
+     *
+     * <p>Static (package-private) so {@link OvnVifDriver}'s orphan-representor
+     * fallback can reuse this sysfs scan instead of duplicating it — that path
+     * derives a {@code pfIdx} straight from a representor's own
+     * {@code phys_port_name} ({@code pf<N>vf<M>}) and needs the parent PF
+     * netdev without ever having a PCI address to start from.
      */
-    private String findPfByPhysPortIndex(int pfIdx) {
+    static String findPfByPhysPortIndex(int pfIdx) {
         String expected = "p" + pfIdx;
         File netDir = new File("/sys/class/net");
         String[] ifaces = netDir.list();

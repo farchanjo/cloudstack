@@ -265,7 +265,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
         } else {
-            logger.warn("OvnVdpaVifDriver.unplug: VF MAC reverse lookup failed for mac={}", mac);
+            logger.warn("OvnVdpaVifDriver.unplug: VF MAC reverse lookup failed for mac={}; "
+                    + "falling back to attached-mac rep lookup", mac);
+            OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVdpaVifDriver.unplug", integrationBridge, mac);
         }
     }
 
