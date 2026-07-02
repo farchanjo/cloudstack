@@ -48,6 +48,23 @@ import com.cloud.utils.script.Script;
 public class OvnVdpaVifDriverOrphanRepTest {
 
     /**
+     * The stop-path fan-out (getAllVifDrivers) hands every InterfaceDef to
+     * every driver; a non-vDPA iface (e.g. an OVN kernel tap or a hostdev
+     * VF) must be ignored entirely — zero Script activity (Bug 30 type gate).
+     */
+    @Test
+    public void unplug_foreignNetType_isNoOp() {
+        final OvnVdpaVifDriver driver = new OvnVdpaVifDriver();
+        final LibvirtVMDef.InterfaceDef iface = new LibvirtVMDef.InterfaceDef();
+        iface.defHostdevNet("0000:01:00.6", "fa:16:3e:00:02:99", 0);
+
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            driver.unplug(iface, true);
+            scriptMock.verify(() -> Script.runSimpleBashScript(org.mockito.ArgumentMatchers.anyString()), never());
+        }
+    }
+
+    /**
      * With the PCI reverse lookup failing, unplug() must fall back to the
      * OVSDB {@code attached-mac} lookup and remove every representor it
      * finds from the integration bridge. The vdpa-dev deletion branch

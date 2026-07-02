@@ -2245,6 +2245,20 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             vifDrivers.add(tungstenVifDriver);
         }
         vifDrivers.addAll(trafficTypeVifDriverMap.values());
+        // Specialized datapath drivers are held in dedicated fields, not in
+        // trafficTypeVifDriverMap — without listing them here the unplug
+        // fan-out on VM stop (LibvirtStopCommandWrapper) never reaches them,
+        // so hostdev/vDPA NICs leaked their representor on the integration
+        // bridge and their PF-side VF identity on every stop (Bug 30). Each
+        // driver's unplug() is gated by InterfaceDef.getNetType(), so the
+        // fan-out stays safe for foreign interface types.
+        for (final VifDriver specialized : new VifDriver[] {
+                vfPassthroughVifDriver, vdpaVifDriver,
+                ovnVifDriver, ovnVfPassthroughVifDriver, ovnVdpaVifDriver}) {
+            if (specialized != null) {
+                vifDrivers.add(specialized);
+            }
+        }
 
         final ArrayList<VifDriver> vifDriverList = new ArrayList<VifDriver>(vifDrivers);
 

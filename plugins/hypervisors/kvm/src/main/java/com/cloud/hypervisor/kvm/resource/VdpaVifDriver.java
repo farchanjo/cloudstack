@@ -182,6 +182,11 @@ public class VdpaVifDriver extends VifDriverBase {
 
     @Override
     public void unplug(LibvirtVMDef.InterfaceDef iface, boolean delete) {
+        // Stop-path fan-out calls every VifDriver for every InterfaceDef
+        // (getAllVifDrivers); only act on the vDPA NICs this driver owns.
+        if (iface == null || iface.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.VDPA) {
+            return;
+        }
         // For vDPA the source is the /dev/vhost-vdpa-N path — there's no
         // straightforward way to derive vdpaName from it without `vdpa dev
         // show`. Use the name pattern stored on the iface's MAC.

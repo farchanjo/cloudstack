@@ -151,7 +151,9 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
 
     @Override
     public void unplug(final InterfaceDef iface, final boolean delete) {
-        if (iface == null) {
+        // Stop-path fan-out calls every VifDriver for every InterfaceDef
+        // (getAllVifDrivers); only act on the hostdev NICs this driver owns.
+        if (iface == null || iface.getNetType() != InterfaceDef.GuestNetType.HOSTDEV) {
             return;
         }
         String pciAddress = iface.getPciAddress();

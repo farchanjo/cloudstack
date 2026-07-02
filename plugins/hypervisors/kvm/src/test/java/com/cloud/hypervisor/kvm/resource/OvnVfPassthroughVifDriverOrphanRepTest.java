@@ -252,6 +252,24 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
     }
 
     /**
+     * The stop-path fan-out (getAllVifDrivers) hands every InterfaceDef to
+     * every driver; a non-hostdev iface (e.g. an OVN kernel tap) must be
+     * ignored entirely — zero Script activity (Bug 30 type gate).
+     */
+    @Test
+    public void unplug_foreignNetType_isNoOp() {
+        final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
+        final LibvirtVMDef.InterfaceDef iface = new LibvirtVMDef.InterfaceDef();
+        iface.defBridgeNet("br-overlay", "vnet7", "fa:16:3e:00:01:99",
+                LibvirtVMDef.InterfaceDef.NicModel.VIRTIO, 0);
+
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            driver.unplug(iface, true);
+            scriptMock.verify(() -> Script.runSimpleBashScript(anyString()), never());
+        }
+    }
+
+    /**
      * When the attached-mac fallback finds no matching representor either
      * (no orphan exists), unplug() must be a clean no-op: no del-port call
      * is issued.

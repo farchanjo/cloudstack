@@ -231,7 +231,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
 
     @Override
     public void unplug(final InterfaceDef iface, final boolean delete) {
-        if (iface == null) {
+        // Stop-path fan-out calls every VifDriver for every InterfaceDef
+        // (getAllVifDrivers); only act on the vDPA NICs this driver owns.
+        if (iface == null || iface.getNetType() != InterfaceDef.GuestNetType.VDPA) {
             return;
         }
         final String mac = iface.getMacAddress();

@@ -155,6 +155,11 @@ public class VfPassthroughVifDriver extends VifDriverBase {
 
     @Override
     public void unplug(LibvirtVMDef.InterfaceDef iface, boolean delete) {
+        // Stop-path fan-out calls every VifDriver for every InterfaceDef
+        // (getAllVifDrivers); only act on the hostdev NICs this driver owns.
+        if (iface == null || iface.getNetType() != LibvirtVMDef.InterfaceDef.GuestNetType.HOSTDEV) {
+            return;
+        }
         String pciAddress = iface.getPciAddress();
         String mac = iface.getMacAddress();
         logger.info("VfPassthroughVifDriver.unplug ENTRY: pci={} mac={} netType={} delete={}",
