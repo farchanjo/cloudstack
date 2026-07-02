@@ -466,6 +466,23 @@ public class OvnNetworkElement extends AdapterBase
         if (controller == null) {
             return true;
         }
+        // Drop per-tier DHCP_Options + DNS rows before the LS itself, same
+        // ordering as destroy(). Must run even when the tier LS mapping is
+        // already gone (removeTierDhcp/removeTierDns handle a null LS
+        // mapping internally) — otherwise a network shut down here and
+        // destroyed later leaks a DNS row that neither path ever revisits.
+        try {
+            dhcpService.removeTierDhcp(network);
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.shutdown: removeTierDhcp failed (network id={}): {}",
+                    network.getId(), e.getMessage());
+        }
+        try {
+            dnsService.removeTierDns(network);
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.shutdown: removeTierDns failed (network id={}): {}",
+                    network.getId(), e.getMessage());
+        }
         final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
         if (lsMapping == null) {
             return true;

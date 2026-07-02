@@ -144,8 +144,13 @@ public class OvnDnsService {
         if (mapping != null) {
             final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
             if (lsMapping == null) {
+                // Tier LS is already gone (e.g. shutdown() ran the LS-delete
+                // before this method, or a prior version left the mapping
+                // dangling). DNS is a root OVN NB table — an unreferenced
+                // row is never garbage-collected by ovsdb-server, so it MUST
+                // be deleted directly rather than emptied.
                 try {
-                    nb.updateDnsRecords(mapping.getOvnUuid(), Map.of());
+                    nb.deleteDnsRowDirect(mapping.getOvnUuid());
                 } catch (OvnException ignored) {
                     // best-effort
                 }
@@ -162,13 +167,14 @@ public class OvnDnsService {
         }
         // Orphan sweep — drop any DNS rows tagged with this network's cs_id
         // whose CS-side mapping was already wiped (earlier failed tx, prior
-        // plugin version pre-stale-guard). Each orphan gets emptied; ovsdb
-        // cascades the dangling reference on next sync once parent LS dies.
+        // plugin version pre-stale-guard). DNS is a root table with no
+        // garbage collection, so each orphan is deleted directly rather
+        // than emptied.
         for (final String orphan : nb.findUuidsByExternalIds("DNS",
                 OvnConstants.EXT_ID_ID, String.valueOf(network.getId()))) {
             try {
-                nb.updateDnsRecords(orphan, Map.of());
-                LOGGER.info("OvnDnsService.removeTierDns: orphan DNS {} swept (network id={})",
+                nb.deleteDnsRowDirect(orphan);
+                LOGGER.info("OvnDnsService.removeTierDns: orphan DNS {} deleted (network id={})",
                         orphan, network.getId());
             } catch (OvnException ignored) {
                 // best-effort
