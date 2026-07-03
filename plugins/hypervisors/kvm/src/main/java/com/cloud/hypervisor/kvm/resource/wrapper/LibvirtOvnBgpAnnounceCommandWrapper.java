@@ -68,7 +68,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         if (!withdraw && !OvnBgpAnnounceCommand.OP_ANNOUNCE.equalsIgnoreCase(operation)) {
             return new OvnBgpAnnounceAnswer(cmd, false, "unknown operation: " + operation);
         }
-        final Integer asn = resolveAsn(vtysh, cmd.getAsn());
+        final Long asn = resolveAsn(vtysh, cmd.getAsn());
         if (asn == null) {
             LOGGER.warn("OvnBgpAnnounce: could not resolve FRR BGP ASN (vtysh={}); skipping {} {}",
                     vtysh, operation, publicIp);
@@ -132,8 +132,8 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      * (optionally with the {@code "number"} keyword in between), tolerating
      * trailing tokens like {@code VRF default vrf-id 0}.
      */
-    private Integer resolveAsn(final String vtysh, final Integer fromCommand) {
-        if (fromCommand != null && fromCommand.intValue() > 0) {
+    private Long resolveAsn(final String vtysh, final Long fromCommand) {
+        if (fromCommand != null && fromCommand.longValue() > 0) {
             return fromCommand;
         }
         final String probe = String.format(
@@ -164,7 +164,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     }
                     continue;
                 }
-                final Integer asn = parseAsn(tok);
+                final Long asn = parseAsn(tok);
                 if (asn != null && asn > 0) {
                     return asn;
                 }
@@ -175,7 +175,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         return null;
     }
 
-    private static Integer parseAsn(final String raw) {
+    private static Long parseAsn(final String raw) {
         if (raw == null) {
             return null;
         }
@@ -184,7 +184,9 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
             return null;
         }
         try {
-            final int value = Integer.parseInt(trimmed);
+            // 4-byte private ASNs (4200000000-4294967294) overflow Integer;
+            // the whole chain is Long for that reason.
+            final long value = Long.parseLong(trimmed);
             return value > 0 ? value : null;
         } catch (NumberFormatException nfe) {
             return null;

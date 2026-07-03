@@ -107,7 +107,7 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
             final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                     PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
-                    "/usr/bin/vtysh", 0);
+                    "/usr/bin/vtysh", 0L);
             final LibvirtOvnBgpAnnounceCommandWrapper wrapper = new LibvirtOvnBgpAnnounceCommandWrapper();
 
             final Answer answer = wrapper.execute(cmd, mockResource());
@@ -130,19 +130,47 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
             final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                     PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
-                    "/usr/bin/vtysh", 0);
+                    "/usr/bin/vtysh", 0L);
             final LibvirtOvnBgpAnnounceCommandWrapper wrapper = new LibvirtOvnBgpAnnounceCommandWrapper();
 
             final Answer answer = wrapper.execute(cmd, mockResource());
 
             Assert.assertTrue("auto-detected ASN must succeed", answer.getResult());
             Assert.assertTrue(answer instanceof OvnBgpAnnounceAnswer);
-            Assert.assertEquals(Integer.valueOf(24452), ((OvnBgpAnnounceAnswer) answer).getAsn());
+            Assert.assertEquals(Long.valueOf(24452), ((OvnBgpAnnounceAnswer) answer).getAsn());
 
             final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
             scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeastOnce());
             Assert.assertTrue("router bgp uses auto-detected ASN",
                     captor.getValue().contains("\"router bgp 24452\""));
+        }
+    }
+
+    @Test
+    public void asnAutoDetectHandlesFourByteAsn() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            // 4-byte private ASN (RFC 6996: 4200000000-4294967294) — used one
+            // per host on eBGP fabrics. Overflows Integer.parseInt, which used
+            // to make auto-detect silently fail on every such host.
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString()))
+                    .thenReturn("BGP router identifier 217.179.88.37, local AS number 4200000002 VRF default vrf-id 0");
+            scriptMock.when(() -> Script.executeCommand(anyString()))
+                    .thenReturn(new Pair<>("ok", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
+                    "/usr/bin/vtysh", 0L);
+            final LibvirtOvnBgpAnnounceCommandWrapper wrapper = new LibvirtOvnBgpAnnounceCommandWrapper();
+
+            final Answer answer = wrapper.execute(cmd, mockResource());
+
+            Assert.assertTrue("4-byte ASN must auto-detect successfully", answer.getResult());
+            Assert.assertEquals(Long.valueOf(4200000002L), ((OvnBgpAnnounceAnswer) answer).getAsn());
+
+            final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeastOnce());
+            Assert.assertTrue("router bgp uses the 4-byte ASN",
+                    captor.getValue().contains("\"router bgp 4200000002\""));
         }
     }
 
@@ -157,13 +185,13 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
             final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                     PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
-                    "/usr/bin/vtysh", 0);
+                    "/usr/bin/vtysh", 0L);
             final LibvirtOvnBgpAnnounceCommandWrapper wrapper = new LibvirtOvnBgpAnnounceCommandWrapper();
 
             final Answer answer = wrapper.execute(cmd, mockResource());
 
             Assert.assertTrue(answer.getResult());
-            Assert.assertEquals(Integer.valueOf(65001), ((OvnBgpAnnounceAnswer) answer).getAsn());
+            Assert.assertEquals(Long.valueOf(65001), ((OvnBgpAnnounceAnswer) answer).getAsn());
         }
     }
 

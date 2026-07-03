@@ -24,7 +24,7 @@ package com.cloud.agent.api;
  */
 public class OvnBgpAnnounceAnswer extends Answer {
 
-    private Integer asn;
+    private Long asn;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceAnswer() {
@@ -35,16 +35,16 @@ public class OvnBgpAnnounceAnswer extends Answer {
         super(command, success, details);
     }
 
-    public OvnBgpAnnounceAnswer(final Command command, final boolean success, final String details, final Integer asn) {
+    public OvnBgpAnnounceAnswer(final Command command, final boolean success, final String details, final Long asn) {
         super(command, success, details);
         this.asn = asn;
     }
 
-    public Integer getAsn() {
+    public Long getAsn() {
         return asn;
     }
 
-    public void setAsn(final Integer asn) {
+    public void setAsn(final Long asn) {
         this.asn = asn;
     }
 }

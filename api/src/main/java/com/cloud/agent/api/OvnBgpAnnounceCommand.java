@@ -48,7 +48,7 @@ public class OvnBgpAnnounceCommand extends Command {
     private String publicIp;
     private String operation;
     private String vtyshPath;
-    private Integer asn;
+    private Long asn;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -66,7 +66,7 @@ public class OvnBgpAnnounceCommand extends Command {
      *                   auto-detect via {@code show ip bgp summary}.
      */
     public OvnBgpAnnounceCommand(final String publicIp, final String operation,
-                                 final String vtyshPath, final Integer asn) {
+                                 final String vtyshPath, final Long asn) {
         this.publicIp = publicIp;
         this.operation = operation;
         this.vtyshPath = vtyshPath;
@@ -90,7 +90,7 @@ public class OvnBgpAnnounceCommand extends Command {
         return vtyshPath;
     }
 
-    public Integer getAsn() {
+    public Long getAsn() {
         return asn;
     }
 }

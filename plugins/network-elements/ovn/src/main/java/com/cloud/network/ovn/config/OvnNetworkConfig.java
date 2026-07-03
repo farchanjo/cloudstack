@@ -109,7 +109,7 @@ public class OvnNetworkConfig implements Configurable {
             "Path to vtysh binary on KVM hosts.",
             true);
 
-    public static final ConfigKey<Integer> BgpFrrAsn = new ConfigKey<>(CATEGORY, Integer.class,
+    public static final ConfigKey<Long> BgpFrrAsn = new ConfigKey<>(CATEGORY, Long.class,
             OVN_BGP_FRR_ASN, "0",
             "BGP ASN for the `router bgp <asn>` block on each KVM host. 0 = auto-detect from "
                     + "running FRR via `vtysh -c 'show ip bgp summary'`.",
