@@ -37,6 +37,7 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceAnswer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
@@ -67,6 +68,7 @@ public class OvnBgpRedistributeManagerTest {
     private OvnLogicalIdMapDao logicalIdMapDao;
     private OvnChassisMapDao chassisMapDao;
     private OvnPublicNetworkManager publicNetworkManager;
+    private IPAddressDao ipAddressDao;
     private OvnNbClient nbClient;
     private OvnBgpRedistributeManager manager;
 
@@ -77,6 +79,7 @@ public class OvnBgpRedistributeManagerTest {
         logicalIdMapDao = mock(OvnLogicalIdMapDao.class);
         chassisMapDao = mock(OvnChassisMapDao.class);
         publicNetworkManager = mock(OvnPublicNetworkManager.class);
+        ipAddressDao = mock(IPAddressDao.class);
         nbClient = mock(OvnNbClient.class);
 
         final OvnControllerVO controller = mock(OvnControllerVO.class);
@@ -103,6 +106,7 @@ public class OvnBgpRedistributeManagerTest {
         injectField(manager, "logicalIdMapDao", logicalIdMapDao);
         injectField(manager, "chassisMapDao", chassisMapDao);
         injectField(manager, "publicNetworkManager", publicNetworkManager);
+        injectField(manager, "ipAddressDao", ipAddressDao);
     }
 
     @Test
@@ -130,6 +134,40 @@ public class OvnBgpRedistributeManagerTest {
         assertEquals(OvnBgpAnnounceCommand.OP_ANNOUNCE, sent.getOperation());
 
         verify(logicalIdMapDao, times(1)).persist(any(OvnLogicalIdMapVO.class));
+    }
+
+    @Test
+    public void announceThreadsResolvedPublicGatewayIpIntoCommand() {
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        // Manager resolves the VPC public LRP IP and passes it as the /32
+        // route next-hop carried on the agent command.
+        when(publicNetworkManager.getVpcPublicGatewayIp(ZONE_ID, VPC_ID)).thenReturn("217.179.89.34");
+        when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
+
+        manager.announce(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        final ArgumentCaptor<OvnBgpAnnounceCommand> captor =
+                ArgumentCaptor.forClass(OvnBgpAnnounceCommand.class);
+        verify(agentManager, times(1)).easySend(eq(HOST_ID), captor.capture());
+        assertEquals("217.179.89.34", captor.getValue().getGatewayIp());
+    }
+
+    @Test
+    public void announceFallsBackToAdvertiseOnlyWhenNoPublicGatewayIp() {
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        // No public LRP IP resolvable (VPC not bound / row missing) -> null
+        // gateway on the command -> wrapper stays advertise-only.
+        when(publicNetworkManager.getVpcPublicGatewayIp(ZONE_ID, VPC_ID)).thenReturn(null);
+        when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
+
+        manager.announce(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        final ArgumentCaptor<OvnBgpAnnounceCommand> captor =
+                ArgumentCaptor.forClass(OvnBgpAnnounceCommand.class);
+        verify(agentManager, times(1)).easySend(eq(HOST_ID), captor.capture());
+        org.junit.Assert.assertNull(captor.getValue().getGatewayIp());
     }
 
     @Test

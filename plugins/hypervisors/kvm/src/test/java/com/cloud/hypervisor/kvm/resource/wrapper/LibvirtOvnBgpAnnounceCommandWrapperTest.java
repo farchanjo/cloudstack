@@ -20,6 +20,7 @@
 package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mockStatic;
 
@@ -44,6 +45,7 @@ import com.cloud.utils.script.Script;
 public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
     private static final String PUBLIC_IP = "217.179.89.42";
+    private static final String GATEWAY_IP = "217.179.89.34";
     private static final long CONFIGURED_ASN = 24452L;
 
     @Test
@@ -216,6 +218,94 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
         final Answer answer = wrapper.execute(cmd, mockResource());
 
         Assert.assertFalse(answer.getResult());
+    }
+
+    @Test
+    public void announceWithGatewayIpInstallsKernelRouteAndWritesNetwork() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
+                    "/usr/bin/vtysh", CONFIGURED_ASN, GATEWAY_IP);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeast(2));
+            final java.util.List<String> issued = captor.getAllValues();
+            Assert.assertTrue("kernel /32 route installed via the OVN LR public IP",
+                    issued.stream().anyMatch(s ->
+                            s.equals("ip route replace " + PUBLIC_IP + "/32 via " + GATEWAY_IP)));
+            Assert.assertTrue("vtysh network line still written (BGP origination)",
+                    issued.stream().anyMatch(s -> s.contains("\"network " + PUBLIC_IP + "/32\"")));
+        }
+    }
+
+    @Test
+    public void withdrawDeletesKernelRouteAndWritesNoNetwork() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_WITHDRAW,
+                    "/usr/bin/vtysh", CONFIGURED_ASN, null);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeast(2));
+            final java.util.List<String> issued = captor.getAllValues();
+            Assert.assertTrue("kernel /32 route deleted by prefix",
+                    issued.stream().anyMatch(s -> s.equals("ip route del " + PUBLIC_IP + "/32")));
+            Assert.assertTrue("vtysh no-network line written",
+                    issued.stream().anyMatch(s -> s.contains("\"no network " + PUBLIC_IP + "/32\"")));
+        }
+    }
+
+    @Test
+    public void announceWithoutGatewayIpIsAdvertiseOnlyNoKernelRoute() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            // 4-arg ctor → gatewayIp null → advertise-only fall-back.
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeastOnce());
+            Assert.assertTrue("no `ip route` command emitted when gatewayIp is absent",
+                    captor.getAllValues().stream().noneMatch(s -> s.startsWith("ip route")));
+        }
+    }
+
+    @Test
+    public void routeInstallFailureDegradesToAdvertiseOnlyNotFatal() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            // `ip route replace` returns a non-empty stderr (e.g. anchor not
+            // provisioned yet → "Network is unreachable"). This is NON-fatal:
+            // the announce still succeeds and the vtysh `network` line is still
+            // written (advertise-only), never regressing below pre-datapath.
+            scriptMock.when(() -> Script.executeCommand(anyString()))
+                    .thenReturn(new Pair<>("", "RTNETLINK answers: Network is unreachable"));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
+                    "/usr/bin/vtysh", CONFIGURED_ASN, GATEWAY_IP);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue("route install failure must NOT fail the announce (advertise-only)",
+                    answer.getResult());
+            final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeast(2));
+            final java.util.List<String> issued = captor.getAllValues();
+            Assert.assertTrue("route install was attempted",
+                    issued.stream().anyMatch(s -> s.equals("ip route replace " + PUBLIC_IP + "/32 via " + GATEWAY_IP)));
+            Assert.assertTrue("vtysh network line still written despite route failure",
+                    issued.stream().anyMatch(s -> s.contains("\"network " + PUBLIC_IP + "/32\"")));
+        }
     }
 
     private static LibvirtComputingResource mockResource() {
