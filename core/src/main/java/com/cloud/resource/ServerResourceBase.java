@@ -137,10 +137,24 @@ public abstract class ServerResourceBase implements ServerResource {
 
         logger.debug(String.format("Verifying if NIC [%s] can be used as private NIC.", nic));
 
-        String[] nicNameStartsToAvoid = {"vnif", "vnbr", "peth", "vif", "virbr"};
+        String[] nicNameStartsToAvoid = {"vnif", "vnbr", "peth", "vif", "virbr", "tun", "tap", "wg", "utun"};
         if (nic.isVirtual() || StringUtils.startsWithAny(nicName, nicNameStartsToAvoid) || nicName.contains(":")) {
             logger.debug(String.format("Not using NIC [%s] because it is either virtual, starts with %s, or contains \":\"" +
              " in its name.", Arrays.toString(nicNameStartsToAvoid), nic));
+            return false;
+        }
+
+        // Tunnel/loopback devices are never valid management NICs and expose
+        // no hardware address, which used to NPE deeper in the MAC formatting
+        // path (e.g. a VPN tun device present on a KVM host broke the whole
+        // agent startup once autodiscovery iterated over it).
+        try {
+            if (nic.isLoopback() || nic.isPointToPoint() || nic.getHardwareAddress() == null) {
+                logger.debug(String.format("Not using NIC [%s] because it is loopback, point-to-point, or has no hardware address.", nic));
+                return false;
+            }
+        } catch (SocketException e) {
+            logger.debug(String.format("Not using NIC [%s] because its flags/hardware address could not be read: %s.", nic, e.getMessage()));
             return false;
         }
 

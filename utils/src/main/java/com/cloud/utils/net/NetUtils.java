@@ -478,8 +478,15 @@ public class NetUtils {
         result[0] = addr.getAddress().getHostAddress();
 
         try {
+            // Tunnel devices (tun/wireguard/utun) legitimately expose no
+            // hardware address; getHardwareAddress() returns null for them
+            // rather than throwing, and byte2Mac would NPE on the null array.
             final byte[] mac = nic.getHardwareAddress();
-            result[1] = byte2Mac(mac);
+            if (mac != null) {
+                result[1] = byte2Mac(mac);
+            } else {
+                LOGGER.debug(String.format("NIC [%s] has no hardware address (tunnel/virtual device); leaving MAC unset.", nic));
+            }
         } catch (final SocketException e) {
             LOGGER.warn(String.format("Unable to get NIC's [%s] MAC address due to [%s].", nic, e.getMessage()), e);
         }

@@ -89,11 +89,27 @@ public class ServerResourceBaseTest {
         Assert.assertFalse(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
     }
 
+    /**
+     * Stub a NIC mock that passes every eligibility gate before the
+     * NetUtils.getNicParams() lookup: physical, safe name, not loopback,
+     * not point-to-point, and carrying a hardware address.
+     */
+    private void stubEligibleNic(NetworkInterface nic) {
+        Mockito.when(nic.isVirtual()).thenReturn(false);
+        Mockito.when(nic.getName()).thenReturn("testvnif", "testvnbr", "testpeth", "testvif", "testvirbr");
+        try {
+            Mockito.when(nic.isLoopback()).thenReturn(false);
+            Mockito.when(nic.isPointToPoint()).thenReturn(false);
+            Mockito.when(nic.getHardwareAddress()).thenReturn(new byte[] {0x02, 0x00, 0x00, 0x00, 0x00, 0x01});
+        } catch (SocketException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     @Test
     public void isValidNicToUseAsPrivateNicTestReturnFalseWhenNetUtilsGetNicParamsReturnsNull() {
         NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
-        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
-        Mockito.when(networkInterfaceMock.getName()).thenReturn("testvnif", "testvnbr", "testpeth", "testvif", "testvirbr");
+        stubEligibleNic(networkInterfaceMock);
 
         try (MockedStatic<NetUtils> ignored = Mockito.mockStatic(NetUtils.class)) {
             Mockito.when(NetUtils.getNicParams(Mockito.anyString())).thenReturn(null);
@@ -107,8 +123,7 @@ public class ServerResourceBaseTest {
     @Test
     public void isValidNicToUseAsPrivateNicTestReturnFalseWhenNetUtilsGetNicParamsReturnsFirstElementNull() {
         NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
-        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
-        Mockito.when(networkInterfaceMock.getName()).thenReturn("testvnif", "testvnbr", "testpeth", "testvif", "testvirbr");
+        stubEligibleNic(networkInterfaceMock);
 
         try (MockedStatic<NetUtils> ignored = Mockito.mockStatic(NetUtils.class)) {
             Mockito.when(NetUtils.getNicParams(Mockito.anyString())).thenReturn(new String[]{null});
@@ -122,8 +137,7 @@ public class ServerResourceBaseTest {
     @Test
     public void isValidNicToUseAsPrivateNicTestReturnTrueWhenNetUtilsGetNicParamsReturnsAValidFirstElement() {
         NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
-        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
-        Mockito.when(networkInterfaceMock.getName()).thenReturn("testvnif", "testvnbr", "testpeth", "testvif", "testvirbr");
+        stubEligibleNic(networkInterfaceMock);
 
         try (MockedStatic<NetUtils> ignored = Mockito.mockStatic(NetUtils.class)) {
             Mockito.when(NetUtils.getNicParams(Mockito.anyString())).thenReturn(new String[]{"test"});
@@ -132,6 +146,50 @@ public class ServerResourceBaseTest {
                 Assert.assertTrue(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
             });
         }
+    }
+
+    @Test
+    public void isValidNicToUseAsPrivateNicTestReturnFalseForTunnelLikeNames() {
+        NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
+        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.getName()).thenReturn("tun-firezone", "tap0", "wg-ny1", "utun4");
+
+        for (int i = 0; i < 4; i++) {
+            Assert.assertFalse(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
+        }
+    }
+
+    @Test
+    public void isValidNicToUseAsPrivateNicTestReturnFalseWhenNicHasNoHardwareAddress() throws SocketException {
+        NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
+        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.getName()).thenReturn("eth9");
+        Mockito.when(networkInterfaceMock.isLoopback()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.isPointToPoint()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.getHardwareAddress()).thenReturn(null);
+
+        Assert.assertFalse(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
+    }
+
+    @Test
+    public void isValidNicToUseAsPrivateNicTestReturnFalseWhenNicIsPointToPoint() throws SocketException {
+        NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
+        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.getName()).thenReturn("gre0");
+        Mockito.when(networkInterfaceMock.isLoopback()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.isPointToPoint()).thenReturn(true);
+
+        Assert.assertFalse(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
+    }
+
+    @Test
+    public void isValidNicToUseAsPrivateNicTestReturnFalseWhenNicIsLoopback() throws SocketException {
+        NetworkInterface networkInterfaceMock = Mockito.mock(NetworkInterface.class);
+        Mockito.when(networkInterfaceMock.isVirtual()).thenReturn(false);
+        Mockito.when(networkInterfaceMock.getName()).thenReturn("lo");
+        Mockito.when(networkInterfaceMock.isLoopback()).thenReturn(true);
+
+        Assert.assertFalse(serverResourceBaseSpy.isValidNicToUseAsPrivateNic(networkInterfaceMock));
     }
 
     @Test(expected = ConfigurationException.class)

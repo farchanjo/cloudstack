@@ -955,4 +955,25 @@ public class NetUtilsTest {
         String cidr = NetUtils.transformCidr(startIp + "/" + cidrSize);
         Assert.assertEquals("10.1.2.0/28", cidr);
     }
+
+    @Test
+    public void testGetNetworkParamsWithNullHardwareAddress() throws SocketException, UnknownHostException {
+        // Tunnel devices (tun/wireguard) return null from getHardwareAddress();
+        // getNetworkParams must return the IP/netmask with a null MAC instead
+        // of throwing an NPE from byte2Mac.
+        final NetworkInterface nic = Mockito.mock(NetworkInterface.class);
+        final java.net.InterfaceAddress ifaceAddr = Mockito.mock(java.net.InterfaceAddress.class);
+        final InetAddress inet = InetAddress.getByName("100.64.0.8");
+        Mockito.when(ifaceAddr.getAddress()).thenReturn(inet);
+        Mockito.when(ifaceAddr.getNetworkPrefixLength()).thenReturn((short)32);
+        Mockito.when(nic.getInterfaceAddresses()).thenReturn(java.util.Collections.singletonList(ifaceAddr));
+        Mockito.when(nic.getHardwareAddress()).thenReturn(null);
+
+        final String[] result = NetUtils.getNetworkParams(nic);
+
+        Assert.assertNotNull(result);
+        Assert.assertEquals("100.64.0.8", result[0]);
+        Assert.assertNull(result[1]);
+        Assert.assertEquals("255.255.255.255", result[2]);
+    }
 }
