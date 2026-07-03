@@ -31,6 +31,8 @@ import org.springframework.stereotype.Component;
 import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.network.IpAddress;
+import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
@@ -91,6 +93,8 @@ public class OvnBgpRedistributeManager {
     private OvnChassisMapDao chassisMapDao;
     @Inject
     private OvnPublicNetworkManager publicNetworkManager;
+    @Inject
+    private IPAddressDao ipAddressDao;
 
     /**
      * Announce the supplied public IP as a {@code /32} via the gateway-chassis
@@ -120,7 +124,12 @@ public class OvnBgpRedistributeManager {
                     zoneId, publicIp);
             return;
         }
-        if (sendCommand(hostId, publicIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+        final String gatewayIp = publicNetworkManager.getVpcPublicGatewayIp(zoneId, vpcId);
+        if (gatewayIp == null) {
+            LOGGER.warn("OvnBgpRedistribute.announce: no public LRP IP for vpc={}; advertise-only "
+                    + "(datapath /32 route skipped) for {}/32", vpcId, publicIp);
+        }
+        if (sendCommand(hostId, publicIp, gatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistAnnounce(controller.getId(), ipAddrId, hostId, publicIp);
             lastHostByIp.put(publicIp, hostId);
             LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host {} (ip_id={}, vpc={})",
@@ -149,7 +158,9 @@ public class OvnBgpRedistributeManager {
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
         if (hostId != null) {
-            sendCommand(hostId, publicIp, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            // Withdraw needs no next-hop: the wrapper deletes the /32 route by
+            // prefix and writes `no network <ip>/32`.
+            sendCommand(hostId, publicIp, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -194,10 +205,14 @@ public class OvnBgpRedistributeManager {
             }
             // Gateway moved. Announce on the new host first (so the route
             // is in BGP before we tear it down on the old host), then
-            // withdraw on the previous host.
-            if (sendCommand(currentGw, publicIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            // withdraw on the previous host. Resolve the VPC's public LRP IP
+            // (row cs_id = public_ip_address.id -> vpcId) so the /32 datapath
+            // route is re-installed on the NEW gateway chassis, not just
+            // re-advertised.
+            final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, row.getCsId());
+            if (sendCommand(currentGw, publicIp, gatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
                 if (lastHost != null) {
-                    sendCommand(lastHost, publicIp, OvnBgpAnnounceCommand.OP_WITHDRAW);
+                    sendCommand(lastHost, publicIp, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
                 }
                 row.setOvnUuid(String.valueOf(currentGw));
                 logicalIdMapDao.update(row.getId(), row);
@@ -214,12 +229,27 @@ public class OvnBgpRedistributeManager {
         return publicNetworkManager != null && publicNetworkManager.isBgpRedistributeEnabled(vpcId);
     }
 
-    private boolean sendCommand(final long hostId, final String publicIp, final String operation) {
+    /**
+     * Resolve the VPC public LRP IP for a persisted BGP_ANNOUNCE row whose
+     * cs_id is the {@code public_ip_address.id}. Returns {@code null} (→
+     * advertise-only) when the IP row / VPC / public binding is missing.
+     */
+    private String resolveGatewayIpForIpAddr(final long zoneId, final long ipAddrId) {
+        final IpAddress ip = ipAddressDao.findById(ipAddrId);
+        if (ip == null || ip.getVpcId() == null) {
+            return null;
+        }
+        return publicNetworkManager.getVpcPublicGatewayIp(zoneId, ip.getVpcId());
+    }
+
+    private boolean sendCommand(final long hostId, final String publicIp, final String gatewayIp,
+                                final String operation) {
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                 publicIp,
                 operation,
                 OvnNetworkConfig.BgpFrrVtyshPath.value(),
-                OvnNetworkConfig.BgpFrrAsn.value());
+                OvnNetworkConfig.BgpFrrAsn.value(),
+                gatewayIp);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {

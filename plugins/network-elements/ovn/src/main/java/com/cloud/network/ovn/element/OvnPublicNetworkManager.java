@@ -508,6 +508,38 @@ public class OvnPublicNetworkManager {
     }
 
     /**
+     * Resolve the bare IP of a VPC's OVN public LRP (e.g. {@code 217.179.89.34}).
+     * This is the LRP's OWN address — the next-hop {@code OvnBgpRedistributeManager}
+     * uses for the {@code <publicIp>/32} kernel route that steers inbound N-S
+     * traffic into OVN on the gateway chassis.
+     *
+     * <p>Deliberately NOT {@link #pickGatewayFromNetworks(List)}: that returns
+     * the subnet's {@code .1} gateway (used to point the LR's default route at
+     * the upstream), whereas the /32 route must target the LRP itself (its MAC
+     * answers ARP on the localnet and performs the DNAT).
+     *
+     * @return the bare IPv4 (no prefix), or {@code null} when the VPC is not
+     *         bound to public yet or the LRP row / networks are missing.
+     */
+    public String getVpcPublicGatewayIp(final long zoneId, final long vpcId) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return null;
+        }
+        final OvnLogicalIdMapVO lrp = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (lrp == null) {
+            return null;
+        }
+        final List<String> nets = pluginManager.nbClient(zoneId).getLogicalRouterPortNetworks(lrp.getOvnUuid());
+        if (nets == null || nets.isEmpty() || nets.get(0) == null) {
+            return null;
+        }
+        final String cidr = nets.get(0);                       // "217.179.89.34/24"
+        final int slash = cidr.indexOf('/');
+        return slash < 0 ? cidr : cidr.substring(0, slash);    // "217.179.89.34"
+    }
+
+    /**
      * Drops the public RSP peer port, public LRP, and default route for a VPC
      * (called from VPC delete).
      *

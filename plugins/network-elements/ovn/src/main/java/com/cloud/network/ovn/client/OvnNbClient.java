@@ -677,6 +677,54 @@ public class OvnNbClient implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Read the {@code networks} column of a Logical_Router_Port (e.g.
+     * {@code ["217.179.89.34/24"]}). Used by {@code OvnBgpRedistributeManager}
+     * to resolve the VPC public LRP's own IP (the /32 route next-hop). Returns
+     * an empty list when the row / column is absent. Handles both OVSDB set
+     * shapes: a bare string (single element) and {@code ["set", [ ... ]]}.
+     */
+    public List<String> getLogicalRouterPortNetworks(final String lrpUuid) {
+        final List<String> out = new java.util.ArrayList<>();
+        if (lrpUuid == null || lrpUuid.isEmpty()) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("networks");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return out;
+        }
+        final var rows = arr.get(0) == null ? null : arr.get(0).get("rows");
+        if (rows == null || rows.size() == 0) {
+            return out;
+        }
+        final var nets = rows.get(0).get("networks");
+        if (nets == null) {
+            return out;
+        }
+        if (nets.isTextual()) {
+            out.add(nets.asText());
+            return out;
+        }
+        // ["set", ["a/24", "b/24"]] — walk the inner array.
+        if (nets.isArray() && nets.size() == 2) {
+            final var inner = nets.get(1);
+            if (inner != null && inner.isArray()) {
+                for (final var e : inner) {
+                    if (e != null && e.isTextual()) {
+                        out.add(e.asText());
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
     /** Read a Logical_Switch_Port's UUID by name. Used by the public-localnet
      *  reconciler to look up the well-known {@code lsp-public-localnet} row
      *  on a per-zone public LS. Returns {@code null} when no row matches. */
