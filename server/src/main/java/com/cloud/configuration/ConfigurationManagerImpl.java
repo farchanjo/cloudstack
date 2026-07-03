@@ -2093,9 +2093,18 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         final long podId = cmd.getPodId();
         final String startIp = cmd.getStartIp();
         final String endIp = cmd.getEndIp();
+        // Accept every form operators actually pass: a full URI (vlan://2011),
+        // a bare vlan id (2011), the "untagged" keyword, or no vlan at all.
+        // BroadcastDomainType.getValue() maps scheme-less strings to null,
+        // which used to NPE at the range comparison below.
         String vlan = cmd.getVlan();
         try {
-            vlan = BroadcastDomainType.getValue(vlan);
+            final String parsed = BroadcastDomainType.getValue(vlan);
+            if (StringUtils.isNotBlank(parsed)) {
+                vlan = parsed;
+            } else {
+                vlan = StringUtils.isBlank(vlan) ? DefaultVlanForPodIpRange : vlan.trim();
+            }
         } catch (URISyntaxException e) {
             throw new CloudRuntimeException("Incorrect vlan " + vlan);
         }
