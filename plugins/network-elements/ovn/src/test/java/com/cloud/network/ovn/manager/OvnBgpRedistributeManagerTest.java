@@ -116,7 +116,7 @@ public class OvnBgpRedistributeManagerTest {
     @Test
     public void announceFiresAgentCommandAndPersistsMapping() {
         when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
-        final OvnBgpAnnounceAnswer ok = new OvnBgpAnnounceAnswer(null, true, "ok", 24452);
+        final OvnBgpAnnounceAnswer ok = new OvnBgpAnnounceAnswer(null, true, "ok", 24452L);
         when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class))).thenReturn(ok);
 
         manager.announce(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
