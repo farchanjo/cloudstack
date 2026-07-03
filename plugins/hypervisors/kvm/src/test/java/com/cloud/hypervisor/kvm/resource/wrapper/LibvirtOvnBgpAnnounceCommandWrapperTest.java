@@ -44,7 +44,7 @@ import com.cloud.utils.script.Script;
 public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
     private static final String PUBLIC_IP = "217.179.89.42";
-    private static final int CONFIGURED_ASN = 24452;
+    private static final long CONFIGURED_ASN = 24452L;
 
     @Test
     public void announceWithExplicitAsnSkipsAutoDetectAndChainsConfigureRouterBgpNetwork() {
