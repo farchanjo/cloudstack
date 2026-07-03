@@ -49,6 +49,7 @@ public class OvnBgpAnnounceCommand extends Command {
     private String operation;
     private String vtyshPath;
     private Long asn;
+    private String gatewayIp;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -56,6 +57,11 @@ public class OvnBgpAnnounceCommand extends Command {
     }
 
     /**
+     * Advertise-only constructor (no datapath route). Kept for wire / test
+     * compatibility with callers predating the {@code gatewayIp} datapath hook;
+     * delegates with a {@code null} gateway so the wrapper only writes the BGP
+     * {@code network} statement.
+     *
      * @param publicIp   bare IPv4 address (no prefix length)
      * @param operation  {@link #OP_ANNOUNCE} or {@link #OP_WITHDRAW}
      * @param vtyshPath  absolute path to vtysh on the agent host (typically
@@ -67,10 +73,27 @@ public class OvnBgpAnnounceCommand extends Command {
      */
     public OvnBgpAnnounceCommand(final String publicIp, final String operation,
                                  final String vtyshPath, final Long asn) {
+        this(publicIp, operation, vtyshPath, asn, null);
+    }
+
+    /**
+     * @param gatewayIp  OVN LR public-port IP (bare, e.g. {@code 217.179.89.34})
+     *                   used as the next-hop of the {@code <publicIp>/32} kernel
+     *                   route the wrapper installs on the gateway chassis, so
+     *                   inbound N-S traffic is delivered into OVN (and the /32
+     *                   is seeded into zebra's RIB so the BGP {@code network}
+     *                   statement actually originates). Pass {@code null} on
+     *                   withdraw, or when the VPC's public LRP IP is unknown, to
+     *                   fall back to advertise-only (no datapath route).
+     */
+    public OvnBgpAnnounceCommand(final String publicIp, final String operation,
+                                 final String vtyshPath, final Long asn,
+                                 final String gatewayIp) {
         this.publicIp = publicIp;
         this.operation = operation;
         this.vtyshPath = vtyshPath;
         this.asn = asn;
+        this.gatewayIp = gatewayIp;
     }
 
     @Override
@@ -92,5 +115,9 @@ public class OvnBgpAnnounceCommand extends Command {
 
     public Long getAsn() {
         return asn;
+    }
+
+    public String getGatewayIp() {
+        return gatewayIp;
     }
 }
