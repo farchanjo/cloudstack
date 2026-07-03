@@ -75,6 +75,19 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
             return new OvnBgpAnnounceAnswer(cmd, false,
                     "ASN auto-detect failed; configure ovn.bgp.frr.asn explicitly");
         }
+
+        // Datapath half: steer the /32 INTO OVN on the gateway chassis. The
+        // next-hop is the VPC's OVN LR public-port IP — its MAC answers ARP on
+        // the provider localnet (reachable once the chassis carries an anchor
+        // IP in the public segment), so ingress lands on the LR port and OVN
+        // performs the DNAT. Installing the kernel route ALSO seeds zebra's RIB
+        // so the `network <ip>/32` below passes import-check and is truly
+        // originated (it was inert before — advertise-only, never forwarded).
+        final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn);
+        if (routeErr != null) {
+            return routeErr;
+        }
+
         final String netClause = (withdraw ? "no " : "") + "network " + publicIp + "/32";
         // Single vtysh -c chain so FRR sees configure -> router bgp -> network
         // as one transaction (matters when the running config is locked by
@@ -108,6 +121,59 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     operation, publicIp, re.getMessage());
             return new OvnBgpAnnounceAnswer(cmd, false, re.getMessage(), asn);
         }
+    }
+
+    /**
+     * Install (announce) or remove (withdraw) the {@code <publicIp>/32} kernel
+     * route that delivers inbound N-S traffic into OVN via the VPC public
+     * LRP next-hop.
+     *
+     * <ul>
+     *   <li>withdraw → {@code ip route del <ip>/32} (best-effort; a never-installed
+     *       route or a stale one is not an error).</li>
+     *   <li>announce with a non-blank {@code gatewayIp} → {@code ip route replace
+     *       <ip>/32 via <gatewayIp>} (idempotent; the device is auto-resolved
+     *       from the on-link gateway).</li>
+     *   <li>announce with a blank {@code gatewayIp} → no route (advertise-only
+     *       fall-back for pre-datapath managers / unbound VPCs).</li>
+     * </ul>
+     *
+     * <p>A failed route install is NON-fatal: it is logged and the caller still
+     * proceeds to the BGP {@code network} advertisement. Rationale — the two
+     * halves deploy independently; if the provider-side anchor (the on-link
+     * {@code gatewayIp}) is not present yet the route cannot resolve, but
+     * dropping the BGP advertise too would REGRESS the announce below its
+     * pre-datapath (advertise-only) behaviour. Degrading to advertise-only (a
+     * loud warning, forwarding restored once the anchor lands) is strictly
+     * safer than failing the whole announce.
+     *
+     * @return always {@code null}; the caller always proceeds to the vtysh
+     *         network write. Kept as an {@link Answer} return for call-site
+     *         symmetry / future hard-fail cases.
+     */
+    private Answer applyDatapathRoute(final String publicIp, final String gatewayIp,
+                                      final boolean withdraw, final OvnBgpAnnounceCommand cmd,
+                                      final Long asn) {
+        if (withdraw) {
+            // Best-effort delete by prefix; ignore "No such process" etc.
+            Script.executeCommand(String.format("ip route del %s/32", publicIp));
+            return null;
+        }
+        if (gatewayIp == null || gatewayIp.isEmpty()) {
+            return null; // advertise-only
+        }
+        final Pair<String, String> result =
+                Script.executeCommand(String.format("ip route replace %s/32 via %s", publicIp, gatewayIp));
+        final String stderr = result == null ? null : result.second();
+        if (stderr != null && !stderr.trim().isEmpty()) {
+            // Non-fatal: log + fall through to advertise-only (see javadoc).
+            // Typically "Network is unreachable" until the provider anchor
+            // (gatewayIp on-link on the gateway chassis) is provisioned.
+            LOGGER.warn("OvnBgpAnnounce: /32 datapath route {} via {} failed ({}); "
+                    + "advertising BGP anyway (advertise-only until the provider anchor is present)",
+                    publicIp, gatewayIp, stderr.trim());
+        }
+        return null;
     }
 
     private String pickVtysh(final String fromCommand) {
