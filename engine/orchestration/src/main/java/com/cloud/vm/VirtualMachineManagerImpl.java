@@ -2255,7 +2255,11 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 _resourceMgr.updateGPUDetailsForVmStop(vm, gpuDevice);
                 if (!answer.getResult()) {
                     final String details = answer.getDetails();
-                    logger.debug("Unable to stop VM due to {}", details);
+                    // WARN, not DEBUG: this is the only place the agent's real
+                    // failure reason surfaces before the caller collapses it
+                    // into a generic "Unable to stop VM instance" job error —
+                    // at DEBUG the root cause is invisible on production logs.
+                    logger.warn("Unable to stop VM {} on host {} due to [{}]", vm, vm.getHostId(), details);
                     return false;
                 }
 
