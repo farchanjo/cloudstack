@@ -57,12 +57,12 @@ public final class LibvirtOvnOvsPolicySweepCommandWrapper extends
 
     private static final Logger LOGGER = LogManager.getLogger(LibvirtOvnOvsPolicySweepCommandWrapper.class);
 
-    /** Default OVN integration bridge when the command does not specify one. */
-    private static final String DEFAULT_BRIDGE = "br-int";
-
     @Override
     public Answer execute(final OvnOvsPolicySweepCommand cmd, final LibvirtComputingResource resource) {
-        final String bridge = StringUtils.defaultIfBlank(cmd.getBridge(), DEFAULT_BRIDGE);
+        // Derive the real integration bridge from OVSDB (external_ids:ovn-bridge)
+        // rather than trusting the command's hardcoded hint — this fleet runs
+        // br-overlay, not br-int, so the sweep must target the actual bridge.
+        final String bridge = OvnNicTunableApplier.resolveIntegrationBridge(cmd.getBridge());
         final Boolean hairpinDefault = cmd.getHairpinDefault();
         final String tcPolicy = cmd.getTcPolicy();
         final String regex = cmd.getPortRegex();

@@ -20,8 +20,13 @@ package com.cloud.hypervisor.kvm.resource;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mockStatic;
 
 import org.junit.Test;
+import org.mockito.MockedStatic;
+
+import com.cloud.utils.script.Script;
 
 /**
  * Pure-string tests for the new OVS hairpin / tc-policy helpers in
@@ -88,6 +93,21 @@ public class OvnNicTunableApplierHairpinTest {
         // Same shape as the null check. Blank port name short-circuits.
         OvnNicTunableApplier.applyHairpin("", Boolean.TRUE);
         OvnNicTunableApplier.applyHairpin(null, Boolean.TRUE);
+    }
+
+    @Test
+    public void resolveIntegrationBridgePrefersOvsdbThenHintThenBrInt() {
+        try (MockedStatic<Script> script = mockStatic(Script.class)) {
+            // (1) OVSDB has an explicit ovn-bridge (quoted) -> that wins; the
+            //     quote-strip yields br-overlay even though the hint is br-int.
+            script.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("\"br-overlay\"");
+            assertEquals("br-overlay", OvnNicTunableApplier.resolveIntegrationBridge("br-int"));
+            // (2) OVSDB blank -> fall back to the command hint.
+            script.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
+            assertEquals("physnet-int", OvnNicTunableApplier.resolveIntegrationBridge("physnet-int"));
+            // (3) OVSDB blank + no hint -> br-int default; never blank.
+            assertEquals("br-int", OvnNicTunableApplier.resolveIntegrationBridge(null));
+        }
     }
 
     @Test

@@ -256,6 +256,34 @@ public final class OvnNicTunableApplier {
     }
 
     /**
+     * Resolve the OVN integration bridge from OVSDB
+     * ({@code external_ids:ovn-bridge}) — the authoritative value ovn-controller
+     * itself uses. Forks that rename the default {@code br-int} (this fleet runs
+     * {@code br-overlay}) are handled automatically, so the reconciler sweep no
+     * longer depends on a hardcoded or per-fleet-configured bridge name. Falls
+     * back to {@code hint} (the bridge carried on the command) and finally
+     * {@code "br-int"} when OVSDB has no explicit setting.
+     *
+     * @param hint bridge name carried on the command; used only as fallback
+     * @return the integration bridge name; never blank
+     */
+    public static String resolveIntegrationBridge(final String hint) {
+        final String fallback = StringUtils.defaultIfBlank(hint, "br-int");
+        try {
+            final String raw = Script.runSimpleBashScript(
+                    "ovs-vsctl --if-exists get open_vswitch . external_ids:ovn-bridge 2>/dev/null");
+            if (raw == null) {
+                return fallback;
+            }
+            final String trimmed = raw.trim().replace("\"", "");
+            return StringUtils.isBlank(trimmed) ? fallback : trimmed;
+        } catch (RuntimeException e) {
+            LOGGER.debug("OvnNicTunableApplier.resolveIntegrationBridge: lookup failed: {}", e.getMessage());
+            return fallback;
+        }
+    }
+
+    /**
      * Result of {@link #sweepHairpin}: counts of ports inspected, drifted,
      * and fixed. Pure value object — no state across calls.
      */
