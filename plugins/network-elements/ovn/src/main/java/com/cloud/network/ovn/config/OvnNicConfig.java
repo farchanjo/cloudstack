@@ -123,6 +123,15 @@ public class OvnNicConfig implements Configurable {
      */
     public static final String OVN_OVS_TC_POLICY = "ovn.ovs.tc.policy";
 
+    /**
+     * Port-name regex the reconciler OVS-policy drift sweep matches on br-int.
+     * Default covers VF + vDPA representors ({@code dx<NN>p<NN>vf<NN>}) and
+     * virtio/tap ports ({@code vnet<NN>}) so hairpin / tc-policy re-assertion
+     * covers all three NIC modes, not just VF; anchoring keeps infra ports
+     * (patch / localnet / cs-public / pub-anchor) out of scope.
+     */
+    public static final String OVN_OVS_SWEEP_PORT_REGEX = "ovn.ovs.sweep.port_regex";
+
     /* OVN binding / chassis */
     public static final String OVN_REQUESTED_CHASSIS = "ovn.requested_chassis";
     public static final String OVN_HA_CHASSIS_PRIORITY = "ovn.ha_chassis_priority";
@@ -297,6 +306,14 @@ public class OvnNicConfig implements Configurable {
                     + "`skip_hw` = SW only.",
             true);
 
+    public static final ConfigKey<String> OvsSweepPortRegex = new ConfigKey<>(CATEGORY, String.class,
+            OVN_OVS_SWEEP_PORT_REGEX, "^(dx[0-9]+p[0-9]+vf[0-9]+|vnet[0-9]+)$",
+            "Port-name regex the reconciler OVS-policy sweep matches on br-int for hairpin / "
+                    + "tc-policy drift correction. Default covers VF + vDPA representors "
+                    + "(dx<N>p<N>vf<N>) and virtio/tap (vnet<N>); anchored to exclude infra "
+                    + "ports. Blank = VF-only fallback.",
+            true);
+
     public static final ConfigKey<String> RequestedChassis = new ConfigKey<>(CATEGORY, String.class,
             OVN_REQUESTED_CHASSIS, "",
             "OVN logical-port `requested-chassis` (pin port to a specific chassis). Empty = any.",
@@ -387,7 +404,7 @@ public class OvnNicConfig implements Configurable {
                 VfTrust, VfSpoofcheck, VfLinkState, VfMaxTxRate, VfMinTxRate, VfVlan, VfQos,
                 VhostQueues, VhostDriver, VhostTxQueueSize, VhostRxQueueSize,
                 Mtu, Tso, Gso, Gro, Lro, CsumOffload, DriverModel,
-                TcOffload, OvsHairpin, OvsTcPolicy,
+                TcOffload, OvsHairpin, OvsTcPolicy, OvsSweepPortRegex,
                 RequestedChassis, HaChassisPriority,
                 BfdEnable, BfdMinRx, BfdMinTx, BfdMultiplier,
                 CtSnatInactiveTimeout, CtTcpInactiveTimeout, CtUdpInactiveTimeout, CtIcmpInactiveTimeout,

@@ -68,6 +68,37 @@ public class OvnReconcilerOvsPolicyTest {
     }
 
     @Test
+    public void resolveSweepPortRegexNeverBlankAndCompiles() {
+        final OvnReconcilerService svc = new OvnReconcilerService();
+        final String regex = svc.resolveSweepPortRegex();
+        assertNotNull(regex);
+        assertTrue("sweep regex must be non-blank", !regex.trim().isEmpty());
+        // Must compile + match a VF representor; must never match infra ports.
+        final java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
+        assertTrue(p.matcher("dx6p0vf3").matches());
+        assertTrue(!p.matcher("pub-anchor").matches());
+    }
+
+    @Test
+    public void sweepPortRegexDefaultCoversVfVdpaAndTapButNotInfra() {
+        // The ConfigKey default is the whole point of the follow-up: the sweep
+        // must cover all three NIC modes, not just VF.
+        final java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                com.cloud.network.ovn.config.OvnNicConfig.OvsSweepPortRegex.defaultValue());
+        // VF + vDPA both attach the VF representor dx<N>p<N>vf<N>.
+        assertTrue(p.matcher("dx6p0vf3").matches());
+        assertTrue(p.matcher("dx0p1vf15").matches());
+        // virtio / tap (libvirt vnet<N>).
+        assertTrue(p.matcher("vnet0").matches());
+        assertTrue(p.matcher("vnet42").matches());
+        // infra ports must stay out of scope (anchored, no substring hits).
+        assertTrue(!p.matcher("pub-anchor").matches());
+        assertTrue(!p.matcher("patch-lsp-public-localnet-to-br-overlay").matches());
+        assertTrue(!p.matcher("cs-public").matches());
+        assertTrue(!p.matcher("br-int").matches());
+    }
+
+    @Test
     public void synthethicTableKeysAreNamedDistinctly() {
         // The two new categories must not collide with the existing
         // localnet-vlan synthetic key — distinct rows in the admin output.

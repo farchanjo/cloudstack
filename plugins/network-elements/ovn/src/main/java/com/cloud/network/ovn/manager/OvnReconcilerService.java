@@ -87,10 +87,10 @@ public class OvnReconcilerService {
     /** Default OVN integration bridge swept on every chassis. */
     static final String DEFAULT_BRIDGE = "br-int";
 
-    /** Default port-name regex covering the VF representor pattern used in
-     *  this fork: {@code dx<NN>p<NN>vf<NN>}. Operators with another naming
-     *  convention can adjust by overriding the call site (or by adding a
-     *  ConfigKey in a follow-up). */
+    /** Fallback port-name regex when {@link OvnNicConfig#OvsSweepPortRegex} is
+     *  blank. Covers the VF representor pattern ({@code dx<NN>p<NN>vf<NN>}); the
+     *  ConfigKey default widens this to also match vDPA representors and
+     *  virtio/tap ({@code vnet<NN>}) ports. */
     static final String DEFAULT_PORT_REGEX = "^dx[0-9]+p[0-9]+vf[0-9]+$";
 
     @Inject
@@ -235,8 +235,9 @@ public class OvnReconcilerService {
             return;
         }
 
+        final String portRegex = resolveSweepPortRegex();
         for (final OvnChassisMapVO row : chassisRows) {
-            sweepOneChassis(row.getHostId(), hairpinDefault, tcPolicyDefault, dryRun, out);
+            sweepOneChassis(row.getHostId(), hairpinDefault, tcPolicyDefault, portRegex, dryRun, out);
         }
     }
 
@@ -247,9 +248,9 @@ public class OvnReconcilerService {
      * unchanged so the operator can re-run the sweep after agent recovery.
      */
     private void sweepOneChassis(final long hostId, final Boolean hairpinDefault, final String tcPolicy,
-                                 final boolean dryRun, final Result out) {
+                                 final String portRegex, final boolean dryRun, final Result out) {
         final OvnOvsPolicySweepCommand cmd = new OvnOvsPolicySweepCommand(
-                DEFAULT_BRIDGE, hairpinDefault, tcPolicy, DEFAULT_PORT_REGEX, dryRun);
+                DEFAULT_BRIDGE, hairpinDefault, tcPolicy, portRegex, dryRun);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {
@@ -297,6 +298,19 @@ public class OvnReconcilerService {
         } catch (RuntimeException re) {
             LOGGER.debug("OvnReconcilerService.resolveTcPolicyDefault: ConfigKey lookup failed: {}", re.getMessage());
             return null;
+        }
+    }
+
+    /** Resolve the sweep port-name regex; falls back to the VF-only default
+     *  when the ConfigKey is blank so a cleared value never means match-all
+     *  (which would stamp hairpin on infra ports like patch / localnet). */
+    String resolveSweepPortRegex() {
+        try {
+            final String v = OvnNicConfig.OvsSweepPortRegex.value();
+            return StringUtils.isBlank(v) ? DEFAULT_PORT_REGEX : v;
+        } catch (RuntimeException re) {
+            LOGGER.debug("OvnReconcilerService.resolveSweepPortRegex: ConfigKey lookup failed: {}", re.getMessage());
+            return DEFAULT_PORT_REGEX;
         }
     }
 
