@@ -130,7 +130,9 @@ public class OvnBgpRedistributeManager {
                     + "(datapath /32 route skipped) for {}/32", vpcId, publicIp);
         }
         final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
-        if (sendCommand(hostId, publicIp, gatewayIp, anchorCidr, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+        final String vlan = resolveVlan(zoneId, vpcId);
+        final String networkGatewayIp = resolveNetworkGateway(zoneId, vpcId);
+        if (sendCommand(hostId, publicIp, gatewayIp, anchorCidr, vlan, networkGatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistAnnounce(controller.getId(), ipAddrId, hostId, publicIp);
             lastHostByIp.put(publicIp, hostId);
             LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host {} (ip_id={}, vpc={})",
@@ -162,7 +164,7 @@ public class OvnBgpRedistributeManager {
             // Withdraw needs no next-hop and no anchor: the wrapper deletes the
             // /32 route by prefix and writes `no network <ip>/32`. The chassis
             // anchor is shared across FIPs and is NOT torn down per withdraw.
-            sendCommand(hostId, publicIp, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            sendCommand(hostId, publicIp, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -213,9 +215,11 @@ public class OvnBgpRedistributeManager {
             // re-advertised.
             final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, row.getCsId());
             final String anchorCidr = resolveAnchorForIpAddr(zoneId, row.getCsId());
-            if (sendCommand(currentGw, publicIp, gatewayIp, anchorCidr, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            final String vlan = resolveVlanForIpAddr(zoneId, row.getCsId());
+            final String networkGatewayIp = resolveNetworkGatewayForIpAddr(zoneId, row.getCsId());
+            if (sendCommand(currentGw, publicIp, gatewayIp, anchorCidr, vlan, networkGatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
                 if (lastHost != null) {
-                    sendCommand(lastHost, publicIp, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+                    sendCommand(lastHost, publicIp, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
                 }
                 row.setOvnUuid(String.valueOf(currentGw));
                 logicalIdMapDao.update(row.getId(), row);
@@ -269,15 +273,53 @@ public class OvnBgpRedistributeManager {
         return resolveAnchorCidr(zoneId, ip.getVpcId());
     }
 
+    /** Public-segment VLAN id for the VPC (gated by the anchor toggle); {@code null}
+     *  when disabled or the segment is untagged (anchor stays untagged). */
+    private String resolveVlan(final long zoneId, final long vpcId) {
+        if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpPublicAnchorEnabled.value())) {
+            return null;
+        }
+        return publicNetworkManager.getVpcPublicVlanTag(zoneId, vpcId);
+    }
+
+    private String resolveVlanForIpAddr(final long zoneId, final long ipAddrId) {
+        final IpAddress ip = ipAddressDao.findById(ipAddrId);
+        if (ip == null || ip.getVpcId() == null) {
+            return null;
+        }
+        return resolveVlan(zoneId, ip.getVpcId());
+    }
+
+    /** Public network gateway IP (the VPC LR's egress next-hop) for the VPC;
+     *  gated + null-safe like the anchor. The gateway chassis holds it so VM
+     *  egress lands on the host and is forwarded upstream. */
+    private String resolveNetworkGateway(final long zoneId, final long vpcId) {
+        if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpPublicAnchorEnabled.value())) {
+            return null;
+        }
+        return publicNetworkManager.getVpcPublicNetworkGateway(zoneId, vpcId);
+    }
+
+    private String resolveNetworkGatewayForIpAddr(final long zoneId, final long ipAddrId) {
+        final IpAddress ip = ipAddressDao.findById(ipAddrId);
+        if (ip == null || ip.getVpcId() == null) {
+            return null;
+        }
+        return resolveNetworkGateway(zoneId, ip.getVpcId());
+    }
+
     private boolean sendCommand(final long hostId, final String publicIp, final String gatewayIp,
-                                final String anchorCidr, final String operation) {
+                                final String anchorCidr, final String vlan,
+                                final String networkGatewayIp, final String operation) {
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                 publicIp,
                 operation,
                 OvnNetworkConfig.BgpFrrVtyshPath.value(),
                 OvnNetworkConfig.BgpFrrAsn.value(),
                 gatewayIp,
-                anchorCidr);
+                anchorCidr,
+                vlan,
+                networkGatewayIp);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {

@@ -618,6 +618,73 @@ public class OvnPublicNetworkManager {
     }
 
     /**
+     * Resolve the CloudStack public {@link VlanVO} that owns the VPC's public
+     * LRP subnet — the single source for both the localnet VLAN tag and the
+     * network gateway IP used to provision the gateway-chassis anchor port.
+     * Mirrors the subnet-resolution prologue of {@link #getVpcPublicAnchorCidr}.
+     *
+     * @return the matching {@code VlanVO}, or {@code null} when the VPC is not
+     *         public-bound or no public VLAN covers the LRP subnet.
+     */
+    private VlanVO resolvePublicVlan(final long zoneId, final long vpcId) {
+        final String lrpCidr = getVpcPublicLrpCidr(zoneId, vpcId);   // "217.179.89.34/24"
+        if (lrpCidr == null) {
+            return null;
+        }
+        final int slash = lrpCidr.indexOf('/');
+        if (slash <= 0 || slash == lrpCidr.length() - 1) {
+            return null;
+        }
+        final int prefix;
+        try {
+            prefix = Integer.parseInt(lrpCidr.substring(slash + 1).trim());
+        } catch (NumberFormatException nfe) {
+            return null;
+        }
+        if (prefix < 1 || prefix > 30) {
+            return null;
+        }
+        final long mask = NetUtils.ip2Long(NetUtils.getCidrNetmask(prefix));
+        final long network = NetUtils.ip2Long(lrpCidr.substring(0, slash)) & mask;
+        return findPublicVlanForSubnet(zoneId, NetUtils.long2Ip(network) + "/" + prefix);
+    }
+
+    /**
+     * The public network's 802.1Q VLAN id (bare numeric, e.g. {@code "2988"})
+     * for the VPC's public segment. The OVN provider localnet ingress is
+     * matched on {@code dl_vlan=<tag>}, so the gateway-chassis {@code pub-anchor}
+     * port MUST be an access port on this VLAN — otherwise host-originated
+     * frames (untagged) never match the localnet ingress flow and are dropped,
+     * breaking egress-return and FIP ingress.
+     *
+     * @return the numeric VLAN id, or {@code null} when the segment is untagged
+     *         / not a plain {@code vlan://<n>} URI (caller keeps the anchor
+     *         port untagged, preserving pre-fix behaviour).
+     */
+    public String getVpcPublicVlanTag(final long zoneId, final long vpcId) {
+        final VlanVO vlan = resolvePublicVlan(zoneId, vpcId);
+        if (vlan == null || StringUtils.isBlank(vlan.getVlanTag())) {
+            return null;
+        }
+        final String tag = vlan.getVlanTag().replaceAll("(?i)^vlan://", "").trim();
+        return tag.matches("\\d+") ? tag : null;
+    }
+
+    /**
+     * The public network gateway IP (e.g. {@code "217.179.89.1"}) — the VPC
+     * LR's default-route next-hop. There is no physical device on this address
+     * in the BGP-to-host model; the gateway-chassis host must itself answer ARP
+     * for it (hold it on {@code pub-anchor}) so VM egress lands on the host and
+     * is forwarded upstream.
+     *
+     * @return the gateway IPv4, or {@code null} when not resolvable.
+     */
+    public String getVpcPublicNetworkGateway(final long zoneId, final long vpcId) {
+        final VlanVO vlan = resolvePublicVlan(zoneId, vpcId);
+        return (vlan == null || StringUtils.isBlank(vlan.getVlanGateway())) ? null : vlan.getVlanGateway();
+    }
+
+    /**
      * First public ({@link Vlan.VlanType#VirtualNetwork}) VLAN in the zone
      * whose gateway is within {@code subnetCidr}; {@code null} when none
      * matches (or the pool is IPv6-only, i.e. no IPv4 gateway).

@@ -51,6 +51,8 @@ public class OvnBgpAnnounceCommand extends Command {
     private Long asn;
     private String gatewayIp;
     private String anchorCidr;
+    private String vlan;
+    private String networkGatewayIp;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -111,12 +113,37 @@ public class OvnBgpAnnounceCommand extends Command {
     public OvnBgpAnnounceCommand(final String publicIp, final String operation,
                                  final String vtyshPath, final Long asn,
                                  final String gatewayIp, final String anchorCidr) {
+        this(publicIp, operation, vtyshPath, asn, gatewayIp, anchorCidr, null, null);
+    }
+
+    /**
+     * Full constructor adding the provider-localnet VLAN tag and the public
+     * network gateway IP, both needed to correctly provision the gateway-chassis
+     * {@code pub-anchor} port.
+     *
+     * @param vlan             bare 802.1Q VLAN id of the public segment (e.g.
+     *                         {@code "2988"}); the anchor is created as an ACCESS
+     *                         port on it so host frames match the OVN localnet
+     *                         ingress ({@code dl_vlan=<vlan>}). {@code null}
+     *                         keeps the anchor untagged (pre-fix behaviour).
+     * @param networkGatewayIp public network gateway IP (bare, e.g.
+     *                         {@code 217.179.89.1}) — the LR's egress next-hop.
+     *                         The wrapper also holds it on {@code pub-anchor} so
+     *                         the gateway chassis answers ARP for it and VM
+     *                         egress is forwarded upstream. {@code null} skips it.
+     */
+    public OvnBgpAnnounceCommand(final String publicIp, final String operation,
+                                 final String vtyshPath, final Long asn,
+                                 final String gatewayIp, final String anchorCidr,
+                                 final String vlan, final String networkGatewayIp) {
         this.publicIp = publicIp;
         this.operation = operation;
         this.vtyshPath = vtyshPath;
         this.asn = asn;
         this.gatewayIp = gatewayIp;
         this.anchorCidr = anchorCidr;
+        this.vlan = vlan;
+        this.networkGatewayIp = networkGatewayIp;
     }
 
     @Override
@@ -146,5 +173,13 @@ public class OvnBgpAnnounceCommand extends Command {
 
     public String getAnchorCidr() {
         return anchorCidr;
+    }
+
+    public String getVlan() {
+        return vlan;
+    }
+
+    public String getNetworkGatewayIp() {
+        return networkGatewayIp;
     }
 }

@@ -93,7 +93,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // route below can actually install. Non-fatal + idempotent; skipped on
         // withdraw (the anchor is chassis-level, shared across all FIPs).
         if (!withdraw) {
-            ensureAnchor(cmd.getAnchorCidr());
+            ensureAnchor(cmd.getAnchorCidr(), cmd.getVlan(), cmd.getNetworkGatewayIp());
         }
 
         final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn);
@@ -203,7 +203,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      * hardcoded); the anchor address is supplied by the management server,
      * itself derived from CloudStack's public IP range (never hardcoded).
      */
-    private void ensureAnchor(final String anchorCidr) {
+    private void ensureAnchor(final String anchorCidr, final String vlan, final String networkGatewayIp) {
         if (anchorCidr == null || anchorCidr.trim().isEmpty()) {
             return;
         }
@@ -213,12 +213,23 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     + "ovn-bridge-mappings; skipping anchor {} (advertise-/route-only)", anchorCidr);
             return;
         }
-        // Create the internal port if missing, bring it up, and (re)assert the
-        // address. `--may-exist` makes add-port a no-op when the port exists;
-        // `ip addr replace` is idempotent.
+        // Create the internal port if missing, then (re)assert its VLAN and
+        // addresses. `--may-exist` makes add-port a no-op when the port exists;
+        // the tag / `ip addr replace` steps are idempotent.
         Script.runSimpleBashScript(String.format(
                 "ovs-vsctl --may-exist add-port %s %s -- set interface %s type=internal",
                 bridge, ANCHOR_PORT, ANCHOR_PORT));
+        // The OVN provider localnet is realized on a tagged VLAN — its ingress
+        // is matched on `dl_vlan=<vlan>`. The anchor MUST therefore be an ACCESS
+        // port on that VLAN, or host-originated frames (untagged) never match
+        // the localnet ingress and are dropped, breaking egress-return and FIP
+        // ingress. The tag is set explicitly (not only on --may-exist create)
+        // so a pre-existing untagged anchor is corrected in place. Blank/invalid
+        // vlan -> leave untagged (pre-fix behaviour, e.g. untagged providers).
+        if (vlan != null && vlan.trim().matches("\\d+")) {
+            Script.runSimpleBashScript(String.format(
+                    "ovs-vsctl set port %s tag=%s", ANCHOR_PORT, vlan.trim()));
+        }
         Script.runSimpleBashScript("ip link set " + ANCHOR_PORT + " up");
         final Pair<String, String> res = Script.executeCommand(
                 String.format("ip addr replace %s dev %s", anchorCidr, ANCHOR_PORT));
@@ -227,8 +238,18 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
             LOGGER.warn("OvnBgpAnnounce: anchor {} on {} (port {}) — ip addr replace stderr: {}",
                     anchorCidr, bridge, ANCHOR_PORT, stderr.trim());
         } else {
-            LOGGER.info("OvnBgpAnnounce: anchor {} ensured on {} (port {})",
-                    anchorCidr, bridge, ANCHOR_PORT);
+            LOGGER.info("OvnBgpAnnounce: anchor {} ensured on {} (port {}, vlan {})",
+                    anchorCidr, bridge, ANCHOR_PORT, vlan);
+        }
+        // Hold the public network gateway IP on the anchor so the VPC LR's
+        // egress next-hop is answered locally — in the BGP-to-host model there
+        // is no physical gateway device on that address — and enable IPv4
+        // forwarding so egress traffic landing on the host is routed upstream
+        // (the FIP /32s are BGP-originated from here). Idempotent.
+        if (networkGatewayIp != null && !networkGatewayIp.trim().isEmpty()) {
+            Script.executeCommand(String.format(
+                    "ip addr replace %s/32 dev %s", networkGatewayIp.trim(), ANCHOR_PORT));
+            Script.runSimpleBashScript("sysctl -w net.ipv4.ip_forward=1");
         }
     }
 
