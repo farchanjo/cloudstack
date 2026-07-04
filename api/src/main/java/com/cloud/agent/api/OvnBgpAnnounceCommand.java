@@ -50,6 +50,7 @@ public class OvnBgpAnnounceCommand extends Command {
     private String vtyshPath;
     private Long asn;
     private String gatewayIp;
+    private String anchorCidr;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -89,11 +90,33 @@ public class OvnBgpAnnounceCommand extends Command {
     public OvnBgpAnnounceCommand(final String publicIp, final String operation,
                                  final String vtyshPath, final Long asn,
                                  final String gatewayIp) {
+        this(publicIp, operation, vtyshPath, asn, gatewayIp, null);
+    }
+
+    /**
+     * Full constructor adding the datapath on-link anchor.
+     *
+     * @param anchorCidr reserved out-of-pool host address WITH prefix in the
+     *                   public segment (e.g. {@code 217.179.89.2/24}) that the
+     *                   wrapper puts on-link on a dedicated {@code pub-anchor}
+     *                   OVS internal port of the provider-localnet bridge on the
+     *                   gateway chassis. This makes the LRP next-hop
+     *                   ({@code gatewayIp}) ARP-resolvable so the {@code /32}
+     *                   route can be installed and inbound N-S actually enters
+     *                   OVN. A single anchor per public segment; it lives only on
+     *                   the current gateway chassis. Pass {@code null} on
+     *                   withdraw or when the anchor is not managed here (falls
+     *                   back to the pre-anchor advertise-/route-only behaviour).
+     */
+    public OvnBgpAnnounceCommand(final String publicIp, final String operation,
+                                 final String vtyshPath, final Long asn,
+                                 final String gatewayIp, final String anchorCidr) {
         this.publicIp = publicIp;
         this.operation = operation;
         this.vtyshPath = vtyshPath;
         this.asn = asn;
         this.gatewayIp = gatewayIp;
+        this.anchorCidr = anchorCidr;
     }
 
     @Override
@@ -119,5 +142,9 @@ public class OvnBgpAnnounceCommand extends Command {
 
     public String getGatewayIp() {
         return gatewayIp;
+    }
+
+    public String getAnchorCidr() {
+        return anchorCidr;
     }
 }

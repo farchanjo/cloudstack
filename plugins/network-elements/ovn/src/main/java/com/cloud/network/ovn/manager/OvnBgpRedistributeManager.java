@@ -129,7 +129,8 @@ public class OvnBgpRedistributeManager {
             LOGGER.warn("OvnBgpRedistribute.announce: no public LRP IP for vpc={}; advertise-only "
                     + "(datapath /32 route skipped) for {}/32", vpcId, publicIp);
         }
-        if (sendCommand(hostId, publicIp, gatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+        final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
+        if (sendCommand(hostId, publicIp, gatewayIp, anchorCidr, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistAnnounce(controller.getId(), ipAddrId, hostId, publicIp);
             lastHostByIp.put(publicIp, hostId);
             LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host {} (ip_id={}, vpc={})",
@@ -158,9 +159,10 @@ public class OvnBgpRedistributeManager {
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
         if (hostId != null) {
-            // Withdraw needs no next-hop: the wrapper deletes the /32 route by
-            // prefix and writes `no network <ip>/32`.
-            sendCommand(hostId, publicIp, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            // Withdraw needs no next-hop and no anchor: the wrapper deletes the
+            // /32 route by prefix and writes `no network <ip>/32`. The chassis
+            // anchor is shared across FIPs and is NOT torn down per withdraw.
+            sendCommand(hostId, publicIp, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -210,9 +212,10 @@ public class OvnBgpRedistributeManager {
             // route is re-installed on the NEW gateway chassis, not just
             // re-advertised.
             final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, row.getCsId());
-            if (sendCommand(currentGw, publicIp, gatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            final String anchorCidr = resolveAnchorForIpAddr(zoneId, row.getCsId());
+            if (sendCommand(currentGw, publicIp, gatewayIp, anchorCidr, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
                 if (lastHost != null) {
-                    sendCommand(lastHost, publicIp, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+                    sendCommand(lastHost, publicIp, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
                 }
                 row.setOvnUuid(String.valueOf(currentGw));
                 logicalIdMapDao.update(row.getId(), row);
@@ -242,14 +245,39 @@ public class OvnBgpRedistributeManager {
         return publicNetworkManager.getVpcPublicGatewayIp(zoneId, ip.getVpcId());
     }
 
+    /**
+     * Resolve the DERIVED datapath anchor CIDR for a VPC's public segment,
+     * gated by the global {@link OvnNetworkConfig#BgpPublicAnchorEnabled}
+     * toggle. Returns {@code null} (→ wrapper skips the anchor, advertise-/
+     * route-only) when the anchor feature is off, or the public segment / pool
+     * cannot be resolved. The address itself is never configured here — see
+     * {@link OvnPublicNetworkManager#getVpcPublicAnchorCidr}.
+     */
+    private String resolveAnchorCidr(final long zoneId, final long vpcId) {
+        if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpPublicAnchorEnabled.value())) {
+            return null;
+        }
+        return publicNetworkManager.getVpcPublicAnchorCidr(zoneId, vpcId);
+    }
+
+    /** Anchor CIDR for a persisted BGP_ANNOUNCE row (cs_id = {@code public_ip_address.id}). */
+    private String resolveAnchorForIpAddr(final long zoneId, final long ipAddrId) {
+        final IpAddress ip = ipAddressDao.findById(ipAddrId);
+        if (ip == null || ip.getVpcId() == null) {
+            return null;
+        }
+        return resolveAnchorCidr(zoneId, ip.getVpcId());
+    }
+
     private boolean sendCommand(final long hostId, final String publicIp, final String gatewayIp,
-                                final String operation) {
+                                final String anchorCidr, final String operation) {
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                 publicIp,
                 operation,
                 OvnNetworkConfig.BgpFrrVtyshPath.value(),
                 OvnNetworkConfig.BgpFrrAsn.value(),
-                gatewayIp);
+                gatewayIp,
+                anchorCidr);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {

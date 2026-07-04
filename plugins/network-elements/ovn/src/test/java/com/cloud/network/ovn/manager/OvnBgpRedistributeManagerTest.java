@@ -19,6 +19,7 @@ package com.cloud.network.ovn.manager;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -235,6 +236,24 @@ public class OvnBgpRedistributeManagerTest {
         //  test, which depends on the same isEnabled gate.
         // (No assertion here beyond shape; agent send may or may not fire
         // depending on the global default.)
+    }
+
+    @Test
+    public void announceLeavesAnchorNullAndSkipsDerivationWhenFeatureDisabledByDefault() {
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        when(publicNetworkManager.getVpcPublicGatewayIp(ZONE_ID, VPC_ID)).thenReturn("217.179.89.34");
+        when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
+
+        manager.announce(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        final ArgumentCaptor<OvnBgpAnnounceCommand> captor =
+                ArgumentCaptor.forClass(OvnBgpAnnounceCommand.class);
+        verify(agentManager, times(1)).easySend(eq(HOST_ID), captor.capture());
+        // The anchor feature (ovn.bgp.public.anchor.enabled) defaults OFF, so the
+        // command carries no anchor and the derivation is never invoked.
+        org.junit.Assert.assertNull(captor.getValue().getAnchorCidr());
+        verify(publicNetworkManager, never()).getVpcPublicAnchorCidr(anyLong(), anyLong());
     }
 
     private static void injectField(final Object target, final String name, final Object value) throws Exception {

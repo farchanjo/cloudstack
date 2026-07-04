@@ -77,6 +77,16 @@ public class OvnNetworkConfig implements Configurable {
      *  plugin namespace. */
     public static final String OVN_BGP_RESPECT_MANUAL = "ovn.bgp.respect_manual";
 
+    /** Master gate for the gateway-chassis public-IP datapath anchor: a single
+     *  on-link IP that makes the VPC public LRP next-hop ARP-resolvable so the
+     *  /32 route delivers inbound N-S into OVN. The anchor address itself is NOT
+     *  configured — it is DERIVED at runtime as the first address of the public
+     *  segment that sits outside CloudStack's allocation pool ({@code ip4_range})
+     *  and is not the subnet gateway. Devops governs it purely through the
+     *  existing public IP range in CloudStack (change the range -&gt; the anchor
+     *  follows); this key only turns the behaviour on/off. Default off. */
+    public static final String OVN_BGP_PUBLIC_ANCHOR_ENABLED = "ovn.bgp.public.anchor.enabled";
+
     /** Per-VPC detail name (mirrors {@link #OVN_BGP_REDISTRIBUTE_PUBLIC_IPS}). */
     public static final String VPC_DETAIL_BGP_REDISTRIBUTE = "ovn.bgp.redistribute";
 
@@ -135,6 +145,17 @@ public class OvnNetworkConfig implements Configurable {
                     + "owns the /32 namespace and prunes any /32 it did not announce.",
             true);
 
+    public static final ConfigKey<Boolean> BgpPublicAnchorEnabled = new ConfigKey<>(CATEGORY, Boolean.class,
+            OVN_BGP_PUBLIC_ANCHOR_ENABLED, "false",
+            "Opt-in: on the OVN gateway-chassis, put a single on-link anchor IP on a dedicated "
+                    + "pub-anchor OVS internal port of the provider-localnet bridge so the VPC public "
+                    + "LRP next-hop is ARP-resolvable and the /32 datapath route delivers inbound N-S "
+                    + "into OVN. The anchor address is DERIVED (first address of the public segment "
+                    + "outside the CloudStack ip4_range allocation pool, not the gateway) — never "
+                    + "hardcoded; it follows the public range devops manages. Default off (advertise-/"
+                    + "route-only until enabled).",
+            true);
+
     /* ---------- Configurable contract ---------- */
 
     @Override
@@ -152,7 +173,8 @@ public class OvnNetworkConfig implements Configurable {
                 BgpFrrAsn,
                 BgpReconcileIntervalSeconds,
                 BgpFrrInstanceTag,
-                BgpRespectManual
+                BgpRespectManual,
+                BgpPublicAnchorEnabled
         };
     }
 

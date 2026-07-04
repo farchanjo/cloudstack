@@ -20,9 +20,11 @@
 package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -306,6 +308,73 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
             Assert.assertTrue("vtysh network line still written despite route failure",
                     issued.stream().anyMatch(s -> s.contains("\"network " + PUBLIC_IP + "/32\"")));
         }
+    }
+
+    @Test
+    public void announceWithAnchorCreatesPubAnchorPortAndAssignsDerivedAddress() {
+        final String anchorCidr = "217.179.89.2/24";
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            // Bridge discovery + add-port + link-up run via runSimpleBashScript;
+            // the mapping value is quoted exactly as ovs-vsctl returns it.
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString()))
+                    .thenReturn("\"physnet1:br-cluster\"");
+            // ip addr replace, the /32 route and vtysh run via executeCommand.
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
+                    "/usr/bin/vtysh", CONFIGURED_ASN, GATEWAY_IP, anchorCidr);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+
+            final ArgumentCaptor<String> shell = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.runSimpleBashScript(shell.capture()), atLeastOnce());
+            Assert.assertTrue("pub-anchor internal port created on the discovered bridge (no hardcode)",
+                    shell.getAllValues().stream().anyMatch(s ->
+                            s.contains("ovs-vsctl --may-exist add-port br-cluster pub-anchor")
+                                    && s.contains("type=internal")));
+
+            final ArgumentCaptor<String> exec = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(exec.capture()), atLeast(2));
+            Assert.assertTrue("derived anchor address assigned on pub-anchor",
+                    exec.getAllValues().stream().anyMatch(s ->
+                            s.equals("ip addr replace " + anchorCidr + " dev pub-anchor")));
+            Assert.assertTrue("/32 datapath route still installed after the anchor",
+                    exec.getAllValues().stream().anyMatch(s ->
+                            s.equals("ip route replace " + PUBLIC_IP + "/32 via " + GATEWAY_IP)));
+        }
+    }
+
+    @Test
+    public void withdrawNeverTouchesTheAnchorPort() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString()))
+                    .thenReturn("\"physnet1:br-cluster\"");
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            // anchorCidr present but the op is withdraw → ensureAnchor is skipped
+            // (the anchor is chassis-level, shared across FIPs).
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_WITHDRAW,
+                    "/usr/bin/vtysh", CONFIGURED_ASN, null, "217.179.89.2/24");
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            scriptMock.verify(() -> Script.runSimpleBashScript(
+                    argThat(s -> s != null && s.contains("add-port") && s.contains("pub-anchor"))), never());
+        }
+    }
+
+    @Test
+    public void anchorCidrRoundTripsThroughTheCommand() {
+        final OvnBgpAnnounceCommand withAnchor = new OvnBgpAnnounceCommand(
+                PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh",
+                CONFIGURED_ASN, GATEWAY_IP, "217.179.89.2/24");
+        Assert.assertEquals("217.179.89.2/24", withAnchor.getAnchorCidr());
+        // 5-arg ctor leaves the anchor null (advertise-/route-only, pre-anchor behaviour).
+        Assert.assertNull(new OvnBgpAnnounceCommand(PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE,
+                "/usr/bin/vtysh", CONFIGURED_ASN, GATEWAY_IP).getAnchorCidr());
     }
 
     private static LibvirtComputingResource mockResource() {

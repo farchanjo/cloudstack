@@ -56,6 +56,10 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
 
     private static final String DEFAULT_VTYSH = "/usr/bin/vtysh";
 
+    /** Dedicated OVS internal port that carries the on-link datapath anchor IP
+     *  on the provider-localnet bridge of the gateway chassis. */
+    private static final String ANCHOR_PORT = "pub-anchor";
+
     @Override
     public Answer execute(final OvnBgpAnnounceCommand cmd, final LibvirtComputingResource resource) {
         final String publicIp = cmd.getPublicIp();
@@ -83,6 +87,15 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // performs the DNAT. Installing the kernel route ALSO seeds zebra's RIB
         // so the `network <ip>/32` below passes import-check and is truly
         // originated (it was inert before — advertise-only, never forwarded).
+        // Anchor half: on announce, ensure the derived on-link anchor IP exists
+        // on a dedicated pub-anchor OVS internal port of the provider-localnet
+        // bridge, so the LRP next-hop (gatewayIp) is ARP-resolvable and the /32
+        // route below can actually install. Non-fatal + idempotent; skipped on
+        // withdraw (the anchor is chassis-level, shared across all FIPs).
+        if (!withdraw) {
+            ensureAnchor(cmd.getAnchorCidr());
+        }
+
         final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn);
         if (routeErr != null) {
             return routeErr;
@@ -174,6 +187,76 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     publicIp, gatewayIp, stderr.trim());
         }
         return null;
+    }
+
+    /**
+     * Ensure the single on-link datapath anchor address exists on a dedicated
+     * {@code pub-anchor} OVS internal port of the provider-localnet bridge, so
+     * the VPC public LRP next-hop is ARP-resolvable on the localnet and the
+     * {@code /32} route can be installed. Idempotent and NON-fatal: any failure
+     * is logged and the caller still proceeds (degrading to advertise-/route-
+     * only). No-op when {@code anchorCidr} is blank (anchor feature disabled or
+     * not derivable on the management side) or the provider bridge cannot be
+     * discovered.
+     *
+     * <p>The bridge is DISCOVERED from {@code ovn-bridge-mappings} (never
+     * hardcoded); the anchor address is supplied by the management server,
+     * itself derived from CloudStack's public IP range (never hardcoded).
+     */
+    private void ensureAnchor(final String anchorCidr) {
+        if (anchorCidr == null || anchorCidr.trim().isEmpty()) {
+            return;
+        }
+        final String bridge = detectLocalnetBridge();
+        if (bridge == null) {
+            LOGGER.warn("OvnBgpAnnounce: cannot discover provider-localnet bridge from "
+                    + "ovn-bridge-mappings; skipping anchor {} (advertise-/route-only)", anchorCidr);
+            return;
+        }
+        // Create the internal port if missing, bring it up, and (re)assert the
+        // address. `--may-exist` makes add-port a no-op when the port exists;
+        // `ip addr replace` is idempotent.
+        Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --may-exist add-port %s %s -- set interface %s type=internal",
+                bridge, ANCHOR_PORT, ANCHOR_PORT));
+        Script.runSimpleBashScript("ip link set " + ANCHOR_PORT + " up");
+        final Pair<String, String> res = Script.executeCommand(
+                String.format("ip addr replace %s dev %s", anchorCidr, ANCHOR_PORT));
+        final String stderr = res == null ? null : res.second();
+        if (stderr != null && !stderr.trim().isEmpty()) {
+            LOGGER.warn("OvnBgpAnnounce: anchor {} on {} (port {}) — ip addr replace stderr: {}",
+                    anchorCidr, bridge, ANCHOR_PORT, stderr.trim());
+        } else {
+            LOGGER.info("OvnBgpAnnounce: anchor {} ensured on {} (port {})",
+                    anchorCidr, bridge, ANCHOR_PORT);
+        }
+    }
+
+    /**
+     * Discover the OVS bridge carrying the OVN provider localnet, from
+     * {@code ovs-vsctl get open_vswitch . external_ids:ovn-bridge-mappings}
+     * (value {@code "physnet:bridge[,physnet:bridge...]"}). A single mapping is
+     * used directly; with multiple mappings the first is used and a warning is
+     * logged (the deployment carries one provider mapping per KVM host).
+     * Returns {@code null} when the mapping is absent or empty.
+     */
+    private String detectLocalnetBridge() {
+        String raw = Script.runSimpleBashScript(
+                "ovs-vsctl --if-exists get open_vswitch . external_ids:ovn-bridge-mappings");
+        if (raw == null) {
+            return null;
+        }
+        raw = raw.trim().replaceAll("^\"|\"$", "");   // strip ovs quoting
+        if (raw.isEmpty()) {
+            return null;
+        }
+        final String[] mappings = raw.split(",");
+        if (mappings.length > 1) {
+            LOGGER.warn("OvnBgpAnnounce: multiple ovn-bridge-mappings [{}]; using the first for the "
+                    + "anchor port", raw);
+        }
+        final String[] pair = mappings[0].split(":");
+        return pair.length == 2 ? pair[1].trim() : null;
     }
 
     private String pickVtysh(final String fromCommand) {

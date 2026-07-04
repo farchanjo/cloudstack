@@ -51,6 +51,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
 import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
+import com.cloud.utils.net.NetUtils;
 
 /**
  * Owns the per-zone {@code Logical_Switch} that bridges OVN's overlay onto
@@ -522,6 +523,20 @@ public class OvnPublicNetworkManager {
      *         bound to public yet or the LRP row / networks are missing.
      */
     public String getVpcPublicGatewayIp(final long zoneId, final long vpcId) {
+        final String cidr = getVpcPublicLrpCidr(zoneId, vpcId);   // "217.179.89.34/24"
+        if (cidr == null) {
+            return null;
+        }
+        final int slash = cidr.indexOf('/');
+        return slash < 0 ? cidr : cidr.substring(0, slash);      // "217.179.89.34"
+    }
+
+    /**
+     * Raw first network CIDR of the VPC's public LRP ({@code ip/prefix}, e.g.
+     * {@code 217.179.89.34/24}), or {@code null} when the VPC is not
+     * public-bound or the LRP row / its networks are missing.
+     */
+    private String getVpcPublicLrpCidr(final long zoneId, final long vpcId) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             return null;
@@ -534,9 +549,107 @@ public class OvnPublicNetworkManager {
         if (nets == null || nets.isEmpty() || nets.get(0) == null) {
             return null;
         }
-        final String cidr = nets.get(0);                       // "217.179.89.34/24"
-        final int slash = cidr.indexOf('/');
-        return slash < 0 ? cidr : cidr.substring(0, slash);    // "217.179.89.34"
+        return nets.get(0);
+    }
+
+    /**
+     * Derive the single on-link datapath anchor address (WITH prefix, e.g.
+     * {@code 217.179.89.2/24}) for the VPC's public segment. The address is
+     * NOT configured anywhere: it is computed as the FIRST usable address of
+     * the public subnet that sits OUTSIDE CloudStack's allocation pool
+     * ({@code vlan.ip4_range}) and is neither the subnet gateway nor the LRP
+     * IP. Devops governs it purely by editing the public IP range in
+     * CloudStack — change the range and the anchor follows; nothing is
+     * hardcoded.
+     *
+     * @return the anchor {@code ip/prefix}, or {@code null} (→ caller falls
+     *         back to advertise-/route-only, no anchor) when the VPC is not
+     *         public-bound, or the matching CloudStack public VLAN / IPv4 pool
+     *         for the LRP subnet cannot be resolved, or the subnet has no free
+     *         out-of-pool address.
+     */
+    public String getVpcPublicAnchorCidr(final long zoneId, final long vpcId) {
+        final String lrpCidr = getVpcPublicLrpCidr(zoneId, vpcId);      // "217.179.89.34/24"
+        if (lrpCidr == null) {
+            return null;
+        }
+        final int slash = lrpCidr.indexOf('/');
+        if (slash <= 0 || slash == lrpCidr.length() - 1) {
+            return null;
+        }
+        final String lrpIp = lrpCidr.substring(0, slash);
+        final int prefix;
+        try {
+            prefix = Integer.parseInt(lrpCidr.substring(slash + 1).trim());
+        } catch (NumberFormatException nfe) {
+            return null;
+        }
+        if (prefix < 1 || prefix > 30) {
+            return null;
+        }
+        final long mask = NetUtils.ip2Long(NetUtils.getCidrNetmask(prefix));
+        final long network = NetUtils.ip2Long(lrpIp) & mask;
+        final long broadcast = network | (~mask & 0xffffffffL);
+        final String subnetCidr = NetUtils.long2Ip(network) + "/" + prefix;
+
+        // Resolve the CloudStack public IPv4 pool whose gateway falls in this subnet.
+        final VlanVO vlan = findPublicVlanForSubnet(zoneId, subnetCidr);
+        if (vlan == null || StringUtils.isBlank(vlan.getIpRange())) {
+            return null;
+        }
+        final long[] pool = parseIpRange(vlan.getIpRange());
+        if (pool == null) {
+            return null;
+        }
+        final long gatewayLong = StringUtils.isBlank(vlan.getVlanGateway())
+                ? -1L : NetUtils.ip2Long(vlan.getVlanGateway());
+        final long lrpLong = NetUtils.ip2Long(lrpIp);
+
+        for (long cand = network + 1; cand < broadcast; cand++) {
+            if (cand == gatewayLong || cand == lrpLong) {
+                continue;
+            }
+            if (cand >= pool[0] && cand <= pool[1]) {
+                continue;                    // inside the CloudStack allocation pool
+            }
+            return NetUtils.long2Ip(cand) + "/" + prefix;   // first address outside the pool
+        }
+        return null;
+    }
+
+    /**
+     * First public ({@link Vlan.VlanType#VirtualNetwork}) VLAN in the zone
+     * whose gateway is within {@code subnetCidr}; {@code null} when none
+     * matches (or the pool is IPv6-only, i.e. no IPv4 gateway).
+     */
+    private VlanVO findPublicVlanForSubnet(final long zoneId, final String subnetCidr) {
+        final List<VlanVO> vlans = vlanDao.listByZoneAndType(zoneId, Vlan.VlanType.VirtualNetwork);
+        if (vlans == null) {
+            return null;
+        }
+        for (final VlanVO vlan : vlans) {
+            final String gw = vlan.getVlanGateway();
+            if (StringUtils.isNotBlank(gw) && NetUtils.isIpWithInCidrRange(gw, subnetCidr)) {
+                return vlan;
+            }
+        }
+        return null;
+    }
+
+    /** Parse {@code "start-end"} IPv4 range into {@code [startLong, endLong]}
+     *  (ascending); {@code null} when malformed. */
+    private static long[] parseIpRange(final String range) {
+        final int dash = range.indexOf('-');
+        if (dash <= 0) {
+            return null;
+        }
+        try {
+            final long start = NetUtils.ip2Long(range.substring(0, dash).trim());
+            final long end = NetUtils.ip2Long(range.substring(dash + 1).trim());
+            return start <= end ? new long[] {start, end} : new long[] {end, start};
+        } catch (RuntimeException re) {
+            return null;
+        }
     }
 
     /**
