@@ -54,6 +54,7 @@ public class OvnNetworkConfig implements Configurable {
 
     /** Opt-in toggle for /32 BGP redistribute per allocated public IP. */
     public static final String OVN_BGP_REDISTRIBUTE_PUBLIC_IPS = "ovn.bgp.redistribute.public_ips";
+    public static final String OVN_BGP_REDISTRIBUTE_ROUTED_TIERS = "ovn.bgp.redistribute.routed_tiers";
 
     /** Path to vtysh binary on KVM hosts (passed to agent command wrapper). */
     public static final String OVN_BGP_FRR_VTYSH_PATH = "ovn.bgp.frr.vtysh.path";
@@ -114,6 +115,14 @@ public class OvnNetworkConfig implements Configurable {
                     + "static setups stay non-disruptive.",
             true);
 
+    public static final ConfigKey<Boolean> BgpRedistributeRoutedTiers = new ConfigKey<>(CATEGORY, Boolean.class,
+            OVN_BGP_REDISTRIBUTE_ROUTED_TIERS, "true",
+            "Announce the subnet (tier CIDR) of every ROUTED-mode OVN VPC tier via host-side FRR "
+                    + "vtysh on the gateway-chassis, so the route reflectors learn it. RFC1918 tiers "
+                    + "stay internal via the fabric EBGP egress deny; a PUBLIC-block tier reaches "
+                    + "upstream. Default on (routed mode implies advertising the tier). Kill-switch.",
+            true);
+
     public static final ConfigKey<String> BgpFrrVtyshPath = new ConfigKey<>(CATEGORY, String.class,
             OVN_BGP_FRR_VTYSH_PATH, "/usr/bin/vtysh",
             "Path to vtysh binary on KVM hosts.",
@@ -169,6 +178,7 @@ public class OvnNetworkConfig implements Configurable {
                 PublicVlanAuto,
                 PublicVlanOverride,
                 BgpRedistributePublicIps,
+                BgpRedistributeRoutedTiers,
                 BgpFrrVtyshPath,
                 BgpFrrAsn,
                 BgpReconcileIntervalSeconds,

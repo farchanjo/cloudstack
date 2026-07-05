@@ -96,12 +96,13 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
             ensureAnchor(cmd.getAnchorCidr(), cmd.getVlan(), cmd.getNetworkGatewayIp());
         }
 
-        final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn);
+        final int prefixLen = resolvePrefixLen(cmd.getPrefixLength());
+        final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn, prefixLen);
         if (routeErr != null) {
             return routeErr;
         }
 
-        final String netClause = (withdraw ? "no " : "") + "network " + publicIp + "/32";
+        final String netClause = (withdraw ? "no " : "") + "network " + publicIp + "/" + prefixLen;
         // Single vtysh -c chain so FRR sees configure -> router bgp -> network
         // as one transaction (matters when the running config is locked by
         // another caller; vtysh internally serialises -c chains).
@@ -166,17 +167,17 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      */
     private Answer applyDatapathRoute(final String publicIp, final String gatewayIp,
                                       final boolean withdraw, final OvnBgpAnnounceCommand cmd,
-                                      final Long asn) {
+                                      final Long asn, final int prefixLen) {
         if (withdraw) {
             // Best-effort delete by prefix; ignore "No such process" etc.
-            Script.executeCommand(String.format("ip route del %s/32", publicIp));
+            Script.executeCommand(String.format("ip route del %s/%d", publicIp, prefixLen));
             return null;
         }
         if (gatewayIp == null || gatewayIp.isEmpty()) {
             return null; // advertise-only
         }
         final Pair<String, String> result =
-                Script.executeCommand(String.format("ip route replace %s/32 via %s", publicIp, gatewayIp));
+                Script.executeCommand(String.format("ip route replace %s/%d via %s", publicIp, prefixLen, gatewayIp));
         final String stderr = result == null ? null : result.second();
         if (stderr != null && !stderr.trim().isEmpty()) {
             // Non-fatal: log + fall through to advertise-only (see javadoc).
@@ -278,6 +279,15 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         }
         final String[] pair = mappings[0].split(":");
         return pair.length == 2 ? pair[1].trim() : null;
+    }
+
+    /** Resolve the advertised prefix length: the command value when a sane
+     *  1..32 is supplied, else the legacy {@code /32} host-route default. */
+    private int resolvePrefixLen(final Integer fromCommand) {
+        if (fromCommand != null && fromCommand > 0 && fromCommand <= 32) {
+            return fromCommand;
+        }
+        return 32;
     }
 
     private String pickVtysh(final String fromCommand) {

@@ -398,6 +398,11 @@ public class OvnNetworkElement extends AdapterBase
         // motivation as ensureVpcSourceNatFromTier: the VPC LR may have
         // implemented before the source-NAT IP existed, so retry on prepare.
         ensureVpcPublicAttachedFromTier(network);
+        // P3 — ROUTED tier: advertise the tier subnet (/24) to the RRs. Fired
+        // here (after public-attach) so the VPC public LRP next-hop exists and
+        // the announce installs the datapath route + truly originates. No-op
+        // for NATTED VPCs and when the routed-tier toggle is off. Idempotent.
+        ensureRoutedTierAnnounce(network);
         // DHCP pin (idempotent — OvnDhcpService handles the per-tier row).
         dhcpService.ensureDhcpForNic(network, nic);
         // DNS record (best-effort — DnsServiceProvider path runs separately
@@ -528,6 +533,10 @@ public class OvnNetworkElement extends AdapterBase
         //  3. Drop tier-LRP from VPC LR.
         runDestroyStep("detachTierFromVpcLr", () -> { detachTierFromVpcLr(network); return null; },
                 failures, network, Kind.PUBLIC_LRP);
+        //  3b. Withdraw the ROUTED tier subnet announce (FRR + kernel route + row).
+        runDestroyStep("withdrawRoutedTierAnnounce",
+                () -> { withdrawRoutedTierAnnounce(network); return null; },
+                failures, network, Kind.BGP_SUBNET_ANNOUNCE);
         //  4. Drop the Logical_Switch (cascade kills any leftover LSPs).
         runDestroyStep("deleteLogicalSwitchFor", () -> { guru.deleteLogicalSwitchFor(network); return null; },
                 failures, network, Kind.NETWORK);
@@ -1326,6 +1335,45 @@ public class OvnNetworkElement extends AdapterBase
             return false;
         }
         return NetworkOffering.NetworkMode.ROUTED == offering.getNetworkMode();
+    }
+
+    /**
+     * Announce this tier's subnet to the route reflectors when its VPC is
+     * ROUTED. Best-effort: a missing VPC / non-routed offering / blank CIDR is
+     * a soft no-op. The redistribute manager applies the routed-tier toggle.
+     */
+    private void ensureRoutedTierAnnounce(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null || !isRoutedVpc(vpc)) {
+            return;
+        }
+        final String cidr = network.getCidr();
+        if (StringUtils.isBlank(cidr)) {
+            return;
+        }
+        bgpRedistributeManager.announceSubnet(cidr, network.getId(), vpc.getId(), vpc.getZoneId());
+    }
+
+    /**
+     * Withdraw this tier's routed-subnet announce on tier teardown. Not gated
+     * on {@link #isRoutedVpc} — the offering may already be gone during
+     * destroy, and withdrawSubnet is a no-op when no announce row exists.
+     */
+    private void withdrawRoutedTierAnnounce(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        final long vpcId = vpc != null ? vpc.getId() : network.getVpcId();
+        final long zoneId = vpc != null ? vpc.getZoneId() : network.getDataCenterId();
+        final String cidr = network.getCidr();
+        if (StringUtils.isBlank(cidr)) {
+            return;
+        }
+        bgpRedistributeManager.withdrawSubnet(cidr, network.getId(), vpcId, zoneId);
     }
 
     /**

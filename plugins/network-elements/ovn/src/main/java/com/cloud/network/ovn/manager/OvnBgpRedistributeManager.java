@@ -176,6 +176,85 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
+     * Announce a ROUTED-tier subnet (tier CIDR, e.g. {@code 10.90.6.0/24}) as a
+     * BGP {@code network <cidr>} on the gateway-chassis FRR, and install the
+     * matching kernel route via the VPC public LRP so fabric return traffic
+     * enters OVN and zebra originates the prefix. No-op when the routed-tier
+     * toggle is off or no gateway-chassis exists yet.
+     *
+     * @param cidr      tier CIDR with prefix (e.g. {@code 10.90.6.0/24})
+     * @param networkId CloudStack tier {@code NetworkVO.id} (cs_id for the
+     *                  {@link Kind#BGP_SUBNET_ANNOUNCE} row)
+     * @param vpcId     owning VPC id
+     * @param zoneId    zone id (selects controller / gateway-chassis)
+     */
+    public void announceSubnet(final String cidr, final long networkId, final long vpcId, final long zoneId) {
+        if (!isRoutedAnnounceEnabled()) {
+            return;
+        }
+        if (StringUtils.isBlank(cidr) || !cidr.contains("/")) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            LOGGER.debug("OvnBgpRedistribute.announceSubnet: no OVN controller for zone {}", zoneId);
+            return;
+        }
+        final Long hostId = findGatewayChassisHostId(zoneId, controller.getId());
+        if (hostId == null) {
+            LOGGER.warn("OvnBgpRedistribute.announceSubnet: no gateway-chassis for zone={}; skipping {}",
+                    zoneId, cidr);
+            return;
+        }
+        // Datapath next-hop + anchor are identical to the /32 FIP path: the tier
+        // return traffic enters OVN via the VPC public LRP, and installing the
+        // kernel route seeds zebra's RIB so `network <cidr>` truly originates
+        // (advertise-only would be inert). null gatewayIp => advertise-only.
+        final String gatewayIp = publicNetworkManager.getVpcPublicGatewayIp(zoneId, vpcId);
+        final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
+        final String vlan = resolveVlan(zoneId, vpcId);
+        final String networkGatewayIp = resolveNetworkGateway(zoneId, vpcId);
+        if (sendSubnetCommand(hostId, cidr, gatewayIp, anchorCidr, vlan, networkGatewayIp,
+                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            persistSubnetAnnounce(controller.getId(), networkId, hostId, cidr);
+            lastHostByIp.put(cidr, hostId);
+            LOGGER.info("OvnBgpRedistribute.announceSubnet: {} announced on host {} (net={}, vpc={})",
+                    cidr, hostId, networkId, vpcId);
+        }
+    }
+
+    /**
+     * Withdraw a previously-announced ROUTED-tier subnet. Best-effort and
+     * idempotent: safe to call when never announced or already withdrawn.
+     */
+    public void withdrawSubnet(final String cidr, final long networkId, final long vpcId, final long zoneId) {
+        if (StringUtils.isBlank(cidr)) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping =
+                logicalIdMapDao.findByCsId(Kind.BGP_SUBNET_ANNOUNCE, networkId, controller.getId());
+        if (mapping == null) {
+            lastHostByIp.remove(cidr);
+            return;
+        }
+        final Long hostId = parseHostId(mapping.getOvnUuid());
+        if (hostId != null) {
+            sendSubnetCommand(hostId, cidr, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+        }
+        try {
+            logicalIdMapDao.remove(mapping.getId());
+        } finally {
+            lastHostByIp.remove(cidr);
+        }
+        LOGGER.info("OvnBgpRedistribute.withdrawSubnet: {} withdrawn on host {} (net={}, vpc={})",
+                cidr, hostId, networkId, vpcId);
+    }
+
+    /**
      * Reconcile the live gateway-chassis assignment against the persisted
      * {@link Kind#BGP_ANNOUNCE} rows. When the gateway-chassis migrated,
      * announce on the new host and withdraw from the old. Designed to be
@@ -358,6 +437,77 @@ public class OvnBgpRedistributeManager {
         }
         final OvnChassisMapVO chassis = chassisMapDao.findByChassisUuid(chassisName);
         return chassis == null ? null : chassis.getHostId();
+    }
+
+    private boolean isRoutedAnnounceEnabled() {
+        // ConfigKey.value() can return the raw String default ("true") rather than
+        // a parsed Boolean when the key was hot-added (jar-uf patch) and ConfigDepot
+        // has no persisted/parsed entry yet, so Boolean.TRUE.equals(value()) compares
+        // a Boolean to a String and is always false. Parse defensively — correct for
+        // both the String-default and the properly-registered Boolean cases.
+        return Boolean.parseBoolean(String.valueOf(OvnNetworkConfig.BgpRedistributeRoutedTiers.value()));
+    }
+
+    /**
+     * Send an announce/withdraw for a full CIDR. Splits {@code cidr} into the
+     * network address (carried in the command's publicIp slot) and the prefix
+     * length (carried in the new prefixLength field). Mirrors {@link
+     * #sendCommand} but logs the CIDR verbatim instead of {@code /32}.
+     */
+    private boolean sendSubnetCommand(final long hostId, final String cidr, final String gatewayIp,
+                                      final String anchorCidr, final String vlan,
+                                      final String networkGatewayIp, final String operation) {
+        final int slash = cidr.indexOf('/');
+        final String netAddr = cidr.substring(0, slash);
+        final int prefixLen;
+        try {
+            prefixLen = Integer.parseInt(cidr.substring(slash + 1).trim());
+        } catch (NumberFormatException nfe) {
+            LOGGER.warn("OvnBgpRedistribute: bad CIDR {} (host={}); skipping {}", cidr, hostId, operation);
+            return false;
+        }
+        final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                netAddr,
+                operation,
+                OvnNetworkConfig.BgpFrrVtyshPath.value(),
+                OvnNetworkConfig.BgpFrrAsn.value(),
+                gatewayIp,
+                anchorCidr,
+                vlan,
+                networkGatewayIp);
+        cmd.setPrefixLength(prefixLen);
+        try {
+            final Answer answer = agentManager.easySend(hostId, cmd);
+            if (answer == null) {
+                LOGGER.warn("OvnBgpRedistribute: {} {} host={} no answer (agent offline or wrapper missing)",
+                        operation, cidr, hostId);
+                return false;
+            }
+            if (!answer.getResult()) {
+                LOGGER.warn("OvnBgpRedistribute: {} {} host={} failed: {}",
+                        operation, cidr, hostId, answer.getDetails());
+                return false;
+            }
+            return true;
+        } catch (RuntimeException re) {
+            LOGGER.warn("OvnBgpRedistribute: {} {} host={} threw: {}", operation, cidr, hostId, re.getMessage());
+            return false;
+        }
+    }
+
+    /** Upsert the {@link Kind#BGP_SUBNET_ANNOUNCE} bookkeeping row (cs_id = tier network id). */
+    private void persistSubnetAnnounce(final long controllerId, final long networkId, final long hostId,
+                                       final String cidr) {
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                Kind.BGP_SUBNET_ANNOUNCE, networkId, controllerId);
+        if (existing != null) {
+            existing.setOvnUuid(String.valueOf(hostId));
+            existing.setOvnName(cidr);
+            logicalIdMapDao.update(existing.getId(), existing);
+            return;
+        }
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(
+                Kind.BGP_SUBNET_ANNOUNCE, networkId, controllerId, String.valueOf(hostId), cidr));
     }
 
     private void persistAnnounce(final long controllerId, final long ipAddrId, final long hostId,

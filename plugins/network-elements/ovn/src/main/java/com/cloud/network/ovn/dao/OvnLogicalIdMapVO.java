@@ -97,7 +97,13 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  IP for cheap reverse lookup. Holds no actual OVN UUID — the kind
          *  exists to drive {@code OvnBgpRedistributeManager} reconciliation
          *  on gateway-chassis migration. */
-        BGP_ANNOUNCE
+        BGP_ANNOUNCE,
+        /** ROUTED-tier subnet BGP announce bookkeeping. cs_id = tier
+         *  {@code NetworkVO.id}; ovn_uuid holds the agent host id (as string)
+         *  that last announced the subnet; ovn_name carries the tier CIDR
+         *  (e.g. {@code 10.90.6.0/24}). Kept distinct from {@link #BGP_ANNOUNCE}
+         *  (keyed by public_ip_address.id) so the two id spaces never collide. */
+        BGP_SUBNET_ANNOUNCE
     }
 
     @Id

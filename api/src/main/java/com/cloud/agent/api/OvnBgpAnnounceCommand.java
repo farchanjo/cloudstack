@@ -53,6 +53,11 @@ public class OvnBgpAnnounceCommand extends Command {
     private String anchorCidr;
     private String vlan;
     private String networkGatewayIp;
+    /** Prefix length of the advertised route. {@code null} or {@code <= 0}
+     *  means the legacy host-route default of {@code /32} (per-public-IP FIP
+     *  announce); a value like {@code 24} lets the same command carry a whole
+     *  ROUTED-tier subnet (e.g. {@code 10.90.6.0/24}). */
+    private Integer prefixLength;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -181,5 +186,17 @@ public class OvnBgpAnnounceCommand extends Command {
 
     public String getNetworkGatewayIp() {
         return networkGatewayIp;
+    }
+
+    /** @return advertised prefix length, or {@code null} for the {@code /32}
+     *  host-route default. */
+    public Integer getPrefixLength() {
+        return prefixLength;
+    }
+
+    /** Set the advertised prefix length (e.g. {@code 24} for a routed tier
+     *  subnet). Leave unset for the {@code /32} FIP host-route behaviour. */
+    public void setPrefixLength(final Integer prefixLength) {
+        this.prefixLength = prefixLength;
     }
 }
