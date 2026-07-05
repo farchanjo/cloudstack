@@ -26,6 +26,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
+import com.cloud.dc.DataCenterVO;
+import com.cloud.dc.dao.DataCenterDao;
 import com.cloud.network.Network;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
@@ -63,6 +65,8 @@ public class OvnDhcpService {
     private OvnPluginManager pluginManager;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
+    @Inject
+    private DataCenterDao dataCenterDao;
 
     /**
      * Ensure the tier's DHCP_Options row exists and pin it on the LSP for
@@ -218,7 +222,7 @@ public class OvnDhcpService {
      * gateway (CloudStack convention) so the VM sees one identity for both
      * the DHCP server and the default route.
      */
-    private static Map<String, String> buildDhcpv4Options(final Network network) {
+    private Map<String, String> buildDhcpv4Options(final Network network) {
         final Map<String, String> opts = new HashMap<>();
         final String gateway = StringUtils.defaultString(network.getGateway());
         opts.put("server_id", gateway);
@@ -227,10 +231,25 @@ public class OvnDhcpService {
         if (StringUtils.isNotBlank(gateway)) {
             opts.put("router", gateway);
         }
-        if (StringUtils.isNotBlank(network.getDns1())) {
-            final StringBuilder dns = new StringBuilder("{").append(network.getDns1());
-            if (StringUtils.isNotBlank(network.getDns2())) {
-                dns.append(", ").append(network.getDns2());
+        // DNS: prefer the network's own dns1/dns2; fall back to the zone's
+        // guest DNS when the network row carries none. CloudStack does NOT
+        // persist the inherited zone DNS onto the guest network row (the
+        // dns1/dns2 seen in the API response are synthesized at read-time),
+        // so network.getDns1() is routinely null — without this fallback the
+        // OVN DHCP responder would hand out no resolver at all.
+        String dns1 = network.getDns1();
+        String dns2 = network.getDns2();
+        if (StringUtils.isBlank(dns1)) {
+            final DataCenterVO zone = dataCenterDao.findById(network.getDataCenterId());
+            if (zone != null) {
+                dns1 = zone.getDns1();
+                dns2 = zone.getDns2();
+            }
+        }
+        if (StringUtils.isNotBlank(dns1)) {
+            final StringBuilder dns = new StringBuilder("{").append(dns1);
+            if (StringUtils.isNotBlank(dns2)) {
+                dns.append(", ").append(dns2);
             }
             dns.append("}");
             opts.put("dns_server", dns.toString());
@@ -246,13 +265,23 @@ public class OvnDhcpService {
      * Build the OVN DHCPv6 options map. {@code server_id} is a stable
      * link-local for the LR's south-side LRP; OVN uses it as the responder.
      */
-    private static Map<String, String> buildDhcpv6Options(final Network network) {
+    private Map<String, String> buildDhcpv6Options(final Network network) {
         final Map<String, String> opts = new HashMap<>();
         opts.put("server_id", deriveLinkLocalFromGateway(network.getIp6Gateway()));
-        if (StringUtils.isNotBlank(network.getIp6Dns1())) {
-            final StringBuilder dns = new StringBuilder("{").append(network.getIp6Dns1());
-            if (StringUtils.isNotBlank(network.getIp6Dns2())) {
-                dns.append(", ").append(network.getIp6Dns2());
+        // Same zone-DNS fallback as v4 (see buildDhcpv4Options).
+        String dns1 = network.getIp6Dns1();
+        String dns2 = network.getIp6Dns2();
+        if (StringUtils.isBlank(dns1)) {
+            final DataCenterVO zone = dataCenterDao.findById(network.getDataCenterId());
+            if (zone != null) {
+                dns1 = zone.getIp6Dns1();
+                dns2 = zone.getIp6Dns2();
+            }
+        }
+        if (StringUtils.isNotBlank(dns1)) {
+            final StringBuilder dns = new StringBuilder("{").append(dns1);
+            if (StringUtils.isNotBlank(dns2)) {
+                dns.append(", ").append(dns2);
             }
             dns.append("}");
             opts.put("dns_server", dns.toString());
