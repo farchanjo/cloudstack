@@ -776,21 +776,27 @@ public class OvnFirewallService extends AdapterBase {
      * Synthetic NEGATIVE cs_id for a baseline-drop row, unique per network and
      * direction. Real FirewallRule ids are positive, so these never collide.
      */
-    // Synthetic NEGATIVE cs_id slots per network, spaced by 16 so a slot can
-    // never collide with a different network's slot: 1=drop-egress,
-    // 2=drop-ingress, 3=default-egress-allow, 4..=infrastructure allows.
+    // Synthetic cs_id slots per network (spaced by 16, so slots never collide
+    // across networks): 1=drop-egress, 2=drop-ingress, 3=default-egress-allow,
+    // 4..=infrastructure allows. Offset by FW_SYNTHETIC_CSID_BASE (a huge value
+    // real FirewallRule ids never reach) so a synthetic row never collides with
+    // a user-rule row (cs_id = rule.getId()) under Kind.FIREWALL. MUST be
+    // POSITIVE: the ovn_logical_id_map.cs_id column is `bigint unsigned`, so a
+    // negative value is rejected with "Out of range value for column 'cs_id'".
+    private static final long FW_SYNTHETIC_CSID_BASE = 9_000_000_000_000_000_000L;
+
     private static long baselineCsId(final long networkId, final boolean fromLport) {
-        return -(networkId * 16 + (fromLport ? 1 : 2));
+        return FW_SYNTHETIC_CSID_BASE + networkId * 16 + (fromLport ? 1 : 2);
     }
 
-    /** Synthetic NEGATIVE cs_id for the default-egress ALLOW override row. */
+    /** Synthetic cs_id for the default-egress ALLOW override row. */
     private static long defaultEgressCsId(final long networkId) {
-        return -(networkId * 16 + 3);
+        return FW_SYNTHETIC_CSID_BASE + networkId * 16 + 3;
     }
 
-    /** Synthetic NEGATIVE cs_id for an infrastructure-allow row (slot 4..15). */
+    /** Synthetic cs_id for an infrastructure-allow row (slot 4..15). */
     private static long infraCsId(final long networkId, final int slot) {
-        return -(networkId * 16 + slot);
+        return FW_SYNTHETIC_CSID_BASE + networkId * 16 + slot;
     }
 
     private static Map<String, String> buildFwExternalIds(final FirewallRule rule) {
