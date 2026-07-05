@@ -106,7 +106,7 @@ replace the separate jars; restart both; activate/verify via cmk. JVM debug via
 | Design | ✅ done | this doc |
 | RR bgppeers via cmk | ✅ done | `.34/.35/.36` AS 4200000002 created |
 | P1 Gateway capability | ✅ done | fix in `VpcManagerImpl.createVpcOffering` (Gateway follows Connectivity provider for ROUTED SDN) + `OvnNetworkElement` declares Service.Gateway. Verified: OVN Routed VPC (`vpc-ovn-routed`, routingmode=Dynamic) + tier `10.90.6.0/24` create via cmk with no "Gateway/Ovn not supported"; VM `gap-ovnr-p1` boots (10.90.6.30 on aragog). Deployed to mgmt fat jar. |
-| P2 skip-SNAT routed | ⬜ todo | |
+| P2 skip-SNAT routed | ✅ done | `OvnNetworkElement`: inject `VpcOfferingDao`, add `isRoutedVpc(Vpc)` (offering.getNetworkMode()==ROUTED, fails safe to NATTED), early-return in `ensureVpcSourceNat` for ROUTED (skips both the VPC-wide `snat` row and the source-nat /32 announce; covers both call sites). Verified: a routed VPC created post-fix has **0 snat** rules on its OVN LR (vs 1 on the pre-fix P1 VPC); VM boots + egresses with its real tier IP. Deployed to mgmt fat jar. Open (deferred to P5): whether a ROUTED VPC should allocate a source-nat public IP at all (server-side createVpc path). |
 | P3 routed-private announce | ⬜ todo | |
 | P4 routed-public | ⬜ todo | |
 | P5 mixed + cmk surface | ⬜ todo | |

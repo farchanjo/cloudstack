@@ -83,7 +83,9 @@ import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.PrivateGateway;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
+import com.cloud.network.vpc.VpcOffering;
 import com.cloud.network.vpc.dao.VpcDao;
+import com.cloud.network.vpc.dao.VpcOfferingDao;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.utils.component.AdapterBase;
 import com.cloud.vm.NicProfile;
@@ -162,6 +164,8 @@ public class OvnNetworkElement extends AdapterBase
     private OvnVpcElement vpcElement;
     @Inject
     private VpcDao vpcDao;
+    @Inject
+    private VpcOfferingDao vpcOfferingDao;
     @Inject
     private VlanDao vlanDao;
     @Inject
@@ -1268,6 +1272,18 @@ public class OvnNetworkElement extends AdapterBase
      * {@link #updateVpcSourceNatIp} fires later).
      */
     private void ensureVpcSourceNat(final Vpc vpc, final String lrUuid) {
+        // P2: ROUTED VPCs have no SourceNat service. Their tiers egress with
+        // their real (RFC1918 or public) source IP and are reachable via
+        // BGP-advertised connected routes, not NAT. Skip BOTH the VPC-wide
+        // 'snat <ip> <cidr>' row and the source-nat-IP /32 announce here (both
+        // belong to NATTED mode only). The per-IP applyIps path is already
+        // gated on Service.SourceNat, so this closes the one remaining leak
+        // (implementVpc + ensureVpcSourceNatFromTier both funnel through here).
+        if (isRoutedVpc(vpc)) {
+            LOGGER.info("OvnNetworkElement.ensureVpcSourceNat: VPC id={} is ROUTED — skipping VPC-wide SNAT + source-nat /32 announce",
+                    vpc.getId());
+            return;
+        }
         final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
         if (sourceNatIps == null || sourceNatIps.isEmpty()) {
             LOGGER.debug("OvnNetworkElement.ensureVpcSourceNat: VPC id={} no source-NAT IP yet", vpc.getId());
@@ -1290,6 +1306,26 @@ public class OvnNetworkElement extends AdapterBase
             LOGGER.warn("OvnNetworkElement.ensureVpcSourceNat: VPC id={} SNAT add failed: {}",
                     vpc.getId(), e.getMessage());
         }
+    }
+
+    /**
+     * True when the VPC's offering is in ROUTED network mode. ROUTED VPCs get
+     * no OVN SNAT and no source-nat /32 announce (P2); reachability is via
+     * BGP-advertised tier subnets (P3/P4). Fails safe to {@code false} (NATTED
+     * behaviour) when the offering row is missing, so an orphaned offering
+     * never silently disables NAT on a genuinely NATTED VPC.
+     */
+    private boolean isRoutedVpc(final Vpc vpc) {
+        if (vpc == null) {
+            return false;
+        }
+        final VpcOffering offering = vpcOfferingDao.findById(vpc.getVpcOfferingId());
+        if (offering == null) {
+            LOGGER.warn("OvnNetworkElement.isRoutedVpc: VPC id={} offering id={} not found; assuming NATTED",
+                    vpc.getId(), vpc.getVpcOfferingId());
+            return false;
+        }
+        return NetworkOffering.NetworkMode.ROUTED == offering.getNetworkMode();
     }
 
     /**
