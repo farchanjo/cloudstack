@@ -684,7 +684,13 @@ public class OvnReconcilerService {
         // any LB-PF row still tagged with cs_kind=PORT_FORWARDING in
         // external_ids so a reconcile after upgrade reports + drops them.
         m.put("NAT", new Kind[]{Kind.STATIC_NAT, Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT, Kind.PORT_FORWARDING});
-        m.put("ACL", new Kind[]{Kind.NETWORK_ACL});
+        // FIREWALL (standalone-isolated Firewall service: baseline deny +
+        // infra allow + per-rule ACLs) maps to the same NB `ACL` table as
+        // NETWORK_ACL. It MUST be listed here or sweepStaleMappings never
+        // walks FIREWALL rows → their ovn_logical_id_map bookkeeping rows leak
+        // forever once the owning network is deleted (the NB ACL itself is
+        // cascade-removed with the Logical_Switch, but the mapping row is not).
+        m.put("ACL", new Kind[]{Kind.NETWORK_ACL, Kind.FIREWALL});
         m.put("Load_Balancer", new Kind[]{Kind.LOAD_BALANCER});
         m.put("Logical_Switch_Port", new Kind[]{Kind.NIC, Kind.ORPHAN_NIC, Kind.VPC_PUBLIC_RSP});
         m.put("Logical_Router_Port", new Kind[]{Kind.PUBLIC_LRP, Kind.VPC_PUBLIC_LRP});
