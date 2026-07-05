@@ -2542,7 +2542,16 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         // added to vpc
         boolean isForNsx = _ntwkModel.isProviderForNetworkOffering(Provider.Nsx, guestNtwkOff.getId());
         boolean isForNNetris = _ntwkModel.isProviderForNetworkOffering(Provider.Netris, guestNtwkOff.getId());
-        if (!isForNsx && !isForNNetris
+        // A ROUTED OVN tier carries neither SourceNat nor Gateway on its own
+        // offering (Gateway is a VPC-level service and is rejected on a network
+        // offering at create). Such a tier is still valid for a VPC when its
+        // Connectivity is provided by a non-VirtualRouter SDN (e.g. Ovn): the
+        // SDN's logical router IS the tier's gateway, and egress is BGP-routed,
+        // not NAT'd. Accept it alongside the classic SourceNat/Gateway tiers.
+        boolean isSdnConnectivityTier = guestNtwkOff.getGuestType() == GuestType.Isolated
+                && supportedSvcs.contains(Service.Connectivity)
+                && !providers.contains(Provider.VPCVirtualRouter) && !providers.contains(Provider.VirtualRouter);
+        if (!isForNsx && !isForNNetris && !isSdnConnectivityTier
                 && !(guestNtwkOff.getGuestType() == GuestType.Isolated && (supportedSvcs.contains(Service.SourceNat) || supportedSvcs.contains(Service.Gateway)))) {
 
             throw new InvalidParameterValueException("Only network offerings of type " + GuestType.Isolated + " with service " + Service.SourceNat.getName()
