@@ -3184,6 +3184,15 @@ Configurable, StateListener<VirtualMachine.State, VirtualMachine.Event, VirtualM
     }
 
     private void removeDhcpRulesForPvLan(DomainRouterVO domR, Nic nic, Network network, DataCenterVO dcVO) {
+        if (network == null) {
+            // The guest network this router NIC referenced was already deleted
+            // (e.g. a VPC tier removed before the VPC's router teardown runs).
+            // There is nothing to clean up, and dereferencing a null network
+            // here NPEs the entire router finalizeStop/removeNics path, which
+            // strands the VPC half-deleted (delete-vpc then fails on the same
+            // NPE forever). No-op when the network is gone.
+            return;
+        }
         if (network.getTrafficType() == TrafficType.Guest && nic.getBroadcastUri() != null && nic.getBroadcastUri().getScheme().equals("pvlan")) {
             final NicProfile nicProfile = new NicProfile(nic, network, nic.getBroadcastUri(), nic.getIsolationUri(), 0, false, "pvlan-nic");
 
