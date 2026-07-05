@@ -47,6 +47,10 @@ import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.PublicIpAddress;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
+import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.NetworkDetailVO;
+import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.network.element.ConnectivityProvider;
 import com.cloud.network.element.DhcpServiceProvider;
@@ -61,6 +65,7 @@ import com.cloud.network.element.VpcProvider;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnNicConfig;
 import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -87,6 +92,7 @@ import com.cloud.network.vpc.VpcOffering;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.network.vpc.dao.VpcOfferingDao;
 import com.cloud.offering.NetworkOffering;
+import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
 import com.cloud.utils.component.AdapterBase;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.ReservationContext;
@@ -166,6 +172,12 @@ public class OvnNetworkElement extends AdapterBase
     private VpcDao vpcDao;
     @Inject
     private VpcOfferingDao vpcOfferingDao;
+    @Inject
+    private NetworkDao networkDao;
+    @Inject
+    private NetworkOfferingServiceMapDao networkOfferingServiceMapDao;
+    @Inject
+    private NetworkDetailsDao networkDetailsDao;
     @Inject
     private VlanDao vlanDao;
     @Inject
@@ -393,7 +405,12 @@ public class OvnNetworkElement extends AdapterBase
         // rotation. Catching the case here, on every NIC prepare, ensures
         // the SNAT row exists as soon as both the VPC LR and the source-NAT
         // IP coexist. Idempotent — re-runs return the existing UUID.
-        ensureVpcSourceNatFromTier(network);
+        // P5 mixed-mode dispatch: program egress PER-TIER when the VPC hosts
+        // any routed tier (NAT tier => snat scoped to its OWN cidr; routed
+        // tier => no snat, announce handled below). A pure-NAT VPC and a
+        // uniformly-ROUTED VPC both keep their P2 path unchanged (the legacy
+        // VPC-wide snat writer, whose isRoutedVpc gate already no-ops routed).
+        ensureTierEgressSourceNat(network);
         // Phase II — public-side LRP + default route attachment. Same
         // motivation as ensureVpcSourceNatFromTier: the VPC LR may have
         // implemented before the source-NAT IP existed, so retry on prepare.
@@ -1247,6 +1264,171 @@ public class OvnNetworkElement extends AdapterBase
         }
     }
 
+    // ------------------------------------------------------------------
+    // P5 — per-tier mode (mixed NAT + routed under one VPC LR).
+    //
+    // CloudStack networkmode is a per-VPC property, but a tier's OWN network
+    // offering may omit SourceNat and carry Gateway instead
+    // (VpcManagerImpl.validateNtwkOffForVpc accepts Isolated + SourceNat OR
+    // Gateway; validateNtwkOffForNtwkInVpc only needs the tier's
+    // service/provider pairs to be a subset of the VPC offering's). So NAT
+    // tiers (SourceNat/Ovn) and routed tiers (Gateway/Ovn, no SourceNat)
+    // coexist under one NATTED OVN VPC offering. The per-tier mode is read
+    // from the tier's OWN offering, never from the VPC networkmode.
+    //
+    // Behaviour matrix (preserves P2/P3 for uniform VPCs):
+    //   - uniform NATTED VPC  (no routed tier)  -> legacy VPC-wide snat path.
+    //   - uniform ROUTED VPC  (isRoutedVpc)      -> P2: no snat; P3: announce.
+    //   - MIXED VPC (NATTED offering + >=1 routed tier) -> per-tier: NAT tier
+    //     snat scoped to its own cidr, routed tier no snat + announce.
+    // ------------------------------------------------------------------
+
+    /** ROUTED tier iff its OWN offering does NOT provide {@link Service#SourceNat}
+     *  (it carries Gateway/Connectivity only). NAT tiers (offering has
+     *  SourceNat) => false. */
+    private boolean isRoutedTier(final Network network) {
+        final long offId = network.getNetworkOfferingId();
+        // Fail-safe to NATTED (mirrors isRoutedVpc): a missing/corrupt offering
+        // has NO service-map rows, so areServicesSupportedByNetworkOffering(...
+        // SourceNat) returns false and the raw !SourceNat signal would wrongly
+        // read "routed" — dropping the VPC-wide SNAT and killing NAT egress.
+        // Require Connectivity (every valid OVN tier declares it) as proof the
+        // service map is populated before trusting the SourceNat-absent signal.
+        if (!networkOfferingServiceMapDao.areServicesSupportedByNetworkOffering(offId, Service.Connectivity)) {
+            return false;
+        }
+        return !networkOfferingServiceMapDao.areServicesSupportedByNetworkOffering(offId, Service.SourceNat);
+    }
+
+    /** True when at least one guest tier of the VPC is a routed tier. */
+    private boolean vpcHasRoutedTier(final long vpcId) {
+        final List<NetworkVO> tiers = networkDao.listByVpc(vpcId);
+        if (tiers == null) {
+            return false;
+        }
+        for (final NetworkVO tier : tiers) {
+            if (isRoutedTier(tier)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Per-tier egress SNAT dispatcher (P5). Idempotent; called on every NIC
+     * prepare. Preserves the P2 legacy VPC-wide path for uniform VPCs and
+     * only switches to per-tier SNAT when a NATTED VPC actually hosts a
+     * routed tier (a mixed VPC). The announce side is handled separately by
+     * {@link #ensureRoutedTierAnnounce} (after public-attach, per P3 ordering).
+     */
+    private void ensureTierEgressSourceNat(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        // Uniform ROUTED VPC (P2): delegate to the VPC-wide writer whose
+        // isRoutedVpc gate short-circuits (no snat, no /32 announce). Unchanged.
+        if (isRoutedVpc(vpc)) {
+            ensureVpcSourceNatFromTier(network);
+            return;
+        }
+        // NATTED VPC offering with only NAT tiers -> pure-NAT VPC: keep the
+        // legacy VPC-wide snat on the parent CIDR. No behavioural change.
+        if (!vpcHasRoutedTier(vpc.getId())) {
+            ensureVpcSourceNatFromTier(network);
+            return;
+        }
+        // MIXED VPC: a VPC-wide parent-CIDR snat would wrongly SNAT the routed
+        // tiers living inside the VPC cidr. Drop it (no-op when never written)
+        // and program egress per-tier. A routed tier gets NO snat; a NAT tier
+        // gets a snat scoped to its OWN cidr.
+        sourceNatService.removeVpcSourceNat(network.getDataCenterId(), vpc.getId());
+        // Re-assert per-tier SNAT for EVERY NAT tier of the VPC, not just the
+        // tier being prepared: the VPC-wide row we just removed may have been the
+        // sole egress for NAT tiers prepared while the VPC was still pure-NAT, so
+        // deleting it on a routed-tier prepare would strand them until they
+        // re-prepare. ensureTierSourceNat is idempotent (one Kind.SOURCE_NAT row
+        // per tier), so re-asserting all NAT tiers is safe.
+        final List<NetworkVO> vpcTiers = networkDao.listByVpc(vpc.getId());
+        if (vpcTiers != null) {
+            for (final NetworkVO tier : vpcTiers) {
+                if (!isRoutedTier(tier)) {
+                    ensureTierSourceNat(tier);
+                }
+            }
+        }
+    }
+
+    /**
+     * NAT tier inside a mixed VPC: emit {@code snat <vpcSourceNatIp> <tierCidr>}
+     * on the VPC LR (one {@link Kind#SOURCE_NAT} row per tier, matching
+     * {@link #applyIps} and destroy's {@code removeSnatForTier}), and keep the
+     * shared source-nat /32 steered to the gateway chassis for return traffic.
+     */
+    private void ensureTierSourceNat(final Network network) {
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        final String tierCidr = network.getCidr();
+        if (StringUtils.isBlank(tierCidr)) {
+            return;
+        }
+        final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
+        if (sourceNatIps == null || sourceNatIps.isEmpty()) {
+            return;
+        }
+        final IPAddressVO snatIp = sourceNatIps.get(0);
+        final String externalIp = snatIp.getAddress() == null ? null : snatIp.getAddress().addr();
+        if (StringUtils.isBlank(externalIp)) {
+            return;
+        }
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.SOURCE_NAT, network.getId(), controller.getId());
+        if (existing == null) {
+            try {
+                sourceNatService.addSnat(network.getDataCenterId(), network.getId(), lrMapping.getOvnUuid(),
+                        externalIp, tierCidr);
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnNetworkElement.ensureTierSourceNat: tier id={} snat add failed: {}",
+                        network.getId(), e.getMessage());
+            }
+        }
+        // /32 return-traffic steering (self-gates on the FIP redistribute toggle).
+        bgpRedistributeManager.announce(externalIp, snatIp.getId(), vpc.getId(), vpc.getZoneId());
+    }
+
+    /**
+     * Per-tier advertise override for a routed tier. An explicit
+     * {@link OvnNetworkConfig#NETWORK_DETAIL_TIER_ADVERTISE} network detail
+     * wins ({@code true/1/yes/on} => announce, anything else => suppress);
+     * absent/blank => {@code true}, deferring to
+     * {@link OvnBgpRedistributeManager#announceSubnet}'s own global
+     * routed-tiers gate (so P3 behaviour is unchanged). Nothing hardcoded —
+     * the operator toggles a single tier via {@code cmk update network
+     * details[0].key=ovn.tier.advertise}.
+     */
+    private boolean isTierAdvertiseEnabled(final Network network) {
+        final NetworkDetailVO detail = networkDetailsDao.findDetail(network.getId(),
+                OvnNetworkConfig.NETWORK_DETAIL_TIER_ADVERTISE);
+        if (detail == null || StringUtils.isBlank(detail.getValue())) {
+            return true;
+        }
+        final String v = detail.getValue().trim();
+        return "true".equalsIgnoreCase(v) || "1".equals(v)
+                || "yes".equalsIgnoreCase(v) || "on".equalsIgnoreCase(v);
+    }
+
     /**
      * Same intent as {@link #ensureVpcSourceNat(Vpc, String)} but driven from
      * a tier {@link Network} (no Vpc reference handy). Loads the parent Vpc
@@ -1338,16 +1520,28 @@ public class OvnNetworkElement extends AdapterBase
     }
 
     /**
-     * Announce this tier's subnet to the route reflectors when its VPC is
-     * ROUTED. Best-effort: a missing VPC / non-routed offering / blank CIDR is
-     * a soft no-op. The redistribute manager applies the routed-tier toggle.
+     * Announce this tier's subnet to the route reflectors. Fires when the VPC
+     * is uniformly ROUTED (P3) OR when THIS specific tier is a routed tier
+     * inside an otherwise-NATTED (mixed) VPC (P5). A NAT tier never announces
+     * its subnet. Best-effort: a missing VPC / blank CIDR / advertise-disabled
+     * detail is a soft no-op. The redistribute manager applies the global
+     * routed-tier toggle on top of the per-tier gate here.
      */
     private void ensureRoutedTierAnnounce(final Network network) {
         if (network.getVpcId() == null) {
             return;
         }
         final Vpc vpc = vpcDao.findById(network.getVpcId());
-        if (vpc == null || !isRoutedVpc(vpc)) {
+        if (vpc == null) {
+            return;
+        }
+        // Uniform ROUTED VPC (P3) announces every tier; a mixed VPC announces
+        // only its routed tiers (per-tier signal = tier offering has no SourceNat).
+        if (!isRoutedVpc(vpc) && !isRoutedTier(network)) {
+            return;
+        }
+        // Per-tier advertise override (nothing hardcoded — see isTierAdvertiseEnabled).
+        if (!isTierAdvertiseEnabled(network)) {
             return;
         }
         final String cidr = network.getCidr();

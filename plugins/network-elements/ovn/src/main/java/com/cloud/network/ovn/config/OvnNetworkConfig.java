@@ -94,6 +94,13 @@ public class OvnNetworkConfig implements Configurable {
     /** Per-VPC detail name (mirrors {@link #OVN_PUBLIC_VLAN_OVERRIDE}). */
     public static final String VPC_DETAIL_PUBLIC_VLAN = "ovn.public.vlan";
 
+    /** Per-network (tier) detail: force-enable/disable BGP subnet advertise
+     *  for a routed tier, overriding the plugin's per-tier decision. Absent =>
+     *  the routed-tier's /24 announce follows the global routed-tiers toggle.
+     *  Set via {@code cmk create/update network ... details[0].key=ovn.tier.advertise
+     *  details[0].value=true}. */
+    public static final String NETWORK_DETAIL_TIER_ADVERTISE = "ovn.tier.advertise";
+
     /* ---------- ConfigKeys ---------- */
 
     public static final ConfigKey<Boolean> PublicVlanAuto = new ConfigKey<>(CATEGORY, Boolean.class,
