@@ -692,6 +692,20 @@ public class OvnFirewallService extends AdapterBase {
                 "udp && (udp.dst == 67 || udp.dst == 68)", "dhcp-ingress");
         ensureInfraAllow(nb, controller, network, tierLsUuid, OvnNbClient.ACL_DIRECTION_FROM_LPORT, 6,
                 "udp.dst == 53 || tcp.dst == 53", "dns-egress");
+        // Egress-to-router: the to-lport baseline drop above is UNQUALIFIED by
+        // outport, so it ALSO catches a VM's egress toward its own router-peer
+        // port (rsp-<netuuid>) — silently black-holing ALL VM egress. The
+        // from-lport allow only authorizes the packet's ENTRY into the LS from
+        // the VM; the LS egress pipeline (to-lport) still runs when delivering
+        // the packet to the router port, and with no to-lport allow for that
+        // port it hits the prio-10 drop (proven via ct.new ovn-trace: fresh
+        // egress flow dropped at ls_out_acl for outport==rsp). Permit to-lport
+        // traffic destined to the router-peer port so egress reaches L3. Egress
+        // *filtering* stays enforced at from-lport (this does not weaken it),
+        // and ingress-to-VM stays default-deny (its outport is the VM LSP, not
+        // the router). Port name mirrors the guru/bind convention rsp-<uuid>.
+        ensureInfraAllow(nb, controller, network, tierLsUuid, OvnNbClient.ACL_DIRECTION_TO_LPORT, 7,
+                "outport == \"rsp-" + network.getUuid() + "\"", "router-egress");
     }
 
     /**
