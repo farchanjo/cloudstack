@@ -748,8 +748,16 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         if (CollectionUtils.isNotEmpty(sourceNatServiceProviders)) {
             svcProviderMap.put(Service.Gateway, sourceNatServiceProviders);
         } else if (NetworkOffering.NetworkMode.ROUTED.equals(networkMode) && org.apache.commons.lang3.StringUtils.isBlank(externalProvider)) {
-            // For Routed mode, add the Gateway service except for external providers such as NSX, Netris to not override the svcProviderMap mapping
-            svcProviderMap.put(Service.Gateway, Sets.newHashSet(Provider.VPCVirtualRouter));
+            // For Routed mode, add the Gateway service except for external providers such as NSX, Netris to not override the svcProviderMap mapping.
+            // When an SDN element backs Connectivity (e.g. OVN), that element's logical router IS the routed gateway, so the Gateway service must
+            // follow the Connectivity provider rather than being forced to VPCVirtualRouter -- otherwise an OVN tier (Gateway/Ovn) can never match
+            // the VPC's Gateway provider and network creation fails with "Service/provider combination Gateway/Ovn is not supported by VPC".
+            final Set<Provider> connectivityProviders = svcProviderMap.get(Service.Connectivity);
+            if (CollectionUtils.isNotEmpty(connectivityProviders) && !connectivityProviders.contains(Provider.VPCVirtualRouter)) {
+                svcProviderMap.put(Service.Gateway, connectivityProviders);
+            } else {
+                svcProviderMap.put(Service.Gateway, Sets.newHashSet(Provider.VPCVirtualRouter));
+            }
             redundantRouterService = Service.Gateway;
         }
 

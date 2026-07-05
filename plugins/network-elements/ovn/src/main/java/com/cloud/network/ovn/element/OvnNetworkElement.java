@@ -1468,11 +1468,15 @@ public class OvnNetworkElement extends AdapterBase
     private static Map<Service, Map<Capability, String>> buildCapabilities() {
         final Map<Service, Map<Capability, String>> caps = new HashMap<>();
         // Every Service entry must have a (possibly empty) map; CloudStack
-        // capability look-ups assume non-null values. Service.Firewall and
-        // Service.Gateway intentionally left out: their upstream definitions
-        // enforce sub-capability lists OVN does not surface natively
-        // (Firewall: TrafficStatistics, Gateway: RedundantRouter).
+        // capability look-ups assume non-null values. Service.Firewall is
+        // intentionally left out (its upstream definition enforces
+        // TrafficStatistics, which OVN does not surface natively).
+        // Service.Gateway IS declared: a Routed (dynamic-routing / BGP) VPC
+        // needs a Gateway provider, and the OVN distributed LR is that gateway
+        // (HA via ha_chassis_group). Without it a ROUTED OVN VPC tier fails
+        // "Service/provider combination Gateway/Ovn is not supported by VPC".
         caps.put(Service.Connectivity, new HashMap<>());
+        caps.put(Service.Gateway, gatewayCaps());
         caps.put(Service.Dhcp, dhcpCaps());
         caps.put(Service.Dns, dnsCaps());
         caps.put(Service.SourceNat, sourceNatCaps());
@@ -1486,6 +1490,15 @@ public class OvnNetworkElement extends AdapterBase
     private static Map<Capability, String> dnsCaps() {
         final Map<Capability, String> m = new HashMap<>();
         m.put(Capability.AllowDnsSuffixModification, "true");
+        return m;
+    }
+
+    private static Map<Capability, String> gatewayCaps() {
+        final Map<Capability, String> m = new HashMap<>();
+        // OVN's LR gateway is distributed + HA via ha_chassis_group; expose the
+        // RedundantRouter capability (consistent with sourceNatCaps) so the
+        // Gateway service validates on Routed VPC offerings.
+        m.put(Capability.RedundantRouter, "true");
         return m;
     }
 
