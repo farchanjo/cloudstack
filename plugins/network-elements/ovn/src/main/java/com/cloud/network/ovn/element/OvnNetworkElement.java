@@ -1168,12 +1168,29 @@ public class OvnNetworkElement extends AdapterBase
             }
         }
         final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.TRUE);
-        if (sourceNatIps == null || sourceNatIps.isEmpty()) {
+        final IPAddressVO ip;
+        if (sourceNatIps != null && !sourceNatIps.isEmpty()) {
+            ip = sourceNatIps.get(0);
+        } else if (vpcHasRoutedTier(vpc.getId())) {
+            // Mode-4 (routed-public): a VPC hosting only routed tiers never gets
+            // a source-NAT IP marked (nothing drives VPC-level SourceNat), yet
+            // its LR still needs a public-segment foot + default route so the
+            // routed tiers can egress. Anchor the public LRP on the first
+            // operator-associated public IP instead of the (absent) source-NAT
+            // IP. Gated on vpcHasRoutedTier so pure-NAT / FIP VPCs (which always
+            // have a source-NAT IP) never reach this branch.
+            final List<IPAddressVO> associated = ipAddressDao.listByAssociatedVpc(vpc.getId(), Boolean.FALSE);
+            if (associated == null || associated.isEmpty()) {
+                LOGGER.debug("OvnNetworkElement.ensureVpcPublicAttached: routed VPC id={} has no source-NAT and no associated public IP to anchor the public LRP — deferred (associate a public IP)",
+                        vpc.getId());
+                return;
+            }
+            ip = associated.get(0);
+        } else {
             LOGGER.debug("OvnNetworkElement.ensureVpcPublicAttached: VPC id={} no source-NAT IP yet — deferred",
                     vpc.getId());
             return;
         }
-        final IPAddressVO ip = sourceNatIps.get(0);
         final String externalIp = ip.getAddress() == null ? null : ip.getAddress().addr();
         if (StringUtils.isBlank(externalIp)) {
             return;
