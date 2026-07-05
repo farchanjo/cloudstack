@@ -2587,6 +2587,23 @@ public class NetworkOrchestrator extends ManagerBase implements NetworkOrchestra
             _nicDao.update(nic.getId(), nic);
         }
 
+        if (network == null) {
+            // The guest network this NIC referenced was already deleted (e.g. a
+            // VPC tier removed before the owning router/VM is expunged). Every
+            // step below (security-group profile, element.release, guru.deallocate,
+            // shared-subnet DHCP/DNS cleanup, IPv6 usage event) unconditionally
+            // dereferences `network`, so a null here NPEs the whole expunge path
+            // and strands the VM/VPC half-deleted. With no network there is
+            // nothing network-scoped to release — just drop the orphaned NIC row
+            // (+ its secondary IPs) and return.
+            if (BooleanUtils.isNotTrue(preserveNics)) {
+                _nicDao.remove(nic.getId());
+                logger.debug("Removed orphaned NIC ID={} whose network was already deleted", nic.getId());
+            }
+            removeVmSecondaryIpsOfNic(nic.getId());
+            return;
+        }
+
         final NicProfile profile = new NicProfile(nic, network, null, null, null, _networkModel.isSecurityGroupSupportedInNetwork(network), _networkModel.getNetworkTag(
                 vm.getHypervisorType(), network));
 
