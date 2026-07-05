@@ -414,6 +414,26 @@ public class OvnPublicNetworkManager {
      */
     public OvnNbClient.BindResult bindVpcToPublic(final long zoneId, final String lrUuid, final String publicMac,
                                                    final List<String> publicNetworks, final long vpcId) {
+        return bindOwnerToPublic(zoneId, vpcId, lrUuid, publicMac, publicNetworks,
+                "lrp-public-vpc" + vpcId, "rsp-public-vpc" + vpcId, null,
+                Kind.VPC_PUBLIC_LRP, Kind.VPC_PUBLIC_RSP, Kind.STATIC_ROUTE, "default-vpc" + vpcId);
+    }
+
+    /**
+     * Owner-agnostic public bind. A VPC caller passes the VPC public Kinds +
+     * {@code lrp-public-vpc<id>} / {@code rsp-public-vpc<id>} names +
+     * {@code nexthopOverride=null} (→ {@link #pickGatewayFromNetworks}), which
+     * reproduces the historical VPC behaviour byte-for-byte. A standalone
+     * Isolated network passes the ISOLATED_* Kinds + {@code *-net<id>} names +
+     * an explicit next-hop (the real public VLAN gateway) so its default route
+     * points at a reachable upstream instead of the naive {@code .1} heuristic.
+     */
+    private OvnNbClient.BindResult bindOwnerToPublic(final long zoneId, final long ownerId, final String lrUuid,
+                                                     final String publicMac, final List<String> publicNetworks,
+                                                     final String lrpName, final String lspName,
+                                                     final String nexthopOverride,
+                                                     final Kind lrpKind, final Kind rspKind,
+                                                     final Kind routeKind, final String routeName) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             throw new OvnException("OvnPublicNetworkManager: no controller for zone " + zoneId);
@@ -422,26 +442,23 @@ public class OvnPublicNetworkManager {
         final String hagUuid = ensureHaChassisGroupForZone(zoneId);
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final OvnNbClient.BindRequest req = new OvnNbClient.BindRequest(
-                lrUuid, publicLsUuid,
-                "lrp-public-vpc" + vpcId,
-                publicMac,
-                publicNetworks,
-                "rsp-public-vpc" + vpcId);
+                lrUuid, publicLsUuid, lrpName, publicMac, publicNetworks, lspName);
         // Tag the peer LSP so OvnReconcilerService can classify it as a
-        // VPC_PUBLIC_RSP row instead of an untaggable, invisible orphan.
-        final OvnNbClient.BindResult result = nb.bindLrToLs(req, rspExternalIds(zoneId, vpcId));
+        // *_PUBLIC_RSP row instead of an untaggable, invisible orphan.
+        final OvnNbClient.BindResult result = nb.bindLrToLs(req, ownerRspExternalIds(zoneId, ownerId, rspKind));
         nb.lrpSetHaChassisGroup(result.lrpUuid, hagUuid);
-        persistVpcPublicBind(controller, zoneId, vpcId, lrUuid, req, result);
-        LOGGER.info("OvnPublicNetworkManager: bound VPC LR {} to public LS {} (lrp={} hag={})",
+        persistOwnerPublicBind(controller, zoneId, ownerId, lrUuid, req, result,
+                nexthopOverride, lrpKind, rspKind, routeKind, routeName);
+        LOGGER.info("OvnPublicNetworkManager: bound LR {} to public LS {} (lrp={} hag={})",
                 lrUuid, publicLsUuid, result.lrpUuid, hagUuid);
         return result;
     }
 
-    /** {@code external_ids} tag for the VPC public peer LSP (rsp-public-vpc&lt;id&gt;). */
-    private Map<String, String> rspExternalIds(final long zoneId, final long vpcId) {
+    /** {@code external_ids} tag for the public peer LSP, keyed by owner + rsp Kind. */
+    private Map<String, String> ownerRspExternalIds(final long zoneId, final long ownerId, final Kind rspKind) {
         final Map<String, String> ext = new HashMap<>();
-        ext.put(OvnConstants.EXT_ID_KIND, Kind.VPC_PUBLIC_RSP.name());
-        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(vpcId));
+        ext.put(OvnConstants.EXT_ID_KIND, rspKind.name());
+        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(ownerId));
         ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(zoneId));
         return ext;
     }
@@ -451,25 +468,28 @@ public class OvnPublicNetworkManager {
      * mapping rows created by {@link #bindVpcToPublic} so
      * {@link #unbindVpcFromPublic} can resolve and drop all three cleanly.
      */
-    private void persistVpcPublicBind(final OvnControllerVO controller, final long zoneId, final long vpcId,
-                                      final String lrUuid, final OvnNbClient.BindRequest req,
-                                      final OvnNbClient.BindResult result) {
+    private void persistOwnerPublicBind(final OvnControllerVO controller, final long zoneId, final long ownerId,
+                                        final String lrUuid, final OvnNbClient.BindRequest req,
+                                        final OvnNbClient.BindResult result, final String nexthopOverride,
+                                        final Kind lrpKind, final Kind rspKind,
+                                        final Kind routeKind, final String routeName) {
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
-        // Default route so VPC traffic reaches upstream BGP fabric. The
-        // nexthop is the first IP on the public network — caller controls.
+        // Default route so owner traffic reaches the upstream fabric. VPC callers
+        // pass a null override and keep the historical .1 heuristic; isolated
+        // callers pass the real public VLAN gateway.
+        final String nexthop = nexthopOverride != null ? nexthopOverride : pickGatewayFromNetworks(req.lrpNetworks);
         final String routeUuid = nb.addLogicalRouterStaticRoute(lrUuid, "0.0.0.0/0",
-                pickGatewayFromNetworks(req.lrpNetworks),
-                req.lrpName, "dst-ip",
-                Map.of(OvnConstants.EXT_ID_KIND, Kind.STATIC_ROUTE.name(),
-                        OvnConstants.EXT_ID_ID, String.valueOf(vpcId)));
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId(),
+                nexthop, req.lrpName, "dst-ip",
+                Map.of(OvnConstants.EXT_ID_KIND, routeKind.name(),
+                        OvnConstants.EXT_ID_ID, String.valueOf(ownerId)));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(lrpKind, ownerId, controller.getId(),
                 result.lrpUuid, req.lrpName));
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_PUBLIC_RSP, vpcId, controller.getId(),
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(rspKind, ownerId, controller.getId(),
                 result.lspUuid, req.lspName));
         // Persist the static-route mapping so unbind can drop it cleanly.
-        // Uses Kind.STATIC_ROUTE keyed by vpcId — one default route per VPC.
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.STATIC_ROUTE, vpcId, controller.getId(),
-                routeUuid, "default-vpc" + vpcId));
+        // One default route per owner (keyed by owner id under routeKind).
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(routeKind, ownerId, controller.getId(),
+                routeUuid, routeName));
     }
 
     /**
@@ -481,30 +501,66 @@ public class OvnPublicNetworkManager {
     public String ensureVpcBoundToPublic(final long zoneId, final long vpcId, final String lrUuid,
                                          final String publicMac, final List<String> publicNetworks,
                                          final Integer publicVlanTag, final String physnetName) {
+        return ensureOwnerBoundToPublic(zoneId, vpcId, lrUuid, publicMac, publicNetworks,
+                publicVlanTag, physnetName,
+                "lrp-public-vpc" + vpcId, "rsp-public-vpc" + vpcId, null,
+                Kind.VPC_PUBLIC_LRP, Kind.VPC_PUBLIC_RSP, Kind.STATIC_ROUTE, "default-vpc" + vpcId);
+    }
+
+    /**
+     * Phase B — idempotent public bind for a standalone Isolated network.
+     * Isolated analogue of {@link #ensureVpcBoundToPublic}: keys every row
+     * under the ISOLATED_* Kinds by {@code networkId}, names the ports
+     * {@code lrp-public-net<id>} / {@code rsp-public-net<id>}, and points the
+     * default route at the supplied real public VLAN gateway ({@code nexthopGateway}).
+     */
+    public String ensureIsolatedNetworkBoundToPublic(final long zoneId, final long networkId, final String lrUuid,
+                                                      final String publicMac, final List<String> publicNetworks,
+                                                      final Integer publicVlanTag, final String physnetName,
+                                                      final String nexthopGateway) {
+        return ensureOwnerBoundToPublic(zoneId, networkId, lrUuid, publicMac, publicNetworks,
+                publicVlanTag, physnetName,
+                "lrp-public-net" + networkId, "rsp-public-net" + networkId, nexthopGateway,
+                Kind.ISOLATED_PUBLIC_LRP, Kind.ISOLATED_PUBLIC_RSP, Kind.ISOLATED_STATIC_ROUTE, "default-net" + networkId);
+    }
+
+    /**
+     * Owner-agnostic idempotent public bind. VPC + isolated callers feed their
+     * own Kind trio / port names / next-hop; the stale-mapping guard, public LS
+     * pre-create and HA-chassis ensure are shared verbatim.
+     */
+    private String ensureOwnerBoundToPublic(final long zoneId, final long ownerId, final String lrUuid,
+                                            final String publicMac, final List<String> publicNetworks,
+                                            final Integer publicVlanTag, final String physnetName,
+                                            final String lrpName, final String lspName,
+                                            final String nexthopOverride,
+                                            final Kind lrpKind, final Kind rspKind,
+                                            final Kind routeKind, final String routeName) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             throw new OvnException("OvnPublicNetworkManager: no controller for zone " + zoneId);
         }
         final OvnNbClient nbExist = pluginManager.nbClient(zoneId);
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(lrpKind, ownerId, controller.getId());
         if (existing != null) {
             if (nbExist.rowExistsByUuid("Logical_Router_Port", existing.getOvnUuid())) {
                 return existing.getOvnUuid();
             }
-            LOGGER.warn("OvnPublicNetworkManager: VPC_PUBLIC_LRP mapping vpc={} -> {} stale; recreating",
-                    vpcId, existing.getOvnUuid());
+            LOGGER.warn("OvnPublicNetworkManager: {} mapping owner={} -> {} stale; recreating",
+                    lrpKind, ownerId, existing.getOvnUuid());
             logicalIdMapDao.remove(existing.getId());
             // A stale public LRP implies the paired default route + peer RSP
             // may also have been GC'd by cascade.
-            dropStaleMapping(controller, Kind.STATIC_ROUTE, vpcId);
-            dropStaleMapping(controller, Kind.VPC_PUBLIC_RSP, vpcId);
+            dropStaleMapping(controller, routeKind, ownerId);
+            dropStaleMapping(controller, rspKind, ownerId);
         }
         // Pre-create public LS with the supplied vlan/physnet so the localnet
         // port is correctly tagged on first creation. Subsequent calls hit the
         // idempotent path inside ensurePublicLogicalSwitch.
         ensurePublicLogicalSwitch(zoneId, publicVlanTag, physnetName);
         ensureHaChassisGroupForZone(zoneId);
-        final OvnNbClient.BindResult bound = bindVpcToPublic(zoneId, lrUuid, publicMac, publicNetworks, vpcId);
+        final OvnNbClient.BindResult bound = bindOwnerToPublic(zoneId, ownerId, lrUuid, publicMac, publicNetworks,
+                lrpName, lspName, nexthopOverride, lrpKind, rspKind, routeKind, routeName);
         return bound.lrpUuid;
     }
 
@@ -733,6 +789,24 @@ public class OvnPublicNetworkManager {
      * OVSDB strong reference between an LRP and its peer LSP).
      */
     public void unbindVpcFromPublic(final long zoneId, final long vpcId, final String lrUuid) {
+        unbindOwnerFromPublic(zoneId, vpcId, lrUuid,
+                Kind.VPC_PUBLIC_LRP, Kind.VPC_PUBLIC_RSP, Kind.STATIC_ROUTE);
+    }
+
+    /**
+     * Phase B — reverse of {@link #ensureIsolatedNetworkBoundToPublic}. Drops
+     * the isolated network's default route, public peer RSP, and public LRP
+     * (RSP before LRP — no cascade between them). Every ISOLATED_* row keyed
+     * by {@code networkId}.
+     */
+    public void unbindIsolatedNetworkFromPublic(final long zoneId, final long networkId, final String lrUuid) {
+        unbindOwnerFromPublic(zoneId, networkId, lrUuid,
+                Kind.ISOLATED_PUBLIC_LRP, Kind.ISOLATED_PUBLIC_RSP, Kind.ISOLATED_STATIC_ROUTE);
+    }
+
+    /** Owner-agnostic public unbind. VPC + isolated callers feed their own Kind trio. */
+    private void unbindOwnerFromPublic(final long zoneId, final long ownerId, final String lrUuid,
+                                       final Kind lrpKind, final Kind rspKind, final Kind routeKind) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             return;
@@ -742,31 +816,31 @@ public class OvnPublicNetworkManager {
         // is still fully cleaned synchronously instead of waiting for the
         // reconciler sweep. Every helper below is a no-op on a null mapping.
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
-        dropStaticRoute(nb, controller, zoneId, vpcId, lrUuid);
-        final OvnLogicalIdMapVO rspMapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_RSP, vpcId, controller.getId());
-        dropMappedRow(nb::deleteLogicalSwitchPort, controller, zoneId, vpcId, Kind.VPC_PUBLIC_RSP, rspMapping);
-        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
-        if (dropMappedRow(nb::deleteLogicalRouterPort, controller, zoneId, vpcId, Kind.VPC_PUBLIC_LRP, mapping)) {
-            LOGGER.info("OvnPublicNetworkManager: unbound VPC {} from public LS (lrp={})",
-                    vpcId, mapping.getOvnUuid());
+        dropStaticRoute(nb, controller, zoneId, ownerId, lrUuid, routeKind);
+        final OvnLogicalIdMapVO rspMapping = logicalIdMapDao.findByCsId(rspKind, ownerId, controller.getId());
+        dropMappedRow(nb::deleteLogicalSwitchPort, controller, zoneId, ownerId, rspKind, rspMapping);
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(lrpKind, ownerId, controller.getId());
+        if (dropMappedRow(nb::deleteLogicalRouterPort, controller, zoneId, ownerId, lrpKind, mapping)) {
+            LOGGER.info("OvnPublicNetworkManager: unbound owner {} from public LS (lrp={})",
+                    ownerId, mapping.getOvnUuid());
         }
     }
 
-    /** Drops the default static route mapping for a VPC (its own NB delete signature needs {@code lrUuid}). */
+    /** Drops the default static route mapping for an owner (its own NB delete signature needs {@code lrUuid}). */
     private void dropStaticRoute(final OvnNbClient nb, final OvnControllerVO controller, final long zoneId,
-                                 final long vpcId, final String lrUuid) {
-        final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE, vpcId, controller.getId());
+                                 final long ownerId, final String lrUuid, final Kind routeKind) {
+        final OvnLogicalIdMapVO routeMapping = logicalIdMapDao.findByCsId(routeKind, ownerId, controller.getId());
         if (routeMapping == null) {
             return;
         }
         // Enqueue first so async retry covers any sync failure mode.
-        enqueueIfAbsent(controller.getId(), zoneId, Kind.STATIC_ROUTE, routeMapping.getOvnUuid(), vpcId);
+        enqueueIfAbsent(controller.getId(), zoneId, routeKind, routeMapping.getOvnUuid(), ownerId);
         try {
             nb.deleteLogicalRouterStaticRoute(lrUuid, routeMapping.getOvnUuid());
             logicalIdMapDao.remove(routeMapping.getId());
-            pendingDeletionDao.markSucceededByOvnUuid(routeMapping.getOvnUuid(), Kind.STATIC_ROUTE.name());
+            pendingDeletionDao.markSucceededByOvnUuid(routeMapping.getOvnUuid(), routeKind.name());
         } catch (OvnException e) {
-            LOGGER.warn("OvnPublicNetworkManager.unbindVpc: route {} delete failed; mapping retained for retry: {}",
+            LOGGER.warn("OvnPublicNetworkManager.unbind: route {} delete failed; mapping retained for retry: {}",
                     routeMapping.getOvnUuid(), e.getMessage());
         }
     }

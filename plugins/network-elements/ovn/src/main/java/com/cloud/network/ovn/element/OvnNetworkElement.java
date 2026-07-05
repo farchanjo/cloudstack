@@ -228,6 +228,12 @@ public class OvnNetworkElement extends AdapterBase
             // without an external VR. Idempotent: bindTierToVpc returns the
             // existing LRP/LSP UUIDs when the patch already exists.
             ensureTierBoundToVpcLr(network, lsUuid);
+            // Phase B — a standalone (non-VPC) Isolated network with L3
+            // (SourceNat) gets its own per-network LR + gateway LRP here so it
+            // has a default gateway; public attach + source-NAT are deferred to
+            // prepare()/applyIps() (no public IP allocated yet at implement).
+            ensureIsolatedNetworkGateway(network, lsUuid);
+            ensureIsolatedNetworkPublic(network);
         } catch (OvnException e) {
             throw new ResourceUnavailableException("OVN LS create failed: " + e.getMessage(),
                     Network.class, network.getId());
@@ -426,6 +432,15 @@ public class OvnNetworkElement extends AdapterBase
         // the announce installs the datapath route + truly originates. No-op
         // for NATTED VPCs and when the routed-tier toggle is off. Idempotent.
         ensureRoutedTierAnnounce(network);
+        // Phase B — standalone Isolated (non-VPC) L3 retry path. Mirrors the
+        // VPC lazy-alloc catch-up above: the source-NAT public IP may have
+        // been allocated only after implement() ran, so (re)ensure the
+        // per-network LR + gateway and (re)attach public + program source-NAT
+        // on the first NIC prepare. All idempotent and gated internally.
+        if (network.getVpcId() == null) {
+            ensureIsolatedNetworkGateway(network, guru.findLogicalSwitchUuidFor(network));
+            ensureIsolatedNetworkPublic(network);
+        }
         // DHCP pin (idempotent — OvnDhcpService handles the per-tier row).
         dhcpService.ensureDhcpForNic(network, nic);
         // DNS record (best-effort — DnsServiceProvider path runs separately
@@ -515,6 +530,29 @@ public class OvnNetworkElement extends AdapterBase
             LOGGER.warn("OvnNetworkElement.shutdown: removeTierDns failed (network id={}): {}",
                     network.getId(), e.getMessage());
         }
+        // Phase B — mirror destroy()'s isolated L3 teardown: drop source-NAT,
+        // unbind public, delete the per-network LR before the LS itself so no
+        // ISOLATED_* / NETWORK_LR rows leak on a shutdown-without-destroy path.
+        if (network.getVpcId() == null) {
+            try {
+                sourceNatService.removeSnatForTier(network.getDataCenterId(), network.getId());
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnNetworkElement.shutdown: removeSnatForTier failed (network id={}): {}",
+                        network.getId(), e.getMessage());
+            }
+            try {
+                unbindIsolatedPublic(network);
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnNetworkElement.shutdown: unbindIsolatedPublic failed (network id={}): {}",
+                        network.getId(), e.getMessage());
+            }
+            try {
+                deleteIsolatedNetworkLr(network);
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnNetworkElement.shutdown: deleteIsolatedNetworkLr failed (network id={}): {}",
+                        network.getId(), e.getMessage());
+            }
+        }
         final OvnLogicalIdMapVO lsMapping = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
         if (lsMapping == null) {
             return true;
@@ -560,6 +598,16 @@ public class OvnNetworkElement extends AdapterBase
         runDestroyStep("withdrawRoutedTierAnnounce",
                 () -> { withdrawRoutedTierAnnounce(network); return null; },
                 failures, network, Kind.BGP_SUBNET_ANNOUNCE);
+        //  3c. Phase B — standalone Isolated network: unbind public (RSP + LRP
+        //      + default route) BEFORE the LR delete so the LR is still alive
+        //      to detach the route, and the shared public LS's RSP peer LSP
+        //      (no cascade from the LRP) is dropped explicitly.
+        runDestroyStep("unbindIsolatedPublic", () -> { unbindIsolatedPublic(network); return null; },
+                failures, network, Kind.ISOLATED_PUBLIC_LRP);
+        //  3d. Delete the per-network LR (cascade drops gateway LRP + default
+        //      route + snat; sweeps the isolated child mapping rows).
+        runDestroyStep("deleteIsolatedNetworkLr", () -> { deleteIsolatedNetworkLr(network); return null; },
+                failures, network, Kind.NETWORK_LR);
         //  4. Drop the Logical_Switch (cascade kills any leftover LSPs).
         runDestroyStep("deleteLogicalSwitchFor", () -> { guru.deleteLogicalSwitchFor(network); return null; },
                 failures, network, Kind.NETWORK);
@@ -655,6 +703,213 @@ public class OvnNetworkElement extends AdapterBase
             LOGGER.warn("OvnNetworkElement.detachTier: LRP {} delete failed; mapping retained for retry: {}",
                     mapping.getOvnUuid(), e.getMessage());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase B — standalone (non-VPC) Isolated network L3.
+    //
+    // A standalone Isolated network whose offering carries SourceNat gets its
+    // OWN per-network Logical_Router (Kind.NETWORK_LR), a gateway LRP off
+    // network.getGateway()/getCidr(), a public-side LRP into the shared
+    // per-zone public LS + a 0.0.0.0/0 default route, and a source-NAT rule
+    // mapping the tier CIDR to the associated source-NAT public IP. This is
+    // strictly additive: every method below no-ops unless the network is
+    // non-VPC AND the offering provides SourceNat, so no VPC path is touched.
+    // ------------------------------------------------------------------
+
+    /** A non-VPC network whose OWN offering provides {@link Service#SourceNat}
+     *  — i.e. a standalone Isolated network that needs OVN L3 egress. Nothing
+     *  hardcoded: the signal is the offering's service map. */
+    private boolean isStandaloneL3Isolated(final Network network) {
+        return network.getVpcId() == null
+                && networkOfferingServiceMapDao.areServicesSupportedByNetworkOffering(
+                        network.getNetworkOfferingId(), Service.SourceNat);
+    }
+
+    /**
+     * Ensure the per-network LR + gateway LRP exist for a standalone Isolated
+     * network. Idempotent (stale-guarded on the NETWORK_GW_LRP mapping);
+     * mirrors {@link #ensureTierBoundToVpcLr} but off the per-network LR.
+     */
+    private void ensureIsolatedNetworkGateway(final Network network, final String netLsUuid) {
+        if (!isStandaloneL3Isolated(network) || StringUtils.isBlank(netLsUuid)) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final String gateway = network.getGateway();
+        final String cidr = network.getCidr();
+        if (gateway == null || cidr == null) {
+            LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkGateway: network id={} missing gateway/cidr; skipping",
+                    network.getId());
+            return;
+        }
+        try {
+            final String lrUuid = vpcElement.createLogicalRouterForNetwork(network);
+            applyLrCtTimeouts(pluginManager.nbClient(network.getDataCenterId()), lrUuid);
+            final int prefix = Integer.parseInt(cidr.substring(cidr.indexOf('/') + 1));
+            final List<String> networks = List.of(gateway + "/" + prefix);
+            final String gwMac = deriveGatewayMac(gateway);
+            final String tierName = network.getUuid();
+            final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+            OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK_GW_LRP, network.getId(), controller.getId());
+            if (existing != null && !nb.rowExistsByUuid("Logical_Router_Port", existing.getOvnUuid())) {
+                LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkGateway: NETWORK_GW_LRP mapping net={} -> {} stale; recreating",
+                        network.getId(), existing.getOvnUuid());
+                logicalIdMapDao.remove(existing.getId());
+                existing = null;
+            }
+            if (existing != null) {
+                nb.updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
+                nb.ensureRouterPeerLsp(netLsUuid, "rsp-" + tierName, "lrp-" + tierName);
+                return;
+            }
+            final OvnNbClient.BindResult bind = vpcElement.bindNetworkGateway(network, lrUuid, netLsUuid,
+                    tierName, gwMac, networks);
+            logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK_GW_LRP, network.getId(), controller.getId(),
+                    bind.lrpUuid, "lrp-" + tierName));
+            LOGGER.info("OvnNetworkElement.ensureIsolatedNetworkGateway: LR {} + gw LRP {} for isolated network id={}",
+                    lrUuid, bind.lrpUuid, network.getId());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkGateway: network id={} L3 setup failed: {}",
+                    network.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * Program source-NAT + public attach + default route for a standalone
+     * Isolated network, reading the source-NAT public IP from
+     * {@link IPAddressDao#listByAssociatedNetwork}. Soft no-op (deferred retry
+     * on the next prepare/applyIps) when the LR or the source-NAT IP is not
+     * yet present. Idempotent throughout.
+     */
+    private void ensureIsolatedNetworkPublic(final Network network) {
+        if (!isStandaloneL3Isolated(network)) {
+            return;
+        }
+        final long zoneId = network.getDataCenterId();
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, network.getId(), controller.getId());
+        if (lrMapping == null) {
+            LOGGER.debug("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} has no LR yet — deferred", network.getId());
+            return;
+        }
+        final List<IPAddressVO> sourceNatIps = ipAddressDao.listByAssociatedNetwork(network.getId(), Boolean.TRUE);
+        if (sourceNatIps == null || sourceNatIps.isEmpty()) {
+            LOGGER.debug("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} no source-NAT IP yet — deferred", network.getId());
+            return;
+        }
+        final IPAddressVO ip = sourceNatIps.get(0);
+        final String externalIp = ip.getAddress() == null ? null : ip.getAddress().addr();
+        if (StringUtils.isBlank(externalIp)) {
+            return;
+        }
+        final Vlan vlan = vlanDao.findById(ip.getVlanId());
+        if (vlan == null || StringUtils.isBlank(vlan.getVlanNetmask())) {
+            LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} no usable Vlan for IP {}",
+                    network.getId(), externalIp);
+            return;
+        }
+        // Source-NAT: tier CIDR -> public IP on the per-network LR (idempotent;
+        // one Kind.SOURCE_NAT row per network id, matching destroy's cleanup).
+        final String tierCidr = network.getCidr();
+        if (StringUtils.isNotBlank(tierCidr)
+                && logicalIdMapDao.findByCsId(Kind.SOURCE_NAT, network.getId(), controller.getId()) == null) {
+            try {
+                sourceNatService.addSnat(zoneId, network.getId(), lrMapping.getOvnUuid(), externalIp, tierCidr);
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} snat add failed: {}",
+                        network.getId(), e.getMessage());
+            }
+        }
+        // Public-attach + 0.0.0.0/0 default route (nexthop = real public VLAN
+        // gateway, not the naive .1 heuristic — mirrors the mode-4 datapath fix).
+        final long prefix = NetUtils.getCidrSize(vlan.getVlanNetmask());
+        final List<String> publicNetworks = List.of(externalIp + "/" + prefix);
+        final String publicMac = derivePublicMac(externalIp);
+        final Integer vlanTag = parseVlanTag(vlan.getVlanTag());
+        final String nexthop = StringUtils.isNotBlank(vlan.getVlanGateway()) ? vlan.getVlanGateway() : null;
+        try {
+            publicNetworkManager.ensureIsolatedNetworkBoundToPublic(zoneId, network.getId(), lrMapping.getOvnUuid(),
+                    publicMac, publicNetworks, vlanTag, DEFAULT_PUBLIC_PHYSNET, nexthop);
+            LOGGER.info("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} bound to public (networks={}, mac={}, vlan={}, nexthop={})",
+                    network.getId(), publicNetworks, publicMac, vlanTag, nexthop);
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.ensureIsolatedNetworkPublic: network id={} public bind failed: {}",
+                    network.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * StaticNat (floating IP) for a standalone Isolated network — programs the
+     * {@code dnat_and_snat} rule onto the per-network LR. FIP reachability is
+     * via the isolated public LRP; no VPC-flavored BGP /32 announce.
+     */
+    private boolean applyIsolatedStaticNats(final Network config, final List<? extends StaticNat> rules) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(config.getDataCenterId());
+        if (controller == null) {
+            return false;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, config.getId(), controller.getId());
+        if (lrMapping == null) {
+            LOGGER.warn("OvnNetworkElement.applyStaticNats: isolated network id={} has no LR; skipping", config.getId());
+            return false;
+        }
+        boolean overall = true;
+        for (final StaticNat rule : rules) {
+            try {
+                if (rule.isForRevoke()) {
+                    staticNatService.removeStaticNat(config.getDataCenterId(), rule.getSourceIpAddressId());
+                    continue;
+                }
+                final IPAddressVO publicIp = ipAddressDao.findById(rule.getSourceIpAddressId());
+                final String externalIpStr = publicIp == null || publicIp.getAddress() == null
+                        ? null : publicIp.getAddress().addr();
+                if (StringUtils.isBlank(externalIpStr) || StringUtils.isBlank(rule.getDestIpAddress())) {
+                    LOGGER.warn("OvnNetworkElement.applyStaticNats: isolated rule src id={} unresolved (public={} priv={}); skipping",
+                            rule.getSourceIpAddressId(), externalIpStr, rule.getDestIpAddress());
+                    overall = false;
+                    continue;
+                }
+                staticNatService.addStaticNat(config.getDataCenterId(), rule.getSourceIpAddressId(),
+                        lrMapping.getOvnUuid(), externalIpStr, rule.getDestIpAddress(), null);
+            } catch (RuntimeException e) {
+                LOGGER.error("OvnNetworkElement.applyStaticNats: isolated rule revoke={} src={} dst={} failed: {}",
+                        rule.isForRevoke(), rule.getSourceIpAddressId(), rule.getDestIpAddress(), e.getMessage());
+                overall = false;
+            }
+        }
+        return overall;
+    }
+
+    /** Unbind a standalone Isolated network's public attach (RSP + LRP + default route). */
+    private void unbindIsolatedPublic(final Network network) {
+        if (network.getVpcId() != null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, network.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        publicNetworkManager.unbindIsolatedNetworkFromPublic(network.getDataCenterId(), network.getId(),
+                lrMapping.getOvnUuid());
+    }
+
+    /** Delete a standalone Isolated network's per-network LR (cascade + sweep). */
+    private void deleteIsolatedNetworkLr(final Network network) {
+        if (network.getVpcId() != null) {
+            return;
+        }
+        vpcElement.deleteLogicalRouterForNetwork(network);
     }
 
     @Override
@@ -769,6 +1024,12 @@ public class OvnNetworkElement extends AdapterBase
         }
         final Long vpcId = network.getVpcId();
         if (vpcId == null) {
+            // Phase B — standalone Isolated network: program egress on the
+            // per-network LR (source-NAT + public attach + 0.0.0.0/0 default
+            // route). Both helpers are idempotent and gate internally on the
+            // offering carrying SourceNat.
+            ensureIsolatedNetworkGateway(network, guru.findLogicalSwitchUuidFor(network));
+            ensureIsolatedNetworkPublic(network);
             return true;
         }
         final long zoneId = network.getDataCenterId();
@@ -821,7 +1082,11 @@ public class OvnNetworkElement extends AdapterBase
         }
         final Long vpcId = config.getVpcId();
         if (vpcId == null) {
-            return true;
+            // Phase B — standalone Isolated network StaticNat: program the
+            // dnat_and_snat rule onto the per-network LR. FIP reachability is
+            // via the public LRP (installed by ensureIsolatedNetworkPublic),
+            // so no VPC-flavored BGP /32 announce is needed here.
+            return applyIsolatedStaticNats(config, rules);
         }
         final OvnControllerVO controller = pluginManager.findControllerForZone(config.getDataCenterId());
         if (controller == null) {

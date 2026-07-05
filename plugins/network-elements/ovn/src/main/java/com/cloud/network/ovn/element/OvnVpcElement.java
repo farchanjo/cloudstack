@@ -37,6 +37,7 @@ import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
 import com.cloud.network.ovn.dao.OvnPendingDeletionDaoImpl;
 import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
+import com.cloud.network.Network;
 import com.cloud.network.vpc.Vpc;
 
 /**
@@ -270,6 +271,117 @@ public class OvnVpcElement {
         final String lrpName = "lrp-" + tierName;
         final String lspName = "rsp-" + tierName;
         return nb.bindLrToLs(new OvnNbClient.BindRequest(lrUuid, tierLsUuid, lrpName, gatewayMac, networks, lspName));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase B — standalone (non-VPC) Isolated network L3.
+    //
+    // A per-network Logical_Router keyed by Kind.NETWORK_LR (name
+    // "lr-net-<networkUuid>", never clashing with a VPC "lr-<vpcUuid>").
+    // These methods mirror their VPC counterparts exactly but never touch
+    // the Kind.VPC id space or the VPC sweep list, so the VPC datapath is
+    // byte-for-byte unchanged.
+    // ------------------------------------------------------------------
+
+    /**
+     * Creates the per-network LR backing a standalone Isolated network.
+     * Idempotent — re-running on a network that already has an LR returns the
+     * existing UUID (and re-syncs {@code external_ids}), mirroring
+     * {@link #createLogicalRouterFor(Vpc)}.
+     */
+    public String createLogicalRouterForNetwork(final Network network) {
+        final long zoneId = network.getDataCenterId();
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            throw new OvnException("no OVN controller for zone " + zoneId);
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        final String lrName = buildNetworkLrName(network);
+        final Map<String, String> ext = buildNetworkExternalIds(network);
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, network.getId(), controller.getId());
+        if (existing != null) {
+            if (nb.rowExistsByUuid("Logical_Router", existing.getOvnUuid())) {
+                try {
+                    nb.updateLogicalRouterExternalIds(existing.getOvnUuid(), ext);
+                } catch (OvnException e) {
+                    LOGGER.warn("OvnVpcElement.createLogicalRouterForNetwork: re-sync external_ids failed for network {}: {}",
+                            network.getId(), e.getMessage());
+                }
+                return existing.getOvnUuid();
+            }
+            LOGGER.warn("OvnVpcElement.createLogicalRouterForNetwork: mapping network={} -> {} stale (NB gone); recreating",
+                    network.getId(), existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
+        }
+        final String uuid = nb.createLogicalRouter(lrName, ext);
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK_LR, network.getId(), controller.getId(), uuid, lrName));
+        LOGGER.info("OVN LR {} created for isolated network id={} name={}", uuid, network.getId(), network.getName());
+        return uuid;
+    }
+
+    /**
+     * Connects the per-network LR to the network's own Logical_Switch via a
+     * router-patch pair carrying the tier gateway IP/MAC. Isolated analogue of
+     * {@link #bindTierToVpc}, but the caller supplies the resolved LR UUID
+     * (created by {@link #createLogicalRouterForNetwork}).
+     */
+    public OvnNbClient.BindResult bindNetworkGateway(final Network network, final String lrUuid,
+                                                     final String netLsUuid, final String tierName,
+                                                     final String gatewayMac, final List<String> networks) {
+        final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+        final String lrpName = "lrp-" + tierName;
+        final String lspName = "rsp-" + tierName;
+        return nb.bindLrToLs(new OvnNbClient.BindRequest(lrUuid, netLsUuid, lrpName, gatewayMac, networks, lspName));
+    }
+
+    /**
+     * Cascade-removes the per-network LR + its OVN children (gateway LRP,
+     * public LRP, default route, snat — all strong refs on the LR) and sweeps
+     * the isolated child mapping rows. Mirrors {@link #deleteLogicalRouterFor}
+     * but scoped entirely to the Kind.NETWORK_LR / ISOLATED_* id space, so no
+     * VPC row is ever touched.
+     */
+    public void deleteLogicalRouterForNetwork(final Network network) {
+        final long zoneId = network.getDataCenterId();
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, network.getId(), controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        // Enqueue first so async retry covers any sync failure mode.
+        enqueueIfAbsent(controller.getId(), zoneId, Kind.NETWORK_LR, mapping.getOvnUuid(), network.getId());
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        try {
+            nb.deleteLogicalRouter(mapping.getOvnUuid());
+            logicalIdMapDao.remove(mapping.getId());
+            markPendingSucceeded(mapping.getOvnUuid(), Kind.NETWORK_LR);
+            sweepChildMappings(network.getId(), controller.getId(),
+                    Kind.NETWORK_GW_LRP, Kind.ISOLATED_PUBLIC_LRP, Kind.ISOLATED_PUBLIC_RSP,
+                    Kind.ISOLATED_STATIC_ROUTE, Kind.SOURCE_NAT);
+            LOGGER.info("OVN LR {} removed for isolated network id={} (cascade)", mapping.getOvnUuid(), network.getId());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnVpcElement.deleteLogicalRouterForNetwork: LR {} delete failed; mapping retained for retry: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            throw e;
+        }
+    }
+
+    private String buildNetworkLrName(final Network network) {
+        return "lr-net-" + network.getUuid();
+    }
+
+    private Map<String, String> buildNetworkExternalIds(final Network network) {
+        final Map<String, String> ext = new HashMap<>();
+        ext.put(OvnConstants.EXT_ID_KIND, Kind.NETWORK_LR.name());
+        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(network.getId()));
+        ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(network.getDataCenterId()));
+        if (network.getName() != null) {
+            ext.put("cs_name", network.getName());
+        }
+        return ext;
     }
 
     private String buildLrName(final Vpc vpc) {

@@ -114,7 +114,32 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  </ul>
          *  Kept distinct from {@link #NETWORK_ACL} (VPC-tier NetworkACLItem rows)
          *  so the two ACL id spaces on the same OVN deployment never collide. */
-        FIREWALL
+        FIREWALL,
+        /** Per-network Logical_Router backing a standalone (non-VPC) Isolated
+         *  network's L3 (Phase B). cs_id = {@code NetworkVO.id} (always &gt; 0);
+         *  ovn_name is {@code lr-net-<networkUuid>}. Distinct from {@link #VPC}
+         *  so the isolated LR lifecycle never collides with a VPC LR. */
+        NETWORK_LR,
+        /** Gateway-side Logical_Router_Port patching a standalone Isolated
+         *  network's own Logical_Switch into its {@link #NETWORK_LR} (the tier
+         *  gateway IP/MAC), keyed by {@code NetworkVO.id}. Distinct from
+         *  {@link #PUBLIC_LRP} (VPC tier gateway) so VPC teardown never sweeps it. */
+        NETWORK_GW_LRP,
+        /** Public-side Logical_Router_Port attaching a standalone Isolated
+         *  network's {@link #NETWORK_LR} to the per-zone public Logical_Switch,
+         *  keyed by {@code NetworkVO.id}. Isolated analogue of
+         *  {@link #VPC_PUBLIC_LRP}; kept distinct so the id spaces never collide. */
+        ISOLATED_PUBLIC_LRP,
+        /** Router-type peer Logical_Switch_Port ({@code rsp-public-net<id>}) of
+         *  {@link #ISOLATED_PUBLIC_LRP} inserted into the shared per-zone public
+         *  Logical_Switch, keyed by {@code NetworkVO.id}. Dropped explicitly on
+         *  teardown (no OVSDB strong ref from the LRP to its peer LSP), mirroring
+         *  {@link #VPC_PUBLIC_RSP}. */
+        ISOLATED_PUBLIC_RSP,
+        /** Default (0.0.0.0/0) Logical_Router_Static_Route on a standalone
+         *  Isolated network's {@link #NETWORK_LR}, keyed by {@code NetworkVO.id}.
+         *  Isolated analogue of the VPC {@link #STATIC_ROUTE}. */
+        ISOLATED_STATIC_ROUTE
     }
 
     @Id
