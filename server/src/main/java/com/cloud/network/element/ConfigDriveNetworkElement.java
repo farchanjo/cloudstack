@@ -631,13 +631,20 @@ public class ConfigDriveNetworkElement extends AdapterBase implements NetworkEle
         Map<Long, List<Network.Service>> supportedServices = new HashMap<>();
         for (NicProfile nic: nics) {
             ArrayList<Network.Service> serviceList = new ArrayList<>();
-            if (_networkModel.isProviderSupportServiceInNetwork(nic.getNetworkId(), Service.Dns, getProvider())) {
+            // Dns/Dhcp here only gate whether ConfigDrive emits network_data.json
+            // (so the guest self-configures its NIC via cloud-init). These services
+            // may be provided by a NON-ConfigDrive element — e.g. OVN native
+            // DHCP/DNS — so gate on the NETWORK supporting the service via ANY
+            // provider, not just ConfigDrive. Otherwise SDN-backed (OVN) guests get
+            // an empty network_data and never bring up / DHCP their NIC (no IP).
+            // UserData stays ConfigDrive-specific: it is genuinely this element's service.
+            if (_networkModel.areServicesSupportedInNetwork(nic.getNetworkId(), Service.Dns)) {
                 serviceList.add(Service.Dns);
             }
             if (_networkModel.isProviderSupportServiceInNetwork(nic.getNetworkId(), Service.UserData, getProvider())) {
                 serviceList.add(Service.UserData);
             }
-            if (_networkModel.isProviderSupportServiceInNetwork(nic.getNetworkId(), Service.Dhcp, getProvider())) {
+            if (_networkModel.areServicesSupportedInNetwork(nic.getNetworkId(), Service.Dhcp)) {
                 serviceList.add(Service.Dhcp);
             }
             supportedServices.put(nic.getId(), serviceList);
