@@ -103,7 +103,18 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  that last announced the subnet; ovn_name carries the tier CIDR
          *  (e.g. {@code 10.90.6.0/24}). Kept distinct from {@link #BGP_ANNOUNCE}
          *  (keyed by public_ip_address.id) so the two id spaces never collide. */
-        BGP_SUBNET_ANNOUNCE
+        BGP_SUBNET_ANNOUNCE,
+        /** Per-{@link com.cloud.network.rules.FirewallRule} OVN ACL mapping for
+         *  a standalone (non-VPC) Isolated network's Firewall service.
+         *  <ul>
+         *    <li>User rule row: cs_id = {@code FirewallRule.id} (always &gt; 0).</li>
+         *    <li>Default-deny baseline + default-egress override rows: cs_id is a
+         *        synthetic NEGATIVE key derived from the network id, so they never
+         *        collide with positive FirewallRule ids.</li>
+         *  </ul>
+         *  Kept distinct from {@link #NETWORK_ACL} (VPC-tier NetworkACLItem rows)
+         *  so the two ACL id spaces on the same OVN deployment never collide. */
+        FIREWALL
     }
 
     @Id

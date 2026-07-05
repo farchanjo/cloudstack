@@ -43,6 +43,7 @@ import com.cloud.network.Network;
 import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
 import com.cloud.network.Network.Service;
+import com.cloud.network.NetworkModel;
 import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.PublicIpAddress;
 import com.cloud.network.dao.IPAddressDao;
@@ -55,6 +56,7 @@ import com.cloud.utils.net.NetUtils;
 import com.cloud.network.element.ConnectivityProvider;
 import com.cloud.network.element.DhcpServiceProvider;
 import com.cloud.network.element.DnsServiceProvider;
+import com.cloud.network.element.FirewallServiceProvider;
 import com.cloud.network.element.IpDeployer;
 import com.cloud.network.element.LoadBalancingServiceProvider;
 import com.cloud.network.element.NetworkACLServiceProvider;
@@ -82,6 +84,7 @@ import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.utils.component.PluggableService;
+import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.rules.StaticNat;
 import com.cloud.network.vpc.NetworkACLItem;
@@ -134,6 +137,7 @@ public class OvnNetworkElement extends AdapterBase
                    PortForwardingServiceProvider,
                    LoadBalancingServiceProvider,
                    NetworkACLServiceProvider,
+                   FirewallServiceProvider,
                    IpDeployer,
                    VpcProvider,
                    PluggableService {
@@ -144,6 +148,8 @@ public class OvnNetworkElement extends AdapterBase
 
     @Inject
     private OvnPluginManager pluginManager;
+    @Inject
+    private NetworkModel networkModel;
     @Inject
     private OvnLogicalIdMapDao logicalIdMapDao;
     @Inject
@@ -898,6 +904,34 @@ public class OvnNetworkElement extends AdapterBase
     public boolean reorderAclRules(final Vpc vpc, final List<? extends Network> networks,
                                    final List<? extends NetworkACLItem> networkACLItems) {
         return firewallService.reorderAclRules(vpc, networks, networkACLItems);
+    }
+
+    // ------------------------------------------------------------------
+    // FirewallServiceProvider — standalone (non-VPC) Isolated networks.
+    // ------------------------------------------------------------------
+
+    /**
+     * Applies CloudStack {@link FirewallRule}s to a standalone Isolated network
+     * (Phase A). The single System-Egress default rule is special-cased exactly
+     * like {@code VirtualRouterElement.applyFWRules}: instead of being programmed
+     * as a normal ACL, it flips the default-egress ALLOW override on/off per the
+     * network's egress default policy (the low-priority default-DENY baseline
+     * that {@link OvnFirewallService} installs governs the deny case). All other
+     * batches delegate to {@link OvnFirewallService#applyFirewallRules}.
+     */
+    @Override
+    public boolean applyFWRules(final Network network, final List<? extends FirewallRule> rules)
+            throws ResourceUnavailableException {
+        if (rules != null && rules.size() == 1) {
+            final FirewallRule rule = rules.get(0);
+            if (rule.getTrafficType() == FirewallRule.TrafficType.Egress
+                    && rule.getType() == FirewallRule.FirewallRuleType.System) {
+                final boolean defaultAllow = networkModel.getNetworkEgressDefaultPolicy(network.getId());
+                final boolean add = rule.getState() != FirewallRule.State.Revoke;
+                return firewallService.applyDefaultEgressRule(network, defaultAllow, add);
+            }
+        }
+        return firewallService.applyFirewallRules(network, rules);
     }
 
     // ------------------------------------------------------------------
@@ -1763,9 +1797,15 @@ public class OvnNetworkElement extends AdapterBase
     private static Map<Service, Map<Capability, String>> buildCapabilities() {
         final Map<Service, Map<Capability, String>> caps = new HashMap<>();
         // Every Service entry must have a (possibly empty) map; CloudStack
-        // capability look-ups assume non-null values. Service.Firewall is
-        // intentionally left out (its upstream definition enforces
-        // TrafficStatistics, which OVN does not surface natively).
+        // capability look-ups assume non-null values.
+        // Service.Firewall IS declared (Phase A): it lets a standalone Isolated
+        // OVN network carry the Firewall service. The only offering-create gate
+        // (NetworkModelImpl.canProviderSupportServices) just checks the Service
+        // key exists; TrafficStatistics is NOT required (OVN ACLs do not surface
+        // per-rule counters, and it is omitted here). firewallCaps() must carry
+        // SupportedTrafficDirection + SupportedProtocols + SupportedEgressProtocols
+        // because FirewallManagerImpl.detectRulesConflict reads all three
+        // unconditionally on rule-create.
         // Service.Gateway IS declared: a Routed (dynamic-routing / BGP) VPC
         // needs a Gateway provider, and the OVN distributed LR is that gateway
         // (HA via ha_chassis_group). Without it a ROUTED OVN VPC tier fails
@@ -1779,7 +1819,22 @@ public class OvnNetworkElement extends AdapterBase
         caps.put(Service.PortForwarding, portForwardingCaps());
         caps.put(Service.Lb, lbCaps());
         caps.put(Service.NetworkACL, aclCaps());
+        caps.put(Service.Firewall, firewallCaps());
         return caps;
+    }
+
+    private static Map<Capability, String> firewallCaps() {
+        final Map<Capability, String> m = new HashMap<>();
+        // Required by FirewallManagerImpl.detectRulesConflict (read on every
+        // Firewall rule-create). TrafficStatistics + MultipleIps are omitted:
+        // OVN ACLs do not surface per-rule counters, and neither is gated on.
+        m.put(Capability.SupportedTrafficDirection, "ingress,egress");
+        m.put(Capability.SupportedProtocols, "tcp,udp,icmp");
+        // 'all' MUST be present for egress or FirewallManagerImpl.detectRulesConflict
+        // rejects the common 'allow all egress' rule (VirtualRouterElement lists it too).
+        // composeMatch already emits no protocol predicate for 'all'.
+        m.put(Capability.SupportedEgressProtocols, "tcp,udp,icmp,all");
+        return m;
     }
 
     private static Map<Capability, String> dnsCaps() {
