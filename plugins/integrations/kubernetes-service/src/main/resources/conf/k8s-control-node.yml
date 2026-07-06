@@ -287,41 +287,51 @@ write_files:
 
       EXTERNAL_ETCD_NODES={{ etcd.unstacked_etcd }}
       EXTERNAL_CNI_PLUGIN={{ k8s.external.cni.plugin }}
-      MAX_SETUP_CRUCIAL_CMD_ATTEMPTS=3
-      crucial_cmd_attempts=1
-      while true; do
-        if (( "$crucial_cmd_attempts" > "$MAX_SETUP_CRUCIAL_CMD_ATTEMPTS" )); then
-          echo "Error: kubeadm init failed!"
-          exit 1
-        fi
-        retval=0
-        set +e
-        if [[ ${EXTERNAL_ETCD_NODES} == true ]]; then
-          kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --upload-certs
-        else
-          kubeadm init --token {{ k8s_control_node.cluster.token }} --token-ttl 0 {{ k8s_control_node.cluster.initargs }} --cri-socket /run/containerd/containerd.sock
-        fi
-        retval=$?
-        set -e
-        if [ $retval -eq 0 ]; then
-          break;
-        fi
-        crucial_cmd_attempts=$[$crucial_cmd_attempts + 1]
-      done
+      if [[ -f /etc/kubernetes/admin.conf ]]; then
+        echo "kubeadm init already completed (/etc/kubernetes/admin.conf exists); skipping init"
+      else
+        MAX_SETUP_CRUCIAL_CMD_ATTEMPTS=3
+        crucial_cmd_attempts=1
+        while true; do
+          if (( "$crucial_cmd_attempts" > "$MAX_SETUP_CRUCIAL_CMD_ATTEMPTS" )); then
+            echo "Error: kubeadm init failed!"
+            exit 1
+          fi
+          retval=0
+          set +e
+          if [[ ${EXTERNAL_ETCD_NODES} == true ]]; then
+            kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --upload-certs
+          else
+            kubeadm init --token {{ k8s_control_node.cluster.token }} --token-ttl 0 {{ k8s_control_node.cluster.initargs }} --cri-socket /run/containerd/containerd.sock
+          fi
+          retval=$?
+          set -e
+          if [ $retval -eq 0 ]; then
+            break;
+          fi
+          crucial_cmd_attempts=$[$crucial_cmd_attempts + 1]
+        done
+      fi
 
       K8S_CONFIG_SCRIPTS_COPY_DIR=/tmp/k8sconfigscripts/
 
-      if [[ $(systemctl is-active setup-kube-system) != "inactive" ]]; then
-        echo "setup-kube-system is running!"
-        exit 1
-      fi
+      gate_wait_attempts=1
+      while [[ $(systemctl is-active setup-kube-system) != "inactive" ]]; do
+        if (( "$gate_wait_attempts" > 60 )); then
+          echo "Error: setup-kube-system did not finish in time!"
+          exit 1
+        fi
+        echo "Waiting for setup-kube-system to finish..."
+        sleep 10
+        gate_wait_attempts=$[$gate_wait_attempts + 1]
+      done
       if [[ "$PATH" != *:/opt/bin && "$PATH" != *:/opt/bin:* ]]; then
         export PATH=$PATH:/opt/bin
       fi
       export KUBECONFIG=/etc/kubernetes/admin.conf
 
       mkdir -p /root/.kube
-      cp -i /etc/kubernetes/admin.conf /root/.kube/config
+      cp -f /etc/kubernetes/admin.conf /root/.kube/config
       chown $(id -u):$(id -g) /root/.kube/config
       echo export PATH=\$PATH:/opt/bin >> /root/.bashrc
 

@@ -240,10 +240,16 @@ write_files:
       exit 0
       fi
 
-      if [[ $(systemctl is-active setup-kube-system) != "inactive" ]]; then
-        echo "setup-kube-system is running!"
-        exit 1
-      fi
+      gate_wait_attempts=1
+      while [[ $(systemctl is-active setup-kube-system) != "inactive" ]]; do
+        if (( "$gate_wait_attempts" > 60 )); then
+          echo "Error: setup-kube-system did not finish in time!"
+          exit 1
+        fi
+        echo "Waiting for setup-kube-system to finish..."
+        sleep 10
+        gate_wait_attempts=$[$gate_wait_attempts + 1]
+      done
       modprobe ip_vs
       modprobe ip_vs_wrr
       modprobe ip_vs_sh
@@ -251,7 +257,11 @@ write_files:
       if [[ "$PATH" != *:/opt/bin && "$PATH" != *:/opt/bin:* ]]; then
         export PATH=$PATH:/opt/bin
       fi
-      kubeadm join {{ k8s_control_node.join_ip }}:6443 --token {{ k8s_control_node.cluster.token }} --discovery-token-unsafe-skip-ca-verification
+      if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+        echo "kubeadm join already completed (/etc/kubernetes/kubelet.conf exists); skipping join"
+      else
+        kubeadm join {{ k8s_control_node.join_ip }}:6443 --token {{ k8s_control_node.cluster.token }} --discovery-token-unsafe-skip-ca-verification
+      fi
 
       sudo touch /home/cloud/success
       echo "true" > /home/cloud/success
