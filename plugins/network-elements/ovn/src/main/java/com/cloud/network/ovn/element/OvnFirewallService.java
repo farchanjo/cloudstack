@@ -226,6 +226,42 @@ public class OvnFirewallService extends AdapterBase {
         }
     }
 
+    /**
+     * Sweep this network's baseline-deny / default-egress / infra-allow /
+     * router-egress FIREWALL mapping rows on network delete. Their NB ACL rows
+     * are cascade-removed with the Logical_Switch, but the
+     * {@code ovn_logical_id_map} bookkeeping rows are NOT — without this they
+     * leak forever (an audit found 52 such orphans across ~10 deleted network
+     * generations, cleaned only by an on-demand reconcile). These synthetic
+     * rows live in this network's reserved band
+     * [{@link #FW_SYNTHETIC_CSID_BASE} + networkId*16, +16); per-rule FIREWALL
+     * rows (cs_id = FirewallRule.id) fall outside the band and are cleaned on
+     * rule revoke. Idempotent + best-effort — safe to call on every destroy.
+     */
+    public void removeTierFirewall(final Network network) {
+        if (network == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final long lo = FW_SYNTHETIC_CSID_BASE + network.getId() * 16L;
+        final long hi = lo + 16L;
+        int removed = 0;
+        for (final OvnLogicalIdMapVO row : logicalIdMapDao.listByKind(Kind.FIREWALL, controller.getId())) {
+            final long csId = row.getCsId();
+            if (csId >= lo && csId < hi) {
+                logicalIdMapDao.remove(row.getId());
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            LOGGER.info("OvnFirewallService.removeTierFirewall: swept {} synthetic FIREWALL mapping rows (network id={})",
+                    removed, network.getId());
+        }
+    }
+
     private void applyOne(final OvnNbClient nb, final OvnControllerVO controller, final String tierLsUuid,
                           final NetworkACLItem rule) {
         final NetworkACLItem.State state = rule.getState();

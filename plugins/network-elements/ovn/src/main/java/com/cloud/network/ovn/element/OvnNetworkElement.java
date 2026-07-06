@@ -587,6 +587,12 @@ public class OvnNetworkElement extends AdapterBase
                 failures, network, Kind.DHCP_OPTIONS);
         runDestroyStep("removeTierDns", () -> { dnsService.removeTierDns(network); return null; },
                 failures, network, Kind.DNS_RECORDS);
+        //  1b. Sweep the network-keyed FIREWALL baseline/infra/router-egress
+        //      mapping rows. The NB ACLs cascade-die with the LS, but the
+        //      ovn_logical_id_map rows would otherwise leak (on-demand
+        //      reconcile is the only other cleaner, so they accumulate).
+        runDestroyStep("removeTierFirewall", () -> { firewallService.removeTierFirewall(network); return null; },
+                failures, network, Kind.FIREWALL);
         //  2. Drop the SOURCE_NAT row for this tier.
         runDestroyStep("removeSnatForTier",
                 () -> { sourceNatService.removeSnatForTier(network.getDataCenterId(), network.getId()); return null; },
