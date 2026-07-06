@@ -1,3 +1,16 @@
+cloudstack (4.24.1.26-SNAPSHOT) UNRELEASED; urgency=low
+
+  * OVN: DHCP dns_server zone fallback; firewall egress-to-router-peer allow;
+    reconciler sweeps stale FIREWALL mapping rows; proactive removeTierFirewall
+    on network delete; standalone isolated L3 (Phase B); routed-public LRP (mode-4);
+    per-tier mixed NAT/routed egress dispatch.
+  * Orchestrator/router: null-guard VPC teardown paths (removeNic, removeDhcpRulesForPvLan)
+    when the guest network is already gone.
+  * Server: configurable embedded-Jetty request/response header size (request.header.size,
+    default 64k) — fixes SAML SSO HTTP 431 on the management UI.
+
+ -- Fabricio Archanjo <fabricio@eonf.ltd>  Mon, 06 Jul 2026 02:55:35 -0300
+
 cloudstack (4.24.1.18-SNAPSHOT) UNRELEASED; urgency=low
 
   * Symmetric VR remove dispatch on VR finalizeStop
