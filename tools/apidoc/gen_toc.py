@@ -92,6 +92,7 @@ known_categories = {
     'Network': 'Network',
     'CiscoNexus': 'Network',
     'OpenDaylight': 'Network',
+    'Ovn': 'Network',
     'createServiceInstance': 'Network',
     'addGloboDnsHost': 'Network',
     'TungstenFabric': 'Tungsten',
