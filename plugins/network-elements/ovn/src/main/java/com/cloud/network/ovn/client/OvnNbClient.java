@@ -1323,8 +1323,11 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
-     * Attaches a load_balancer row to a Logical_Switch (east-west LB on a
-     * tier; not used by the MVP but exposed for completeness).
+     * Attaches a load_balancer row to a Logical_Switch. LS-attached LBs run
+     * {@code ct_lb} in the {@code ls_in_lb} stage of the SOURCE chassis —
+     * fully distributed and symmetric — so a guest on the tier can reach the
+     * VIP (east-west) without router-centralized NAT. Idempotent (OVSDB set
+     * insert of a present element is a no-op).
      */
     public void attachLoadBalancerToLogicalSwitch(final String lsUuid, final String lbUuid) {
         final OvnTransaction tx = newTransaction();
@@ -1332,6 +1335,67 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(lsUuid), "load_balancer",
                 OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
         tx.commit();
+    }
+
+    /** Detaches a load_balancer row from a Logical_Switch. */
+    public void detachLoadBalancerFromLogicalSwitch(final String lsUuid, final String lbUuid) {
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateDeleteSet("Logical_Switch",
+                OvnOpFactory.whereUuid(lsUuid), "load_balancer",
+                OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
+        tx.commit();
+    }
+
+    /**
+     * Adds a {@code Load_Balancer_Health_Check} row for one VIP and writes
+     * the LB's {@code ip_port_mappings} in a single transaction (per
+     * ovn-nb(5) both are required for the service monitor to probe
+     * backends). Dead backends are then excluded from rotation instead of
+     * blackholing new connections. The health-check row is garbage-collected
+     * by OVSDB when its {@code health_check} reference goes away with the LB
+     * — no explicit delete needed on revoke.
+     *
+     * @param vip            must exactly match one key of the LB's
+     *                       {@code vips} map (e.g. {@code "ip:port"})
+     * @param ipPortMappings backend IP -> {@code "<lsp-name>:<source-ip>"};
+     *                       the source IP must be an otherwise unused
+     *                       address on the backend's logical switch
+     * @param hcOptions      {@code interval} / {@code timeout} /
+     *                       {@code success_count} / {@code failure_count}
+     */
+    public void configureLoadBalancerHealthCheck(final String lbUuid, final String vip,
+                                                 final Map<String, String> ipPortMappings,
+                                                 final Map<String, String> hcOptions,
+                                                 final Map<String, String> externalIds) {
+        if (ipPortMappings == null || ipPortMappings.isEmpty()) {
+            throw new OvnException("configureLoadBalancerHealthCheck requires ip_port_mappings");
+        }
+        final ObjectNode hcRow = JsonNodeFactory.instance.objectNode();
+        hcRow.put("vip", vip);
+        if (hcOptions != null && !hcOptions.isEmpty()) {
+            hcRow.set("options", buildMap(hcOptions));
+        }
+        if (externalIds != null && !externalIds.isEmpty()) {
+            hcRow.set("external_ids", buildMap(externalIds));
+        }
+        final String named = OvnNamedUuid.next("hc");
+        final ObjectNode lbRow = JsonNodeFactory.instance.objectNode();
+        lbRow.set("ip_port_mappings", buildMap(ipPortMappings));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Load_Balancer_Health_Check", named, hcRow));
+        tx.add(OvnOpFactory.mutateInsertSet("Load_Balancer", OvnOpFactory.whereUuid(lbUuid),
+                "health_check", OvnRowRef.singletonSet(OvnRowRef.namedUuid(named))));
+        tx.add(OvnOpFactory.update("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), lbRow));
+        tx.commit();
+    }
+
+    /** True when the LB already carries at least one health_check row. */
+    public boolean loadBalancerHasHealthCheck(final String lbUuid) {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("health_check");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), columns));
+        return !extractUuidSet(tx.commit().raw(), 0, "health_check").isEmpty();
     }
 
     /**

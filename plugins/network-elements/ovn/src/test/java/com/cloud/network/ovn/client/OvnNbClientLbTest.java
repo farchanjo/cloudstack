@@ -171,6 +171,56 @@ public class OvnNbClientLbTest {
     }
 
     @Test
+    public void detachLbFromLsEmitsMutateDeleteOnLogicalSwitch() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+
+        client.detachLoadBalancerFromLogicalSwitch("ls-uuid", "lb-uuid-9");
+
+        final ArrayNode params = captureTransactCall();
+        assertEquals("Logical_Switch", params.get(1).get("table").asText());
+        final JsonNode mutation = params.get(1).get("mutations").get(0);
+        assertEquals("load_balancer", mutation.get(0).asText());
+        assertEquals("delete", mutation.get(1).asText());
+    }
+
+    @Test
+    public void configureHealthCheckEmitsInsertReferenceAndMappings() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+
+        client.configureLoadBalancerHealthCheck("lb-uuid-hc",
+                "217.179.89.35:6443",
+                Map.of("10.45.0.125", "lsp-aaa:10.45.0.254"),
+                Map.of("interval", "5", "timeout", "3", "success_count", "1", "failure_count", "3"),
+                Map.of("cs_id", "882"));
+
+        final ArrayNode params = captureTransactCall();
+        // op1: insert Load_Balancer_Health_Check with the vip + options.
+        final JsonNode insert = params.get(1);
+        assertEquals("insert", insert.get("op").asText());
+        assertEquals("Load_Balancer_Health_Check", insert.get("table").asText());
+        assertEquals("217.179.89.35:6443", insert.get("row").get("vip").asText());
+        assertEquals("map", insert.get("row").get("options").get(0).asText());
+        // op2: mutate LB.health_check inserting the named uuid.
+        final JsonNode mutate = params.get(2);
+        assertEquals("mutate", mutate.get("op").asText());
+        assertEquals("Load_Balancer", mutate.get("table").asText());
+        assertEquals("health_check", mutate.get("mutations").get(0).get(0).asText());
+        assertEquals("insert", mutate.get("mutations").get(0).get(1).asText());
+        // op3: update LB.ip_port_mappings.
+        final JsonNode update = params.get(3);
+        assertEquals("update", update.get("op").asText());
+        final JsonNode mappings = update.get("row").get("ip_port_mappings");
+        assertEquals("map", mappings.get(0).asText());
+        assertEquals("10.45.0.125", mappings.get(1).get(0).get(0).asText());
+        assertEquals("lsp-aaa:10.45.0.254", mappings.get(1).get(0).get(1).asText());
+    }
+
+    @Test(expected = OvnException.class)
+    public void configureHealthCheckWithoutMappingsFails() {
+        client.configureLoadBalancerHealthCheck("lb-uuid", "1.2.3.4:80", Map.of(), Map.of(), Map.of());
+    }
+
+    @Test
     public void updateBackendsEmitsUpdateWithVips() {
         when(pool.call(anyString(), any())).thenReturn(emptyReply());
 

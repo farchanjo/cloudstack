@@ -257,6 +257,42 @@ public class OvnPortForwardingServiceTest {
     }
 
     @Test
+    public void freshPfRuleAlsoAttachesToTierLs() throws Exception {
+        final OvnLogicalIdMapVO lsMap = mock(OvnLogicalIdMapVO.class);
+        when(lsMap.getOvnUuid()).thenReturn("ls-uuid-tier");
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK), eq(NETWORK_ID), eq(CONTROLLER_ID))).thenReturn(lsMap);
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap(), isNull()))
+                .thenReturn("lb-uuid-ls");
+
+        final PortForwardingRule rule = pfRule(541L, 2222, 2222, 22, 22, FirewallRule.State.Add);
+
+        assertTrue(service.applyPFRules(network, List.of(rule)));
+
+        verify(nbClient, times(1)).attachLoadBalancerToLogicalRouter(eq(LR_UUID), eq("lb-uuid-ls"));
+        verify(nbClient, times(1)).attachLoadBalancerToLogicalSwitch(eq("ls-uuid-tier"), eq("lb-uuid-ls"));
+    }
+
+    @Test
+    public void revokeDetachesFromTierLsToo() throws Exception {
+        final OvnLogicalIdMapVO lsMap = mock(OvnLogicalIdMapVO.class);
+        when(lsMap.getOvnUuid()).thenReturn("ls-uuid-tier");
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK), eq(NETWORK_ID), eq(CONTROLLER_ID))).thenReturn(lsMap);
+        final OvnLogicalIdMapVO mapping = mock(OvnLogicalIdMapVO.class);
+        when(mapping.getId()).thenReturn(910L);
+        when(mapping.getOvnUuid()).thenReturn("lb-uuid-rls");
+        when(logicalIdMapDao.findByCsId(eq(Kind.PORT_FORWARDING), eq(542L), eq(CONTROLLER_ID))).thenReturn(mapping);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-rls"))).thenReturn(true);
+
+        final PortForwardingRule rule = pfRule(542L, 80, 80, 8080, 8080, FirewallRule.State.Revoke);
+
+        assertTrue(service.applyPFRules(network, List.of(rule)));
+
+        verify(nbClient, times(1)).detachLoadBalancerFromLogicalRouter(eq(LR_UUID), eq("lb-uuid-rls"));
+        verify(nbClient, times(1)).detachLoadBalancerFromLogicalSwitch(eq("ls-uuid-tier"), eq("lb-uuid-rls"));
+        verify(nbClient, times(1)).deleteLoadBalancer(eq("lb-uuid-rls"));
+    }
+
+    @Test
     public void revokeCleansUntrackedLegacyNatWhenMappingAbsent() throws Exception {
         // No mapping row for the rule — only the match-based legacy sweep runs.
         final PortForwardingRule rule = pfRule(540L, 2222, 2222, 22, 22, FirewallRule.State.Revoke);

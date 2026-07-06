@@ -224,12 +224,46 @@ public class OvnPortForwardingService {
             }
             throw oe;
         }
+        attachToTierLs(nb, controller, network, lbUuid);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, rule.getId(), controller.getId(), lbUuid, name));
         LOGGER.info("OvnPortForwardingService: PF rule id={} -> LB {} (protocol={}, vips={})",
                 rule.getId(), lbUuid, protocol, vips);
         // Announce /32 for the public IP backing this PF rule. Idempotent —
         // a public IP with multiple PF rules announces once (keyed by IP id).
         announce(network, publicIpRow);
+    }
+
+    /**
+     * Also attach the LB to the rule's tier Logical_Switch so guests on the
+     * tier reach the VIP east-west: LS-attached LBs run {@code ct_lb} on the
+     * source chassis (symmetric), while the LR attachment keeps serving
+     * north-south. Scope: the rule's own tier only — sibling tiers of the
+     * VPC are deliberately out (no cheap enumeration + teardown coupling).
+     * Best-effort: a missing LS mapping degrades to LR-only (pre-existing
+     * behavior).
+     */
+    private void attachToTierLs(final OvnNbClient nb, final OvnControllerVO controller,
+                                final Network network, final String lbUuid) {
+        final String lsUuid = lookupTierLsUuid(network, controller);
+        if (lsUuid == null) {
+            LOGGER.debug("OvnPortForwardingService: no LS mapping for network id={}; LB {} stays LR-only",
+                    network.getId(), lbUuid);
+            return;
+        }
+        try {
+            nb.attachLoadBalancerToLogicalSwitch(lsUuid, lbUuid);
+        } catch (final OvnException e) {
+            LOGGER.warn("OvnPortForwardingService: LS attach of LB {} failed (east-west VIP degraded): {}",
+                    lbUuid, e.getMessage());
+        }
+    }
+
+    private String lookupTierLsUuid(final Network network, final OvnControllerVO controller) {
+        if (network == null || controller == null) {
+            return null;
+        }
+        final OvnLogicalIdMapVO ls = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        return ls == null ? null : ls.getOvnUuid();
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
@@ -250,7 +284,7 @@ public class OvnPortForwardingService {
                     mapping.getOvnUuid(), rule.getId());
         }
         try {
-            deleteTrackedRow(nb, lrUuid, mapping);
+            deleteTrackedRow(nb, lrUuid, lookupTierLsUuid(network, controller), mapping);
             logicalIdMapDao.remove(mapping.getId());
             pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.PORT_FORWARDING.name());
         } catch (OvnException e) {
@@ -262,22 +296,37 @@ public class OvnPortForwardingService {
 
     /**
      * Delete the NB row a mapping points at. New PF rules track a
-     * {@code Load_Balancer} (detach from the LR, then delete); a legacy
-     * mapping may still track a {@code NAT} row (delete directly). A row that
-     * is already gone is a no-op.
+     * {@code Load_Balancer} (detach from the LR and the tier LS, then
+     * delete); a legacy mapping may still track a {@code NAT} row (delete
+     * directly). A row that is already gone is a no-op.
      */
-    private void deleteTrackedRow(final OvnNbClient nb, final String lrUuid, final OvnLogicalIdMapVO mapping) {
+    private void deleteTrackedRow(final OvnNbClient nb, final String lrUuid, final String lsUuid,
+                                  final OvnLogicalIdMapVO mapping) {
         if (nb.rowExistsByUuid("Load_Balancer", mapping.getOvnUuid())) {
-            try {
-                nb.detachLoadBalancerFromLogicalRouter(lrUuid, mapping.getOvnUuid());
-            } catch (OvnException ignored) {
-                // Best-effort; the LB may already be detached.
-            }
+            detachLbBestEffort(nb, lrUuid, lsUuid, mapping.getOvnUuid());
             nb.deleteLoadBalancer(mapping.getOvnUuid());
         } else if (nb.rowExistsByUuid("NAT", mapping.getOvnUuid())) {
             nb.deleteNatRule(mapping.getOvnUuid());
         } else {
             LOGGER.debug("OvnPortForwardingService: revoke {} no-op (row already gone)", mapping.getOvnUuid());
+        }
+    }
+
+    /** Detach an LB from the LR and (when known) the tier LS; best-effort. */
+    private void detachLbBestEffort(final OvnNbClient nb, final String lrUuid, final String lsUuid,
+                                    final String lbUuid) {
+        try {
+            nb.detachLoadBalancerFromLogicalRouter(lrUuid, lbUuid);
+        } catch (OvnException ignored) {
+            // Best-effort; the LB may already be detached.
+        }
+        if (lsUuid == null) {
+            return;
+        }
+        try {
+            nb.detachLoadBalancerFromLogicalSwitch(lsUuid, lbUuid);
+        } catch (OvnException ignored) {
+            // Best-effort; set delete of an absent element is a no-op anyway.
         }
     }
 
@@ -335,10 +384,11 @@ public class OvnPortForwardingService {
             return;
         }
         final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+        final String lsUuid = lookupTierLsUuid(network, controller);
         final Set<String> onLr = new HashSet<>(nb.listLoadBalancersOnLogicalRouter(lrMap.getOvnUuid()));
         int removed = 0;
         for (final OvnLogicalIdMapVO row : logicalIdMapDao.listByKind(Kind.PORT_FORWARDING, controller.getId())) {
-            if (onLr.contains(row.getOvnUuid()) && sweepPfLb(nb, lrMap.getOvnUuid(), row)) {
+            if (onLr.contains(row.getOvnUuid()) && sweepPfLb(nb, lrMap.getOvnUuid(), lsUuid, row)) {
                 removed++;
             }
         }
@@ -348,9 +398,10 @@ public class OvnPortForwardingService {
         }
     }
 
-    private boolean sweepPfLb(final OvnNbClient nb, final String lrUuid, final OvnLogicalIdMapVO row) {
+    private boolean sweepPfLb(final OvnNbClient nb, final String lrUuid, final String lsUuid,
+                              final OvnLogicalIdMapVO row) {
         try {
-            nb.detachLoadBalancerFromLogicalRouter(lrUuid, row.getOvnUuid());
+            detachLbBestEffort(nb, lrUuid, lsUuid, row.getOvnUuid());
             nb.deleteLoadBalancer(row.getOvnUuid());
         } catch (final OvnException e) {
             LOGGER.warn("OvnPortForwardingService.removeTierPortForwarding: sweep LB {} failed: {}",

@@ -19,6 +19,7 @@ package com.cloud.network.ovn.element;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -66,9 +67,13 @@ import com.cloud.network.rules.FirewallRule;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.dao.NetworkOfferingDetailsDao;
 import com.cloud.utils.component.AdapterBase;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicProfile;
+import com.cloud.vm.NicVO;
 import com.cloud.vm.ReservationContext;
 import com.cloud.vm.VirtualMachineProfile;
+import com.cloud.vm.dao.NicDao;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Maps CloudStack {@link LoadBalancingRule} rows onto OVN NB
@@ -131,6 +136,8 @@ public class OvnLoadBalancerService extends AdapterBase {
     private NetworkDetailsDao networkDetailsDao;
     @Inject
     private NetworkOfferingDetailsDao networkOfferingDetailsDao;
+    @Inject
+    private NicDao nicDao;
 
     public Map<Service, Map<Capability, String>> getCapabilities() {
         return CAPABILITIES;
@@ -220,7 +227,7 @@ public class OvnLoadBalancerService extends AdapterBase {
         if (existing != null) {
             // Stale-mapping guard — recreate when LB row was deleted out-of-band.
             if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
-                updateExistingLbRow(nb, existing.getOvnUuid(), rule, vips);
+                updateExistingLbRow(nb, controller, network, existing.getOvnUuid(), rule, vips);
                 return;
             }
             LOGGER.warn("OvnLoadBalancerService: LOAD_BALANCER mapping rule={} -> {} stale; recreating",
@@ -249,17 +256,132 @@ public class OvnLoadBalancerService extends AdapterBase {
             }
             throw oe;
         }
+        attachToTierLs(nb, controller, network, lbUuid);
+        configureHealthCheck(nb, network, rule, lbUuid);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.LOAD_BALANCER, rule.getId(), controller.getId(), lbUuid, name));
         LOGGER.info("OvnLoadBalancerService: LB {} created (rule id={}, vips={}, algo={}, protocol={})",
                 lbUuid, rule.getId(), vips, rule.getAlgorithm(), protocol);
-        if (rule.getHealthCheckPolicies() != null && !rule.getHealthCheckPolicies().isEmpty()) {
-            LOGGER.warn("OvnLoadBalancerService: rule id={} has CloudStack health-check policies; "
-                    + "OVN L4 health-check mapping is not implemented in MVP", rule.getId());
-        }
         // Announce /32 for the LB VIP. The manager is idempotent — multiple
         // LB rules sharing the same source IP collapse to a single
         // BGP_ANNOUNCE row (keyed by ip address id, not rule id).
         announceLbVip(network, rule);
+    }
+
+    /**
+     * Also attach the LB to the rule's tier Logical_Switch so guests on the
+     * tier reach the VIP east-west ({@code ct_lb} runs on the source chassis,
+     * fully symmetric); the LR attachment keeps serving north-south. Scope:
+     * the rule's own tier only — sibling tiers of the VPC are deliberately
+     * out (no cheap enumeration + teardown coupling). Best-effort.
+     */
+    private void attachToTierLs(final OvnNbClient nb, final OvnControllerVO controller,
+                                final Network network, final String lbUuid) {
+        final String lsUuid = lookupTierLsUuid(network, controller);
+        if (lsUuid == null) {
+            LOGGER.debug("OvnLoadBalancerService: no LS mapping for network; LB {} stays LR-only", lbUuid);
+            return;
+        }
+        try {
+            nb.attachLoadBalancerToLogicalSwitch(lsUuid, lbUuid);
+        } catch (final OvnException e) {
+            LOGGER.warn("OvnLoadBalancerService: LS attach of LB {} failed (east-west VIP degraded): {}",
+                    lbUuid, e.getMessage());
+        }
+    }
+
+    private String lookupTierLsUuid(final Network network, final OvnControllerVO controller) {
+        if (network == null || controller == null || logicalIdMapDao == null) {
+            return null;
+        }
+        final OvnLogicalIdMapVO ls = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        return ls == null ? null : ls.getOvnUuid();
+    }
+
+    /** OVN service-monitor probe cadence: 5s interval, 3s timeout, up 1, down 3. */
+    private static final Map<String, String> HC_OPTIONS = Map.of(
+            "interval", "5", "timeout", "3", "success_count", "1", "failure_count", "3");
+
+    /**
+     * Configure an OVN L4 health check so dead backends drop out of rotation
+     * instead of blackholing new connections (critical while multi-backend
+     * VIPs — e.g. the CKS API LB — bootstrap with only one live backend).
+     * Best-effort: any failure leaves the LB functional without probes.
+     * Skipped when a health check already exists (idempotent re-apply).
+     */
+    private void configureHealthCheck(final OvnNbClient nb, final Network network,
+                                      final LoadBalancingRule rule, final String lbUuid) {
+        try {
+            if (rule.getSourceIp() == null || nb.loadBalancerHasHealthCheck(lbUuid)) {
+                return;
+            }
+            final Map<String, String> mappings = buildIpPortMappings(network, rule);
+            if (mappings.isEmpty()) {
+                LOGGER.debug("OvnLoadBalancerService: no ip_port_mappings resolvable for rule id={}; "
+                        + "health check skipped", rule.getId());
+                return;
+            }
+            final String vip = rule.getSourceIp().addr() + ":" + rule.getSourcePortStart();
+            nb.configureLoadBalancerHealthCheck(lbUuid, vip, mappings, HC_OPTIONS, buildExternalIds(rule));
+            LOGGER.info("OvnLoadBalancerService: health check configured on LB {} (rule id={}, {} backend(s))",
+                    lbUuid, rule.getId(), mappings.size());
+        } catch (final Exception e) {
+            LOGGER.warn("OvnLoadBalancerService: health-check config for LB {} failed (LB stays probe-less): {}",
+                    lbUuid, e.getMessage());
+        }
+    }
+
+    /**
+     * Backend IP -> {@code "<lsp-name>:<probe-source-ip>"} for every live
+     * destination. All-or-nothing: a backend whose NIC cannot be resolved
+     * aborts the mapping (a partial map would leave unprobed backends
+     * permanently "online" per ovn-nb(5) semantics).
+     */
+    private Map<String, String> buildIpPortMappings(final Network network, final LoadBalancingRule rule) {
+        final Map<String, String> out = new LinkedHashMap<>();
+        if (nicDao == null || network == null || rule.getDestinations() == null) {
+            return out;
+        }
+        final String sourceIp = healthCheckSourceIp(network);
+        if (sourceIp == null) {
+            return out;
+        }
+        for (final LbDestination d : rule.getDestinations()) {
+            if (d.isRevoked()) {
+                continue;
+            }
+            final NicVO nic = nicDao.findByIp4AddressAndNetworkId(d.getIpAddress(), network.getId());
+            if (nic == null || StringUtils.isBlank(nic.getUuid())) {
+                LOGGER.debug("OvnLoadBalancerService: no NIC for backend {} on network id={}; "
+                        + "skipping health check for rule id={}", d.getIpAddress(), network.getId(), rule.getId());
+                return new LinkedHashMap<>();
+            }
+            out.put(d.getIpAddress(), "lsp-" + nic.getUuid() + ":" + sourceIp);
+        }
+        return out;
+    }
+
+    /**
+     * Probe source IP: OVN claims (svc_monitor_mac, source-ip) on the LS, so
+     * the address must be unused. Walk down from the subnet's last usable
+     * host IP until an unallocated one is found (bounded). Follow-up: reserve
+     * the address through IPAM instead of probing allocation state.
+     */
+    private String healthCheckSourceIp(final Network network) {
+        final String cidr = network.getCidr();
+        if (StringUtils.isBlank(cidr) || !cidr.contains("/")) {
+            return null;
+        }
+        final String[] parts = cidr.split("/");
+        long candidate = NetUtils.ip2Long(NetUtils.getIpRangeEndIpFromCidr(parts[0], Long.parseLong(parts[1])));
+        for (int i = 0; i < 8; i++, candidate--) {
+            final String ip = NetUtils.long2Ip(candidate);
+            if (nicDao.findByIp4AddressAndNetworkId(ip, network.getId()) == null) {
+                return ip;
+            }
+        }
+        LOGGER.warn("OvnLoadBalancerService: no free probe source IP near the top of {} (network id={})",
+                cidr, network.getId());
+        return null;
     }
 
     /**
@@ -279,8 +401,8 @@ public class OvnLoadBalancerService extends AdapterBase {
      * conntrack state for the VIP, rescheduling in-flight connections.
      * This is the intended behaviour for an admin-driven algorithm change.
      */
-    private void updateExistingLbRow(final OvnNbClient nb, final String lbUuid,
-                                     final LoadBalancingRule rule, final Map<String, String> vips) {
+    private void updateExistingLbRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network,
+                                     final String lbUuid, final LoadBalancingRule rule, final Map<String, String> vips) {
         if (!vips.isEmpty()) {
             nb.updateLoadBalancerBackends(lbUuid, vips);
             LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}", lbUuid, rule.getId());
@@ -291,6 +413,11 @@ public class OvnLoadBalancerService extends AdapterBase {
         nb.updateLoadBalancerProperties(lbUuid, selectionFieldsFor(rule), buildExternalIds(rule));
         LOGGER.info("OvnLoadBalancerService: LB {} properties re-synced (algo={}) for rule id={}",
                 lbUuid, rule.getAlgorithm(), rule.getId());
+        // Re-assert the east-west LS attachment (idempotent set insert) and
+        // the health check (skipped when one already exists) so pre-existing
+        // LB rows converge to the new shape on their next apply touch.
+        attachToTierLs(nb, controller, network, lbUuid);
+        configureHealthCheck(nb, network, rule, lbUuid);
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
@@ -314,6 +441,16 @@ public class OvnLoadBalancerService extends AdapterBase {
         } catch (final OvnException oe) {
             LOGGER.warn("OvnLoadBalancerService: detach LB {} from LR {} failed: {}",
                     mapping.getOvnUuid(), lrUuid, oe.getMessage());
+        }
+        final String lsUuid = lookupTierLsUuid(network, controller);
+        if (lsUuid != null) {
+            try {
+                nb.detachLoadBalancerFromLogicalSwitch(lsUuid, mapping.getOvnUuid());
+            } catch (final OvnException oe) {
+                // Best-effort; set delete of an absent element is a no-op anyway.
+                LOGGER.warn("OvnLoadBalancerService: detach LB {} from LS {} failed: {}",
+                        mapping.getOvnUuid(), lsUuid, oe.getMessage());
+            }
         }
         try {
             nb.deleteLoadBalancer(mapping.getOvnUuid());
