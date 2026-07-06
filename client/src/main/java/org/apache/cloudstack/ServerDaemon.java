@@ -78,6 +78,14 @@ public class ServerDaemon implements Daemon {
     private static final int DEFAULT_REQUEST_CONTENT_SIZE = 1048576;
     private static final String REQUEST_MAX_FORM_KEYS_KEY = "request.max.form.keys";
     private static final int DEFAULT_REQUEST_MAX_FORM_KEYS = 5000;
+    private static final String REQUEST_HEADER_SIZE_KEY = "request.header.size";
+    // Jetty's default request/response header size is 8192 bytes. SAML SSO
+    // session cookies routinely exceed that, so a login POST (or even the UI's
+    // /client/config.json GET carrying the cookie) is rejected with HTTP 431
+    // by the embedded server — the nginx front-end large_client_header_buffers
+    // widening alone does not help because this limit is enforced here. Default
+    // to 64k (above the nginx 32k buffer) and allow an override.
+    private static final int DEFAULT_REQUEST_HEADER_SIZE = 65536;
     private static final String THREADS_MIN = "threads.min";
     private static final String THREADS_MAX = "threads.max";
 
@@ -93,6 +101,7 @@ public class ServerDaemon implements Daemon {
     private int sessionTimeout = 30;
     private int maxFormContentSize = DEFAULT_REQUEST_CONTENT_SIZE;
     private int maxFormKeys = DEFAULT_REQUEST_MAX_FORM_KEYS;
+    private int requestHeaderSize = DEFAULT_REQUEST_HEADER_SIZE;
     private boolean httpsEnable = false;
     private String accessLogFile = "access.log";
     private String bindInterface = null;
@@ -143,6 +152,7 @@ public class ServerDaemon implements Daemon {
             setSessionTimeout(Integer.valueOf(properties.getProperty(SESSION_TIMEOUT, "30")));
             setMaxFormContentSize(Integer.valueOf(properties.getProperty(REQUEST_CONTENT_SIZE_KEY, String.valueOf(DEFAULT_REQUEST_CONTENT_SIZE))));
             setMaxFormKeys(Integer.valueOf(properties.getProperty(REQUEST_MAX_FORM_KEYS_KEY, String.valueOf(DEFAULT_REQUEST_MAX_FORM_KEYS))));
+            setRequestHeaderSize(Integer.valueOf(properties.getProperty(REQUEST_HEADER_SIZE_KEY, String.valueOf(DEFAULT_REQUEST_HEADER_SIZE))));
             setMinThreads(Integer.valueOf(properties.getProperty(THREADS_MIN, "10")));
             setMaxThreads(Integer.valueOf(properties.getProperty(THREADS_MAX, "500")));
         } catch (final IOException e) {
@@ -181,8 +191,8 @@ public class ServerDaemon implements Daemon {
         httpConfig.setSecureScheme("https");
         httpConfig.setSecurePort(httpsPort);
         httpConfig.setOutputBufferSize(32768);
-        httpConfig.setRequestHeaderSize(8192);
-        httpConfig.setResponseHeaderSize(8192);
+        httpConfig.setRequestHeaderSize(requestHeaderSize);
+        httpConfig.setResponseHeaderSize(requestHeaderSize);
         httpConfig.setSendServerVersion(false);
         httpConfig.setSendDateHeader(false);
 
@@ -375,6 +385,10 @@ public class ServerDaemon implements Daemon {
 
     public void setMaxFormKeys(int maxFormKeys) {
         this.maxFormKeys = maxFormKeys;
+    }
+
+    public void setRequestHeaderSize(int requestHeaderSize) {
+        this.requestHeaderSize = requestHeaderSize;
     }
 
     public void setMinThreads(int minThreads) {
