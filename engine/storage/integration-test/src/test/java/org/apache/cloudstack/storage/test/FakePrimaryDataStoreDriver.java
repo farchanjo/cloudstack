@@ -29,7 +29,6 @@ import org.apache.cloudstack.engine.subsystem.api.storage.DataStore;
 import org.apache.cloudstack.engine.subsystem.api.storage.PrimaryDataStoreDriver;
 import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotInfo;
 import org.apache.cloudstack.engine.subsystem.api.storage.TemplateInfo;
-import org.apache.cloudstack.engine.subsystem.api.storage.VolumeInfo;
 import org.apache.cloudstack.framework.async.AsyncCompletionCallback;
 import org.apache.cloudstack.storage.command.CommandResult;
 import org.apache.cloudstack.storage.command.CreateObjectAnswer;
@@ -39,7 +38,6 @@ import com.cloud.agent.api.to.DataStoreTO;
 import com.cloud.agent.api.to.DataTO;
 import com.cloud.host.Host;
 import com.cloud.storage.StoragePool;
-import com.cloud.storage.Volume;
 
 public class FakePrimaryDataStoreDriver implements PrimaryDataStoreDriver {
     boolean snapshotResult = true;

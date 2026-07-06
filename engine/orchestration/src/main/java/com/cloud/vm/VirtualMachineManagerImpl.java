@@ -133,7 +133,6 @@ import com.cloud.agent.api.PlugNicAnswer;
 import com.cloud.agent.api.PlugNicCommand;
 import com.cloud.agent.api.PrepareExternalProvisioningAnswer;
 import com.cloud.agent.api.PrepareExternalProvisioningCommand;
-import com.cloud.agent.api.PostMigrateOvnStampAnswer;
 import com.cloud.agent.api.PostMigrateOvnStampCommand;
 import com.cloud.agent.api.PrepareForMigrationAnswer;
 import com.cloud.agent.api.PrepareForMigrationCommand;
