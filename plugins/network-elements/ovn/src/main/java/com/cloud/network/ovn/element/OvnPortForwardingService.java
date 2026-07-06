@@ -16,9 +16,13 @@
 // under the License.
 package com.cloud.network.ovn.element;
 
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import javax.inject.Inject;
@@ -44,34 +48,55 @@ import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.network.vpc.VpcVO;
-import com.cloud.vm.NicVO;
-import com.cloud.vm.dao.NicDao;
 
 /**
- * Maps CloudStack {@link PortForwardingRule}s onto OVN {@code NAT} rows of
- * type {@code dnat_and_snat} attached to the VPC's {@code Logical_Router}.
+ * Maps CloudStack {@link PortForwardingRule}s onto OVN {@code Load_Balancer}
+ * rows attached to the VPC tier's / isolated network's gateway
+ * {@code Logical_Router}.
  *
- * <p>NAT rows (rather than {@code Load_Balancer} rows) are emitted so the
- * underlying datapath gets ConnectX-6 Dx TC-flower CT-NAT 5-tuple hardware
- * offload — {@code dnat_and_snat} is in the offloaded action set on dx6,
- * whereas {@code group:type=select} (the LB lowering) historically falls
- * back to software on mlx5 TC. {@code Load_Balancer} rows remain reserved
- * for true LB use cases (multi-backend, health-checks, custom selection
- * fields) — handled by {@link OvnLoadBalancerService}.
+ * <p>Rationale: OVN's {@code NAT} table does NOT translate destination
+ * <em>ports</em> — {@code external_port_range} on a {@code dnat_and_snat} row
+ * is SNAT-source-port scoped only, so a {@code dnat_and_snat} row emitted with
+ * an external port delivers the packet with its destination port unchanged.
+ * A port-forward such as {@code ext:2222 -> vm:22} therefore arrived at the VM
+ * still addressed to port 2222 and was refused. Destination-port DNAT in OVN
+ * is expressed exclusively through {@code Load_Balancer} VIP entries
+ * ({@code vip_ip:vip_port -> backend_ip:backend_port}); this is the same shape
+ * the plugin already uses for CloudStack LB rules
+ * ({@link OvnLoadBalancerService}). One PF rule becomes one
+ * {@code cs-pf-<ruleId>} load_balancer row with a single backend.
  *
- * <p>The mapping table tracks the rule under {@link Kind#PORT_FORWARDING}.
- * On hot upgrade from the previous LB-based shape, the first {@code apply}
- * touch detects the legacy {@code Load_Balancer} UUID, drops it, and
- * recreates the rule as a NAT row — read-side fallback so existing PF state
- * does not need an operator-driven migration.
+ * <p>Full-IP 1:1 static NAT ({@code enableStaticNat}) legitimately stays on
+ * {@code dnat_and_snat} (no port translation involved) and is owned by
+ * {@link OvnStaticNatService} — untouched here.
+ *
+ * <p>Self-heal: a broken deployment whose PF rules still live as legacy
+ * {@code dnat_and_snat}-with-port rows migrates transparently. On
+ * {@code apply} a mapping pointing at a {@code NAT} row is dropped and the
+ * rule is recreated as an LB; on {@code revoke} both the tracked row and any
+ * untracked legacy {@code dnat_and_snat} matching
+ * {@code external_ip + external_port_range + logical_ip} are removed.
  */
 @Component
 public class OvnPortForwardingService {
 
     private static final Logger LOGGER = LogManager.getLogger(OvnPortForwardingService.class);
 
-    /** OVN NAT type emitted for port-forwarding rules. */
-    public static final String NAT_TYPE_DNAT_AND_SNAT = "dnat_and_snat";
+    /**
+     * OVN NAT type of the legacy (pre-Load_Balancer) PF shape. Retained only
+     * for self-heal detection + cleanup; live PF rules now use Load_Balancer.
+     */
+    public static final String LEGACY_NAT_TYPE_DNAT_AND_SNAT = "dnat_and_snat";
+
+    /** Load_Balancer name prefix for a port-forward rule ({@code cs-pf-<ruleId>}). */
+    public static final String PF_LB_NAME_PREFIX = "cs-pf-";
+
+    /**
+     * Upper bound on the number of ports a single PF rule may expand into
+     * (one Load_Balancer VIP entry per port). Guards against a fat range
+     * exploding the {@code vips} column.
+     */
+    static final int MAX_PF_RANGE_PORTS = 64;
 
     @Inject
     private OvnPluginManager pluginManager;
@@ -84,18 +109,15 @@ public class OvnPortForwardingService {
     @Inject
     private IPAddressDao ipAddressDao;
     @Inject
-    private NicDao nicDao;
-    @Inject
     private com.cloud.network.ovn.manager.OvnBgpRedistributeManager bgpRedistributeManager;
     @Inject
     private OvnPendingDeletionDao pendingDeletionDao;
 
     /**
-     * Apply every supplied PF rule. Idempotent: an existing mapping for the
-     * rule id collapses to a no-op (or to a rebuild when the mapping points
-     * at a row of the wrong table — i.e. legacy LB-PF migration).
-     * Rules in {@code Revoke} state drop the NAT (or legacy LB) row and the
-     * mapping.
+     * Apply every supplied PF rule. Idempotent: an existing mapping to a live
+     * {@code Load_Balancer} re-syncs its backends; a mapping to a legacy
+     * {@code NAT} row migrates to an LB; rules in {@code Revoke} state drop
+     * the LB (or legacy NAT) row and the mapping.
      */
     public boolean applyPFRules(final Network network, final List<PortForwardingRule> rules) {
         if (rules == null || rules.isEmpty()) {
@@ -135,11 +157,9 @@ public class OvnPortForwardingService {
             LOGGER.debug("OvnPortForwardingService: skipping rule id={} in state {}", rule.getId(), rule.getState());
             return;
         }
-        // Public IP comes from FirewallRule.sourceIpAddressId (the floating
-        // IP allocated to the rule); private IP is the VM-side target carried
-        // on PortForwardingRule.destinationIpAddress. Earlier revisions used
-        // destinationIpAddress for both, producing a row whose external IP
-        // was the VM internal IP — useless for N-S traffic.
+        // Public IP comes from FirewallRule.sourceIpAddressId (the floating IP
+        // allocated to the rule); private IP is the VM-side target carried on
+        // PortForwardingRule.destinationIpAddress.
         final IPAddressVO publicIpRow = ipAddressDao.findById(rule.getSourceIpAddressId());
         final String publicIp = publicIpRow == null || publicIpRow.getAddress() == null
                 ? null : publicIpRow.getAddress().addr();
@@ -149,70 +169,75 @@ public class OvnPortForwardingService {
                     rule.getId(), publicIp, privateIp);
             return;
         }
-        final String externalPortRange = buildExternalPortRange(rule);
-        final String logicalPort = lookupLogicalPort(network, rule);
-        final Map<String, String> ext = new LinkedHashMap<>();
-        ext.put(OvnConstants.EXT_ID_KIND, Kind.PORT_FORWARDING.name());
-        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(rule.getId()));
-        ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(network.getDataCenterId()));
+        final Map<String, String> vips = buildPfVips(publicIp, privateIp, rule);
+        final String protocol = protocolFor(rule);
+        final Map<String, String> ext = buildExternalIds(network, rule);
+        if (existing != null && reconcileExisting(nb, existing, rule, vips)) {
+            return;
+        }
+        createAndAttachLb(nb, controller, lrUuid, network, rule, vips, protocol, ext, publicIpRow);
+    }
 
-        if (existing != null) {
-            // Legacy migration path: the row lives in Load_Balancer table from
-            // a pre-NAT plugin version. Drop the LB row + mapping; fall through
-            // to fresh NAT-row creation below. Keeps hot upgrade lossless —
-            // the operator does not need to revoke and re-add PF rules.
-            if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
-                LOGGER.info("OvnPortForwardingService: migrating legacy LB-based PF rule id={} (lb={}) to NAT",
-                        rule.getId(), existing.getOvnUuid());
-                try {
-                    nb.detachLoadBalancerFromLogicalRouter(lrUuid, existing.getOvnUuid());
-                } catch (OvnException e) {
-                    LOGGER.warn("OvnPortForwardingService: legacy LB detach failed (rule={}, lb={}): {}",
-                            rule.getId(), existing.getOvnUuid(), e.getMessage());
-                }
-                try {
-                    nb.deleteLoadBalancer(existing.getOvnUuid());
-                } catch (OvnException e) {
-                    LOGGER.warn("OvnPortForwardingService: legacy LB delete failed (rule={}, lb={}): {}",
-                            rule.getId(), existing.getOvnUuid(), e.getMessage());
-                }
-                logicalIdMapDao.remove(existing.getId());
-            } else if (nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
-                // Mapping points at a live NAT row. OVN NAT semantics treat
-                // (type, external_ip, external_port_range, logical_ip,
-                // logical_port) as the natural key. Any change there forces a
-                // delete-then-recreate so OVSDB picks up the new tuple
-                // cleanly. CloudStack drives PF rules as immutable from the
-                // user's perspective (a port change = revoke + re-add) so the
-                // happy path here is a no-op.
-                LOGGER.debug("OvnPortForwardingService: rule id={} mapped to NAT {}; no-op",
-                        rule.getId(), existing.getOvnUuid());
-                return;
-            } else {
-                LOGGER.warn("OvnPortForwardingService: PORT_FORWARDING mapping rule={} -> {} stale; recreating",
-                        rule.getId(), existing.getOvnUuid());
-                logicalIdMapDao.remove(existing.getId());
+    /**
+     * Handle a pre-existing PORT_FORWARDING mapping. Returns {@code true} when
+     * the rule is fully reconciled (mapping points at a live
+     * {@code Load_Balancer}, whose backends are re-synced idempotently).
+     * Returns {@code false} — after dropping the row + mapping — when the
+     * caller must create a fresh LB: a legacy {@code dnat_and_snat} NAT-PF row
+     * (migrated to LB) or a stale mapping.
+     */
+    private boolean reconcileExisting(final OvnNbClient nb, final OvnLogicalIdMapVO existing,
+                                      final PortForwardingRule rule, final Map<String, String> vips) {
+        if (nb.rowExistsByUuid("Load_Balancer", existing.getOvnUuid())) {
+            nb.updateLoadBalancerBackends(existing.getOvnUuid(), vips);
+            LOGGER.debug("OvnPortForwardingService: rule id={} LB {} backends re-synced",
+                    rule.getId(), existing.getOvnUuid());
+            return true;
+        }
+        if (nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
+            LOGGER.info("OvnPortForwardingService: migrating legacy dnat_and_snat PF rule id={} (nat={}) to LB",
+                    rule.getId(), existing.getOvnUuid());
+            nb.deleteNatRule(existing.getOvnUuid());
+            logicalIdMapDao.remove(existing.getId());
+            return false;
+        }
+        LOGGER.warn("OvnPortForwardingService: PORT_FORWARDING mapping rule={} -> {} stale; recreating",
+                rule.getId(), existing.getOvnUuid());
+        logicalIdMapDao.remove(existing.getId());
+        return false;
+    }
+
+    private void createAndAttachLb(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
+                                   final Network network, final PortForwardingRule rule,
+                                   final Map<String, String> vips, final String protocol,
+                                   final Map<String, String> ext, final IPAddressVO publicIpRow) {
+        final String name = PF_LB_NAME_PREFIX + rule.getId();
+        final String lbUuid = nb.createLoadBalancer(name, vips, protocol, Collections.emptyList(), ext, null);
+        try {
+            nb.attachLoadBalancerToLogicalRouter(lrUuid, lbUuid);
+        } catch (final OvnException oe) {
+            // Best-effort cleanup so a failed attach does not leave an orphan row.
+            try {
+                nb.deleteLoadBalancer(lbUuid);
+            } catch (final OvnException ignored) {
+                // Already swallowed.
             }
+            throw oe;
         }
-        final String natUuid = nb.addNatRule(lrUuid, NAT_TYPE_DNAT_AND_SNAT, publicIp, privateIp,
-                logicalPort, externalPortRange, null, ext);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, rule.getId(), controller.getId(), natUuid,
-                NAT_TYPE_DNAT_AND_SNAT + "-pf-" + rule.getId()));
-        LOGGER.info("OvnPortForwardingService: PF rule id={} -> NAT {} (extIp={}:{} -> {}:{}, lsp={})",
-                rule.getId(), natUuid, publicIp, externalPortRange, privateIp,
-                rule.getDestinationPortStart(), logicalPort);
-        // Announce /32 for the public IP backing this PF rule. The manager
-        // is idempotent — a public IP carrying multiple PF rules announces
-        // exactly once because the BGP_ANNOUNCE row is keyed by IP id, not
-        // rule id.
-        if (network.getVpcId() != null && publicIpRow != null) {
-            bgpRedistributeManager.announce(publicIp, publicIpRow.getId(),
-                    network.getVpcId(), network.getDataCenterId());
-        }
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, rule.getId(), controller.getId(), lbUuid, name));
+        LOGGER.info("OvnPortForwardingService: PF rule id={} -> LB {} (protocol={}, vips={})",
+                rule.getId(), lbUuid, protocol, vips);
+        // Announce /32 for the public IP backing this PF rule. Idempotent —
+        // a public IP with multiple PF rules announces once (keyed by IP id).
+        announce(network, publicIpRow);
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
                            final OvnLogicalIdMapVO mapping, final Network network, final PortForwardingRule rule) {
+        // Belt-and-suspenders self-heal: drop any untracked legacy
+        // dnat_and_snat PF row for this rule (fat-jar drift can desync the
+        // mapping from the NB DB). Runs regardless of mapping presence.
+        cleanupLegacyNat(nb, rule);
         if (mapping == null) {
             return;
         }
@@ -225,47 +250,136 @@ public class OvnPortForwardingService {
                     mapping.getOvnUuid(), rule.getId());
         }
         try {
-            // Probe both tables — the row may still live in Load_Balancer
-            // from a pre-migration revoke that races a hot upgrade.
-            if (nb.rowExistsByUuid("NAT", mapping.getOvnUuid())) {
-                nb.deleteNatRule(mapping.getOvnUuid());
-            } else if (nb.rowExistsByUuid("Load_Balancer", mapping.getOvnUuid())) {
-                try {
-                    nb.detachLoadBalancerFromLogicalRouter(lrUuid, mapping.getOvnUuid());
-                } catch (OvnException ignored) {
-                    // best-effort; LB may already be detached
-                }
-                nb.deleteLoadBalancer(mapping.getOvnUuid());
-            } else {
-                LOGGER.debug("OvnPortForwardingService: revoke {} no-op (row already gone)", mapping.getOvnUuid());
-            }
+            deleteTrackedRow(nb, lrUuid, mapping);
             logicalIdMapDao.remove(mapping.getId());
             pendingDeletionDao.markSucceededByOvnUuid(mapping.getOvnUuid(), Kind.PORT_FORWARDING.name());
         } catch (OvnException e) {
             LOGGER.warn("OvnPortForwardingService: revoke {} failed; mapping retained for retry: {}",
                     mapping.getOvnUuid(), e.getMessage());
         }
-        // Withdraw /32 only when no other PF rule still claims this public
-        // IP. The IP itself may also back a static-NAT or VPC source-NAT
-        // mapping; for those the BGP_ANNOUNCE row is keyed by the same IP
-        // id and will be re-announced by the periodic reconciler if dropped
-        // here erroneously. We rely on the absence of other PF rules as the
-        // soft signal that the IP no longer needs the /32 from the PF
-        // perspective; orchestrator-level cleanup (IP release) emits an
-        // explicit withdraw via OvnNetworkElement.
-        if (network == null || rule == null || network.getVpcId() == null) {
+        withdraw(network, rule);
+    }
+
+    /**
+     * Delete the NB row a mapping points at. New PF rules track a
+     * {@code Load_Balancer} (detach from the LR, then delete); a legacy
+     * mapping may still track a {@code NAT} row (delete directly). A row that
+     * is already gone is a no-op.
+     */
+    private void deleteTrackedRow(final OvnNbClient nb, final String lrUuid, final OvnLogicalIdMapVO mapping) {
+        if (nb.rowExistsByUuid("Load_Balancer", mapping.getOvnUuid())) {
+            try {
+                nb.detachLoadBalancerFromLogicalRouter(lrUuid, mapping.getOvnUuid());
+            } catch (OvnException ignored) {
+                // Best-effort; the LB may already be detached.
+            }
+            nb.deleteLoadBalancer(mapping.getOvnUuid());
+        } else if (nb.rowExistsByUuid("NAT", mapping.getOvnUuid())) {
+            nb.deleteNatRule(mapping.getOvnUuid());
+        } else {
+            LOGGER.debug("OvnPortForwardingService: revoke {} no-op (row already gone)", mapping.getOvnUuid());
+        }
+    }
+
+    /**
+     * Remove any legacy {@code dnat_and_snat} PF row for this rule by matching
+     * {@code external_ip + external_port_range + logical_ip}. The mandatory
+     * non-empty {@code external_port_range} match keeps full-IP static-NAT
+     * rows (which never set it) untouched. Best-effort.
+     */
+    private void cleanupLegacyNat(final OvnNbClient nb, final PortForwardingRule rule) {
+        if (rule == null) {
             return;
         }
         final IPAddressVO publicIpRow = ipAddressDao.findById(rule.getSourceIpAddressId());
         final String publicIp = publicIpRow == null || publicIpRow.getAddress() == null
                 ? null : publicIpRow.getAddress().addr();
-        if (publicIp == null || publicIpRow == null) {
+        final String privateIp = lookupVmIp(rule);
+        if (StringUtils.isBlank(publicIp) || StringUtils.isBlank(privateIp)) {
             return;
         }
-        // Best-effort withdraw — if another PF rule shares the IP the
-        // announce path will re-announce on its next applyOne() touch (the
-        // BGP_ANNOUNCE row was rebuilt fresh from there).
-        bgpRedistributeManager.withdraw(publicIp, publicIpRow.getId(),
+        try {
+            final int removed = nb.deleteNatByMatch(LEGACY_NAT_TYPE_DNAT_AND_SNAT, publicIp,
+                    buildExternalPortRange(rule), privateIp);
+            if (removed > 0) {
+                LOGGER.info("OvnPortForwardingService: self-healed {} legacy dnat_and_snat PF row(s) for rule id={} "
+                        + "({}:{} -> {})", removed, rule.getId(), publicIp, buildExternalPortRange(rule), privateIp);
+            }
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPortForwardingService: legacy NAT self-heal for rule id={} failed: {}",
+                    rule.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * Sweep this network's {@code cs-pf-*} {@code Load_Balancer} rows on
+     * network delete. Fires only for a network that owns an exclusive LR
+     * (isolated Phase B, {@link Kind#NETWORK_LR}): its LR is exclusive, so
+     * every PF LB attached to it belongs to this network. VPC tiers share the
+     * VPC LR — their PF LBs are cleaned per-rule on revoke and by the
+     * VPC-delete cascade, so this is a no-op there (sweeping a shared LR would
+     * nuke sibling tiers). PF LB rows are weak refs and do NOT cascade with
+     * the LR, so detach + delete them explicitly before the LR is dropped.
+     * Idempotent + best-effort.
+     */
+    public void removeTierPortForwarding(final Network network) {
+        if (network == null || network.getVpcId() != null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMap = logicalIdMapDao.findByCsId(Kind.NETWORK_LR, network.getId(), controller.getId());
+        if (lrMap == null) {
+            return;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+        final Set<String> onLr = new HashSet<>(nb.listLoadBalancersOnLogicalRouter(lrMap.getOvnUuid()));
+        int removed = 0;
+        for (final OvnLogicalIdMapVO row : logicalIdMapDao.listByKind(Kind.PORT_FORWARDING, controller.getId())) {
+            if (onLr.contains(row.getOvnUuid()) && sweepPfLb(nb, lrMap.getOvnUuid(), row)) {
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            LOGGER.info("OvnPortForwardingService.removeTierPortForwarding: swept {} cs-pf LB(s) (network id={})",
+                    removed, network.getId());
+        }
+    }
+
+    private boolean sweepPfLb(final OvnNbClient nb, final String lrUuid, final OvnLogicalIdMapVO row) {
+        try {
+            nb.detachLoadBalancerFromLogicalRouter(lrUuid, row.getOvnUuid());
+            nb.deleteLoadBalancer(row.getOvnUuid());
+        } catch (final OvnException e) {
+            LOGGER.warn("OvnPortForwardingService.removeTierPortForwarding: sweep LB {} failed: {}",
+                    row.getOvnUuid(), e.getMessage());
+            return false;
+        }
+        logicalIdMapDao.remove(row.getId());
+        return true;
+    }
+
+    private void announce(final Network network, final IPAddressVO publicIpRow) {
+        if (network.getVpcId() == null || publicIpRow == null || publicIpRow.getAddress() == null) {
+            return;
+        }
+        bgpRedistributeManager.announce(publicIpRow.getAddress().addr(), publicIpRow.getId(),
+                network.getVpcId(), network.getDataCenterId());
+    }
+
+    private void withdraw(final Network network, final PortForwardingRule rule) {
+        if (network == null || rule == null || network.getVpcId() == null) {
+            return;
+        }
+        final IPAddressVO publicIpRow = ipAddressDao.findById(rule.getSourceIpAddressId());
+        if (publicIpRow == null || publicIpRow.getAddress() == null) {
+            return;
+        }
+        // Best-effort withdraw — if another PF rule shares the IP the announce
+        // path re-announces on its next applyOne() touch.
+        bgpRedistributeManager.withdraw(publicIpRow.getAddress().addr(), publicIpRow.getId(),
                 network.getVpcId(), network.getDataCenterId());
     }
 
@@ -291,11 +405,9 @@ public class OvnPortForwardingService {
     }
 
     /**
-     * PortForwardingRule does not directly carry the destination IP —
-     * CloudStack resolves it via {@code getDestinationIpAddress()} (set by
-     * the orchestrator before the rule is applied). When the rule arrives
-     * pre-resolved we use it as-is; otherwise we leave the lookup to the
-     * caller.
+     * PortForwardingRule carries the destination IP via
+     * {@code getDestinationIpAddress()} (set by the orchestrator before the
+     * rule is applied). Returns {@code null} when unresolved.
      */
     private static String lookupVmIp(final PortForwardingRule rule) {
         if (rule.getDestinationIpAddress() != null) {
@@ -305,38 +417,70 @@ public class OvnPortForwardingService {
     }
 
     /**
-     * Resolve the LSP name of the VM NIC sitting on the rule's network. OVN
-     * uses {@code logical_port} on a {@code dnat_and_snat} row to bind the
-     * NAT to a specific guest port — required for distributed gateway-port
-     * traffic (proxy ARP / GARP, reverse-path SNAT, ovn-trace correctness).
-     * Returns {@code null} when the lookup fails (no NIC on that network for
-     * that VM, or the NIC has no UUID); the NAT row is still emitted but
-     * without {@code logical_port}, which OVN treats as any-port match.
+     * Expand a PF rule into OVN {@code Load_Balancer} VIP entries:
+     * {@code publicIp:extPort -> privateIp:privPort}. CloudStack "source"
+     * ports are the public/external ports; "destination" ports are the
+     * VM-side ports. A single-port rule yields one entry; a port range yields
+     * one offset-mapped entry per external port (all mapping to the single
+     * private port when the private side is not itself a range). Fails with a
+     * clear error when the range exceeds {@link #MAX_PF_RANGE_PORTS}.
      */
-    private String lookupLogicalPort(final Network network, final PortForwardingRule rule) {
-        final NicVO nic = nicDao.findNonReleasedByInstanceIdAndNetworkId(network.getId(), rule.getVirtualMachineId());
-        if (nic == null) {
-            LOGGER.debug("OvnPortForwardingService: no NIC for vm={} on network={} (rule={})",
-                    rule.getVirtualMachineId(), network.getId(), rule.getId());
-            return null;
+    private Map<String, String> buildPfVips(final String publicIp, final String privateIp,
+                                            final PortForwardingRule rule) {
+        final int extStart = orZero(rule.getSourcePortStart());
+        final int extEndRaw = orZero(rule.getSourcePortEnd());
+        final int extEnd = extEndRaw < extStart ? extStart : extEndRaw;
+        final int privStart = rule.getDestinationPortStart();
+        final int privEndRaw = rule.getDestinationPortEnd();
+        final boolean privIsRange = privEndRaw > privStart;
+        final int count = extEnd - extStart + 1;
+        if (count > MAX_PF_RANGE_PORTS) {
+            throw new OvnException(String.format(Locale.ROOT,
+                    "OvnPortForwardingService: PF rule id=%d external port range %d-%d spans %d ports; max %d per rule",
+                    rule.getId(), extStart, extEnd, count, MAX_PF_RANGE_PORTS));
         }
-        if (StringUtils.isNotBlank(nic.getUuid())) {
-            return "lsp-" + nic.getUuid();
+        final Map<String, String> vips = new LinkedHashMap<>();
+        for (int i = 0; i < count; i++) {
+            final int privPort = privIsRange ? privStart + i : privStart;
+            vips.put(publicIp + ":" + (extStart + i), privateIp + ":" + privPort);
         }
-        return "lsp-nic-" + nic.getId();
+        return vips;
+    }
+
+    private static int orZero(final Integer value) {
+        return value == null ? 0 : value;
     }
 
     /**
-     * Render the NAT row's {@code external_port_range} value. CloudStack
-     * exposes start/end ports per rule; OVN accepts a single port (e.g.
-     * {@code "22"}) or a range (e.g. {@code "8080-8090"}). When start ==
-     * end we emit a single port — the canonical 1:1 PF shape.
+     * OVN {@code Load_Balancer} VIPs carrying an L4 port require a protocol.
+     * CloudStack PF rules are tcp/udp; unknown/blank defaults to tcp.
+     */
+    private static String protocolFor(final PortForwardingRule rule) {
+        final String proto = rule.getProtocol() == null ? "" : rule.getProtocol().toLowerCase(Locale.ROOT);
+        if ("udp".equals(proto)) {
+            return OvnNbClient.LB_PROTOCOL_UDP;
+        }
+        if ("sctp".equals(proto)) {
+            return OvnNbClient.LB_PROTOCOL_SCTP;
+        }
+        return OvnNbClient.LB_PROTOCOL_TCP;
+    }
+
+    private static Map<String, String> buildExternalIds(final Network network, final PortForwardingRule rule) {
+        final Map<String, String> ext = new LinkedHashMap<>();
+        ext.put(OvnConstants.EXT_ID_KIND, Kind.PORT_FORWARDING.name());
+        ext.put(OvnConstants.EXT_ID_ID, String.valueOf(rule.getId()));
+        ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(network.getDataCenterId()));
+        return ext;
+    }
+
+    /**
+     * Render the legacy NAT row's {@code external_port_range} value (single
+     * port, or {@code start-end}) so a self-heal can match + delete it.
      */
     private static String buildExternalPortRange(final PortForwardingRule rule) {
-        final Integer startBoxed = rule.getSourcePortStart();
-        final Integer endBoxed = rule.getSourcePortEnd();
-        final int start = startBoxed == null ? 0 : startBoxed;
-        final int end = endBoxed == null ? 0 : endBoxed;
+        final int start = orZero(rule.getSourcePortStart());
+        final int end = orZero(rule.getSourcePortEnd());
         if (end <= 0 || end == start) {
             return Integer.toString(start);
         }

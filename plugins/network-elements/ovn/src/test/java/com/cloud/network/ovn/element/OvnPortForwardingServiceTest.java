@@ -17,6 +17,7 @@
 package com.cloud.network.ovn.element;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -24,7 +25,6 @@ import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -47,6 +47,7 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
 import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
@@ -54,13 +55,12 @@ import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.net.Ip;
-import com.cloud.vm.NicVO;
-import com.cloud.vm.dao.NicDao;
 
 /**
- * Asserts the CloudStack {@link PortForwardingRule} -> OVN {@code NAT}
- * (type {@code dnat_and_snat}) translation, including hot upgrade migration
- * from the previous {@code Load_Balancer}-based PF shape.
+ * Asserts the CloudStack {@link PortForwardingRule} -> OVN
+ * {@code Load_Balancer} translation (VIP {@code ext_ip:ext_port -> priv_ip:
+ * priv_port}), plus the legacy {@code dnat_and_snat}-with-port self-heal on
+ * both apply (migration) and revoke (match-based cleanup).
  */
 public class OvnPortForwardingServiceTest {
 
@@ -68,11 +68,8 @@ public class OvnPortForwardingServiceTest {
     private static final long CONTROLLER_ID = 11L;
     private static final long NETWORK_ID = 100L;
     private static final long VPC_ID = 9L;
-    private static final long NIC_ID = 555L;
     private static final long IP_ADDRESS_ID = 42L;
-    private static final long VM_ID = 77L;
     private static final String LR_UUID = "lr-uuid-vpc-9";
-    private static final String NIC_UUID = "nic-uuid-aa39e102";
     private static final String PUBLIC_IP = "217.179.89.42";
     private static final String PRIVATE_IP = "10.99.10.137";
 
@@ -84,8 +81,8 @@ public class OvnPortForwardingServiceTest {
     private VpcDao vpcDao;
     private OvnVpcElement vpcElement;
     private IPAddressDao ipAddressDao;
-    private NicDao nicDao;
     private OvnBgpRedistributeManager bgpRedistributeManager;
+    private OvnPendingDeletionDao pendingDeletionDao;
     private OvnPortForwardingService service;
 
     @Before
@@ -98,8 +95,8 @@ public class OvnPortForwardingServiceTest {
         vpcDao = mock(VpcDao.class);
         vpcElement = mock(OvnVpcElement.class);
         ipAddressDao = mock(IPAddressDao.class);
-        nicDao = mock(NicDao.class);
         bgpRedistributeManager = mock(OvnBgpRedistributeManager.class);
+        pendingDeletionDao = mock(OvnPendingDeletionDao.class);
 
         when(controller.getId()).thenReturn(CONTROLLER_ID);
         when(pluginManager.findControllerForZone(ZONE_ID)).thenReturn(controller);
@@ -123,43 +120,37 @@ public class OvnPortForwardingServiceTest {
         when(publicIpRow.getAddress()).thenReturn(new Ip(PUBLIC_IP));
         when(ipAddressDao.findById(IP_ADDRESS_ID)).thenReturn(publicIpRow);
 
-        // VM NIC on the network.
-        final NicVO nic = mock(NicVO.class);
-        when(nic.getId()).thenReturn(NIC_ID);
-        when(nic.getUuid()).thenReturn(NIC_UUID);
-        when(nicDao.findNonReleasedByInstanceIdAndNetworkId(NETWORK_ID, VM_ID)).thenReturn(nic);
-
         service = new OvnPortForwardingService();
         injectField(service, "pluginManager", pluginManager);
         injectField(service, "logicalIdMapDao", logicalIdMapDao);
         injectField(service, "vpcDao", vpcDao);
         injectField(service, "vpcElement", vpcElement);
         injectField(service, "ipAddressDao", ipAddressDao);
-        injectField(service, "nicDao", nicDao);
         injectField(service, "bgpRedistributeManager", bgpRedistributeManager);
+        injectField(service, "pendingDeletionDao", pendingDeletionDao);
     }
 
     @Test
-    public void freshPfRuleEmitsDnatAndSnatNatRowAndPersistsMapping() throws Exception {
-        when(nbClient.addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), anyString(), anyString(), isNull(), anyMap()))
-                .thenReturn("nat-uuid-1");
+    public void freshPfRuleEmitsLoadBalancerAndPersistsMapping() throws Exception {
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap(), isNull()))
+                .thenReturn("lb-uuid-1");
 
-        final PortForwardingRule rule = pfRule(526L, 22, 22, FirewallRule.State.Add);
+        final PortForwardingRule rule = pfRule(526L, 2222, 2222, 22, 22, FirewallRule.State.Add);
 
         assertTrue(service.applyPFRules(network, List.of(rule)));
 
-        final ArgumentCaptor<String> portCaptor = ArgumentCaptor.forClass(String.class);
-        final ArgumentCaptor<String> lspCaptor = ArgumentCaptor.forClass(String.class);
+        final ArgumentCaptor<Map<String, String>> vipsCaptor = mapCaptor();
         final ArgumentCaptor<Map<String, String>> extCaptor = mapCaptor();
-
-        verify(nbClient, times(1)).addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), lspCaptor.capture(), portCaptor.capture(), isNull(), extCaptor.capture());
-        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap());
+        verify(nbClient, times(1)).createLoadBalancer(eq(OvnPortForwardingService.PF_LB_NAME_PREFIX + "526"),
+                vipsCaptor.capture(), eq(OvnNbClient.LB_PROTOCOL_TCP), any(), extCaptor.capture(), isNull());
+        verify(nbClient, times(1)).attachLoadBalancerToLogicalRouter(eq(LR_UUID), eq("lb-uuid-1"));
+        verify(nbClient, never()).addNatRule(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), isNull(), anyMap());
         verify(logicalIdMapDao, times(1)).persist(any(OvnLogicalIdMapVO.class));
 
-        assertEquals("22", portCaptor.getValue());
-        assertEquals("lsp-" + NIC_UUID, lspCaptor.getValue());
+        final Map<String, String> vips = vipsCaptor.getValue();
+        assertEquals(1, vips.size());
+        assertEquals(PRIVATE_IP + ":22", vips.get(PUBLIC_IP + ":2222"));
 
         final Map<String, String> ext = extCaptor.getValue();
         assertNotNull(ext);
@@ -169,98 +160,127 @@ public class OvnPortForwardingServiceTest {
     }
 
     @Test
-    public void revokeDeletesNatRowAndDropsMapping() throws Exception {
+    public void portRangeExpandsToPerPortVips() throws Exception {
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap(), isNull()))
+                .thenReturn("lb-uuid-range");
+
+        final PortForwardingRule rule = pfRule(530L, 8080, 8082, 80, 82, FirewallRule.State.Add);
+
+        assertTrue(service.applyPFRules(network, List.of(rule)));
+
+        final ArgumentCaptor<Map<String, String>> vipsCaptor = mapCaptor();
+        verify(nbClient, times(1)).createLoadBalancer(anyString(), vipsCaptor.capture(), anyString(),
+                any(), anyMap(), isNull());
+
+        final Map<String, String> vips = vipsCaptor.getValue();
+        assertEquals(3, vips.size());
+        assertEquals(PRIVATE_IP + ":80", vips.get(PUBLIC_IP + ":8080"));
+        assertEquals(PRIVATE_IP + ":81", vips.get(PUBLIC_IP + ":8081"));
+        assertEquals(PRIVATE_IP + ":82", vips.get(PUBLIC_IP + ":8082"));
+    }
+
+    @Test
+    public void oversizePortRangeIsRejected() throws Exception {
+        final PortForwardingRule rule = pfRule(531L, 1, 100, 22, 22, FirewallRule.State.Add);
+
+        // A single failing rule collapses the batch result to false and emits no LB.
+        assertFalse(service.applyPFRules(network, List.of(rule)));
+        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(),
+                any(), anyMap(), isNull());
+    }
+
+    @Test
+    public void revokeDeletesLbAndDropsMapping() throws Exception {
         final OvnLogicalIdMapVO mapping = mock(OvnLogicalIdMapVO.class);
         when(mapping.getId()).thenReturn(909L);
-        when(mapping.getOvnUuid()).thenReturn("nat-uuid-revoke");
+        when(mapping.getOvnUuid()).thenReturn("lb-uuid-revoke");
         when(logicalIdMapDao.findByCsId(eq(Kind.PORT_FORWARDING), eq(527L), eq(CONTROLLER_ID))).thenReturn(mapping);
-        when(nbClient.rowExistsByUuid(eq("NAT"), eq("nat-uuid-revoke"))).thenReturn(true);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-revoke"))).thenReturn(true);
 
-        final PortForwardingRule rule = pfRule(527L, 80, 80, FirewallRule.State.Revoke);
+        final PortForwardingRule rule = pfRule(527L, 80, 80, 8080, 8080, FirewallRule.State.Revoke);
 
         assertTrue(service.applyPFRules(network, List.of(rule)));
 
-        verify(nbClient, times(1)).deleteNatRule(eq("nat-uuid-revoke"));
-        verify(nbClient, never()).deleteLoadBalancer(anyString());
+        verify(nbClient, times(1)).detachLoadBalancerFromLogicalRouter(eq(LR_UUID), eq("lb-uuid-revoke"));
+        verify(nbClient, times(1)).deleteLoadBalancer(eq("lb-uuid-revoke"));
+        verify(nbClient, never()).deleteNatRule(anyString());
         verify(logicalIdMapDao, times(1)).remove(eq(909L));
+        // Match-based legacy sweep always runs (belt-and-suspenders self-heal).
+        verify(nbClient, times(1)).deleteNatByMatch(eq(OvnPortForwardingService.LEGACY_NAT_TYPE_DNAT_AND_SNAT),
+                eq(PUBLIC_IP), eq("80"), eq(PRIVATE_IP));
     }
 
     @Test
-    public void legacyLbPfMigratesToNatOnApply() throws Exception {
-        // Pre-existing mapping points at a Load_Balancer row from a pre-NAT plugin version.
+    public void legacyNatPfMigratesToLbOnApply() throws Exception {
+        // Pre-existing mapping points at a legacy dnat_and_snat NAT row.
         final OvnLogicalIdMapVO legacy = mock(OvnLogicalIdMapVO.class);
         when(legacy.getId()).thenReturn(810L);
-        when(legacy.getOvnUuid()).thenReturn("lb-uuid-legacy");
+        when(legacy.getOvnUuid()).thenReturn("nat-uuid-legacy");
         when(logicalIdMapDao.findByCsId(eq(Kind.PORT_FORWARDING), eq(528L), eq(CONTROLLER_ID))).thenReturn(legacy);
 
-        // OVSDB still hosts the LB row.
-        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-legacy"))).thenReturn(true);
-        when(nbClient.rowExistsByUuid(eq("NAT"), eq("lb-uuid-legacy"))).thenReturn(false);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("nat-uuid-legacy"))).thenReturn(false);
+        when(nbClient.rowExistsByUuid(eq("NAT"), eq("nat-uuid-legacy"))).thenReturn(true);
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap(), isNull()))
+                .thenReturn("lb-uuid-new");
 
-        when(nbClient.addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), anyString(), anyString(), isNull(), anyMap()))
-                .thenReturn("nat-uuid-new");
-
-        final PortForwardingRule rule = pfRule(528L, 22, 22, FirewallRule.State.Active);
+        final PortForwardingRule rule = pfRule(528L, 2222, 2222, 22, 22, FirewallRule.State.Active);
 
         assertTrue(service.applyPFRules(network, List.of(rule)));
 
-        // Legacy LB row + LR.load_balancer reference dropped.
-        verify(nbClient, times(1)).detachLoadBalancerFromLogicalRouter(eq(LR_UUID), eq("lb-uuid-legacy"));
-        verify(nbClient, times(1)).deleteLoadBalancer(eq("lb-uuid-legacy"));
-        verify(logicalIdMapDao, atLeastOnce()).remove(eq(810L));
-
-        // Fresh NAT row created with the right tuple + new mapping persisted.
-        verify(nbClient, times(1)).addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), anyString(), anyString(), isNull(), anyMap());
-        verify(logicalIdMapDao, atLeastOnce()).persist(any(OvnLogicalIdMapVO.class));
+        // Legacy NAT row dropped, mapping removed, fresh LB created + persisted.
+        verify(nbClient, times(1)).deleteNatRule(eq("nat-uuid-legacy"));
+        verify(logicalIdMapDao, times(1)).remove(eq(810L));
+        verify(nbClient, times(1)).createLoadBalancer(eq(OvnPortForwardingService.PF_LB_NAME_PREFIX + "528"),
+                anyMap(), eq(OvnNbClient.LB_PROTOCOL_TCP), any(), anyMap(), isNull());
+        verify(nbClient, times(1)).attachLoadBalancerToLogicalRouter(eq(LR_UUID), eq("lb-uuid-new"));
+        verify(logicalIdMapDao, times(1)).persist(any(OvnLogicalIdMapVO.class));
     }
 
     @Test
-    public void existingNatRowMappingIsNoOpOnApply() throws Exception {
+    public void existingLbMappingResyncsBackendsOnApply() throws Exception {
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
         when(existing.getId()).thenReturn(901L);
-        when(existing.getOvnUuid()).thenReturn("nat-uuid-existing");
+        when(existing.getOvnUuid()).thenReturn("lb-uuid-existing");
         when(logicalIdMapDao.findByCsId(eq(Kind.PORT_FORWARDING), eq(529L), eq(CONTROLLER_ID))).thenReturn(existing);
-        when(nbClient.rowExistsByUuid(eq("NAT"), eq("nat-uuid-existing"))).thenReturn(true);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-existing"))).thenReturn(true);
 
-        final PortForwardingRule rule = pfRule(529L, 22, 22, FirewallRule.State.Active);
+        final PortForwardingRule rule = pfRule(529L, 2222, 2222, 22, 22, FirewallRule.State.Active);
 
         assertTrue(service.applyPFRules(network, List.of(rule)));
 
-        verify(nbClient, never()).addNatRule(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyString(), isNull(), anyMap());
+        final ArgumentCaptor<Map<String, String>> vipsCaptor = mapCaptor();
+        verify(nbClient, times(1)).updateLoadBalancerBackends(eq("lb-uuid-existing"), vipsCaptor.capture());
+        assertEquals(PRIVATE_IP + ":22", vipsCaptor.getValue().get(PUBLIC_IP + ":2222"));
+        verify(nbClient, never()).createLoadBalancer(anyString(), anyMap(), anyString(), any(), anyMap(), isNull());
         verify(logicalIdMapDao, never()).persist(any(OvnLogicalIdMapVO.class));
         verify(logicalIdMapDao, never()).remove(eq(901L));
     }
 
     @Test
-    public void portRangeBuildsHyphenatedExternalPortRange() throws Exception {
-        when(nbClient.addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), anyString(), anyString(), isNull(), anyMap()))
-                .thenReturn("nat-uuid-range");
-
-        final PortForwardingRule rule = pfRule(530L, 8080, 8090, FirewallRule.State.Add);
+    public void revokeCleansUntrackedLegacyNatWhenMappingAbsent() throws Exception {
+        // No mapping row for the rule — only the match-based legacy sweep runs.
+        final PortForwardingRule rule = pfRule(540L, 2222, 2222, 22, 22, FirewallRule.State.Revoke);
 
         assertTrue(service.applyPFRules(network, List.of(rule)));
 
-        final ArgumentCaptor<String> portCaptor = ArgumentCaptor.forClass(String.class);
-        verify(nbClient, times(1)).addNatRule(eq(LR_UUID), eq(OvnPortForwardingService.NAT_TYPE_DNAT_AND_SNAT),
-                eq(PUBLIC_IP), eq(PRIVATE_IP), anyString(), portCaptor.capture(), isNull(), anyMap());
-        assertEquals("8080-8090", portCaptor.getValue());
+        verify(nbClient, times(1)).deleteNatByMatch(eq(OvnPortForwardingService.LEGACY_NAT_TYPE_DNAT_AND_SNAT),
+                eq(PUBLIC_IP), eq("2222"), eq(PRIVATE_IP));
+        verify(nbClient, never()).deleteLoadBalancer(anyString());
+        verify(nbClient, never()).deleteNatRule(anyString());
     }
 
-    private PortForwardingRule pfRule(final long id, final int srcPortStart, final int srcPortEnd,
-                                      final FirewallRule.State state) {
+    private PortForwardingRule pfRule(final long id, final int extStart, final int extEnd,
+                                      final int privStart, final int privEnd, final FirewallRule.State state) {
         final PortForwardingRule rule = mock(PortForwardingRule.class);
         when(rule.getId()).thenReturn(id);
         when(rule.getState()).thenReturn(state);
+        when(rule.getProtocol()).thenReturn("tcp");
         when(rule.getSourceIpAddressId()).thenReturn(IP_ADDRESS_ID);
-        when(rule.getSourcePortStart()).thenReturn(srcPortStart);
-        when(rule.getSourcePortEnd()).thenReturn(srcPortEnd);
-        when(rule.getDestinationPortStart()).thenReturn(srcPortStart);
+        when(rule.getSourcePortStart()).thenReturn(extStart);
+        when(rule.getSourcePortEnd()).thenReturn(extEnd);
+        when(rule.getDestinationPortStart()).thenReturn(privStart);
+        when(rule.getDestinationPortEnd()).thenReturn(privEnd);
         when(rule.getDestinationIpAddress()).thenReturn(new Ip(PRIVATE_IP));
-        when(rule.getVirtualMachineId()).thenReturn(VM_ID);
         return rule;
     }
 

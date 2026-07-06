@@ -1037,6 +1037,77 @@ public class OvnNbClient implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Delete legacy port-forward {@code dnat_and_snat} NAT rows that carry an
+     * {@code external_port_range} — the pre-Load_Balancer PF shape. Matches on
+     * {@code type} + {@code external_ip} + {@code logical_ip}, then filters on
+     * an exact {@code external_port_range}. The mandatory non-empty
+     * {@code external_port_range} filter keeps full-IP static-NAT rows (which
+     * never set the column) untouched. Returns the number of rows removed.
+     * Self-heal for deployments whose PF rules pre-date the LB migration.
+     */
+    public int deleteNatByMatch(final String type, final String externalIp,
+                                final String externalPortRange, final String logicalIp) {
+        if (externalIp == null || externalIp.isEmpty()
+                || externalPortRange == null || externalPortRange.isEmpty()
+                || logicalIp == null || logicalIp.isEmpty()) {
+            return 0;
+        }
+        final List<String> uuids = findLegacyPfNatUuids(type, externalIp, externalPortRange, logicalIp);
+        for (final String uuid : uuids) {
+            deleteNatRule(uuid);
+        }
+        return uuids.size();
+    }
+
+    private List<String> findLegacyPfNatUuids(final String type, final String externalIp,
+                                              final String externalPortRange, final String logicalIp) {
+        final ArrayNode where = JsonNodeFactory.instance.arrayNode();
+        where.add(equalityCondition("type", type));
+        where.add(equalityCondition("external_ip", externalIp));
+        where.add(equalityCondition("logical_ip", logicalIp));
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("external_port_range");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("NAT", where, columns));
+        return matchByExternalPortRange(tx.commit().raw(), externalPortRange);
+    }
+
+    private static ArrayNode equalityCondition(final String column, final String value) {
+        final ArrayNode condition = JsonNodeFactory.instance.arrayNode();
+        condition.add(column);
+        condition.add("==");
+        condition.add(value);
+        return condition;
+    }
+
+    private static List<String> matchByExternalPortRange(final ArrayNode raw, final String externalPortRange) {
+        final List<String> out = new ArrayList<>();
+        if (raw == null || raw.size() == 0) {
+            return out;
+        }
+        final var entry = raw.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var epr = row.get("external_port_range");
+            if (epr != null && epr.isTextual() && externalPortRange.equals(epr.asText())) {
+                final var uuid = row.get("_uuid");
+                if (uuid != null && uuid.size() >= 2) {
+                    out.add(uuid.get(1).asText());
+                }
+            }
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------
     // Load_Balancer operations.
     // ------------------------------------------------------------------

@@ -610,6 +610,13 @@ public class OvnNetworkElement extends AdapterBase
         //      (no cascade from the LRP) is dropped explicitly.
         runDestroyStep("unbindIsolatedPublic", () -> { unbindIsolatedPublic(network); return null; },
                 failures, network, Kind.ISOLATED_PUBLIC_LRP);
+        //  3c-bis. Sweep this network's cs-pf-* PortForwarding Load_Balancer
+        //      rows. They are weak refs that do NOT cascade with the LR, so
+        //      detach + delete them while the (exclusive, isolated) LR is
+        //      still alive. No-op for VPC tiers (shared LR).
+        runDestroyStep("removeTierPortForwarding",
+                () -> { portForwardingService.removeTierPortForwarding(network); return null; },
+                failures, network, Kind.PORT_FORWARDING);
         //  3d. Delete the per-network LR (cascade drops gateway LRP + default
         //      route + snat; sweeps the isolated child mapping rows).
         runDestroyStep("deleteIsolatedNetworkLr", () -> { deleteIsolatedNetworkLr(network); return null; },
