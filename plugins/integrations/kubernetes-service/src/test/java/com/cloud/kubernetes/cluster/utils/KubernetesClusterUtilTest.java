@@ -64,14 +64,49 @@ public class KubernetesClusterUtilTest {
 
     @Test
     public void testSanitizeSshOutput() {
-        // The live failure shape: quotes around the payload, newline INSIDE
-        // the quotes — trim-before-strip left "0\n" and parseInt threw.
         Assert.assertEquals("0", KubernetesClusterUtil.sanitizeSshOutput("\"0\n\""));
-        Assert.assertEquals("11", KubernetesClusterUtil.sanitizeSshOutput("\"11\r\n\""));
         Assert.assertEquals("3", KubernetesClusterUtil.sanitizeSshOutput(" 3 \n"));
-        Assert.assertEquals("node1", KubernetesClusterUtil.sanitizeSshOutput("\"node1\n\""));
-        Assert.assertEquals("", KubernetesClusterUtil.sanitizeSshOutput("\"\n\""));
         Assert.assertNull(KubernetesClusterUtil.sanitizeSshOutput(null));
-        Assert.assertEquals(7, Integer.parseInt(KubernetesClusterUtil.sanitizeSshOutput("\"7\n\"")));
+    }
+
+    /**
+     * Live failure shape: SshHelper merges kubectl's stderr after the
+     * stdout payload, so the count line is followed by diagnostic lines.
+     */
+    private static final String STDERR_MERGED_COUNT_OUTPUT = "0\n"
+            + "E0706 14:31:10.668051    2063 memcache.go:265] Unhandled Error err=couldn't get current"
+            + " server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp"
+            + " 127.0.0.1:8080: connect: connection refused\n"
+            + "The connection to the server localhost:8080 was refused - did you specify the right host or port?";
+
+    @Test
+    public void testParseNodesCountFromSshOutput() {
+        Assert.assertEquals(Integer.valueOf(0),
+                KubernetesClusterUtil.parseNodesCountFromSshOutput(STDERR_MERGED_COUNT_OUTPUT));
+        Assert.assertEquals(Integer.valueOf(11), KubernetesClusterUtil.parseNodesCountFromSshOutput("11\n"));
+        Assert.assertEquals(Integer.valueOf(7), KubernetesClusterUtil.parseNodesCountFromSshOutput("\"7\n\""));
+        Assert.assertEquals(Integer.valueOf(3), KubernetesClusterUtil.parseNodesCountFromSshOutput(" 3 \r\n"));
+        // No numeric payload at all -> null (caller logs + retries).
+        Assert.assertNull(KubernetesClusterUtil.parseNodesCountFromSshOutput(
+                "The connection to the server localhost:8080 was refused"));
+        Assert.assertNull(KubernetesClusterUtil.parseNodesCountFromSshOutput(""));
+        Assert.assertNull(KubernetesClusterUtil.parseNodesCountFromSshOutput(null));
+    }
+
+    @Test
+    public void testSshOutputContainsLine() {
+        Assert.assertTrue(KubernetesClusterUtil.sshOutputContainsLine("node1\nE0706 noise", "node1"));
+        Assert.assertTrue(KubernetesClusterUtil.sshOutputContainsLine("\"node1\n\"", "node1"));
+        Assert.assertFalse(KubernetesClusterUtil.sshOutputContainsLine("node10\n", "node1"));
+        Assert.assertFalse(KubernetesClusterUtil.sshOutputContainsLine(null, "node1"));
+        Assert.assertFalse(KubernetesClusterUtil.sshOutputContainsLine("node1", null));
+    }
+
+    @Test
+    public void testClusterNodeVersionMatchesWithMergedStderr() {
+        Pair<Boolean, String> resultPair = new Pair<>(true, "v1.24.0\nE0706 some kubectl noise");
+        Pair<Boolean, String> result = KubernetesClusterUtil.clusterNodeVersionMatches(resultPair, "1.24.0");
+        Assert.assertTrue(result.first());
+        Assert.assertEquals("v1.24.0", result.second());
     }
 }

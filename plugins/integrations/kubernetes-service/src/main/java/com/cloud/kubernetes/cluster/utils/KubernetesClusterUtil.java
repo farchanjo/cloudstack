@@ -53,15 +53,50 @@ public class KubernetesClusterUtil {
 
     /**
      * Normalize SSH command output before strict comparison or numeric
-     * parsing. {@code SshHelper} may deliver the remote command output
-     * wrapped in double quotes with the trailing newline INSIDE the quotes
-     * (e.g. {@code "0\n"}). Trimming before stripping the quotes leaves that
-     * inner newline in place, so {@code Integer.parseInt} or
-     * {@code String.equals} on the result fails forever. Strip the quotes
-     * first, then trim.
+     * parsing. {@code SshHelper} merges the remote command's stderr after
+     * its stdout, so the captured value may carry kubectl diagnostics after
+     * the payload line (e.g. {@code "0\nE0706 ... connection refused"}).
+     * Whole-string trimming or quote-stripping cannot repair that; the
+     * line-scoped helpers below extract the payload instead.
      */
     protected static String sanitizeSshOutput(final String output) {
         return output == null ? null : output.replace("\"", "").trim();
+    }
+
+    /**
+     * Extract a numeric payload from SSH command output: the first line
+     * that is purely digits after quote-stripping and trimming. Lines from
+     * merged stderr (kubectl/awk diagnostics) never are. Returns
+     * {@code null} when no such line exists.
+     */
+    protected static Integer parseNodesCountFromSshOutput(final String output) {
+        if (output == null) {
+            return null;
+        }
+        for (final String line : output.split("\n")) {
+            final String candidate = line.replace("\"", "").trim();
+            if (!candidate.isEmpty() && candidate.chars().allMatch(Character::isDigit)) {
+                return Integer.valueOf(candidate);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True when any line of the SSH command output equals {@code expected}
+     * after quote-stripping and trimming. Tolerates merged stderr lines
+     * surrounding the payload line.
+     */
+    protected static boolean sshOutputContainsLine(final String output, final String expected) {
+        if (output == null || expected == null) {
+            return false;
+        }
+        for (final String line : output.split("\n")) {
+            if (expected.equals(line.replace("\"", "").trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static boolean isKubernetesClusterNodeReady(final KubernetesCluster kubernetesCluster, String ipAddress, int port,
@@ -70,7 +105,7 @@ public class KubernetesClusterUtil {
                 user, sshKeyFile, null,
                 String.format(CLUSTER_NODE_READY_COMMAND, nodeName.toLowerCase()),
                 10000, 10000, 20000);
-        if (result.first() && nodeName.equals(sanitizeSshOutput(result.second()))) {
+        if (result.first() && sshOutputContainsLine(result.second(), nodeName)) {
             return true;
         }
         if (LOGGER.isDebugEnabled()) {
@@ -242,11 +277,13 @@ public class KubernetesClusterUtil {
                 "sudo /opt/bin/kubectl get nodes | grep -w 'Ready' | wc -l",
                 10000, 10000, 20000);
         if (Boolean.TRUE.equals(result.first())) {
-            return Integer.parseInt(sanitizeSshOutput(result.second())) + kubernetesCluster.getEtcdNodeCount().intValue();
-        } else {
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug(String.format("Failed to retrieve ready nodes for Kubernetes cluster %s. Output: %s", kubernetesCluster, result.second()));
+            final Integer count = parseNodesCountFromSshOutput(result.second());
+            if (count != null) {
+                return count + kubernetesCluster.getEtcdNodeCount().intValue();
             }
+        }
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug(String.format("Failed to retrieve ready nodes for Kubernetes cluster %s. Output: %s", kubernetesCluster, result.second()));
         }
         return 0;
     }
@@ -394,9 +431,15 @@ public class KubernetesClusterUtil {
         if (result == null || Boolean.FALSE.equals(result.first()) || StringUtils.isBlank(result.second())) {
             return new Pair<>(false, null);
         }
-        // Sanitize so the version persisted via setNodeVersion is clean even
-        // when the SSH output arrives quote-wrapped with an inner newline.
-        String response = sanitizeSshOutput(result.second());
-        return new Pair<>(response.contains(String.format("v%s", version)), response);
+        // Match line-wise so merged stderr around the payload does not
+        // pollute the version persisted via setNodeVersion.
+        final String expected = String.format("v%s", version);
+        for (final String line : result.second().split("\n")) {
+            final String candidate = line.replace("\"", "").trim();
+            if (candidate.contains(expected)) {
+                return new Pair<>(true, candidate);
+            }
+        }
+        return new Pair<>(false, sanitizeSshOutput(result.second()));
     }
 }
