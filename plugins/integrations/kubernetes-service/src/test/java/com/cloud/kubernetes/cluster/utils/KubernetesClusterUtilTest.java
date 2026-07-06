@@ -52,4 +52,26 @@ public class KubernetesClusterUtilTest {
 
         executeThrowAndTestVersionMatch();
     }
+
+    @Test
+    public void testClusterNodeVersionMatchesQuoteWrappedOutput() {
+        // SshHelper may wrap the output in quotes with the newline inside.
+        Pair<Boolean, String> resultPair = new Pair<>(true, "\"v1.24.0\n\"");
+        Pair<Boolean, String> result = KubernetesClusterUtil.clusterNodeVersionMatches(resultPair, "1.24.0");
+        Assert.assertTrue(result.first());
+        Assert.assertEquals("v1.24.0", result.second());
+    }
+
+    @Test
+    public void testSanitizeSshOutput() {
+        // The live failure shape: quotes around the payload, newline INSIDE
+        // the quotes — trim-before-strip left "0\n" and parseInt threw.
+        Assert.assertEquals("0", KubernetesClusterUtil.sanitizeSshOutput("\"0\n\""));
+        Assert.assertEquals("11", KubernetesClusterUtil.sanitizeSshOutput("\"11\r\n\""));
+        Assert.assertEquals("3", KubernetesClusterUtil.sanitizeSshOutput(" 3 \n"));
+        Assert.assertEquals("node1", KubernetesClusterUtil.sanitizeSshOutput("\"node1\n\""));
+        Assert.assertEquals("", KubernetesClusterUtil.sanitizeSshOutput("\"\n\""));
+        Assert.assertNull(KubernetesClusterUtil.sanitizeSshOutput(null));
+        Assert.assertEquals(7, Integer.parseInt(KubernetesClusterUtil.sanitizeSshOutput("\"7\n\"")));
+    }
 }

@@ -51,13 +51,26 @@ public class KubernetesClusterUtil {
     public static final String CLUSTER_NODE_READY_COMMAND = "sudo /opt/bin/kubectl get nodes | awk '{if ($1 == \"%s\" && $2 == \"Ready\") print $1}'";
     public static final String CLUSTER_NODE_VERSION_COMMAND = "sudo /opt/bin/kubectl get nodes | awk '{if ($1 == \"%s\") print $5}'";
 
+    /**
+     * Normalize SSH command output before strict comparison or numeric
+     * parsing. {@code SshHelper} may deliver the remote command output
+     * wrapped in double quotes with the trailing newline INSIDE the quotes
+     * (e.g. {@code "0\n"}). Trimming before stripping the quotes leaves that
+     * inner newline in place, so {@code Integer.parseInt} or
+     * {@code String.equals} on the result fails forever. Strip the quotes
+     * first, then trim.
+     */
+    protected static String sanitizeSshOutput(final String output) {
+        return output == null ? null : output.replace("\"", "").trim();
+    }
+
     public static boolean isKubernetesClusterNodeReady(final KubernetesCluster kubernetesCluster, String ipAddress, int port,
                                                        String user, File sshKeyFile, String nodeName) throws Exception {
         Pair<Boolean, String> result = SshHelper.sshExecute(ipAddress, port,
                 user, sshKeyFile, null,
                 String.format(CLUSTER_NODE_READY_COMMAND, nodeName.toLowerCase()),
                 10000, 10000, 20000);
-        if (result.first() && nodeName.equals(result.second().trim())) {
+        if (result.first() && nodeName.equals(sanitizeSshOutput(result.second()))) {
             return true;
         }
         if (LOGGER.isDebugEnabled()) {
@@ -229,7 +242,7 @@ public class KubernetesClusterUtil {
                 "sudo /opt/bin/kubectl get nodes | grep -w 'Ready' | wc -l",
                 10000, 10000, 20000);
         if (Boolean.TRUE.equals(result.first())) {
-            return Integer.parseInt(result.second().trim().replace("\"", "")) + kubernetesCluster.getEtcdNodeCount().intValue();
+            return Integer.parseInt(sanitizeSshOutput(result.second())) + kubernetesCluster.getEtcdNodeCount().intValue();
         } else {
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug(String.format("Failed to retrieve ready nodes for Kubernetes cluster %s. Output: %s", kubernetesCluster, result.second()));
@@ -381,7 +394,9 @@ public class KubernetesClusterUtil {
         if (result == null || Boolean.FALSE.equals(result.first()) || StringUtils.isBlank(result.second())) {
             return new Pair<>(false, null);
         }
-        String response = result.second();
+        // Sanitize so the version persisted via setNodeVersion is clean even
+        // when the SSH output arrives quote-wrapped with an inner newline.
+        String response = sanitizeSshOutput(result.second());
         return new Pair<>(response.contains(String.format("v%s", version)), response);
     }
 }
