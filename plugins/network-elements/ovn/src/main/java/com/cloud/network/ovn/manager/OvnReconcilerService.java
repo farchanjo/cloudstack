@@ -170,6 +170,18 @@ public class OvnReconcilerService {
         // enforcement does the canonical correction; this records intent
         // so the reconcile API exposes the categories.
         reassertOvsPolicy(zoneId, dryRun, out);
+        // East-west LB force-SNAT drift — a router carrying LBs must SNAT
+        // load-balanced flows to its own IP (lb_force_snat_ip=router_ip) or
+        // same-subnet clients never see VIP replies (asymmetric return).
+        // Attach-time enforcement covers new LBs; this covers routers whose
+        // LBs pre-date the option.
+        if (!dryRun) {
+            final int snatFixed = nb.ensureLbForceSnatOnRoutersWithLb();
+            if (snatFixed > 0) {
+                LOGGER.info("OvnReconcilerService: zone={} set {}={} on {} logical router(s) carrying LBs",
+                        zoneId, OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP, snatFixed);
+            }
+        }
         LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
                 zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
         return out;

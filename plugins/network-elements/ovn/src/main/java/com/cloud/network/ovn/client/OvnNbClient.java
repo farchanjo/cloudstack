@@ -17,6 +17,7 @@
 package com.cloud.network.ovn.client;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -1117,6 +1118,12 @@ public class OvnNbClient implements AutoCloseable {
     public static final String LB_PROTOCOL_UDP = "udp";
     public static final String LB_PROTOCOL_SCTP = "sctp";
 
+    /** Logical_Router options key forcing SNAT of load-balanced flows. */
+    public static final String LR_OPT_LB_FORCE_SNAT = "lb_force_snat_ip";
+
+    /** ovn-nb(5) magic value: SNAT load-balanced flows to the egress LRP IP. */
+    public static final String LB_FORCE_SNAT_ROUTER_IP = "router_ip";
+
     /**
      * Inserts one {@code load_balancer} row. Returns the new UUID. The caller
      * is responsible for attaching the row to a Logical_Router or
@@ -1190,7 +1197,8 @@ public class OvnNbClient implements AutoCloseable {
 
     /**
      * Attaches a load_balancer row to a Logical_Router (north-south LB on
-     * the VPC's gateway).
+     * the VPC's gateway) and asserts the router-level force-SNAT option so
+     * the VIP is also reachable east-west (see {@link #ensureLbForceSnat}).
      */
     public void attachLoadBalancerToLogicalRouter(final String lrUuid, final String lbUuid) {
         final OvnTransaction tx = newTransaction();
@@ -1198,6 +1206,97 @@ public class OvnNbClient implements AutoCloseable {
                 OvnOpFactory.whereUuid(lrUuid), "load_balancer",
                 OvnRowRef.singletonSet(OvnRowRef.realUuid(lbUuid))));
         tx.commit();
+        ensureLbForceSnat(lrUuid);
+    }
+
+    /**
+     * Ensure the LR SNATs load-balanced flows to its egress LRP IP
+     * ({@code options:lb_force_snat_ip="router_ip"}, per ovn-nb(5)).
+     * Without it, a client on the same subnet as a VIP backend receives
+     * the backend's reply directly over the logical switch (src = backend
+     * IP, not the VIP) and drops it — east-west VIP traffic fails 100%.
+     * The per-LB {@code hairpin_snat_ip} only covers client == backend.
+     * Scope: affects load-balanced flows only; {@code snat} /
+     * {@code dnat_and_snat} NAT rows are untouched. Idempotent — writes
+     * only when the option is absent or different. The option is
+     * deliberately NOT removed on LB detach: it is inert without LBs and
+     * removal would race concurrent attaches.
+     */
+    public void ensureLbForceSnat(final String lrUuid) {
+        final Map<String, String> options = readLogicalRouterOptions(lrUuid);
+        if (options == null || LB_FORCE_SNAT_ROUTER_IP.equals(options.get(LR_OPT_LB_FORCE_SNAT))) {
+            return;
+        }
+        final Map<String, String> merged = new LinkedHashMap<>(options);
+        merged.put(LR_OPT_LB_FORCE_SNAT, LB_FORCE_SNAT_ROUTER_IP);
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("options", buildMap(merged));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(lrUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Reads the {@code options} map of one Logical_Router. Returns
+     * {@code null} when the row does not exist.
+     */
+    private Map<String, String> readLogicalRouterOptions(final String lrUuid) {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("options");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereUuid(lrUuid), columns));
+        final ArrayNode raw = tx.commit().raw();
+        if (raw == null || raw.size() == 0) {
+            return null;
+        }
+        final JsonNode rows = raw.get(0) == null ? null : raw.get(0).get("rows");
+        if (rows == null || rows.size() == 0) {
+            return null;
+        }
+        return OvnNbReader.decodeMap(rows.get(0).get("options"));
+    }
+
+    /**
+     * Reconcile-time safety net: asserts {@code lb_force_snat_ip=router_ip}
+     * on every Logical_Router that carries at least one Load_Balancer.
+     * Attach-time enforcement covers new LBs; this covers routers whose
+     * LBs pre-date the option. Returns the number of routers fixed.
+     */
+    public int ensureLbForceSnatOnRoutersWithLb() {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("load_balancer");
+        columns.add("options");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router", OvnOpFactory.whereAll(), columns));
+        final ArrayNode raw = tx.commit().raw();
+        if (raw == null || raw.size() == 0) {
+            return 0;
+        }
+        final JsonNode rows = raw.get(0) == null ? null : raw.get(0).get("rows");
+        if (rows == null) {
+            return 0;
+        }
+        int fixed = 0;
+        for (int i = 0; i < rows.size(); i++) {
+            if (fixLrForceSnatIfNeeded(rows.get(i))) {
+                fixed++;
+            }
+        }
+        return fixed;
+    }
+
+    /** One row of {@link #ensureLbForceSnatOnRoutersWithLb}: fix + report. */
+    private boolean fixLrForceSnatIfNeeded(final JsonNode row) {
+        if (row == null || OvnNbReader.decodeUuidSet(row.get("load_balancer")).isEmpty()) {
+            return false;
+        }
+        final Map<String, String> options = OvnNbReader.decodeMap(row.get("options"));
+        if (LB_FORCE_SNAT_ROUTER_IP.equals(options.get(LR_OPT_LB_FORCE_SNAT))) {
+            return false;
+        }
+        ensureLbForceSnat(OvnNbReader.decodeUuidColumn(row, "_uuid"));
+        return true;
     }
 
     /**

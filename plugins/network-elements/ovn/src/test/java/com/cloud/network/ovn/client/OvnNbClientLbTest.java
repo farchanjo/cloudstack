@@ -22,6 +22,7 @@ import static org.junit.Assert.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -104,12 +105,57 @@ public class OvnNbClientLbTest {
 
         client.attachLoadBalancerToLogicalRouter("lr-uuid", "lb-uuid-9");
 
-        final ArrayNode params = captureTransactCall();
-        assertEquals("mutate", params.get(1).get("op").asText());
-        assertEquals("Logical_Router", params.get(1).get("table").asText());
-        final JsonNode mutation = params.get(1).get("mutations").get(0);
+        // Attach also probes the LR options for the force-SNAT assertion;
+        // the empty reply (row missing) makes that probe a no-op.
+        final List<JsonNode> calls = captureTransactCalls(2);
+        final JsonNode mutate = ((ArrayNode) calls.get(0)).get(1);
+        assertEquals("mutate", mutate.get("op").asText());
+        assertEquals("Logical_Router", mutate.get("table").asText());
+        final JsonNode mutation = mutate.get("mutations").get(0);
         assertEquals("load_balancer", mutation.get(0).asText());
         assertEquals("insert", mutation.get(1).asText());
+    }
+
+    @Test
+    public void attachLbSetsRouterForceSnatWhenAbsent() {
+        when(pool.call(anyString(), any())).thenReturn(
+                emptyReply(),
+                selectOptionsReply("chassis", "gw1"),
+                emptyReply());
+
+        client.attachLoadBalancerToLogicalRouter("lr-uuid", "lb-uuid-10");
+
+        final List<JsonNode> calls = captureTransactCalls(3);
+        final JsonNode update = ((ArrayNode) calls.get(2)).get(1);
+        assertEquals("update", update.get("op").asText());
+        assertEquals("Logical_Router", update.get("table").asText());
+        final JsonNode options = update.get("row").get("options");
+        assertEquals("map", options.get(0).asText());
+        boolean found = false;
+        boolean preserved = false;
+        for (final JsonNode pair : options.get(1)) {
+            if (OvnNbClient.LR_OPT_LB_FORCE_SNAT.equals(pair.get(0).asText())) {
+                assertEquals(OvnNbClient.LB_FORCE_SNAT_ROUTER_IP, pair.get(1).asText());
+                found = true;
+            }
+            if ("chassis".equals(pair.get(0).asText())) {
+                preserved = true;
+            }
+        }
+        assertEquals("lb_force_snat_ip must be written", true, found);
+        assertEquals("pre-existing option keys must be preserved", true, preserved);
+    }
+
+    @Test
+    public void attachLbForceSnatIsIdempotentWhenAlreadySet() {
+        when(pool.call(anyString(), any())).thenReturn(
+                emptyReply(),
+                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP));
+
+        client.attachLoadBalancerToLogicalRouter("lr-uuid", "lb-uuid-11");
+
+        // mutate + options probe only; NO third update transaction.
+        captureTransactCalls(2);
     }
 
     @Test
@@ -208,6 +254,33 @@ public class OvnNbClientLbTest {
         final ArgumentCaptor<JsonNode> captor = ArgumentCaptor.forClass(JsonNode.class);
         verify(pool).call(anyString(), captor.capture());
         return (ArrayNode) captor.getValue();
+    }
+
+    private List<JsonNode> captureTransactCalls(final int expected) {
+        final ArgumentCaptor<JsonNode> captor = ArgumentCaptor.forClass(JsonNode.class);
+        verify(pool, times(expected)).call(anyString(), captor.capture());
+        return captor.getAllValues();
+    }
+
+    /** Select reply carrying one Logical_Router row with an options map. */
+    private ArrayNode selectOptionsReply(final String... kv) {
+        final ArrayNode pairs = mapper.createArrayNode();
+        for (int i = 0; i + 1 < kv.length; i += 2) {
+            final ArrayNode pair = mapper.createArrayNode();
+            pair.add(kv[i]);
+            pair.add(kv[i + 1]);
+            pairs.add(pair);
+        }
+        final ArrayNode map = mapper.createArrayNode();
+        map.add("map");
+        map.add(pairs);
+        final ObjectNode row = mapper.createObjectNode();
+        row.set("options", map);
+        final ObjectNode result = mapper.createObjectNode();
+        result.set("rows", mapper.createArrayNode().add(row));
+        final ArrayNode reply = mapper.createArrayNode();
+        reply.add(result);
+        return reply;
     }
 
     private ArrayNode singleInsertReply(final String uuid) {
