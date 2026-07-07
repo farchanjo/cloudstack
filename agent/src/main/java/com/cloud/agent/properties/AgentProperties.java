@@ -241,6 +241,49 @@ public class AgentProperties{
     public static final Property<String> AGENT_HOOKS_LIBVIRT_VM_XML_TRANSFORMER_METHOD = new Property<>("agent.hooks.libvirt_vm_xml_transformer.method", "transform");
 
     /**
+     * Cpuset (e.g. <code>16-63,80-127</code>) applied as a per-vCPU <code>&lt;vcpupin&gt;</code> to every guest vCPU<br>
+     * of the domain XML at VM start. This is a local, Java-native alternative/complement to the agent hooks<br>
+     * mechanism above, config-driven via agent.properties instead of an external script.<br>
+     * An empty value disables vcpupin injection.<br>
+     * Data type: String.<br>
+     * Default value: <code>(empty)</code>
+     */
+    public static final Property<String> VM_XML_TUNER_VCPU_POOL = new Property<>("vm.xml.tuner.vcpu.pool", "");
+
+    /**
+     * Cpuset (e.g. <code>0-14,64-78</code>) applied as the domain's <code>&lt;emulatorpin&gt;</code> at VM start.<br>
+     * An empty value disables emulatorpin injection.<br>
+     * Data type: String.<br>
+     * Default value: <code>(empty)</code>
+     */
+    public static final Property<String> VM_XML_TUNER_EMULATOR_POOL = new Property<>("vm.xml.tuner.emulator.pool", "");
+
+    /**
+     * Bridge name to remap from (e.g. <code>cplane</code>) on every <code>&lt;interface type='bridge'&gt;</code><br>
+     * device of the domain XML. Used together with vm.xml.tuner.private.bridge.target and<br>
+     * vm.xml.tuner.private.bridge.vlan; all three must be set (and source must differ from target) for the<br>
+     * bridge remap to be applied.<br>
+     * Data type: String.<br>
+     * Default value: <code>(empty)</code>
+     */
+    public static final Property<String> VM_XML_TUNER_PRIVATE_BRIDGE_SOURCE = new Property<>("vm.xml.tuner.private.bridge.source", "");
+
+    /**
+     * OVS bridge name to remap to (e.g. <code>br-cluster</code>) when vm.xml.tuner.private.bridge.source matches.<br>
+     * Data type: String.<br>
+     * Default value: <code>(empty)</code>
+     */
+    public static final Property<String> VM_XML_TUNER_PRIVATE_BRIDGE_TARGET = new Property<>("vm.xml.tuner.private.bridge.target", "");
+
+    /**
+     * VLAN tag id (e.g. <code>2011</code>) set on the remapped interface's <code>&lt;vlan&gt;</code> element<br>
+     * when vm.xml.tuner.private.bridge.source matches.<br>
+     * Data type: String.<br>
+     * Default value: <code>(empty)</code>
+     */
+    public static final Property<String> VM_XML_TUNER_PRIVATE_BRIDGE_VLAN = new Property<>("vm.xml.tuner.private.bridge.vlan", "");
+
+    /**
      * This property is used with the agent.hooks.basedir property to define the Libvirt VM on start script.<br>
      * The method to be called on the script is defined in the property agent.hooks.libvirt_vm_on_start.method.<br>
      * The hook is called right after Libvirt successfully launched the VM.<br>

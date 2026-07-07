@@ -42,6 +42,7 @@ import com.cloud.exception.InternalErrorException;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.resource.LibvirtKvmAgentHook;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef;
+import com.cloud.hypervisor.kvm.resource.LibvirtVmXmlTuner;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePoolManager;
 import com.cloud.network.Networks.TrafficType;
 import com.cloud.resource.CommandWrapper;
@@ -213,6 +214,19 @@ public final class LibvirtStartCommandWrapper extends CommandWrapper<StartComman
             logger.warn("Exception occurred when handling LibVirt XML transformer hook: {}", e);
             vmFinalSpecification = vmInitialSpecification;
         }
-        return vmFinalSpecification;
+        // Local tuner runs AFTER the external hook so Java-owned pins win over any legacy hook output.
+        return performLocalXmlTuning(vmFinalSpecification, libvirtComputingResource);
+    }
+
+    private String performLocalXmlTuning(String vmSpecification, final LibvirtComputingResource libvirtComputingResource) {
+        try {
+            LibvirtVmXmlTuner tuner = libvirtComputingResource.getVmXmlTuner();
+            if (tuner.isEnabled()) {
+                return tuner.transform(vmSpecification);
+            }
+        } catch (Exception e) {
+            logger.warn("Exception occurred when applying local VM XML tuner: {}", e);
+        }
+        return vmSpecification;
     }
 }

@@ -553,6 +553,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     protected String agentHooksVmOnStopShellScript = "libvirt-vm-state-change.sh";
     protected String agentHooksVmOnStopMethod = "onStop";
 
+    protected String vmXmlTunerVcpuPool = "";
+    protected String vmXmlTunerEmulatorPool = "";
+    protected String vmXmlTunerPrivateBridgeSource = "";
+    protected String vmXmlTunerPrivateBridgeTarget = "";
+    protected String vmXmlTunerPrivateBridgeVlan = "";
+
     protected static final String LOCAL_STORAGE_PATH = "local.storage.path";
     protected static final String LOCAL_STORAGE_UUID = "local.storage.uuid";
     public static final String DEFAULT_LOCAL_STORAGE_PATH = "/var/lib/libvirt/images";
@@ -751,6 +757,11 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
     public LibvirtKvmAgentHook getTransformer() throws IOException {
         return new LibvirtKvmAgentHook(agentHooksBasedir, agentHooksLibvirtXmlScript, agentHooksLibvirtXmlShellScript, agentHooksLibvirtXmlMethod);
+    }
+
+    public LibvirtVmXmlTuner getVmXmlTuner() {
+        return new LibvirtVmXmlTuner(vmXmlTunerVcpuPool, vmXmlTunerEmulatorPool, vmXmlTunerPrivateBridgeSource,
+                vmXmlTunerPrivateBridgeTarget, vmXmlTunerPrivateBridgeVlan);
     }
 
     public LibvirtKvmAgentHook getStartHook() throws IOException {
@@ -1544,6 +1555,8 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         configureAgentHooks();
 
+        configureVmXmlTuner();
+
         migrateSpeed = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_MIGRATE_SPEED);
         if (migrateSpeed == -1) {
             //get guest network device speed
@@ -1952,6 +1965,23 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         agentHooksVmOnStopMethod = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.AGENT_HOOKS_LIBVIRT_VM_ON_STOP_METHOD);
         LOGGER.debug("agent.hooks.libvirt_vm_on_stop.method is " + agentHooksVmOnStopMethod);
+    }
+
+    private void configureVmXmlTuner() {
+        vmXmlTunerVcpuPool = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_XML_TUNER_VCPU_POOL);
+        LOGGER.debug("vm.xml.tuner.vcpu.pool is " + vmXmlTunerVcpuPool);
+
+        vmXmlTunerEmulatorPool = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_XML_TUNER_EMULATOR_POOL);
+        LOGGER.debug("vm.xml.tuner.emulator.pool is " + vmXmlTunerEmulatorPool);
+
+        vmXmlTunerPrivateBridgeSource = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_XML_TUNER_PRIVATE_BRIDGE_SOURCE);
+        LOGGER.debug("vm.xml.tuner.private.bridge.source is " + vmXmlTunerPrivateBridgeSource);
+
+        vmXmlTunerPrivateBridgeTarget = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_XML_TUNER_PRIVATE_BRIDGE_TARGET);
+        LOGGER.debug("vm.xml.tuner.private.bridge.target is " + vmXmlTunerPrivateBridgeTarget);
+
+        vmXmlTunerPrivateBridgeVlan = AgentPropertiesFileHandler.getPropertyValue(AgentProperties.VM_XML_TUNER_PRIVATE_BRIDGE_VLAN);
+        LOGGER.debug("vm.xml.tuner.private.bridge.vlan is " + vmXmlTunerPrivateBridgeVlan);
     }
 
     public boolean isUefiPropertiesFileLoaded() {
