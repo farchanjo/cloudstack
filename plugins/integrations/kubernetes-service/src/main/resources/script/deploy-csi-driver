@@ -16,25 +16,127 @@
 # specific language governing permissions and limitations
 # under the License.
 
-(/opt/bin/kubectl get pods -A | grep cloudstack-csi-controller) && exit 0
+KUBECTL=/opt/bin/kubectl
+CSI_NAMESPACE=kube-system
+CSI_CONTROLLER_DEPLOYMENT=cloudstack-csi-controller
+CSI_NODE_DAEMONSET=cloudstack-csi-node
+CSI_CA_FILE=/opt/csi/cloudstack-ca.crt
+CSI_CA_CONFIGMAP=cloudstack-ca
+CSI_CA_PATCH_NODE_FILE=/opt/csi/csi-ca-patch-node.yaml
+CSI_CA_PATCH_CONTROLLER_FILE=/opt/csi/csi-ca-patch-controller.yaml
+CSI_WORKLOAD_WAIT_ATTEMPTS=12
+CSI_WORKLOAD_WAIT_INTERVAL_SECS=5
 
-# Makes the CSI driver trust an internally-signed CloudStack CA. No-op for clouds
-# fronted by a publicly-trusted CA, since /opt/csi/cloudstack-ca.crt is only ever
-# deployed by KubernetesClusterActionWorker#deployCloudStackCaTrust when a CA
-# certificate chain is actually configured. Upsert (not create-only) so CA
-# rotation propagates on a re-run of this script.
-apply_cloudstack_ca_trust() {
-    if [ -f /opt/csi/cloudstack-ca.crt ]; then
-        /opt/bin/kubectl -n kube-system create configmap cloudstack-ca --from-file=ca.crt=/opt/csi/cloudstack-ca.crt --dry-run=client -o yaml | /opt/bin/kubectl apply -f -
-        /opt/bin/kubectl -n kube-system patch daemonset cloudstack-csi-node --type=strategic --patch-file=/opt/csi/csi-ca-patch-node.yaml
-        /opt/bin/kubectl -n kube-system patch deployment cloudstack-csi-controller --type=strategic --patch-file=/opt/csi/csi-ca-patch-controller.yaml
-    fi
+# Splits a multi-document YAML manifest on lines that are exactly "---" into
+# one file per document under outdir, named doc-000.yaml, doc-001.yaml, ...
+# Used by apply_manifest_tolerant so a single malformed document can be
+# skipped without affecting the rest of the manifest.
+split_manifest_docs() {
+    local manifest="$1"
+    local outdir="$2"
+
+    awk -v outdir="${outdir}" '
+        BEGIN { docnum = 0; outfile = outdir "/doc-000.yaml" }
+        /^---[[:space:]]*$/ { docnum++; outfile = sprintf("%s/doc-%03d.yaml", outdir, docnum); next }
+        { print > outfile }
+    ' "${manifest}"
 }
 
+# Applies a multi-document manifest one document at a time so a single
+# malformed or rejected document does not abort provisioning of the rest of
+# the driver. This is necessary because the upstream cloudstack-csi-driver
+# v3.0.0 manifest.yaml ships a CSIDriver object with roleRef/subjects fields
+# that stricter Kubernetes API server validation (1.33+) rejects, which used
+# to abort this whole script under "bash -e" before the CA trust step ran.
+# Every failing document is logged with its kind/name and skipped.
+apply_manifest_tolerant() {
+    local manifest="$1"
+    local tmp_dir doc_file kind name
+
+    tmp_dir=$(mktemp -d)
+    split_manifest_docs "${manifest}" "${tmp_dir}"
+
+    for doc_file in "${tmp_dir}"/doc-*.yaml; do
+        [ -s "${doc_file}" ] || continue
+        if ! ${KUBECTL} apply -f "${doc_file}"; then
+            kind=$(awk '/^kind:/{print $2; exit}' "${doc_file}")
+            name=$(awk '/^[[:space:]]+name:/{print $2; exit}' "${doc_file}")
+            echo "WARNING: failed to apply manifest document (kind=${kind:-unknown}, name=${name:-unknown}) from $(basename "${manifest}"), continuing"
+        fi
+    done
+
+    rm -rf "${tmp_dir}"
+}
+
+# True only when the CSI controller Deployment and node DaemonSet both report
+# at least one ready replica.
+csi_workloads_ready() {
+    local ready
+
+    ready=$(${KUBECTL} -n "${CSI_NAMESPACE}" get deployment "${CSI_CONTROLLER_DEPLOYMENT}" \
+        -o jsonpath='{.status.availableReplicas}' 2>/dev/null) || return 1
+    [ -n "${ready}" ] && [ "${ready}" -gt 0 ] 2>/dev/null || return 1
+
+    ready=$(${KUBECTL} -n "${CSI_NAMESPACE}" get daemonset "${CSI_NODE_DAEMONSET}" \
+        -o jsonpath='{.status.numberReady}' 2>/dev/null) || return 1
+    [ -n "${ready}" ] && [ "${ready}" -gt 0 ] 2>/dev/null
+}
+
+# True when there is no CA to trust (nothing configured for this cloud) or
+# when the cloudstack-ca ConfigMap already carries the current
+# /opt/csi/cloudstack-ca.crt content. False when the ConfigMap is missing or
+# stale (CA rotated on the CloudStack side), which triggers a refresh.
+csi_ca_trust_current() {
+    [ -f "${CSI_CA_FILE}" ] || return 0
+
+    local configured_hash actual_hash
+    configured_hash=$(${KUBECTL} -n "${CSI_NAMESPACE}" get configmap "${CSI_CA_CONFIGMAP}" \
+        -o jsonpath='{.data.ca\.crt}' 2>/dev/null | sha256sum | awk '{print $1}')
+    actual_hash=$(sha256sum "${CSI_CA_FILE}" | awk '{print $1}')
+    [ -n "${configured_hash}" ] && [ "${configured_hash}" = "${actual_hash}" ]
+}
+
+# Makes the CSI driver trust an internally-signed CloudStack CA. No-op for
+# clouds fronted by a publicly-trusted CA, since /opt/csi/cloudstack-ca.crt is
+# only ever deployed by KubernetesClusterActionWorker#deployCloudStackCaTrust
+# when a CA certificate chain is actually configured. Upsert (not create-only)
+# so CA rotation propagates on a re-run of this script, and the strategic
+# merge patch triggers a rollout that also self-heals any CSI pods that were
+# previously crash-looping on x509 verification failures. Waits for the
+# DaemonSet/Deployment to exist before patching, since this can run right
+# after a first-time manifest apply before the workloads are created.
+apply_cloudstack_ca_trust() {
+    [ -f "${CSI_CA_FILE}" ] || return 0
+
+    local attempt
+    for ((attempt = 0; attempt < CSI_WORKLOAD_WAIT_ATTEMPTS; attempt++)); do
+        if ${KUBECTL} -n "${CSI_NAMESPACE}" get daemonset "${CSI_NODE_DAEMONSET}" >/dev/null 2>&1 \
+            && ${KUBECTL} -n "${CSI_NAMESPACE}" get deployment "${CSI_CONTROLLER_DEPLOYMENT}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep "${CSI_WORKLOAD_WAIT_INTERVAL_SECS}"
+    done
+
+    ${KUBECTL} -n "${CSI_NAMESPACE}" create configmap "${CSI_CA_CONFIGMAP}" \
+        --from-file=ca.crt="${CSI_CA_FILE}" --dry-run=client -o yaml | ${KUBECTL} apply -f -
+    ${KUBECTL} -n "${CSI_NAMESPACE}" patch daemonset "${CSI_NODE_DAEMONSET}" \
+        --type=strategic --patch-file="${CSI_CA_PATCH_NODE_FILE}"
+    ${KUBECTL} -n "${CSI_NAMESPACE}" patch deployment "${CSI_CONTROLLER_DEPLOYMENT}" \
+        --type=strategic --patch-file="${CSI_CA_PATCH_CONTROLLER_FILE}"
+}
+
+# Idempotency guard: only skip provisioning when the CSI workloads are
+# already up AND the CA trust ConfigMap (if any) matches what CloudStack has
+# configured. A healthy-but-stale-CA state falls through so the manifest
+# re-apply (idempotent) and apply_cloudstack_ca_trust refresh the trust bundle.
+if csi_workloads_ready && csi_ca_trust_current; then
+    exit 0
+fi
+
 if [ -e /opt/csi/snapshot-crds.yaml ]; then
-    /opt/bin/kubectl apply -f /opt/csi/snapshot-crds.yaml
+    apply_manifest_tolerant /opt/csi/snapshot-crds.yaml
     sleep 5
-    /opt/bin/kubectl apply -f /opt/csi/manifest.yaml
+    apply_manifest_tolerant /opt/csi/manifest.yaml
     apply_cloudstack_ca_trust
     exit 0
 else
@@ -52,8 +154,8 @@ else
           echo "Unable to connect to the internet to download the relevant files to install and setup CloudStack CSI driver"
           exit 1
         else
-          /opt/bin/kubectl apply -f /opt/csi/snapshot-crds.yaml
-          /opt/bin/kubectl apply -f /opt/csi/manifest.yaml
+          apply_manifest_tolerant /opt/csi/snapshot-crds.yaml
+          apply_manifest_tolerant /opt/csi/manifest.yaml
           apply_cloudstack_ca_trust
           exit 0
         fi
