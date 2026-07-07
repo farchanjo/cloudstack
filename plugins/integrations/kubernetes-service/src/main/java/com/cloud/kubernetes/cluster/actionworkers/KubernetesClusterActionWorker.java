@@ -249,12 +249,18 @@ public class KubernetesClusterActionWorker {
     protected final String autoscaleScriptFilename = "autoscale-kube-cluster";
     protected final String validateNodeScript = "validate-cks-node";
     protected final String removeNodeFromClusterScript = "remove-node-from-cluster";
+    protected final String csiCaPatchNodeFilename = "csi-ca-patch-node.yaml";
+    protected final String csiCaPatchControllerFilename = "csi-ca-patch-controller.yaml";
+    protected final String cloudStackCaTrustFilename = "cloudstack-ca.crt";
     protected final String scriptPath = "/opt/bin/";
+    protected final String csiPatchPath = "/opt/csi/";
     protected File deploySecretsScriptFile;
     protected File deployProviderScriptFile;
     protected File deployCsiDriverScriptFile;
     protected File autoscaleScriptFile;
     protected File deletePvScriptFile;
+    protected File csiCaPatchNodeFile;
+    protected File csiCaPatchControllerFile;
     protected KubernetesClusterManagerImpl manager;
     protected String[] keys;
 
@@ -735,6 +741,8 @@ public class KubernetesClusterActionWorker {
         deployCsiDriverScriptFile = retrieveScriptFile(deployCsiDriverScriptFilename);
         deletePvScriptFile = retrieveScriptFile(deletePvScriptFilename);
         autoscaleScriptFile = retrieveScriptFile(autoscaleScriptFilename);
+        csiCaPatchNodeFile = retrieveScriptFile(csiCaPatchNodeFilename);
+        csiCaPatchControllerFile = retrieveScriptFile(csiCaPatchControllerFilename);
     }
 
     protected void copyScripts(String nodeAddress, final int sshPort) {
@@ -743,21 +751,80 @@ public class KubernetesClusterActionWorker {
         copyScriptFile(nodeAddress, sshPort, deployCsiDriverScriptFile, deployCsiDriverScriptFilename);
         copyScriptFile(nodeAddress, sshPort, deletePvScriptFile, deletePvScriptFilename);
         copyScriptFile(nodeAddress, sshPort, autoscaleScriptFile, autoscaleScriptFilename);
+        copyFileToControlNode(nodeAddress, sshPort, csiCaPatchNodeFile, csiPatchPath, csiCaPatchNodeFilename);
+        copyFileToControlNode(nodeAddress, sshPort, csiCaPatchControllerFile, csiPatchPath, csiCaPatchControllerFilename);
     }
 
     protected void copyScriptFile(String nodeAddress, final int sshPort, File file, String destination) {
+        copyFileToControlNode(nodeAddress, sshPort, file, scriptPath, destination);
+    }
+
+    /**
+     * Copies a file to the control node home directory over SFTP, then moves it under
+     * {@code targetDir} on the remote host. Shared by the CKS script deployment idiom
+     * ({@link #copyScriptFile}) and the CSI CloudStack CA trust bundle deployment
+     * ({@link #deployCloudStackCaTrust}).
+     */
+    protected void copyFileToControlNode(String nodeAddress, final int sshPort, File file, String targetDir, String destination) {
         try {
             if (Objects.isNull(sshKeyFile)) {
                 sshKeyFile = getManagementServerSshPublicKeyFile();
             }
             SshHelper.scpTo(nodeAddress, sshPort, getControlNodeLoginUser(), sshKeyFile, null,
                     "~/", file.getAbsolutePath(), "0755", 20000, 30 * 60 * 1000);
-            // Ensure destination dir scriptPath exists and copy file to destination
-            String cmdStr = String.format("sudo mkdir -p %s ; sudo mv ~/%s %s/%s", scriptPath, file.getName(), scriptPath, destination);
+            // Ensure destination dir targetDir exists and copy file to destination
+            String cmdStr = String.format("sudo mkdir -p %s ; sudo mv ~/%s %s/%s", targetDir, file.getName(), targetDir, destination);
             SshHelper.sshExecute(nodeAddress, sshPort, getControlNodeLoginUser(), sshKeyFile, null,
                     cmdStr, 10000, 10000, 10 * 60 * 1000);
         } catch (Exception e) {
             throw new CloudRuntimeException(e);
+        }
+    }
+
+    /**
+     * Deploys the CloudStack CA certificate chain to the control node so the CKS-managed
+     * CSI driver can trust an internally-signed CloudStack API endpoint. Best-effort: the
+     * {@code deploy-csi-driver} script only patches the CSI workloads when the certificate
+     * file is present on disk, so any failure here safely falls back to today's behaviour
+     * for clouds fronted by a publicly-trusted CA.
+     */
+    protected void deployCloudStackCaTrust() {
+        String caChainPem;
+        try {
+            caChainPem = caManager.getCaCertificate(null);
+        } catch (IOException e) {
+            logMessage(Level.WARN, String.format(
+                    "Failed to retrieve the CloudStack CA certificate chain for Kubernetes cluster: %s, CSI driver will not trust the internal CA",
+                    kubernetesCluster.getName()), e);
+            return;
+        }
+        if (StringUtils.isEmpty(caChainPem)) {
+            return;
+        }
+        Pair<String, Integer> publicIpSshPort = getKubernetesClusterServerIpSshPort(null);
+        publicIpAddress = publicIpSshPort.first();
+        sshPort = publicIpSshPort.second();
+        File caFile = writeCloudStackCaCertificateToTempFile(caChainPem);
+        try {
+            copyFileToControlNode(publicIpAddress, sshPort, caFile, csiPatchPath, cloudStackCaTrustFilename);
+        } catch (CloudRuntimeException e) {
+            logMessage(Level.WARN, String.format(
+                    "Failed to copy the CloudStack CA certificate to the control node of Kubernetes cluster: %s, CSI driver will not trust the internal CA",
+                    kubernetesCluster.getName()), e);
+        } finally {
+            caFile.delete();
+        }
+    }
+
+    private File writeCloudStackCaCertificateToTempFile(String caChainPem) {
+        try {
+            File file = File.createTempFile("cloudstack-ca", ".crt");
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
+                writer.write(caChainPem);
+            }
+            return file;
+        } catch (IOException e) {
+            throw new CloudRuntimeException("Failed to write the CloudStack CA certificate chain to a temporary file", e);
         }
     }
 

@@ -16,6 +16,8 @@
 // under the License.
 package com.cloud.kubernetes.cluster.actionworkers;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -25,10 +27,13 @@ import java.util.UUID;
 import org.apache.cloudstack.affinity.AffinityGroupVO;
 import org.apache.cloudstack.affinity.dao.AffinityGroupDao;
 import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.ca.CAManager;
+import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.MockedStatic;
 import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -46,6 +51,8 @@ import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
+import com.cloud.utils.Pair;
+import com.cloud.utils.ssh.SshHelper;
 
 @RunWith(MockitoJUnitRunner.class)
 public class KubernetesClusterActionWorkerTest {
@@ -74,6 +81,12 @@ public class KubernetesClusterActionWorkerTest {
     @Mock
     AffinityGroupDao affinityGroupDao;
 
+    @Mock
+    CAManager caManager;
+
+    @Mock
+    ConfigurationDao configurationDao;
+
     KubernetesClusterActionWorker actionWorker = null;
 
     final static Long DEFAULT_ID = 1L;
@@ -90,6 +103,8 @@ public class KubernetesClusterActionWorkerTest {
         actionWorker = new KubernetesClusterActionWorker(kubernetesCluster, kubernetesClusterManager);
         actionWorker.ipAddressDao = ipAddressDao;
         actionWorker.affinityGroupDao = affinityGroupDao;
+        actionWorker.caManager = caManager;
+        actionWorker.configurationDao = configurationDao;
     }
 
     @Test
@@ -228,5 +243,52 @@ public class KubernetesClusterActionWorkerTest {
         Assert.assertEquals(2, result.size());
         Assert.assertTrue(result.contains(99L));
         Assert.assertTrue(result.contains(2L));
+    }
+
+    @Test
+    public void testDeployCloudStackCaTrustSkipsOnIOException() throws Exception {
+        Mockito.when(caManager.getCaCertificate(null)).thenThrow(new IOException("no CA provider configured"));
+
+        actionWorker.deployCloudStackCaTrust();
+
+        Mockito.verify(kubernetesClusterDetailsDao, Mockito.never())
+                .findDetail(Mockito.anyLong(), Mockito.eq(ApiConstants.EXTERNAL_LOAD_BALANCER_IP_ADDRESS));
+    }
+
+    @Test
+    public void testDeployCloudStackCaTrustSkipsOnEmptyCertificate() throws Exception {
+        Mockito.when(caManager.getCaCertificate(null)).thenReturn("");
+
+        actionWorker.deployCloudStackCaTrust();
+
+        Mockito.verify(kubernetesClusterDetailsDao, Mockito.never())
+                .findDetail(Mockito.anyLong(), Mockito.eq(ApiConstants.EXTERNAL_LOAD_BALANCER_IP_ADDRESS));
+    }
+
+    @Test
+    public void testDeployCloudStackCaTrustCopiesCertificateWhenAvailable() throws Exception {
+        Mockito.when(caManager.getCaCertificate(null)).thenReturn("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+        KubernetesClusterDetailsVO lbDetail = new KubernetesClusterDetailsVO(DEFAULT_ID, ApiConstants.EXTERNAL_LOAD_BALANCER_IP_ADDRESS, "10.0.0.5", false);
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(DEFAULT_ID, ApiConstants.EXTERNAL_LOAD_BALANCER_IP_ADDRESS)).thenReturn(lbDetail);
+
+        try (MockedStatic<SshHelper> sshHelperMockedStatic = Mockito.mockStatic(SshHelper.class)) {
+            sshHelperMockedStatic.when(() -> SshHelper.scpTo(
+                    Mockito.eq("10.0.0.5"), Mockito.anyInt(), Mockito.anyString(), Mockito.any(File.class), Mockito.isNull(),
+                    Mockito.anyString(), Mockito.anyString(), Mockito.anyString(), Mockito.anyInt(), Mockito.anyInt()))
+                    .thenAnswer(invocation -> null);
+            sshHelperMockedStatic.when(() -> SshHelper.sshExecute(
+                    Mockito.eq("10.0.0.5"), Mockito.anyInt(), Mockito.anyString(), Mockito.any(File.class), Mockito.isNull(),
+                    Mockito.anyString(), Mockito.anyInt(), Mockito.anyInt(), Mockito.anyInt()))
+                    .thenReturn(new Pair<>(true, ""));
+
+            actionWorker.deployCloudStackCaTrust();
+
+            sshHelperMockedStatic.verify(() -> SshHelper.scpTo(
+                    Mockito.eq("10.0.0.5"), Mockito.anyInt(), Mockito.anyString(), Mockito.any(File.class), Mockito.isNull(),
+                    Mockito.anyString(), Mockito.anyString(), Mockito.anyString(), Mockito.anyInt(), Mockito.anyInt()));
+            sshHelperMockedStatic.verify(() -> SshHelper.sshExecute(
+                    Mockito.eq("10.0.0.5"), Mockito.anyInt(), Mockito.anyString(), Mockito.any(File.class), Mockito.isNull(),
+                    Mockito.anyString(), Mockito.anyInt(), Mockito.anyInt(), Mockito.anyInt()));
+        }
     }
 }

@@ -855,6 +855,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         taintControlNodes();
         deployProvider();
         if (kubernetesCluster.isCsiEnabled()) {
+            deployCloudStackCaTrust();
             deployCsiDriver();
         }
         updateLoginUserDetails(clusterVMs.stream().map(InternalIdentity::getId).collect(Collectors.toList()));

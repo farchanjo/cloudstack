@@ -18,10 +18,24 @@
 
 (/opt/bin/kubectl get pods -A | grep cloudstack-csi-controller) && exit 0
 
+# Makes the CSI driver trust an internally-signed CloudStack CA. No-op for clouds
+# fronted by a publicly-trusted CA, since /opt/csi/cloudstack-ca.crt is only ever
+# deployed by KubernetesClusterActionWorker#deployCloudStackCaTrust when a CA
+# certificate chain is actually configured. Upsert (not create-only) so CA
+# rotation propagates on a re-run of this script.
+apply_cloudstack_ca_trust() {
+    if [ -f /opt/csi/cloudstack-ca.crt ]; then
+        /opt/bin/kubectl -n kube-system create configmap cloudstack-ca --from-file=ca.crt=/opt/csi/cloudstack-ca.crt --dry-run=client -o yaml | /opt/bin/kubectl apply -f -
+        /opt/bin/kubectl -n kube-system patch daemonset cloudstack-csi-node --type=strategic --patch-file=/opt/csi/csi-ca-patch-node.yaml
+        /opt/bin/kubectl -n kube-system patch deployment cloudstack-csi-controller --type=strategic --patch-file=/opt/csi/csi-ca-patch-controller.yaml
+    fi
+}
+
 if [ -e /opt/csi/snapshot-crds.yaml ]; then
     /opt/bin/kubectl apply -f /opt/csi/snapshot-crds.yaml
     sleep 5
     /opt/bin/kubectl apply -f /opt/csi/manifest.yaml
+    apply_cloudstack_ca_trust
     exit 0
 else
     TARGET_DIR="/opt/csi"
@@ -40,6 +54,7 @@ else
         else
           /opt/bin/kubectl apply -f /opt/csi/snapshot-crds.yaml
           /opt/bin/kubectl apply -f /opt/csi/manifest.yaml
+          apply_cloudstack_ca_trust
           exit 0
         fi
     done
