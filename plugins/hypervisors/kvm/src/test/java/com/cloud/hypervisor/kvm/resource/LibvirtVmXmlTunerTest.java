@@ -19,10 +19,24 @@ package com.cloud.hypervisor.kvm.resource;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
-import org.junit.Test;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.junit.Test;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+
+/**
+ * Assertions on tuned XML re-parse the output into DOM instead of matching raw substrings:
+ * the JDK serializer emits element attributes sorted by name, so substring checks that assume
+ * a specific attribute order (e.g. vcpu before cpuset) are not reliable.
+ */
 public class LibvirtVmXmlTunerTest {
 
     private static final String DOMAIN_XML =
@@ -39,45 +53,60 @@ public class LibvirtVmXmlTunerTest {
     private static final String NOT_XML = "not xml at all";
     private static final String NOT_DOMAIN_XML = "<notdomain/>";
 
+    private static final String VCPU_POOL = "16-63,80-127";
+    private static final String EMULATOR_POOL = "0-14,64-78";
+
     @Test
-    public void testVcpuAndEmulatorPinAreInjected() {
-        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner("16-63,80-127", "0-14,64-78", "", "", "");
+    public void testVcpuAndEmulatorPinAreInjected() throws Exception {
+        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner(VCPU_POOL, EMULATOR_POOL, "", "", "");
         assertTrue(tuner.isEnabled());
 
-        String result = tuner.transform(DOMAIN_XML);
+        Document result = parseXml(tuner.transform(DOMAIN_XML));
 
+        assertEquals(1, result.getElementsByTagName("cputune").getLength());
+        assertEquals(4, result.getElementsByTagName("vcpupin").getLength());
         for (int i = 0; i < 4; i++) {
-            assertTrue("Missing vcpupin for vcpu " + i,
-                    result.contains("<vcpupin vcpu=\"" + i + "\" cpuset=\"16-63,80-127\""));
+            Element pin = findVcpuPin(result, i);
+            assertNotNull("Missing vcpupin for vcpu " + i, pin);
+            assertEquals(VCPU_POOL, pin.getAttribute("cpuset"));
         }
-        assertTrue(result.contains("<emulatorpin cpuset=\"0-14,64-78\""));
+        NodeList emulatorPins = result.getElementsByTagName("emulatorpin");
+        assertEquals(1, emulatorPins.getLength());
+        assertEquals(EMULATOR_POOL, ((Element) emulatorPins.item(0)).getAttribute("cpuset"));
     }
 
     @Test
-    public void testExistingCpuTuneElementsAreOverwrittenNotDuplicated() {
-        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner("16-63,80-127", "0-14,64-78", "", "", "");
+    public void testExistingCpuTuneElementsAreOverwrittenNotDuplicated() throws Exception {
+        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner(VCPU_POOL, EMULATOR_POOL, "", "", "");
 
-        String result = tuner.transform(DOMAIN_XML_WITH_CPUTUNE);
+        Document result = parseXml(tuner.transform(DOMAIN_XML_WITH_CPUTUNE));
 
-        assertEquals(1, countOccurrences(result, "<cputune"));
-        assertEquals(1, countOccurrences(result, "<emulatorpin"));
-        assertEquals(4, countOccurrences(result, "<vcpupin"));
-        assertTrue(result.contains("<emulatorpin cpuset=\"0-14,64-78\""));
-        assertTrue(result.contains("<vcpupin vcpu=\"0\" cpuset=\"16-63,80-127\""));
-        assertFalse(result.contains("0-15,64-79"));
-        assertFalse(result.contains("cpuset=\"0-127\""));
+        assertEquals(1, result.getElementsByTagName("cputune").getLength());
+        NodeList emulatorPins = result.getElementsByTagName("emulatorpin");
+        assertEquals(1, emulatorPins.getLength());
+        assertEquals(EMULATOR_POOL, ((Element) emulatorPins.item(0)).getAttribute("cpuset"));
+        assertEquals(4, result.getElementsByTagName("vcpupin").getLength());
+        for (int i = 0; i < 4; i++) {
+            Element pin = findVcpuPin(result, i);
+            assertNotNull("Missing vcpupin for vcpu " + i, pin);
+            assertEquals("Stale cpuset not overwritten for vcpu " + i, VCPU_POOL, pin.getAttribute("cpuset"));
+        }
     }
 
     @Test
-    public void testBridgeRemapAppliedWithoutCpuTune() {
+    public void testBridgeRemapAppliedWithoutCpuTune() throws Exception {
         LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner("", "", "cplane", "br-cluster", "2011");
         assertTrue(tuner.isEnabled());
 
-        String result = tuner.transform(DOMAIN_XML);
+        Document result = parseXml(tuner.transform(DOMAIN_XML));
 
-        assertTrue(result.contains("bridge=\"br-cluster\""));
-        assertTrue(result.contains("<tag id=\"2011\""));
-        assertFalse(result.contains("<cputune"));
+        Element source = (Element) result.getElementsByTagName("source").item(0);
+        assertNotNull(source);
+        assertEquals("br-cluster", source.getAttribute("bridge"));
+        NodeList tags = result.getElementsByTagName("tag");
+        assertEquals(1, tags.getLength());
+        assertEquals("2011", ((Element) tags.item(0)).getAttribute("id"));
+        assertEquals(0, result.getElementsByTagName("cputune").getLength());
     }
 
     @Test
@@ -88,13 +117,13 @@ public class LibvirtVmXmlTunerTest {
 
     @Test
     public void testTransformFailsOpenOnInvalidXml() {
-        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner("16-63,80-127", "0-14,64-78", "", "", "");
+        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner(VCPU_POOL, EMULATOR_POOL, "", "", "");
         assertEquals(NOT_XML, tuner.transform(NOT_XML));
     }
 
     @Test
     public void testTransformReturnsInputUnchangedWhenRootIsNotDomain() {
-        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner("16-63,80-127", "0-14,64-78", "", "", "");
+        LibvirtVmXmlTuner tuner = new LibvirtVmXmlTuner(VCPU_POOL, EMULATOR_POOL, "", "", "");
         assertEquals(NOT_DOMAIN_XML, tuner.transform(NOT_DOMAIN_XML));
     }
 
@@ -104,13 +133,19 @@ public class LibvirtVmXmlTunerTest {
         assertFalse(tuner.isEnabled());
     }
 
-    private static int countOccurrences(String haystack, String needle) {
-        int count = 0;
-        int index = 0;
-        while ((index = haystack.indexOf(needle, index)) != -1) {
-            count++;
-            index += needle.length();
+    private static Document parseXml(String xml) throws Exception {
+        return DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static Element findVcpuPin(Document document, int index) {
+        NodeList pins = document.getElementsByTagName("vcpupin");
+        for (int i = 0; i < pins.getLength(); i++) {
+            Element pin = (Element) pins.item(i);
+            if (String.valueOf(index).equals(pin.getAttribute("vcpu"))) {
+                return pin;
+            }
         }
-        return count;
+        return null;
     }
 }
