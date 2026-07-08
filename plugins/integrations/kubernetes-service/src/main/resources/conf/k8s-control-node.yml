@@ -377,6 +377,13 @@ write_files:
         ### Network, dashboard configs available offline ###
         echo "Offline configs are available!"
         if [[ ${EXTERNAL_CNI_PLUGIN} == false ]]; then
+          if [[ "{{ k8s.dual.stack }}" == "true" ]]; then
+            echo "Enabling Calico IPv6 pod address assignment in the CNI config"
+            # calico-ipam defaults assign_ipv6 to false; without this every pod stays
+            # v4-only even with FELIX_IPV6SUPPORT and a v6 IPPool in place. Patch the
+            # manifest before it is applied so all pods get dual IPs from the start.
+            sed -i 's/"type": "calico-ipam"/"type": "calico-ipam", "assign_ipv4": "true", "assign_ipv6": "true"/' ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml || true
+          fi
           /opt/bin/kubectl apply -f ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml
           if [[ "{{ k8s.dual.stack }}" == "true" ]]; then
             echo "Enabling Calico IPv6 dual-stack support"
