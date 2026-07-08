@@ -99,6 +99,8 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
     protected static final String CLUSTER_DEFAULT_SERVICE_CIDR_V4 = "10.96.0.0/12";
     /** Small ULA IPv6 service range paired with the IPv4 service CIDR on dual-stack clusters. */
     protected static final String CLUSTER_DUALSTACK_SERVICE_CIDR_V6 = "fd00:cafe:svc::/108";
+    /** ULA IPv6 pod range handed to Calico as an additional IPPool CR on dual-stack clusters. */
+    protected static final String CLUSTER_DUALSTACK_POD_CIDR_V6 = "fd00:cafe:pod::/64";
     /** Kubernetes version at which IPv6 dual-stack graduated to GA (no feature-gate needed). */
     protected static final String KUBERNETES_DUALSTACK_GA_VERSION = "1.21.0";
 
@@ -137,15 +139,15 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
     }
 
     /**
-     * Acquires an IPv6 guest address for a control node when the cluster network is dual-stack,
-     * mirroring the existing IPv4 acquisition. Returns {@code null} for IPv4-only networks so the
-     * caller falls back to the exact pre-dual-stack behaviour.
+     * The control node's IPv6 address is never pre-reserved from an IPAM pool: isolated and VPC
+     * guest tiers have no {@code user_ipv6_address} pool rows, so acquiring one throws. Instead the
+     * NIC's IPv6 is auto-assigned as EUI-64(MAC) by {@code GuestNetworkGuru.allocate} at deploy
+     * time, and nothing connects to the apiserver over IPv6 before the node boots
+     * (controlPlaneEndpoint / advertiseAddress / join are all IPv4). This method therefore always
+     * returns {@code null}; the node's IPv6 InternalIP is advertised later via kubelet {@code --node-ip}.
      */
-    protected String getKubernetesControlNodeIp6Address(final Network network) throws InsufficientAddressCapacityException {
-        if (!isNetworkDualStack(network)) {
-            return null;
-        }
-        return ipv6AddressManager.acquireGuestIpv6Address(network, null);
+    protected String getKubernetesControlNodeIp6Address(final Network network) {
+        return null;
     }
 
     /**
@@ -237,7 +239,8 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
 
     private Pair<String, String> getKubernetesControlNodeConfig(final String controlNodeIp, final String controlNodeIp6, final String serverIp,
                                                                 final List<Network.IpAddresses> etcdIps, final String hostName, final boolean haSupported,
-                                                                final boolean ejectIso, final boolean externalCni, final boolean setupCsi) throws IOException {
+                                                                final boolean ejectIso, final boolean externalCni, final boolean setupCsi,
+                                                                final boolean dualStack) throws IOException {
         String k8sControlNodeConfig = readK8sConfigFile("/conf/k8s-control-node.yml");
         final String apiServerCert = "{{ k8s_control_node.apiserver.crt }}";
         final String apiServerKey = "{{ k8s_control_node.apiserver.key }}";
@@ -256,8 +259,10 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         final String k8sCertificate = "{{ k8s_control.certificate_key }}";
         final String externalCniPlugin = "{{ k8s.external.cni.plugin }}";
         final String setupCsiDriver = "{{ k8s.setup.csi.driver }}";
+        final String dualStackKey = "{{ k8s.dual.stack }}";
+        final String kubeletNodeIpArgsKey = "{{ k8s.kubelet.node.ip.args }}";
+        final String calicoPodCidrV6Key = "{{ k8s.calico.pod.cidr.v6 }}";
 
-        final boolean dualStack = StringUtils.isNotBlank(controlNodeIp6);
         final List<String> addresses = getControlNodeCertificateSans(controlNodeIp, serverIp, controlNodeIp6);
 
         boolean externalEtcd = !etcdIps.isEmpty();
@@ -306,6 +311,9 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         k8sControlNodeConfig = k8sControlNodeConfig.replace(k8sCertificate, KubernetesClusterUtil.generateClusterHACertificateKey(kubernetesCluster));
         k8sControlNodeConfig = k8sControlNodeConfig.replace(externalCniPlugin, String.valueOf(externalCni));
         k8sControlNodeConfig = k8sControlNodeConfig.replace(setupCsiDriver, String.valueOf(setupCsi));
+        k8sControlNodeConfig = k8sControlNodeConfig.replace(dualStackKey, String.valueOf(dualStack));
+        k8sControlNodeConfig = k8sControlNodeConfig.replace(kubeletNodeIpArgsKey, getKubeletNodeIpArgs());
+        k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV6Key, CLUSTER_DUALSTACK_POD_CIDR_V6);
 
         k8sControlNodeConfig = updateKubeConfigWithRegistryDetails(k8sControlNodeConfig);
 
@@ -341,7 +349,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         Long userDataId = kubernetesCluster.getCniConfigId();
         Pair<String, String> k8sControlNodeConfigAndControlIp = new Pair<>(null, null);
         try {
-            k8sControlNodeConfigAndControlIp = getKubernetesControlNodeConfig(controlNodeIp, controlNodeIp6, serverIp, etcdIps, hostName, haSupported, Hypervisor.HypervisorType.VMware.equals(clusterTemplate.getHypervisorType()), Objects.nonNull(userDataId), kubernetesCluster.isCsiEnabled());
+            k8sControlNodeConfigAndControlIp = getKubernetesControlNodeConfig(controlNodeIp, controlNodeIp6, serverIp, etcdIps, hostName, haSupported, Hypervisor.HypervisorType.VMware.equals(clusterTemplate.getHypervisorType()), Objects.nonNull(userDataId), kubernetesCluster.isCsiEnabled(), isNetworkDualStack(network));
         } catch (IOException e) {
             logAndThrow(Level.ERROR, "Failed to read Kubernetes control node configuration file", e);
         }
@@ -506,8 +514,8 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         ServiceOffering serviceOffering = getServiceOfferingForNodeTypeOnCluster(CONTROL, kubernetesCluster);
         List<Long> networkIds = new ArrayList<Long>();
         networkIds.add(kubernetesCluster.getNetworkId());
-        Network network = networkDao.findById(kubernetesCluster.getNetworkId());
-        Network.IpAddresses addrs = new Network.IpAddresses(null, getKubernetesControlNodeIp6Address(network));
+        // Additional control nodes get no pre-reserved IPv6 either; their EUI-64 v6 is auto-assigned at deploy time.
+        Network.IpAddresses addrs = new Network.IpAddresses(null, null);
         long rootDiskSize = kubernetesCluster.getNodeRootDiskSize();
         Map<String, String> customParameterMap = new HashMap<String, String>();
         if (rootDiskSize > 0) {
@@ -666,11 +674,11 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
     }
 
     private List<Network.IpAddresses> getEtcdNodeGuestIps(final Network network, final long etcdNodeCount) throws InsufficientAddressCapacityException {
-        final boolean dualStack = isNetworkDualStack(network);
+        // etcd nodes never pre-reserve an IPv6 from an IPAM pool (isolated/VPC tiers have none);
+        // any IPv6 they need is auto-assigned as EUI-64 at deploy time.
         List<Network.IpAddresses> guestIps = new ArrayList<>();
         for (int i = 1; i <= etcdNodeCount; i++) {
-            String ip6 = dualStack ? ipv6AddressManager.acquireGuestIpv6Address(network, null) : null;
-            guestIps.add(new Network.IpAddresses(ipAddressManager.acquireGuestIpAddress(network, null), ip6));
+            guestIps.add(new Network.IpAddresses(ipAddressManager.acquireGuestIpAddress(network, null), null));
         }
         return guestIps;
     }

@@ -1029,6 +1029,7 @@ public class KubernetesClusterActionWorker {
         final String installWaitTime = "{{ k8s.install.wait.time }}";
         final String installReattemptsCount = "{{ k8s.install.reattempts.count }}";
         final String kubeletNodeIpArgsKey = "{{ k8s.kubelet.node.ip.args }}";
+        final String dualStackKey = "{{ k8s.dual.stack }}";
 
         final Long waitTime = KubernetesClusterService.KubernetesWorkerNodeInstallAttemptWait.value();
         final Long reattempts = KubernetesClusterService.KubernetesWorkerNodeInstallReattempts.value();
@@ -1055,6 +1056,7 @@ public class KubernetesClusterActionWorker {
         k8sNodeConfig = k8sNodeConfig.replace(installWaitTime, String.valueOf(waitTime));
         k8sNodeConfig = k8sNodeConfig.replace(installReattemptsCount, String.valueOf(reattempts));
         k8sNodeConfig = k8sNodeConfig.replace(kubeletNodeIpArgsKey, getKubeletNodeIpArgs());
+        k8sNodeConfig = k8sNodeConfig.replace(dualStackKey, String.valueOf(isNetworkDualStack(networkDao.findById(kubernetesCluster.getNetworkId()))));
 
         k8sNodeConfig = updateKubeConfigWithRegistryDetails(k8sNodeConfig);
 

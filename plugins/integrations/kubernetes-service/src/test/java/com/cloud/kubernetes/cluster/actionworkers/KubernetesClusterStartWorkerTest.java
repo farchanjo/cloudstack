@@ -41,12 +41,16 @@ import com.cloud.network.dao.NetworkVO;
  * Unit coverage for the IPv6 dual-stack rendering added to {@link KubernetesClusterStartWorker}.
  *
  * <p>The tests exercise the small pure seams the worker delegates to when building control-node
- * userdata. They assert two things for every seam:
+ * userdata. Key invariant: the control node's IPv6 is NEVER pre-reserved from an IPAM pool
+ * (isolated/VPC guest tiers have none); it is auto-assigned as EUI-64 at deploy time. They assert:
  * <ul>
- *   <li>DualStack network: the IPv6 address flows into cert SANs, kubeadm --service-cidr and the
- *       kubelet --node-ip args, and a v6 control-node IP is acquired.</li>
- *   <li>REGRESSION (IPv4-only network): NO v6 is acquired, the cert SAN list is v4-only, and the
- *       init/kubelet args are byte-identical to the pre-dual-stack output.</li>
+ *   <li>The control-node v6 acquisition seam always returns {@code null} and never touches the
+ *       {@code Ipv6AddressManager}, regardless of network type.</li>
+ *   <li>DualStack network: the dual-stack flag is derived from the network and drives the v6
+ *       {@code --service-cidr} member and the kubelet {@code --node-ip} args; cert SANs stay v4-only
+ *       because {@code controlNodeIp6} is {@code null}.</li>
+ *   <li>REGRESSION (IPv4-only network): the cert SAN list is v4-only and the init/kubelet args are
+ *       byte-identical to the pre-dual-stack output.</li>
  * </ul>
  */
 @RunWith(MockitoJUnitRunner.class)
@@ -119,22 +123,23 @@ public class KubernetesClusterStartWorkerTest {
         Assert.assertFalse(worker.isNetworkDualStack(null));
     }
 
-    // ---- v6 control-node IP acquisition ----
+    // ---- v6 control-node IP is NEVER pre-reserved (EUI-64 auto-assigned at deploy time) ----
 
     @Test
-    public void testGetControlNodeIp6AddressAcquiredWhenDualStack() throws Exception {
-        Network network = dualStackNetwork();
-        Mockito.when(ipv6AddressManager.acquireGuestIpv6Address(network, null)).thenReturn(CONTROL_IP6);
+    public void testGetControlNodeIp6AddressNeverAcquiredForDualStackNetwork() {
+        // Even on a dual-stack network the control node's v6 is not pulled from an IPAM pool
+        // (there is none on isolated/VPC tiers): the seam returns null and never calls the manager.
+        Network network = Mockito.mock(NetworkVO.class);
 
         String ip6 = worker.getKubernetesControlNodeIp6Address(network);
 
-        Assert.assertEquals(CONTROL_IP6, ip6);
-        Mockito.verify(ipv6AddressManager).acquireGuestIpv6Address(network, null);
+        Assert.assertNull(ip6);
+        Mockito.verifyNoInteractions(ipv6AddressManager);
     }
 
     @Test
-    public void testGetControlNodeIp6AddressNullWhenIpv4Only() throws Exception {
-        Network network = ipv4OnlyNetwork();
+    public void testGetControlNodeIp6AddressNeverAcquiredForIpv4OnlyNetwork() {
+        Network network = Mockito.mock(NetworkVO.class);
 
         String ip6 = worker.getKubernetesControlNodeIp6Address(network);
 
@@ -223,6 +228,24 @@ public class KubernetesClusterStartWorkerTest {
     @Test
     public void testDualStackFeatureGateRequiredBeforeGaVersion() {
         Assert.assertTrue(worker.isDualStackFeatureGateRequired("1.20.0"));
+    }
+
+    // ---- dual-stack flag derived from the network (not from a pre-reserved v6) ----
+
+    @Test
+    public void testDualStackFlagDerivedFromNetworkDrivesServiceCidrButNotCertSans() {
+        Network network = dualStackNetwork();
+        boolean dualStack = worker.isNetworkDualStack(network);
+        Assert.assertTrue(dualStack);
+
+        // The derived flag still carries the v6 --service-cidr member ...
+        String serviceCidrArg = worker.getServiceCidrInitArg(dualStack, "1.28.0");
+        Assert.assertTrue(serviceCidrArg.contains(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_SERVICE_CIDR_V6));
+
+        // ... but with controlNodeIp6 == null (never acquired), the issued cert SANs stay v4-only.
+        Assert.assertEquals(List.of(CONTROL_IP4, SERVER_IP4),
+                worker.getControlNodeCertificateSans(CONTROL_IP4, SERVER_IP4, null));
+        Assert.assertEquals(SERVER_IP4, worker.getApiServerCertExtraSans(SERVER_IP4, null));
     }
 
     // ---- kubelet --node-ip ----

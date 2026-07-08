@@ -145,7 +145,7 @@ write_files:
         mkdir -p /etc/systemd/system/kubelet.service.d
         sed "s:/usr/bin:/opt/bin:g" ${BINARIES_DIR}/10-kubeadm.conf > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
 
-        echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd" > /etc/default/kubelet
+        echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd{{ k8s.kubelet.node.ip.args }}" > /etc/default/kubelet
 
         output=`ls ${BINARIES_DIR}/docker/`
         if [ "$output" != "" ]; then
@@ -340,6 +340,11 @@ write_files:
         echo "Offline configs are available!"
         if [[ ${EXTERNAL_CNI_PLUGIN} == false ]]; then
           /opt/bin/kubectl apply -f ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml
+          if [[ "{{ k8s.dual.stack }}" == "true" ]]; then
+            echo "Enabling Calico IPv6 dual-stack support"
+            /opt/bin/kubectl -n kube-system set env daemonset/calico-node FELIX_IPV6SUPPORT=true IP6=autodetect || true
+            printf 'apiVersion: crd.projectcalico.org/v1\nkind: IPPool\nmetadata:\n  name: default-ipv6-ippool\nspec:\n  cidr: {{ k8s.calico.pod.cidr.v6 }}\n  natOutgoing: true\n  vxlanMode: Never\n  nodeSelector: all()\n' | /opt/bin/kubectl apply -f - || true
+          fi
         fi
         if [ -f "${K8S_CONFIG_SCRIPTS_COPY_DIR}/headlamp.yaml" ]; then
           echo "Installing Headlamp dashboard from ISO"
