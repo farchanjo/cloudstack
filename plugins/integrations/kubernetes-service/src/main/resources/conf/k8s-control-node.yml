@@ -18,12 +18,17 @@
 # under the License.
 
 ---
-# Runs before cloud-init applies network configuration. On dual-stack clusters the node
-# image ships with IPv6 disabled (net.ipv6.conf.all.disable_ipv6 = 1 in /etc/sysctl.conf),
-# which strips even link-local v6 and empties the kubelet --node-ip v6 member. Re-enable v6
-# here so the subsequent network-config stage can apply the static v6 address normally. The
-# guard renders as `if [ "true"/"false" = "true" ]`, so it is an inert no-op on v4-only
-# clusters (executes but changes nothing).
+# Runs in the cloud-init init stage, after networking.service has already raised eth0 from
+# the image's baked-in v4-only /etc/network/interfaces. On dual-stack clusters the image
+# also ships with IPv6 fully disabled (net.ipv6.conf.all.disable_ipv6 = 1 in
+# /etc/sysctl.conf), so this block (1) enables IPv6 plus the v6 forwarding and
+# bridge-nf-call-ip6tables sysctls required by the kubeadm dual-stack preflight and
+# kube-proxy/Calico, persisting them for later boots, and (2) applies the static v6
+# address that cloud-init rendered into interfaces.d/50-cloud-init - that stanza is never
+# applied on first boot because the file is written after networking.service ran (and v6
+# was still disabled at that point), leaving the NIC with link-local only and crashing
+# calico-node (IP6=autodetect). The guard renders as `if [ "true"/"false" = "true" ]`, so
+# it is an inert no-op on v4-only clusters (executes but changes nothing).
 bootcmd:
   - |
     if [ "{{ k8s.dual.stack }}" = "true" ]; then
@@ -36,6 +41,19 @@ bootcmd:
       sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
       mkdir -p /etc/sysctl.d
       printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv6.conf.default.forwarding = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/99-cks-dualstack.conf
+      ENI=/etc/network/interfaces.d/50-cloud-init
+      if [ -f "$ENI" ]; then
+        V6IF=$(awk '$1=="iface" && $3=="inet6" {print $2; exit}' "$ENI")
+        V6ADDR=$(awk '$1=="iface" {in6=($3=="inet6")} in6 && $1=="address" {print $2; exit}' "$ENI")
+        V6GW=$(awk '$1=="iface" {in6=($3=="inet6")} in6 && $1=="post-up" && $5=="inet6" && $6=="default" {print $8; exit}' "$ENI")
+        if [ -n "$V6IF" ] && [ -n "$V6ADDR" ]; then
+          case "$V6ADDR" in */*) : ;; *) V6ADDR="$V6ADDR/64" ;; esac
+          ip -6 addr replace "$V6ADDR" dev "$V6IF" || true
+          if [ -n "$V6GW" ]; then
+            ip -6 route replace default via "$V6GW" dev "$V6IF" || true
+          fi
+        fi
+      fi
     fi
 
 users:
