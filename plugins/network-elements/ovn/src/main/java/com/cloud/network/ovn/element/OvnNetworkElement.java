@@ -288,7 +288,7 @@ public class OvnNetworkElement extends AdapterBase
                 return;
             }
             final int prefix = Integer.parseInt(cidr.substring(cidr.indexOf('/') + 1));
-            final List<String> networks = List.of(gateway + "/" + prefix);
+            final List<String> networks = buildLrpNetworks(network, gateway + "/" + prefix);
             final String gwMac = deriveGatewayMac(gateway);
             if (existing != null) {
                 // Already bound — reconcile gateway IP / CIDR. Cheap idempotent
@@ -297,6 +297,10 @@ public class OvnNetworkElement extends AdapterBase
                 // tearing the patch pair down.
                 final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
                 nb.updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
+                // Self-heal: (re)advertise IPv6 RA on every reconcile too, so a
+                // network that only gained its v6 gateway/cidr after the LRP
+                // was first bound gets RA without needing a re-create.
+                applyIpv6RaConfigs(nb, existing.getOvnUuid(), network);
                 LOGGER.debug("OvnNetworkElement.ensureTierBound: LRP {} reconciled (tier id={}, networks={})",
                         existing.getOvnUuid(), network.getId(), networks);
                 // Self-heal: verify the router-type peer LSP exists on the tier LS.
@@ -317,6 +321,7 @@ public class OvnNetworkElement extends AdapterBase
             final OvnNbClient.BindResult bind = vpcElement.bindTierToVpc(vpc, tierLsUuid, tierName, gwMac, networks);
             logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.PUBLIC_LRP, network.getId(), controller.getId(),
                     bind.lrpUuid, "lrp-" + tierName));
+            applyIpv6RaConfigs(pluginManager.nbClient(network.getDataCenterId()), bind.lrpUuid, network);
             LOGGER.info("OvnNetworkElement.ensureTierBound: LRP {} + LSP {} created (tier id={}, vpc id={})",
                     bind.lrpUuid, bind.lspUuid, network.getId(), vpc.getId());
         } catch (OvnException e) {
@@ -348,6 +353,46 @@ public class OvnNetworkElement extends AdapterBase
         } catch (NumberFormatException e) {
             return "02:01:01:00:00:01";
         }
+    }
+
+    /**
+     * Extends an LRP {@code networks} list with the tier's IPv6 gateway CIDR
+     * when the network carries a dual-stack (v4+v6) configuration — the v6
+     * prefix length is parsed off {@link Network#getIp6Cidr()} the same way
+     * the v4 prefix is parsed off {@code getCidr()}. Strict no-op for
+     * IPv4-only networks: the returned list then holds only {@code v4Entry},
+     * unchanged from the pre-IPv6 behavior.
+     */
+    private static List<String> buildLrpNetworks(final Network network, final String v4Entry) {
+        final List<String> networks = new ArrayList<>();
+        networks.add(v4Entry);
+        if (StringUtils.isNotBlank(network.getIp6Gateway()) && StringUtils.isNotBlank(network.getIp6Cidr())) {
+            final String ip6Cidr = network.getIp6Cidr();
+            final int v6Prefix = Integer.parseInt(ip6Cidr.substring(ip6Cidr.indexOf('/') + 1));
+            networks.add(network.getIp6Gateway() + "/" + v6Prefix);
+        }
+        return networks;
+    }
+
+    /** OVN {@code Logical_Router_Port.ipv6_ra_configs} keys advertised when a
+     *  tier carries a v6 gateway — {@code dhcpv6_stateful} mirrors the
+     *  DHCPv6/static-address model already on the LSP (M-flag on, SLAAC
+     *  autonomous off), so ovn-northd advertises this LRP as the guest's
+     *  default v6 gateway. */
+    private static final Map<String, String> IPV6_RA_CONFIGS = Map.of(
+            "address_mode", "dhcpv6_stateful",
+            "send_periodic", "true",
+            "max_interval", "30");
+
+    /**
+     * Enable IPv6 Router Advertisements on {@code lrpUuid} when the tier
+     * carries a v6 gateway/cidr. Strict no-op for IPv4-only networks.
+     */
+    private void applyIpv6RaConfigs(final OvnNbClient nb, final String lrpUuid, final Network network) {
+        if (StringUtils.isBlank(network.getIp6Gateway()) || StringUtils.isBlank(network.getIp6Cidr())) {
+            return;
+        }
+        nb.lrpSetIpv6RaConfigs(lrpUuid, IPV6_RA_CONFIGS);
     }
 
     @Override
@@ -763,7 +808,7 @@ public class OvnNetworkElement extends AdapterBase
             final String lrUuid = vpcElement.createLogicalRouterForNetwork(network);
             applyLrCtTimeouts(pluginManager.nbClient(network.getDataCenterId()), lrUuid);
             final int prefix = Integer.parseInt(cidr.substring(cidr.indexOf('/') + 1));
-            final List<String> networks = List.of(gateway + "/" + prefix);
+            final List<String> networks = buildLrpNetworks(network, gateway + "/" + prefix);
             final String gwMac = deriveGatewayMac(gateway);
             final String tierName = network.getUuid();
             final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
@@ -777,12 +822,17 @@ public class OvnNetworkElement extends AdapterBase
             if (existing != null) {
                 nb.updateLogicalRouterPortNetworks(existing.getOvnUuid(), networks, gwMac);
                 nb.ensureRouterPeerLsp(netLsUuid, "rsp-" + tierName, "lrp-" + tierName);
+                // Self-heal: (re)advertise IPv6 RA on every reconcile too, so a
+                // network that only gained its v6 gateway/cidr after the LRP
+                // was first bound gets RA without needing a re-create.
+                applyIpv6RaConfigs(nb, existing.getOvnUuid(), network);
                 return;
             }
             final OvnNbClient.BindResult bind = vpcElement.bindNetworkGateway(network, lrUuid, netLsUuid,
                     tierName, gwMac, networks);
             logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK_GW_LRP, network.getId(), controller.getId(),
                     bind.lrpUuid, "lrp-" + tierName));
+            applyIpv6RaConfigs(nb, bind.lrpUuid, network);
             LOGGER.info("OvnNetworkElement.ensureIsolatedNetworkGateway: LR {} + gw LRP {} for isolated network id={}",
                     lrUuid, bind.lrpUuid, network.getId());
         } catch (OvnException e) {
