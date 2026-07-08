@@ -26,12 +26,14 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import com.cloud.dc.DataCenter.NetworkType;
+import com.cloud.deploy.DeploymentPlan;
 import com.cloud.network.Network;
 import com.cloud.network.Network.GuestType;
 import com.cloud.network.Network.Provider;
 import com.cloud.network.Network.Service;
 import com.cloud.network.PhysicalNetwork;
 import com.cloud.network.PhysicalNetwork.IsolationMethod;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.guru.GuestNetworkGuru;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnException;
@@ -44,6 +46,7 @@ import com.cloud.network.ovn.dao.OvnPendingDeletionVO;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
+import com.cloud.user.Account;
 
 /**
  * Owns the lifecycle of a per-tier OVN logical switch.
@@ -103,6 +106,26 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
             return false;
         }
         return networkOfferingServiceMapDao.isProviderForNetworkOffering(offering.getId(), Provider.Ovn);
+    }
+
+    /**
+     * Extends the inherited {@link GuestNetworkGuru#design} with the IPv6
+     * copy step the base implementation skips. The core auto-allocates a
+     * /64 for Advanced+Isolated networks (see
+     * {@code NetworkServiceImpl#preAllocateIpv6SubnetForNetwork}) and passes
+     * it in via {@code userSpecified}; {@code updateNetworkDesignForIPv6IfNeeded}
+     * copies {@code ip6Cidr}/{@code ip6Gateway} onto the designed
+     * {@link NetworkVO} so {@code NetworkOrchestrator} persists it and calls
+     * {@code Ipv6Service.assignIpv6SubnetToNetwork()}.
+     */
+    @Override
+    public Network design(final NetworkOffering offering, final DeploymentPlan plan, final Network userSpecified,
+                          final String name, final Long vpcId, final Account owner) {
+        NetworkVO network = (NetworkVO) super.design(offering, plan, userSpecified, name, vpcId, owner);
+        if (network == null) {
+            return null;
+        }
+        return updateNetworkDesignForIPv6IfNeeded(network, userSpecified);
     }
 
     /**
