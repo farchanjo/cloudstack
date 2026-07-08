@@ -29,8 +29,12 @@ bootcmd:
       echo "Enabling IPv6 for dual-stack Kubernetes networking"
       sysctl -w net.ipv6.conf.all.disable_ipv6=0
       sysctl -w net.ipv6.conf.default.disable_ipv6=0
+      sysctl -w net.ipv6.conf.all.forwarding=1
+      sysctl -w net.ipv6.conf.default.forwarding=1
+      modprobe br_netfilter || true
+      sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
       mkdir -p /etc/sysctl.d
-      printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\n' > /etc/sysctl.d/99-cks-dualstack.conf
+      printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv6.conf.default.forwarding = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/99-cks-dualstack.conf
     fi
 
 users:
