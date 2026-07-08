@@ -17,6 +17,22 @@
 # under the License.
 
 ---
+# Runs before cloud-init applies network configuration. On dual-stack clusters the node
+# image ships with IPv6 disabled (net.ipv6.conf.all.disable_ipv6 = 1 in /etc/sysctl.conf),
+# which strips even link-local v6 and empties the kubelet --node-ip v6 member. Re-enable v6
+# here so the subsequent network-config stage can apply the static v6 address normally. The
+# guard renders as `if [ "true"/"false" = "true" ]`, so it is an inert no-op on v4-only
+# clusters (executes but changes nothing).
+bootcmd:
+  - |
+    if [ "{{ k8s.dual.stack }}" = "true" ]; then
+      echo "Enabling IPv6 for dual-stack Kubernetes networking"
+      sysctl -w net.ipv6.conf.all.disable_ipv6=0
+      sysctl -w net.ipv6.conf.default.disable_ipv6=0
+      mkdir -p /etc/sysctl.d
+      printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\n' > /etc/sysctl.d/99-cks-dualstack.conf
+    fi
+
 users:
   - name: cloud
     sudo: ALL=(ALL) NOPASSWD:ALL

@@ -36,6 +36,7 @@ import com.cloud.network.Ipv6AddressManager;
 import com.cloud.network.Network;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.utils.net.NetUtils;
 
 /**
  * Unit coverage for the IPv6 dual-stack rendering added to {@link KubernetesClusterStartWorker}.
@@ -191,6 +192,28 @@ public class KubernetesClusterStartWorkerTest {
     @Test
     public void testApiServerCertExtraSansIsV4OnlyWhenIpv4Only() {
         Assert.assertEquals(SERVER_IP4, worker.getApiServerCertExtraSans(SERVER_IP4, null));
+    }
+
+    // ---- dual-stack CIDR constants must be valid IPv6 CIDRs ----
+
+    @Test
+    public void testDualStackServiceCidrConstantIsValidIp6Cidr() {
+        // Guards against non-hex ULA literals (e.g. "fd00:cafe:svc::/108") which kubeadm
+        // rejects with "couldn't parse subnet", restart-looping the control plane.
+        Assert.assertTrue(
+                "CLUSTER_DUALSTACK_SERVICE_CIDR_V6 must be a valid IPv6 CIDR: "
+                        + KubernetesClusterStartWorker.CLUSTER_DUALSTACK_SERVICE_CIDR_V6,
+                NetUtils.isValidIp6Cidr(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_SERVICE_CIDR_V6));
+    }
+
+    @Test
+    public void testDualStackPodCidrConstantIsValidIp6Cidr() {
+        // Guards against non-hex ULA literals (e.g. "fd00:cafe:pod::/64") which Calico
+        // and kubeadm cannot parse.
+        Assert.assertTrue(
+                "CLUSTER_DUALSTACK_POD_CIDR_V6 must be a valid IPv6 CIDR: "
+                        + KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6,
+                NetUtils.isValidIp6Cidr(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6));
     }
 
     // ---- kubeadm --service-cidr ----

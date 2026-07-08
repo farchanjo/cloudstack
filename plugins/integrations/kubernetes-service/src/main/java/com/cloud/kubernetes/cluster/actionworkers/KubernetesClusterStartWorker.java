@@ -98,9 +98,9 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
      */
     protected static final String CLUSTER_DEFAULT_SERVICE_CIDR_V4 = "10.96.0.0/12";
     /** Small ULA IPv6 service range paired with the IPv4 service CIDR on dual-stack clusters. */
-    protected static final String CLUSTER_DUALSTACK_SERVICE_CIDR_V6 = "fd00:cafe:svc::/108";
+    protected static final String CLUSTER_DUALSTACK_SERVICE_CIDR_V6 = "fd00:cafe:2::/108";
     /** ULA IPv6 pod range handed to Calico as an additional IPPool CR on dual-stack clusters. */
-    protected static final String CLUSTER_DUALSTACK_POD_CIDR_V6 = "fd00:cafe:pod::/64";
+    protected static final String CLUSTER_DUALSTACK_POD_CIDR_V6 = "fd00:cafe:1::/64";
     /** Kubernetes version at which IPv6 dual-stack graduated to GA (no feature-gate needed). */
     protected static final String KUBERNETES_DUALSTACK_GA_VERSION = "1.21.0";
 
