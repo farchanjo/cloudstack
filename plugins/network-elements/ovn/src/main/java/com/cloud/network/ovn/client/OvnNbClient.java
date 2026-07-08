@@ -17,9 +17,11 @@
 package com.cloud.network.ovn.client;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.cloud.network.ovn.client.op.OvnNamedUuid;
 import com.cloud.network.ovn.client.op.OvnOpFactory;
@@ -1105,6 +1107,132 @@ public class OvnNbClient implements AutoCloseable {
                     out.add(uuid.get(1).asText());
                 }
             }
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Address_Set operations (SNAT destination exemption).
+    //
+    // OVN's NAT.exempted_ext_ips column (optional single ref, RFC 7047
+    // "set" wire form with 0 or 1 element) points at an Address_Set whose
+    // addresses bypass a source-NAT rule for matching destinations. Used by
+    // OvnSourceNatService to let guests reach specific fabric destinations
+    // (e.g. BGP route reflectors) with their real address instead of the
+    // VPC-wide SNAT IP.
+    // ------------------------------------------------------------------
+
+    /**
+     * Look up an {@code Address_Set} UUID by its unique {@code name} column.
+     * Returns {@code null} when no row matches.
+     */
+    public String findAddressSetUuidByName(final String name) {
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Address_Set", OvnOpFactory.whereName(name), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final List<String> uuids = extractUuidSet(r.raw(), 0, "_uuid");
+        return uuids.isEmpty() ? null : uuids.get(0);
+    }
+
+    /** Reads the current {@code addresses} column of an {@code Address_Set} row. */
+    public List<String> listAddressSetAddresses(final String addressSetUuid) {
+        if (addressSetUuid == null || addressSetUuid.isEmpty()) {
+            return new ArrayList<>();
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("addresses");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Address_Set", OvnOpFactory.whereUuid(addressSetUuid), columns));
+        return extractStringSet(tx.commit().raw(), 0, "addresses");
+    }
+
+    private String createAddressSet(final String name, final List<String> addresses) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("name", name);
+        row.set("addresses", stringSet(addresses));
+        final String named = OvnNamedUuid.next("aset");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.insert("Address_Set", named, row));
+        return tx.commit().insertedUuid(0);
+    }
+
+    private void updateAddressSetAddresses(final String addressSetUuid, final List<String> addresses) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("addresses", stringSet(addresses));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Address_Set", OvnOpFactory.whereUuid(addressSetUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Idempotent {@code Address_Set} writer: creates the set when absent,
+     * rewrites {@code addresses} in place when it drifted from the desired
+     * list (order-insensitive compare), and is a no-op otherwise. The
+     * {@code name} column is the natural idempotency key — mirrors {@link
+     * #ensureRouterPeerLsp} (name-based lookup, create on miss).
+     *
+     * <p><b>Naming gotcha:</b> the name MUST use underscores only. OVN's
+     * match-language parser rejects a hyphen inside an address-set name
+     * token (observed: {@code "Syntax error at `$rr' expecting address set
+     * name"} for a set named {@code rr-snat-exempt}).
+     */
+    public String ensureAddressSet(final String name, final List<String> addresses) {
+        final List<String> desired = addresses == null ? new ArrayList<>() : addresses;
+        final String existing = findAddressSetUuidByName(name);
+        if (existing == null) {
+            return createAddressSet(name, desired);
+        }
+        final Set<String> current = new HashSet<>(listAddressSetAddresses(existing));
+        if (!current.equals(new HashSet<>(desired))) {
+            updateAddressSetAddresses(existing, desired);
+        }
+        return existing;
+    }
+
+    /**
+     * Points a NAT row's {@code exempted_ext_ips} (optional single ref) at
+     * the given {@code Address_Set}. Destinations in that set bypass this
+     * NAT rule. Unconditional write, same pattern as {@link
+     * #lrpSetHaChassisGroup}.
+     */
+    public void natSetExemptedExtIps(final String natUuid, final String addressSetUuid) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("exempted_ext_ips", OvnRowRef.singletonSet(OvnRowRef.realUuid(addressSetUuid)));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("NAT", OvnOpFactory.whereUuid(natUuid), row));
+        tx.commit();
+    }
+
+    private List<String> extractStringSet(final ArrayNode replies, final int index, final String column) {
+        final List<String> out = new ArrayList<>();
+        if (replies == null || replies.size() <= index) {
+            return out;
+        }
+        final var entry = replies.get(index);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null || rows.size() == 0) {
+            return out;
+        }
+        final var col = rows.get(0).get(column);
+        if (col == null) {
+            return out;
+        }
+        // Single-element sets may be sent as the bare atom (RFC 7047 §5.1).
+        if (col.isTextual()) {
+            out.add(col.asText());
+            return out;
+        }
+        if (col.size() < 2 || !"set".equals(col.get(0).asText())) {
+            return out;
+        }
+        final var elements = col.get(1);
+        for (int i = 0; elements != null && i < elements.size(); i++) {
+            out.add(elements.get(i).asText());
         }
         return out;
     }

@@ -101,6 +101,13 @@ public class OvnNetworkConfig implements Configurable {
      *  details[0].value=true}. */
     public static final String NETWORK_DETAIL_TIER_ADVERTISE = "ovn.tier.advertise";
 
+    /** Comma-separated destination IPv4 addresses exempted from the VPC-wide
+     *  source-NAT rule (e.g. BGP route reflectors a guest must peer with
+     *  using its real address instead of the VPC's SNAT IP). Empty disables
+     *  the exemption; existing exemptions on NAT rows are left untouched
+     *  when disabled — see {@code OvnSourceNatService.applySnatDestinationExemption}. */
+    public static final String OVN_SNAT_EXEMPTED_DESTINATIONS = "ovn.snat.exempted.destinations";
+
     /* ---------- ConfigKeys ---------- */
 
     public static final ConfigKey<Boolean> PublicVlanAuto = new ConfigKey<>(CATEGORY, Boolean.class,
@@ -172,6 +179,13 @@ public class OvnNetworkConfig implements Configurable {
                     + "route-only until enabled).",
             true);
 
+    public static final ConfigKey<String> SnatExemptedDestinations = new ConfigKey<>(CATEGORY, String.class,
+            OVN_SNAT_EXEMPTED_DESTINATIONS, "",
+            "Comma-separated list of destination IPv4 addresses exempted from VPC source NAT "
+                    + "(e.g. BGP route reflectors guests must peer with using their real IPs). "
+                    + "Empty disables the exemption.",
+            true);
+
     /* ---------- Configurable contract ---------- */
 
     @Override
@@ -191,7 +205,8 @@ public class OvnNetworkConfig implements Configurable {
                 BgpReconcileIntervalSeconds,
                 BgpFrrInstanceTag,
                 BgpRespectManual,
-                BgpPublicAnchorEnabled
+                BgpPublicAnchorEnabled,
+                SnatExemptedDestinations
         };
     }
 

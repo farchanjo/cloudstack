@@ -16,15 +16,20 @@
 // under the License.
 package com.cloud.network.ovn.element;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import javax.inject.Inject;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
@@ -49,6 +54,16 @@ public class OvnSourceNatService {
 
     /** OVN NAT type for source NAT. */
     public static final String NAT_TYPE_SNAT = "snat";
+
+    /**
+     * Name of the OVN NB {@code Address_Set} that carries the configured
+     * SNAT destination exemptions (see {@link
+     * OvnNetworkConfig#SnatExemptedDestinations}). MUST use underscores
+     * only: ovn-controller's match-language parser rejects a hyphen inside
+     * an address-set name token ({@code "Syntax error at `$rr' expecting
+     * address set name"} was observed for {@code rr-snat-exempt}).
+     */
+    public static final String SNAT_EXEMPT_ADDRESS_SET = "rr_snat_exempt";
 
     @Inject
     private OvnPluginManager pluginManager;
@@ -130,29 +145,73 @@ public class OvnSourceNatService {
         }
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.VPC_SOURCE_NAT, vpcId, controller.getId());
+        // Stale-mapping guard: if the NAT row was deleted out-of-band (manual
+        // ovn-nbctl, parent LR cascade we missed bookkeeping for, prior bug),
+        // updateNatRule is a silent no-op (OVSDB update against zero-row
+        // WHERE clause does nothing). Verify before update so we fall
+        // through to create on miss.
+        if (existing != null && nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
+            return updateVpcSourceNat(nb, existing.getOvnUuid(), lrUuid, externalIp, vpcCidr);
+        }
         if (existing != null) {
-            // Stale-mapping guard: if the NAT row was deleted out-of-band
-            // (manual ovn-nbctl, parent LR cascade we missed bookkeeping
-            // for, prior bug), updateNatRule is a silent no-op (OVSDB
-            // update against zero-row WHERE clause does nothing). Verify
-            // before update so we fall through to create on miss.
-            if (nb.rowExistsByUuid("NAT", existing.getOvnUuid())) {
-                // Update path: rewrite external_ip / logical_ip in place. Cheap
-                // (one OVSDB update; LR.nat reference stays valid).
-                nb.updateNatRule(existing.getOvnUuid(), externalIp, vpcCidr);
-                LOGGER.info("OVN VPC SNAT {} updated: {} -> {} on LR {}",
-                        existing.getOvnUuid(), vpcCidr, externalIp, lrUuid);
-                return existing.getOvnUuid();
-            }
             LOGGER.warn("OvnSourceNatService.ensureVpcSourceNat: VPC_SOURCE_NAT mapping vpc={} -> {} stale (NAT row gone); recreating",
                     vpcId, existing.getOvnUuid());
             logicalIdMapDao.remove(existing.getId());
         }
+        return createVpcSourceNat(controller.getId(), nb, vpcId, lrUuid, externalIp, vpcCidr);
+    }
+
+    /** Update path: rewrite external_ip / logical_ip in place. Cheap (one
+     *  OVSDB update; LR.nat reference stays valid). Re-applies the
+     *  destination exemption on every call — cheap idempotent no-op when
+     *  nothing drifted, and self-heals a manually removed exemption. */
+    private String updateVpcSourceNat(final OvnNbClient nb, final String natUuid,
+                                      final String lrUuid, final String externalIp, final String vpcCidr) {
+        nb.updateNatRule(natUuid, externalIp, vpcCidr);
+        applySnatDestinationExemption(nb, natUuid);
+        LOGGER.info("OVN VPC SNAT {} updated: {} -> {} on LR {}", natUuid, vpcCidr, externalIp, lrUuid);
+        return natUuid;
+    }
+
+    private String createVpcSourceNat(final long controllerId, final OvnNbClient nb,
+                                      final long vpcId, final String lrUuid, final String externalIp,
+                                      final String vpcCidr) {
         final String natUuid = nb.addNatRule(lrUuid, NAT_TYPE_SNAT, externalIp, vpcCidr, null);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_SOURCE_NAT, vpcId, controller.getId(), natUuid,
+        applySnatDestinationExemption(nb, natUuid);
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.VPC_SOURCE_NAT, vpcId, controllerId, natUuid,
                 NAT_TYPE_SNAT + "-vpc-" + vpcId));
         LOGGER.info("OVN VPC SNAT {} added: {} -> {} on LR {}", natUuid, vpcCidr, externalIp, lrUuid);
         return natUuid;
+    }
+
+    /**
+     * Applies the configured destination-exemption {@code Address_Set} to
+     * the VPC-wide SNAT NAT row so guests can reach specific fabric
+     * destinations (e.g. BGP route reflectors) with their real address
+     * instead of the VPC's source-NAT IP.
+     *
+     * <p>Empty config = no-op. This intentionally does NOT clear an
+     * exemption already present on the NAT row (e.g. applied by an operator
+     * directly in the NB DB) — the safer default is to leave existing
+     * exemptions alone rather than have a routine reconcile silently
+     * un-peer a guest from the fabric.
+     */
+    private void applySnatDestinationExemption(final OvnNbClient nb, final String natUuid) {
+        final String csv = OvnNetworkConfig.SnatExemptedDestinations.value();
+        if (StringUtils.isBlank(csv)) {
+            return;
+        }
+        final List<String> addresses = Arrays.stream(csv.split(","))
+                .map(String::trim)
+                .filter(StringUtils::isNotBlank)
+                .collect(Collectors.toList());
+        if (addresses.isEmpty()) {
+            return;
+        }
+        final String addressSetUuid = nb.ensureAddressSet(SNAT_EXEMPT_ADDRESS_SET, addresses);
+        nb.natSetExemptedExtIps(natUuid, addressSetUuid);
+        LOGGER.info("OvnSourceNatService.applySnatDestinationExemption: NAT {} exempted_ext_ips -> {} ({})",
+                natUuid, SNAT_EXEMPT_ADDRESS_SET, addresses);
     }
 
     /**
