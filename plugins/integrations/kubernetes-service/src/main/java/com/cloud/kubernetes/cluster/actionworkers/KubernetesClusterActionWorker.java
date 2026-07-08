@@ -59,6 +59,7 @@ import com.cloud.user.dao.UserDataDao;
 import com.cloud.utils.component.ComponentContext;
 import com.cloud.utils.db.TransactionCallbackWithException;
 import com.cloud.utils.net.Ip;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.Nic;
 import com.cloud.vm.NicVO;
 import com.cloud.vm.VirtualMachine;
@@ -102,6 +103,7 @@ import com.cloud.kubernetes.version.KubernetesSupportedVersion;
 import com.cloud.kubernetes.version.dao.KubernetesSupportedVersionDao;
 import com.cloud.network.IpAddress;
 import com.cloud.network.IpAddressManager;
+import com.cloud.network.Ipv6AddressManager;
 import com.cloud.network.Network;
 import com.cloud.network.NetworkModel;
 import com.cloud.network.NetworkService;
@@ -172,6 +174,8 @@ public class KubernetesClusterActionWorker {
     protected AccountDao accountDao;
     @Inject
     protected IpAddressManager ipAddressManager;
+    @Inject
+    protected Ipv6AddressManager ipv6AddressManager;
     @Inject
     protected IPAddressDao ipAddressDao;
     @Inject
@@ -1006,6 +1010,15 @@ public class KubernetesClusterActionWorker {
         }
     }
 
+    /**
+     * A Kubernetes cluster is treated as dual-stack when its guest network carries a valid
+     * IPv6 CIDR alongside IPv4. This is the single gate for every additive IPv6 code path:
+     * when it returns {@code false} the rendering must be byte-identical to the IPv4-only flow.
+     */
+    protected boolean isNetworkDualStack(final Network network) {
+        return network != null && StringUtils.isNotBlank(network.getIp6Cidr()) && NetUtils.isValidIp6Cidr(network.getIp6Cidr());
+    }
+
     public String getKubernetesNodeConfig(final String joinIp, final boolean ejectIso, final boolean mountCksIsoOnVR) throws IOException {
         String k8sNodeConfig = readK8sConfigFile("/conf/k8s-node.yml");
         final String sshPubKey = "{{ k8s.ssh.pub.key }}";
@@ -1015,6 +1028,7 @@ public class KubernetesClusterActionWorker {
         final String routerIpKey = "{{ k8s.vr.iso.mounted.ip }}";
         final String installWaitTime = "{{ k8s.install.wait.time }}";
         final String installReattemptsCount = "{{ k8s.install.reattempts.count }}";
+        final String kubeletNodeIpArgsKey = "{{ k8s.kubelet.node.ip.args }}";
 
         final Long waitTime = KubernetesClusterService.KubernetesWorkerNodeInstallAttemptWait.value();
         final Long reattempts = KubernetesClusterService.KubernetesWorkerNodeInstallReattempts.value();
@@ -1040,10 +1054,26 @@ public class KubernetesClusterActionWorker {
         k8sNodeConfig = k8sNodeConfig.replace(routerIpKey, routerIp);
         k8sNodeConfig = k8sNodeConfig.replace(installWaitTime, String.valueOf(waitTime));
         k8sNodeConfig = k8sNodeConfig.replace(installReattemptsCount, String.valueOf(reattempts));
+        k8sNodeConfig = k8sNodeConfig.replace(kubeletNodeIpArgsKey, getKubeletNodeIpArgs());
 
         k8sNodeConfig = updateKubeConfigWithRegistryDetails(k8sNodeConfig);
 
         return k8sNodeConfig;
+    }
+
+    /**
+     * Extra kubelet args appended to {@code KUBELET_EXTRA_ARGS} for worker nodes.
+     * IPv4-only clusters return an empty string, so the rendered template is byte-identical
+     * to the pre-dual-stack output. Dual-stack clusters emit {@code --node-ip=<v4>,<v6>} whose
+     * members are resolved on the node itself at boot (worker guest IPs are auto-assigned, so
+     * they are not known at render time) via {@code hostname -I}.
+     */
+    protected String getKubeletNodeIpArgs() {
+        Network network = networkDao.findById(kubernetesCluster.getNetworkId());
+        if (!isNetworkDualStack(network)) {
+            return "";
+        }
+        return " --node-ip=$(hostname -I | awk '{print $1}'),$(hostname -I | tr ' ' '\\n' | grep ':' | head -1)";
     }
 
     protected String updateKubeConfigWithRegistryDetails(String k8sConfig) {
