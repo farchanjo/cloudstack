@@ -48,6 +48,7 @@ public class NicDaoImpl extends GenericDaoBase<NicVO, Long> implements NicDao {
     private GenericSearchBuilder<NicVO, Integer> deviceIdSearch;
     private GenericSearchBuilder<NicVO, Integer> CountByForNonStoppedVms;
     private SearchBuilder<NicVO> PeerRouterSearch;
+    private SearchBuilder<NicVO> Ip4AddressSearch;
 
     @Inject
     VMInstanceDao _vmDao;
@@ -110,6 +111,22 @@ public class NicDaoImpl extends GenericDaoBase<NicVO, Long> implements NicDao {
         PeerRouterSearch.and("macAddress", PeerRouterSearch.entity().getMacAddress(), Op.EQ);
         PeerRouterSearch.and("vmType", PeerRouterSearch.entity().getVmType(), Op.EQ);
         PeerRouterSearch.done();
+
+        Ip4AddressSearch = createSearchBuilder();
+        Ip4AddressSearch.and("address", Ip4AddressSearch.entity().getIPv4Address(), Op.EQ);
+        Ip4AddressSearch.done();
+    }
+
+    @Override
+    public List<NicVO> listByIp4Address(String ip4Address) {
+        if (ip4Address == null) {
+            return new ArrayList<>();
+        }
+        SearchCriteria<NicVO> sc = Ip4AddressSearch.create();
+        sc.setParameters("address", ip4Address);
+        // GenericDaoBase.listBy excludes soft-removed rows by default, so this
+        // returns only nics that a live/undestroyed VM still references.
+        return listBy(sc);
     }
 
     @Override

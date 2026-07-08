@@ -281,4 +281,13 @@ public interface NetworkService {
     String getNicVlanValueForExternalVm(NicTO nic);
 
     Long getPreferredNetworkIdForPublicIpRuleAssignment(IpAddress ip, Long networkId);
+
+    /**
+     * Admin-triggered reconcile of orphaned system-VM public IPs. Delegates to
+     * {@code IpAddressManager.reclaimOrphanedSystemPublicIps}.
+     *
+     * @param zoneId optional data-center scope; {@code null} means all zones.
+     * @return the number of IP addresses reclaimed.
+     */
+    int reconcileSystemPublicIpAddresses(Long zoneId);
 }

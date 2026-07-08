@@ -36,6 +36,7 @@ import com.cloud.network.IpAddress.State;
 import com.cloud.network.vo.PublicIpQuarantineVO;
 import com.cloud.server.ResourceTag.ResourceObjectType;
 import com.cloud.tags.dao.ResourceTagDao;
+import com.cloud.user.Account;
 import com.cloud.utils.db.DB;
 import com.cloud.utils.db.GenericDaoBase;
 import com.cloud.utils.db.GenericSearchBuilder;
@@ -65,6 +66,7 @@ public class IPAddressDaoImpl extends GenericDaoBase<IPAddressVO, Long> implemen
     protected VlanDao _vlanDao;
     protected GenericSearchBuilder<IPAddressVO, Long> CountFreePublicIps;
     protected SearchBuilder<IPAddressVO> PublicIpSearchByAccountAndState;
+    protected SearchBuilder<IPAddressVO> OrphanedSystemIpSearch;
     @Inject
     ResourceTagDao _tagsDao;
     @Inject
@@ -173,6 +175,25 @@ public class IPAddressDaoImpl extends GenericDaoBase<IPAddressVO, Long> implemen
         PublicIpSearchByAccountAndState.and("state", PublicIpSearchByAccountAndState.entity().getState(), Op.EQ);
         PublicIpSearchByAccountAndState.and("allocated", PublicIpSearchByAccountAndState.entity().getAllocatedTime(), Op.NNULL);
         PublicIpSearchByAccountAndState.and("ipAddress", PublicIpSearchByAccountAndState.entity().getAddress(), Op.EQ);
+
+        OrphanedSystemIpSearch = createSearchBuilder();
+        OrphanedSystemIpSearch.and("system", OrphanedSystemIpSearch.entity().getSystem(), Op.EQ);
+        OrphanedSystemIpSearch.and("accountId", OrphanedSystemIpSearch.entity().getAllocatedToAccountId(), Op.EQ);
+        OrphanedSystemIpSearch.and("sourceNat", OrphanedSystemIpSearch.entity().isSourceNat(), Op.EQ);
+        OrphanedSystemIpSearch.and("state", OrphanedSystemIpSearch.entity().getState(), Op.EQ);
+        OrphanedSystemIpSearch.and("allocatedBefore", OrphanedSystemIpSearch.entity().getAllocatedTime(), Op.LT);
+        OrphanedSystemIpSearch.done();
+    }
+
+    @Override
+    public List<IPAddressVO> listOrphanedSystemIps(Date allocatedBefore) {
+        SearchCriteria<IPAddressVO> sc = OrphanedSystemIpSearch.create();
+        sc.setParameters("system", true);
+        sc.setParameters("accountId", Account.ACCOUNT_ID_SYSTEM);
+        sc.setParameters("sourceNat", false);
+        sc.setParameters("state", State.Allocated);
+        sc.setParameters("allocatedBefore", allocatedBefore);
+        return listBy(sc);
     }
 
     @Override

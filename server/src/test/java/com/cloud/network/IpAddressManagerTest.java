@@ -19,8 +19,10 @@ package com.cloud.network;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -50,6 +52,8 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.Network.Service;
+import com.cloud.network.IpAddress.State;
+import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
@@ -60,6 +64,8 @@ import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.user.AccountVO;
 import com.cloud.utils.net.Ip;
+import com.cloud.vm.NicVO;
+import com.cloud.vm.dao.NicDao;
 
 @RunWith(MockitoJUnitRunner.class)
 public class IpAddressManagerTest {
@@ -72,6 +78,12 @@ public class IpAddressManagerTest {
 
     @Mock
     NetworkOfferingDao networkOfferingDao;
+
+    @Mock
+    NicDao _nicDao;
+
+    @Mock
+    FirewallRulesDao _firewallDao;
 
     @Mock
     IPAddressVO ipAddressVoMock;
@@ -490,5 +502,104 @@ public class IpAddressManagerTest {
         boolean result = ipAddressManager.checkIfIpResourceCountShouldBeUpdated(ipAddressVoMock);
 
         Assert.assertTrue(result);
+    }
+
+    // ---------------------------------------------------------------------
+    // Orphaned system-VM public IP reclaim reconciler (safety predicate + wiring)
+    // ---------------------------------------------------------------------
+
+    private static final String ORPHAN_IP = "192.0.2.53";
+
+    /** A fully-eligible orphaned system-VM public IP: is_system, system account, no source_nat, Allocated. */
+    private IPAddressVO buildOrphanSystemIp() {
+        IPAddressVO ip = new IPAddressVO(new Ip(ORPHAN_IP), 1L, 1L, 1L, false);
+        ip.setSystem(true);
+        ip.setState(State.Allocated);
+        ip.setAllocatedToAccountId(Account.ACCOUNT_ID_SYSTEM);
+        ip.setAllocatedTime(new Date(0L));
+        return ip;
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestGenuineOrphanReturnsTrue() {
+        IPAddressVO ip = buildOrphanSystemIp();
+        Mockito.when(_nicDao.listByIp4Address(ORPHAN_IP)).thenReturn(Collections.emptyList());
+        Mockito.when(_firewallDao.countRulesByIpId(ip.getId())).thenReturn(0L);
+
+        Assert.assertTrue(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestLiveNicExcludesIp() {
+        // SAFETY: a running ConsoleProxy (.53) / SSVM (.54) still references the IP via a live nic.
+        IPAddressVO ip = buildOrphanSystemIp();
+        Mockito.when(_nicDao.listByIp4Address(ORPHAN_IP)).thenReturn(Collections.singletonList(mock(NicVO.class)));
+
+        Assert.assertFalse(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestSourceNatExcluded() {
+        IPAddressVO ip = new IPAddressVO(new Ip(ORPHAN_IP), 1L, 1L, 1L, true);
+        ip.setSystem(true);
+        ip.setState(State.Allocated);
+        ip.setAllocatedToAccountId(Account.ACCOUNT_ID_SYSTEM);
+
+        Assert.assertFalse(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestRuleBearingExcluded() {
+        IPAddressVO ip = buildOrphanSystemIp();
+        Mockito.when(_nicDao.listByIp4Address(ORPHAN_IP)).thenReturn(Collections.emptyList());
+        Mockito.when(_firewallDao.countRulesByIpId(ip.getId())).thenReturn(2L);
+
+        Assert.assertFalse(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestNonSystemExcluded() {
+        IPAddressVO ip = buildOrphanSystemIp();
+        ip.setSystem(false);
+
+        Assert.assertFalse(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void isReclaimableOrphanSystemIpTestNonSystemAccountExcluded() {
+        IPAddressVO ip = buildOrphanSystemIp();
+        ip.setAllocatedToAccountId(2L);
+
+        Assert.assertFalse(ipAddressManager.isReclaimableOrphanSystemIp(ip));
+    }
+
+    @Test
+    public void reclaimOrphanedSystemPublicIpsTestReleasesGenuineOrphan() {
+        IPAddressVO ip = buildOrphanSystemIp();
+        Mockito.when(ipAddressDao.listOrphanedSystemIps(any(Date.class))).thenReturn(Collections.singletonList(ip));
+        Mockito.when(_nicDao.listByIp4Address(ORPHAN_IP)).thenReturn(Collections.emptyList());
+        Mockito.when(_firewallDao.countRulesByIpId(ip.getId())).thenReturn(0L);
+        doReturn(ip).when(ipAddressManager).markIpAsUnavailable(ip.getId());
+
+        int reclaimed = ipAddressManager.reclaimOrphanedSystemPublicIps(null);
+
+        Assert.assertEquals(1, reclaimed);
+        verify(ipAddressManager).markIpAsUnavailable(ip.getId());
+        verify(ipAddressDao).unassignIpAddress(ip.getId());
+    }
+
+    @Test
+    public void reclaimOrphanedSystemPublicIpsTestSkipsLiveNicIp() {
+        // The .53/.54 protection at the reconciler level: candidate returned by the DAO
+        // but still bound to a live nic -> never reclaimed.
+        IPAddressVO ip = buildOrphanSystemIp();
+        Mockito.when(ipAddressDao.listOrphanedSystemIps(any(Date.class))).thenReturn(Collections.singletonList(ip));
+        Mockito.when(_nicDao.listByIp4Address(ORPHAN_IP)).thenReturn(Collections.singletonList(mock(NicVO.class)));
+
+        int reclaimed = ipAddressManager.reclaimOrphanedSystemPublicIps(null);
+
+        Assert.assertEquals(0, reclaimed);
+        verify(ipAddressManager, never()).markIpAsUnavailable(anyLong());
+        verify(ipAddressDao, never()).unassignIpAddress(anyLong());
     }
 }

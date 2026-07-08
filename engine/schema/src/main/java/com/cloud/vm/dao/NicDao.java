@@ -52,6 +52,14 @@ public interface NicDao extends GenericDao<NicVO, Long> {
 
     NicVO findNonPlaceHolderByIp4AddressAndNetworkId(String ip4Address, long networkId);
 
+    /**
+     * Lists all live (not soft-removed) nics that carry the given IPv4 address,
+     * across every network. Used by the system-VM orphan public-IP reclaim
+     * reconciler as the SAFETY guard: a non-empty result means a running VM
+     * (e.g. ConsoleProxy/SSVM) still owns the IP, so it must never be reclaimed.
+     */
+    List<NicVO> listByIp4Address(String ip4Address);
+
     NicVO findByNetworkIdAndMacAddress(long networkId, String mac);
 
     NicVO findDefaultNicForVM(long instanceId);

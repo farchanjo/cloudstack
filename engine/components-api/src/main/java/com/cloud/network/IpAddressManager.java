@@ -290,4 +290,23 @@ public interface IpAddressManager {
     void updateSourceNatIpAddress(IPAddressVO requestedIp, List<IPAddressVO> userIps) throws Exception;
 
     Long getPreferredNetworkIdForPublicIpRuleAssignment(IpAddress ip, Long networkId);
+
+    /**
+     * Reconciles orphaned system-VM public IP addresses that were eagerly
+     * acquired for a ConsoleProxy/SecondaryStorageVm but never released because
+     * the owning VM's nic row never persisted (start-failure/expunge). Only IPs
+     * that match ALL of the following are reclaimed:
+     * <ul>
+     *   <li>is_system = 1 and allocated to the system account;</li>
+     *   <li>source_nat = 0 and state = Allocated;</li>
+     *   <li>allocated longer ago than the configured grace window;</li>
+     *   <li>have no firewall/LB/port-forwarding rules; and</li>
+     *   <li>are NOT referenced by any live nic (SAFETY guard that protects a
+     *       running ConsoleProxy/SSVM from being reclaimed).</li>
+     * </ul>
+     *
+     * @param zoneId optional data-center scope; {@code null} means all zones.
+     * @return the number of IP addresses actually reclaimed.
+     */
+    int reclaimOrphanedSystemPublicIps(Long zoneId);
 }

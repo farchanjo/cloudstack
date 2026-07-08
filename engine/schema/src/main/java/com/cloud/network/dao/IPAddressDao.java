@@ -16,6 +16,7 @@
 // under the License.
 package com.cloud.network.dao;
 
+import java.util.Date;
 import java.util.List;
 
 import com.cloud.dc.Vlan.VlanType;
@@ -107,4 +108,13 @@ public interface IPAddressDao extends GenericDao<IPAddressVO, Long> {
     IPAddressVO findBySourceNetworkIdAndDatacenterIdAndState(long sourceNetworkId, long dataCenterId, State state);
 
     int expungeByVmList(List<Long> vmIds, Long batchSize);
+
+    /**
+     * Lists candidate orphaned system-VM public IPs for the reclaim reconciler.
+     * Filters on: is_system = 1, allocated-to account = system account,
+     * source_nat = 0, state = Allocated, and allocated &lt; {@code allocatedBefore}.
+     * Soft-removed rows are excluded by the generic DAO. The manager applies the
+     * remaining safety filters (live-nic exclusion + firewall/LB/PF rule count).
+     */
+    List<IPAddressVO> listOrphanedSystemIps(Date allocatedBefore);
 }

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.Timer;
 import java.util.UUID;
 import java.util.Collections;
 import java.util.stream.Collectors;
@@ -62,6 +63,7 @@ import org.apache.cloudstack.framework.config.Configurable;
 import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
 import org.apache.cloudstack.framework.messagebus.MessageBus;
 import org.apache.cloudstack.framework.messagebus.PublishScope;
+import org.apache.cloudstack.managed.context.ManagedContextTimerTask;
 import org.apache.cloudstack.region.PortableIp;
 import org.apache.cloudstack.region.PortableIpDao;
 import org.apache.cloudstack.region.PortableIpVO;
@@ -192,6 +194,7 @@ import com.cloud.utils.net.Ip;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.Nic;
 import com.cloud.vm.NicProfile;
+import com.cloud.vm.NicVO;
 import com.cloud.vm.ReservationContext;
 import com.cloud.vm.ReservationContextImpl;
 import com.cloud.vm.VirtualMachine;
@@ -354,6 +357,19 @@ public class IpAddressManagerImpl extends ManagerBase implements IpAddressManage
 
     public static final ConfigKey<Integer> PUBLIC_IP_ADDRESS_QUARANTINE_DURATION = new ConfigKey<>("Network", Integer.class, "public.ip.address.quarantine.duration",
             "0", "The duration (in minutes) for the public IP address to be quarantined when it is disassociated.", true, ConfigKey.Scope.Domain);
+
+    public static final ConfigKey<Integer> SystemVmOrphanIpReclaimIntervalSeconds = new ConfigKey<>("Advanced", Integer.class,
+            "system.vm.orphan.public.ip.reclaim.interval", "0",
+            "Interval (in seconds) of the background reconciler that reclaims orphaned system-VM (ConsoleProxy/SecondaryStorageVm) " +
+                    "public IPs left in the Allocated state after a start-failure/expunge. 0 (default) disables the reconciler; the " +
+                    "reclaim can still be triggered on demand via the reconcileSystemPublicIpAddresses admin API.", true, ConfigKey.Scope.Global);
+
+    public static final ConfigKey<Integer> SystemVmOrphanIpReclaimGraceMinutes = new ConfigKey<>("Advanced", Integer.class,
+            "system.vm.orphan.public.ip.reclaim.grace.minutes", "30",
+            "Minimum age (in minutes) since allocation before a candidate orphaned system-VM public IP is eligible for reclaim. " +
+                    "Guards against reclaiming an IP whose owning system VM is still mid-deploy.", true, ConfigKey.Scope.Global);
+
+    private Timer _orphanIpReclaimTimer = null;
 
     private Random rand = new Random(System.currentTimeMillis());
 
@@ -571,6 +587,111 @@ public class IpAddressManagerImpl extends ManagerBase implements IpAddressManage
 
         logger.info("IPAddress Manager is configured.");
 
+        return true;
+    }
+
+    @Override
+    public boolean start() {
+        int intervalSeconds = SystemVmOrphanIpReclaimIntervalSeconds.value() == null ? 0 : SystemVmOrphanIpReclaimIntervalSeconds.value();
+        if (intervalSeconds > 0) {
+            long period = (long) intervalSeconds * 1000L;
+            _orphanIpReclaimTimer = new Timer("SystemVmOrphanIpReclaimTimer");
+            _orphanIpReclaimTimer.schedule(new OrphanIpReclaimTask(), period, period);
+            logger.info("Scheduled system-VM orphan public IP reclaim reconciler every {} second(s).", intervalSeconds);
+        } else {
+            logger.debug("System-VM orphan public IP reclaim reconciler is disabled ({}=0).", SystemVmOrphanIpReclaimIntervalSeconds.key());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean stop() {
+        if (_orphanIpReclaimTimer != null) {
+            _orphanIpReclaimTimer.cancel();
+            _orphanIpReclaimTimer = null;
+        }
+        return true;
+    }
+
+    /**
+     * Periodic backstop for the A2 getIp() eager-assignment path: reclaims
+     * system-VM public IPs that were left Allocated because no nic row ever
+     * persisted for the failed/expunged system VM.
+     */
+    protected class OrphanIpReclaimTask extends ManagedContextTimerTask {
+        @Override
+        protected void runInContext() {
+            try {
+                int reclaimed = reclaimOrphanedSystemPublicIps(null);
+                if (reclaimed > 0) {
+                    logger.info("System-VM orphan public IP reconciler reclaimed {} address(es).", reclaimed);
+                }
+            } catch (Throwable t) {
+                logger.error("Exception while reclaiming orphaned system-VM public IPs", t);
+            }
+        }
+    }
+
+    @Override
+    public int reclaimOrphanedSystemPublicIps(Long zoneId) {
+        int graceMinutes = SystemVmOrphanIpReclaimGraceMinutes.value() == null ? 30 : SystemVmOrphanIpReclaimGraceMinutes.value();
+        Date graceCutoff = new Date(System.currentTimeMillis() - (long) graceMinutes * 60L * 1000L);
+
+        List<IPAddressVO> candidates = _ipAddressDao.listOrphanedSystemIps(graceCutoff);
+        if (CollectionUtils.isEmpty(candidates)) {
+            return 0;
+        }
+
+        int reclaimed = 0;
+        for (IPAddressVO ip : candidates) {
+            if (zoneId != null && ip.getDataCenterId() != zoneId) {
+                continue;
+            }
+            if (!isReclaimableOrphanSystemIp(ip)) {
+                continue;
+            }
+            try {
+                final long addrId = ip.getId();
+                markIpAsUnavailable(addrId);
+                _ipAddressDao.unassignIpAddress(addrId);
+                reclaimed++;
+                logger.info("Reclaimed orphaned system-VM public IP {} (id={}).", ip.getAddress(), addrId);
+            } catch (Exception e) {
+                logger.warn("Failed to reclaim orphaned system-VM public IP {} (id={}); leaving it for the next pass.",
+                        ip.getAddress(), ip.getId(), e);
+            }
+        }
+        return reclaimed;
+    }
+
+    /**
+     * Defense-in-depth predicate re-asserting every DAO-level filter plus the
+     * two safety-critical exclusions (live nic and any firewall/LB/PF rule).
+     * The live-nic check is what protects a running ConsoleProxy/SSVM whose IP
+     * is legitimately Allocated from ever being reclaimed.
+     */
+    protected boolean isReclaimableOrphanSystemIp(IPAddressVO ip) {
+        if (ip == null) {
+            return false;
+        }
+        if (!ip.getSystem() || ip.isSourceNat() || ip.getState() != State.Allocated) {
+            return false;
+        }
+        Long accountId = ip.getAllocatedToAccountId();
+        if (accountId == null || accountId != Account.ACCOUNT_ID_SYSTEM) {
+            return false;
+        }
+        // SAFETY-CRITICAL: a live nic carrying this IP means a running system VM
+        // still owns it (e.g. ConsoleProxy .53 / SSVM .54). Never reclaim those.
+        String addr = ip.getAddress() == null ? null : ip.getAddress().addr();
+        if (addr != null && CollectionUtils.isNotEmpty(_nicDao.listByIp4Address(addr))) {
+            return false;
+        }
+        // Any firewall / load-balancer / port-forwarding rule bound to the IP
+        // means it is in active use; skip it.
+        if (_firewallDao.countRulesByIpId(ip.getId()) > 0) {
+            return false;
+        }
         return true;
     }
 
@@ -2519,7 +2640,7 @@ public class IpAddressManagerImpl extends ManagerBase implements IpAddressManage
     @Override
     public ConfigKey<?>[] getConfigKeys() {
         return new ConfigKey<?>[] {UseSystemPublicIps, RulesContinueOnError, SystemVmPublicIpReservationModeStrictness, VrouterRedundantTiersPlacement, AllowUserListAvailableIpsOnSharedNetwork,
-                PUBLIC_IP_ADDRESS_QUARANTINE_DURATION};
+                PUBLIC_IP_ADDRESS_QUARANTINE_DURATION, SystemVmOrphanIpReclaimIntervalSeconds, SystemVmOrphanIpReclaimGraceMinutes};
     }
 
     /**

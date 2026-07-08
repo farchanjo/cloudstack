@@ -6442,6 +6442,11 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
     }
 
     @Override
+    public int reconcileSystemPublicIpAddresses(Long zoneId) {
+        return _ipAddrMgr.reclaimOrphanedSystemPublicIps(zoneId);
+    }
+
+    @Override
     public Network.IpAddresses getIpAddressesFromIps(String ipAddress, String ip6Address, String macAddress) {
         if (ip6Address != null) {
             ip6Address = NetUtils.standardizeIp6Address(ip6Address);

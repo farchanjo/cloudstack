@@ -142,21 +142,33 @@ public class PublicNetworkGuru extends AdapterBase implements NetworkGuru {
                 forSystemVms = true;
             }
             PublicIp ip = _ipAddrMgr.assignPublicIpAddress(dc.getId(), null, vm.getOwner(), VlanType.VirtualNetwork, null, null, forSystemVms, forSystemVms);
-            nic.setIPv4Address(ip.getAddress().toString());
-            nic.setIPv4Gateway(ip.getGateway());
-            nic.setIPv4Netmask(ip.getNetmask());
-            if (network.getBroadcastDomainType() == BroadcastDomainType.Vxlan) {
-                nic.setIsolationUri(BroadcastDomainType.Vxlan.toUri(ip.getVlanTag()));
-                nic.setBroadcastUri(BroadcastDomainType.Vxlan.toUri(ip.getVlanTag()));
-                nic.setBroadcastType(BroadcastDomainType.Vxlan);
-            } else {
-                nic.setIsolationUri(IsolationType.Vlan.toUri(ip.getVlanTag()));
-                nic.setBroadcastUri(BroadcastDomainType.Vlan.toUri(ip.getVlanTag()));
-                nic.setBroadcastType(BroadcastDomainType.Vlan);
+            try {
+                nic.setIPv4Address(ip.getAddress().toString());
+                nic.setIPv4Gateway(ip.getGateway());
+                nic.setIPv4Netmask(ip.getNetmask());
+                if (network.getBroadcastDomainType() == BroadcastDomainType.Vxlan) {
+                    nic.setIsolationUri(BroadcastDomainType.Vxlan.toUri(ip.getVlanTag()));
+                    nic.setBroadcastUri(BroadcastDomainType.Vxlan.toUri(ip.getVlanTag()));
+                    nic.setBroadcastType(BroadcastDomainType.Vxlan);
+                } else {
+                    nic.setIsolationUri(IsolationType.Vlan.toUri(ip.getVlanTag()));
+                    nic.setBroadcastUri(BroadcastDomainType.Vlan.toUri(ip.getVlanTag()));
+                    nic.setBroadcastType(BroadcastDomainType.Vlan);
+                }
+                nic.setFormat(AddressFormat.Ip4);
+                nic.setReservationId(String.valueOf(ip.getVlanTag()));
+                nic.setMacAddress(ip.getMacAddress());
+            } catch (RuntimeException e) {
+                // A2 hardening: the public IP was eagerly acquired (isSystem for
+                // ConsoleProxy/SSVM) but wiring it into the nic profile failed.
+                // Release it now so it is not stranded in the Allocated state.
+                // NOTE: the broader case where the enclosing system-VM deploy
+                // aborts *after* getIp() returns cleanly (no persisted nic row ->
+                // deallocate() never runs) is NOT covered here; it is backstopped
+                // by IpAddressManager.reclaimOrphanedSystemPublicIps() (A1).
+                releaseAssignedPublicIp(ip);
+                throw e;
             }
-            nic.setFormat(AddressFormat.Ip4);
-            nic.setReservationId(String.valueOf(ip.getVlanTag()));
-            nic.setMacAddress(ip.getMacAddress());
         }
 
         Pair<String, String> dns = networkModel.getNetworkIp4Dns(network, dc);
@@ -164,6 +176,30 @@ public class PublicNetworkGuru extends AdapterBase implements NetworkGuru {
         nic.setIPv4Dns2(dns.second());
 
         ipv6Service.updateNicIpv6(nic, dc, network);
+    }
+
+    /**
+     * A2 hardening helper: releases a just-acquired public IP so an eager
+     * system-VM assignment that fails before the nic is persisted does not leak
+     * the IP as Allocated. Best-effort; failures are logged, never rethrown.
+     */
+    private void releaseAssignedPublicIp(final PublicIp ip) {
+        if (ip == null) {
+            return;
+        }
+        try {
+            final long ipId = ip.getId();
+            Transaction.execute(new TransactionCallbackNoReturn() {
+                @Override
+                public void doInTransactionWithoutResult(TransactionStatus status) {
+                    _ipAddrMgr.markIpAsUnavailable(ipId);
+                    _ipAddressDao.unassignIpAddress(ipId);
+                }
+            });
+        } catch (Exception ex) {
+            logger.warn("Failed to release eagerly-assigned public IP {} after getIp() failure; " +
+                    "the orphan reconciler will backstop it.", ip.getAddress(), ex);
+        }
     }
 
     @Override

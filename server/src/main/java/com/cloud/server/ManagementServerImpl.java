@@ -158,6 +158,7 @@ import org.apache.cloudstack.api.command.admin.network.ListPhysicalNetworksCmd;
 import org.apache.cloudstack.api.command.admin.network.ListStorageNetworkIpRangeCmd;
 import org.apache.cloudstack.api.command.admin.network.ListSupportedNetworkServicesCmd;
 import org.apache.cloudstack.api.command.admin.network.MigrateNetworkCmd;
+import org.apache.cloudstack.api.command.admin.network.ReconcileSystemPublicIpAddressesCmd;
 import org.apache.cloudstack.api.command.admin.network.MigrateVPCCmd;
 import org.apache.cloudstack.api.command.admin.network.ReleaseDedicatedGuestVlanRangeCmd;
 import org.apache.cloudstack.api.command.admin.network.UpdateNetworkCmdByAdmin;
@@ -4355,6 +4356,7 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         cmdList.add(GetUploadParamsForTemplateCmd.class);
         cmdList.add(GetUploadParamsForVolumeCmd.class);
         cmdList.add(MigrateNetworkCmd.class);
+        cmdList.add(ReconcileSystemPublicIpAddressesCmd.class);
         cmdList.add(MigrateVPCCmd.class);
         cmdList.add(AcquirePodIpCmdByAdmin.class);
         cmdList.add(ReleasePodIpCmdByAdmin.class);

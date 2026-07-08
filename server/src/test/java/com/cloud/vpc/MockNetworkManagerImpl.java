@@ -1153,4 +1153,9 @@ public class MockNetworkManagerImpl extends ManagerBase implements NetworkOrches
     public Long getPreferredNetworkIdForPublicIpRuleAssignment(IpAddress ip, Long networkId) {
         return null;
     }
+
+    @Override
+    public int reconcileSystemPublicIpAddresses(Long zoneId) {
+        return 0;
+    }
 }
