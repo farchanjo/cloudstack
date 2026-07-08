@@ -17,6 +17,44 @@
 # under the License.
 
 ---
+# Same dual-stack bootstrap as k8s-control-node.yml/k8s-node.yml, but self-gated: the
+# additional-control render path does not substitute {{ k8s.dual.stack }}, so instead of a
+# render-time flag this block keys off the inet6 stanza that cloud-init writes into
+# interfaces.d/50-cloud-init - only dual-stack tiers deliver an IPv6 address in ConfigDrive
+# network_data, so on v4-only clusters the guard fails and the block is an inert no-op.
+# Runs in the cloud-init init stage, after networking.service has already raised eth0 from
+# the image's baked-in v4-only /etc/network/interfaces with IPv6 fully disabled
+# (net.ipv6.conf.all.disable_ipv6 = 1 in /etc/sysctl.conf): enables IPv6 plus the v6
+# forwarding and bridge-nf-call-ip6tables sysctls (kubeadm/kube-proxy/Calico dual-stack
+# requirements, persisted for later boots) and applies the rendered static v6 address,
+# which the first ifup could never apply (file written after networking.service ran, v6
+# still disabled) - leaving the NIC link-local only and crashing calico-node
+# (IP6=autodetect).
+bootcmd:
+  - |
+    ENI=/etc/network/interfaces.d/50-cloud-init
+    if [ -f "$ENI" ] && grep -q "inet6" "$ENI"; then
+      echo "Enabling IPv6 for dual-stack Kubernetes networking"
+      sysctl -w net.ipv6.conf.all.disable_ipv6=0
+      sysctl -w net.ipv6.conf.default.disable_ipv6=0
+      sysctl -w net.ipv6.conf.all.forwarding=1
+      sysctl -w net.ipv6.conf.default.forwarding=1
+      modprobe br_netfilter || true
+      sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
+      mkdir -p /etc/sysctl.d
+      printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv6.conf.default.forwarding = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/99-cks-dualstack.conf
+      V6IF=$(awk '$1=="iface" && $3=="inet6" {print $2; exit}' "$ENI")
+      V6ADDR=$(awk '$1=="iface" {in6=($3=="inet6")} in6 && $1=="address" {print $2; exit}' "$ENI")
+      V6GW=$(awk '$1=="iface" {in6=($3=="inet6")} in6 && $1=="post-up" && $5=="inet6" && $6=="default" {print $8; exit}' "$ENI")
+      if [ -n "$V6IF" ] && [ -n "$V6ADDR" ]; then
+        case "$V6ADDR" in */*) : ;; *) V6ADDR="$V6ADDR/64" ;; esac
+        ip -6 addr replace "$V6ADDR" dev "$V6IF" || true
+        if [ -n "$V6GW" ]; then
+          ip -6 route replace default via "$V6GW" dev "$V6IF" || true
+        fi
+      fi
+    fi
+
 users:
   - name: cloud
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -124,7 +162,15 @@ write_files:
         mkdir -p /etc/systemd/system/kubelet.service.d
         sed "s:/usr/bin:/opt/bin:g" ${BINARIES_DIR}/10-kubeadm.conf > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
 
-        echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd" > /etc/default/kubelet
+        # Dual-stack (self-gated on the cloud-init inet6 stanza, mirroring the
+        # k8s.kubelet.node.ip.args rendering of the other node templates): pass both
+        # node IPs explicitly so the kubelet registers v4+v6 InternalIPs. v4-only clusters
+        # take the empty branch and render the exact same line as before.
+        KUBELET_NODE_IP_ARGS=""
+        if grep -qs "inet6" /etc/network/interfaces.d/50-cloud-init; then
+          KUBELET_NODE_IP_ARGS=" --node-ip=$(hostname -I | awk '{print $1}'),$(hostname -I | tr ' ' '\n' | grep ':' | head -1)"
+        fi
+        echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd${KUBELET_NODE_IP_ARGS}" > /etc/default/kubelet
 
         output=`ls ${BINARIES_DIR}/docker/`
         if [ "$output" != "" ]; then
