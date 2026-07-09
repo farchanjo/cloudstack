@@ -2054,6 +2054,128 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * List every {@code Logical_Router_Static_Route} row whose
+     * {@code external_ids} carries the supplied marker key, returning its UUID,
+     * destination prefix, next-hop, and the marker value (the owning entity id).
+     * Used by the ECMP static-route reconciler to diff desired routes against
+     * the plugin-owned rows currently in the NB DB — never touching manual or
+     * other-purpose static routes, which lack the marker.
+     *
+     * <p>Walks the table client-side (same rationale as
+     * {@link #findUuidsByExternalIds}): the affected row count per zone is small
+     * and the {@code includes}-over-typed-map predicate returns an awkward
+     * column-indexed shape.
+     *
+     * @param markerKey the {@code external_ids} key that tags an owned row
+     * @return owned route descriptors, never {@code null}
+     */
+    public List<EcmpStaticRoute> listEcmpStaticRoutes(final String markerKey) {
+        final List<EcmpStaticRoute> out = new ArrayList<>();
+        if (markerKey == null || markerKey.isEmpty()) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("ip_prefix");
+        columns.add("nexthop");
+        columns.add("external_ids");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router_Static_Route", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        final var entry = arr == null || arr.size() == 0 ? null : arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            addOwnedRoute(out, rows.get(i), markerKey);
+        }
+        return out;
+    }
+
+    /** Decode one static-route row into an {@link EcmpStaticRoute} when it
+     *  carries {@code markerKey} in its {@code external_ids}; otherwise skip. */
+    private void addOwnedRoute(final List<EcmpStaticRoute> out, final JsonNode row, final String markerKey) {
+        if (row == null) {
+            return;
+        }
+        final String owner = mapValue(row.get("external_ids"), markerKey);
+        if (owner == null) {
+            return;
+        }
+        final var uuidNode = row.get("_uuid");
+        if (uuidNode == null || uuidNode.size() < 2) {
+            return;
+        }
+        final JsonNode prefixNode = row.get("ip_prefix");
+        final JsonNode nexthopNode = row.get("nexthop");
+        out.add(new EcmpStaticRoute(uuidNode.get(1).asText(),
+                prefixNode == null ? "" : prefixNode.asText(),
+                nexthopNode == null ? "" : nexthopNode.asText(), owner));
+    }
+
+    /** Read the value for {@code key} out of an OVSDB {@code ["map", [[k,v],...]]}
+     *  column node, or {@code null} when the key is absent / the node is not a map. */
+    private String mapValue(final JsonNode ext, final String key) {
+        if (ext == null || ext.size() < 2 || !"map".equals(ext.get(0).asText())) {
+            return null;
+        }
+        final var pairs = ext.get(1);
+        if (pairs == null) {
+            return null;
+        }
+        for (int j = 0; j < pairs.size(); j++) {
+            final var pair = pairs.get(j);
+            if (pair != null && pair.size() >= 2 && key.equals(pair.get(0).asText())) {
+                return pair.get(1).asText();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Immutable descriptor of a plugin-owned ECMP static route as read from the
+     * NB DB: the route row UUID, destination {@code ip_prefix}, {@code nexthop},
+     * and the marker value ({@code external_ids:cs-ecmp-route}) identifying the
+     * owning CloudStack network.
+     */
+    public static final class EcmpStaticRoute {
+        private final String uuid;
+        private final String prefix;
+        private final String nexthop;
+        private final String owner;
+
+        public EcmpStaticRoute(final String uuid, final String prefix, final String nexthop, final String owner) {
+            this.uuid = uuid;
+            this.prefix = prefix;
+            this.nexthop = nexthop;
+            this.owner = owner;
+        }
+
+        public String getUuid() {
+            return uuid;
+        }
+
+        public String getPrefix() {
+            return prefix;
+        }
+
+        public String getNexthop() {
+            return nexthop;
+        }
+
+        public String getOwner() {
+            return owner;
+        }
+    }
+
+    /**
      * Deletes an ACL row by UUID, first removing it from its parent
      * {@code Logical_Switch.acls} strong-reference set to satisfy the OVSDB
      * referential-integrity constraint.

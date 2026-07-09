@@ -104,6 +104,10 @@ public class OvnBgpReconcileTask {
             // redistribute toggle: it self-heals guest LSPs (CKS pod / LB-VIP /
             // dual-stack v6) and is a no-op when its own ConfigKey is empty.
             resyncLspExtraPortSecurity(controllers);
+            // ECMP static-route resync also runs independent of the BGP toggle:
+            // it self-heals the k8s LB VIP routes on each VPC LR and is a no-op
+            // when ovn.lr.ecmp.static.routes is empty and no owned route exists.
+            ensureEcmpStaticRoutes(controllers);
             if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value())) {
                 return;
             }
@@ -126,6 +130,17 @@ public class OvnBgpReconcileTask {
                 reconcilerService.resyncLspExtraPortSecurityForZone(ctrl.getZoneId(), false);
             } catch (RuntimeException re) {
                 LOGGER.warn("OvnBgpReconcileTask: zone={} LSP extra port-security resync failed: {}",
+                        ctrl.getZoneId(), re.getMessage());
+            }
+        }
+    }
+
+    private void ensureEcmpStaticRoutes(final List<OvnControllerVO> controllers) {
+        for (final OvnControllerVO ctrl : controllers) {
+            try {
+                reconcilerService.ensureEcmpStaticRoutesForZone(ctrl.getZoneId(), false);
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnBgpReconcileTask: zone={} ECMP static-route resync failed: {}",
                         ctrl.getZoneId(), re.getMessage());
             }
         }

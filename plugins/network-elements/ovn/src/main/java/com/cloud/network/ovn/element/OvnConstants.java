@@ -40,6 +40,12 @@ public final class OvnConstants {
     /** external_ids key holding the originating CloudStack zone id. */
     public static final String EXT_ID_ZONE = "cs_zone_id";
 
+    /** external_ids key marking a plugin-owned ECMP {@code Logical_Router_Static_Route}
+     *  row (see {@code ovn.lr.ecmp.static.routes}). The value is the owning
+     *  CloudStack network UUID, so the reconciler can add / diff / remove ONLY
+     *  the routes it created and never disturb manual or other static routes. */
+    public static final String EXT_ID_ECMP_ROUTE = "cs-ecmp-route";
+
     private OvnConstants() {
     }
 }

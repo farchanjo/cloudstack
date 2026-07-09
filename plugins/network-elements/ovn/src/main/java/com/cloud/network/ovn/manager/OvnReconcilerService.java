@@ -16,9 +16,13 @@
 // under the License.
 package com.cloud.network.ovn.manager;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.inject.Inject;
 
@@ -36,6 +40,8 @@ import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
+import com.cloud.network.ovn.config.OvnEcmpRoutes;
 import com.cloud.network.ovn.config.OvnLspAddresses;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnNicConfig;
@@ -48,6 +54,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnConstants;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.network.vpc.dao.VpcDao;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
 import com.cloud.vm.dao.NicDao;
 
@@ -197,6 +204,18 @@ public class OvnReconcilerService {
             LOGGER.info("OvnReconcilerService: zone={} extra port-security resync {} {} LSP(s)",
                     zoneId, dryRun ? "would fix" : "fixed", psFixed);
         }
+        // ECMP static-route resync — programs the k8s LB VIP prefixes onto the
+        // owning VPC LR with one route per worker next-hop (OVN native ECMP), so
+        // the OVN gateway forwards VIP traffic to the CKS workers. Self-gated:
+        // no-op when ovn.lr.ecmp.static.routes is empty and no owned route
+        // exists; removes only rows tagged cs-ecmp-route when the config drops.
+        final Map<String, OvnEcmpRoutes.Route> desiredEcmp =
+                OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
+        final int ecmpChanged = ensureEcmpStaticRoutes(nb, controller, desiredEcmp, dryRun);
+        if (ecmpChanged > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
+                    zoneId, dryRun ? "would change" : "changed", ecmpChanged);
+        }
         LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
                 zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
         return out;
@@ -287,6 +306,290 @@ public class OvnReconcilerService {
             LOGGER.warn("OvnReconcilerService: LSP {} extra port-security resync failed: {}",
                     mapping.getOvnUuid(), e.getMessage());
             return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // ECMP static routes (ovn.lr.ecmp.static.routes).
+    // ------------------------------------------------------------------
+
+    /**
+     * Zone-scoped entry point for the ECMP static-route resync. Reads the
+     * ConfigKey, resolves the controller + {@link OvnNbClient}, and ensures the
+     * configured ECMP routes exist on each network's owning VPC LR (adding
+     * missing next-hops, removing owned rows no longer configured). Called from
+     * the periodic reconcile loop ({@link OvnBgpReconcileTask}) so a management
+     * restart or a config change self-heals. Idempotent.
+     *
+     * @param zoneId CloudStack zone id
+     * @param dryRun when {@code true}, count only, do not mutate the NB DB
+     * @return number of route rows (that would have been) added + removed
+     */
+    public int ensureEcmpStaticRoutesForZone(final long zoneId, final boolean dryRun) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return 0;
+        }
+        final Map<String, OvnEcmpRoutes.Route> desired =
+                OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
+        final int changed = ensureEcmpStaticRoutes(pluginManager.nbClient(zoneId), controller, desired, dryRun);
+        if (changed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
+                    zoneId, dryRun ? "would change" : "changed", changed);
+        }
+        return changed;
+    }
+
+    /**
+     * Ensure the configured ECMP static routes on their owning VPC LRs. Resolves
+     * each network to its LR + CIDR, reads the plugin-owned routes currently in
+     * the NB DB (tagged {@code cs-ecmp-route}), diffs, and applies the delta.
+     * Only rows carrying the marker are ever touched, so manual / other static
+     * routes are safe. A {@code null} client/controller is a strict no-op.
+     *
+     * @return count of route rows (that would have been) added + removed
+     */
+    int ensureEcmpStaticRoutes(final OvnNbClient nb, final OvnControllerVO controller,
+                               final Map<String, OvnEcmpRoutes.Route> desired, final boolean dryRun) {
+        if (nb == null || controller == null) {
+            return 0;
+        }
+        final Map<String, ResolvedRoute> resolved = resolveEcmpRoutes(desired, controller);
+        final List<EcmpStaticRoute> existing = nb.listEcmpStaticRoutes(OvnConstants.EXT_ID_ECMP_ROUTE);
+        final EcmpPlan plan = planEcmp(resolved, desired.keySet(), existing);
+        if (dryRun) {
+            return plan.size();
+        }
+        return applyEcmpPlan(nb, plan);
+    }
+
+    /** Resolve every well-formed config entry to its owning VPC LR + validated
+     *  next-hops. Entries whose network / VPC / LR cannot be resolved, or whose
+     *  next-hops all fall outside the network CIDR, are skipped (WARN). */
+    private Map<String, ResolvedRoute> resolveEcmpRoutes(final Map<String, OvnEcmpRoutes.Route> desired,
+                                                         final OvnControllerVO controller) {
+        final Map<String, ResolvedRoute> out = new LinkedHashMap<>();
+        for (final Map.Entry<String, OvnEcmpRoutes.Route> e : desired.entrySet()) {
+            final ResolvedRoute rr = resolveOneEcmpRoute(e.getKey(), e.getValue(), controller);
+            if (rr != null) {
+                out.put(e.getKey(), rr);
+            }
+        }
+        return out;
+    }
+
+    private ResolvedRoute resolveOneEcmpRoute(final String networkUuid, final OvnEcmpRoutes.Route route,
+                                              final OvnControllerVO controller) {
+        final Network network = networkDao.findByUuid(networkUuid);
+        if (network == null) {
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} not found; skipping", networkUuid);
+            return null;
+        }
+        if (network.getVpcId() == null) {
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} has no VPC; skipping", networkUuid);
+            return null;
+        }
+        final OvnLogicalIdMapVO lr = logicalIdMapDao.findByCsId(Kind.VPC, network.getVpcId(), controller.getId());
+        if (lr == null) {
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} — no OVN LR for VPC {}; skipping",
+                    networkUuid, network.getVpcId());
+            return null;
+        }
+        final List<String> hops = nextHopsInCidr(route.getNextHops(), network.getCidr(), networkUuid);
+        if (hops.isEmpty()) {
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} — no next-hop inside CIDR {}; skipping",
+                    networkUuid, network.getCidr());
+            return null;
+        }
+        return new ResolvedRoute(lr.getOvnUuid(), route.getPrefix(), hops);
+    }
+
+    /** Keep only next-hops that fall inside the network's CIDR; WARN + drop the
+     *  rest so a mis-scoped worker IP never lands on the LR. */
+    private List<String> nextHopsInCidr(final List<String> nextHops, final String cidr, final String networkUuid) {
+        final List<String> out = new ArrayList<>();
+        for (final String nh : nextHops) {
+            if (isNextHopInCidr(nh, cidr)) {
+                out.add(nh);
+            } else {
+                LOGGER.warn("OvnReconcilerService: ECMP next-hop {} outside network {} CIDR {}; skipping",
+                        nh, networkUuid, cidr);
+            }
+        }
+        return out;
+    }
+
+    private boolean isNextHopInCidr(final String nh, final String cidr) {
+        if (StringUtils.isBlank(cidr) || StringUtils.isBlank(nh)) {
+            return false;
+        }
+        try {
+            if (NetUtils.isValidIp4(nh) && NetUtils.isValidIp4Cidr(cidr)) {
+                return NetUtils.isIpWithInCidrRange(nh, cidr);
+            }
+            if (NetUtils.isValidIp6(nh) && NetUtils.isValidIp6Cidr(cidr)) {
+                return NetUtils.isIp6InNetwork(nh, cidr);
+            }
+        } catch (RuntimeException re) {
+            LOGGER.debug("OvnReconcilerService: ECMP CIDR check failed nh={} cidr={}: {}", nh, cidr, re.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Pure diff between the desired ECMP routes and the plugin-owned routes
+     * present in the NB DB. A route is keyed by {@code (owner, prefix, nexthop)}.
+     * Desired tuples absent from the NB DB become adds; owned rows absent from
+     * the desired set become removes — but only when their owner was dropped
+     * from config OR is still resolvable (so a transiently-unresolvable network
+     * keeps its rows rather than flapping). Never returns a row lacking the
+     * marker, because the caller only ever passes marked rows in.
+     *
+     * @param resolvedDesired  owner -&gt; resolved route (LR + validated hops)
+     * @param configuredOwners owners present in the raw config (may be unresolved)
+     * @param existingOwned    plugin-owned static-route rows read from the NB DB
+     * @return the add / remove plan
+     */
+    static EcmpPlan planEcmp(final Map<String, ResolvedRoute> resolvedDesired,
+                             final Set<String> configuredOwners,
+                             final List<EcmpStaticRoute> existingOwned) {
+        final Map<String, String> existingByKey = new LinkedHashMap<>();
+        for (final EcmpStaticRoute r : existingOwned) {
+            existingByKey.put(tupleKey(r.getOwner(), r.getPrefix(), r.getNexthop()), r.getUuid());
+        }
+        final Set<String> desiredKeys = new HashSet<>();
+        final List<PlannedRoute> toAdd = new ArrayList<>();
+        for (final Map.Entry<String, ResolvedRoute> e : resolvedDesired.entrySet()) {
+            final ResolvedRoute rr = e.getValue();
+            for (final String nh : rr.getNextHops()) {
+                final String key = tupleKey(e.getKey(), rr.getPrefix(), nh);
+                desiredKeys.add(key);
+                if (!existingByKey.containsKey(key)) {
+                    toAdd.add(new PlannedRoute(rr.getLrUuid(), rr.getPrefix(), nh, e.getKey()));
+                }
+            }
+        }
+        final List<String> toRemove = new ArrayList<>();
+        for (final EcmpStaticRoute r : existingOwned) {
+            final String key = tupleKey(r.getOwner(), r.getPrefix(), r.getNexthop());
+            if (desiredKeys.contains(key)) {
+                continue;
+            }
+            if (!configuredOwners.contains(r.getOwner()) || resolvedDesired.containsKey(r.getOwner())) {
+                toRemove.add(r.getUuid());
+            }
+        }
+        return new EcmpPlan(toAdd, toRemove);
+    }
+
+    private static String tupleKey(final String owner, final String prefix, final String nexthop) {
+        return owner + '|' + prefix + '|' + nexthop;
+    }
+
+    /** Apply an {@link EcmpPlan} to the NB DB. Each add stamps the
+     *  {@code cs-ecmp-route} marker; each remove is a direct-by-UUID delete
+     *  (OVSDB GCs the dangling {@code Logical_Router.static_routes} ref). */
+    private int applyEcmpPlan(final OvnNbClient nb, final EcmpPlan plan) {
+        int changed = 0;
+        for (final PlannedRoute pr : plan.getToAdd()) {
+            try {
+                nb.addLogicalRouterStaticRoute(pr.getLrUuid(), pr.getPrefix(), pr.getNexthop(), null, null,
+                        Collections.singletonMap(OvnConstants.EXT_ID_ECMP_ROUTE, pr.getOwner()));
+                changed++;
+            } catch (OvnException ex) {
+                LOGGER.warn("OvnReconcilerService: ECMP add {} -> {} on lr={} failed: {}",
+                        pr.getPrefix(), pr.getNexthop(), pr.getLrUuid(), ex.getMessage());
+            }
+        }
+        for (final String routeUuid : plan.getToRemove()) {
+            try {
+                nb.deleteLogicalRouterStaticRouteDirect(routeUuid);
+                changed++;
+            } catch (OvnException ex) {
+                LOGGER.warn("OvnReconcilerService: ECMP remove route {} failed: {}", routeUuid, ex.getMessage());
+            }
+        }
+        return changed;
+    }
+
+    /** A network's ECMP route resolved to its owning VPC LR UUID and the
+     *  next-hops that passed the CIDR-membership check. */
+    static final class ResolvedRoute {
+        private final String lrUuid;
+        private final String prefix;
+        private final List<String> nextHops;
+
+        ResolvedRoute(final String lrUuid, final String prefix, final List<String> nextHops) {
+            this.lrUuid = lrUuid;
+            this.prefix = prefix;
+            this.nextHops = Collections.unmodifiableList(new ArrayList<>(nextHops));
+        }
+
+        String getLrUuid() {
+            return lrUuid;
+        }
+
+        String getPrefix() {
+            return prefix;
+        }
+
+        List<String> getNextHops() {
+            return nextHops;
+        }
+    }
+
+    /** One static-route row to insert: destination prefix + single next-hop on a
+     *  specific LR, tagged with the owning network UUID. */
+    static final class PlannedRoute {
+        private final String lrUuid;
+        private final String prefix;
+        private final String nexthop;
+        private final String owner;
+
+        PlannedRoute(final String lrUuid, final String prefix, final String nexthop, final String owner) {
+            this.lrUuid = lrUuid;
+            this.prefix = prefix;
+            this.nexthop = nexthop;
+            this.owner = owner;
+        }
+
+        String getLrUuid() {
+            return lrUuid;
+        }
+
+        String getPrefix() {
+            return prefix;
+        }
+
+        String getNexthop() {
+            return nexthop;
+        }
+
+        String getOwner() {
+            return owner;
+        }
+    }
+
+    /** Result of {@link #planEcmp}: rows to insert and route UUIDs to delete. */
+    static final class EcmpPlan {
+        private final List<PlannedRoute> toAdd;
+        private final List<String> toRemove;
+
+        EcmpPlan(final List<PlannedRoute> toAdd, final List<String> toRemove) {
+            this.toAdd = toAdd;
+            this.toRemove = toRemove;
+        }
+
+        List<PlannedRoute> getToAdd() {
+            return toAdd;
+        }
+
+        List<String> getToRemove() {
+            return toRemove;
+        }
+
+        int size() {
+            return toAdd.size() + toRemove.size();
         }
     }
 
