@@ -55,8 +55,9 @@ import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
  * {@link OvnNetworkElement#ensureIsolatedNetworkGateway}: a dual-stack tier's
  * LRP {@code networks} list must carry both the v4 and the v6 gateway CIDR,
  * and {@link OvnNbClient#lrpSetIpv6RaConfigs} must be invoked with
- * {@code address_mode=dhcpv6_stateful}. An IPv4-only network must be a
- * strict no-op on both fronts.
+ * {@code address_mode=slaac} (guests kernel-autoconfigure their GUA from the RA
+ * prefix — the CKS node image runs no DHCPv6 client). An IPv4-only network must
+ * be a strict no-op on both fronts.
  */
 public class OvnNetworkElementV6RaTest {
 
@@ -148,7 +149,7 @@ public class OvnNetworkElementV6RaTest {
         @SuppressWarnings("unchecked")
         final ArgumentCaptor<Map<String, String>> raCaptor = ArgumentCaptor.forClass(Map.class);
         verify(nbClient, times(1)).lrpSetIpv6RaConfigs(eq("lrp-uuid"), raCaptor.capture());
-        assertEquals("dhcpv6_stateful", raCaptor.getValue().get("address_mode"));
+        assertEquals("slaac", raCaptor.getValue().get("address_mode"));
     }
 
     /** Reconcile path: LRP already bound; RA must be (re)applied on every reconcile. */
@@ -176,7 +177,7 @@ public class OvnNetworkElementV6RaTest {
         @SuppressWarnings("unchecked")
         final ArgumentCaptor<Map<String, String>> raCaptor = ArgumentCaptor.forClass(Map.class);
         verify(nbClient, times(1)).lrpSetIpv6RaConfigs(eq("existing-lrp-uuid"), raCaptor.capture());
-        assertEquals("dhcpv6_stateful", raCaptor.getValue().get("address_mode"));
+        assertEquals("slaac", raCaptor.getValue().get("address_mode"));
     }
 
     /** Regression: an IPv4-only tier must not append v6 nor call lrpSetIpv6RaConfigs. */
@@ -236,7 +237,7 @@ public class OvnNetworkElementV6RaTest {
         @SuppressWarnings("unchecked")
         final ArgumentCaptor<Map<String, String>> raCaptor = ArgumentCaptor.forClass(Map.class);
         verify(nbClient, times(1)).lrpSetIpv6RaConfigs(eq("lrp-uuid-iso"), raCaptor.capture());
-        assertEquals("dhcpv6_stateful", raCaptor.getValue().get("address_mode"));
+        assertEquals("slaac", raCaptor.getValue().get("address_mode"));
     }
 
     private static void inject(final Object target, final String name, final Object value) throws Exception {

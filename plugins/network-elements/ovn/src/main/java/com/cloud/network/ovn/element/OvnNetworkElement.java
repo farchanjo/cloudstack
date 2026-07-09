@@ -376,12 +376,27 @@ public class OvnNetworkElement extends AdapterBase
     }
 
     /** OVN {@code Logical_Router_Port.ipv6_ra_configs} keys advertised when a
-     *  tier carries a v6 gateway — {@code dhcpv6_stateful} mirrors the
-     *  DHCPv6/static-address model already on the LSP (M-flag on, SLAAC
-     *  autonomous off), so ovn-northd advertises this LRP as the guest's
-     *  default v6 gateway. */
-    private static final Map<String, String> IPV6_RA_CONFIGS = Map.of(
-            "address_mode", "dhcpv6_stateful",
+     *  tier carries a v6 gateway.
+     *
+     *  <p>{@code address_mode=slaac} sets the RA's prefix <em>autonomous</em>
+     *  (A) flag so guests kernel-autoconfigure their GUA straight from the RA
+     *  prefix — no DHCPv6 client required. This is deliberate: the CKS node
+     *  image runs only an IPv4 DHCP client (netplan {@code dhcp4: true}), has no
+     *  DHCPv6 client and no {@code dhcp6}/networkd v6 stanza, so the previous
+     *  {@code dhcpv6_stateful} mode (M-flag on, SLAAC off) advertised "get your
+     *  address via DHCPv6" to a node that never runs DHCPv6 — the guest booted
+     *  with only a link-local, so Calico's bird6 had no global v6 source and the
+     *  PARSEL-V6 BGP sessions could never establish. Nodes carry
+     *  {@code accept_ra=2} (RAs honoured despite {@code forwarding=1}) and
+     *  {@code addr_gen_mode=0} (EUI-64), so the SLAAC address they form is
+     *  EXACTLY the EUI-64 GUA CloudStack already allocated for the NIC and
+     *  stamped into the LSP {@code addresses}/{@code port_security} — the spoof
+     *  guard passes with zero extra plumbing. {@code send_periodic=true} +
+     *  {@code max_interval=30} keep the address refreshed against lease/lifetime
+     *  lapse. Exposed for the reconciler's existing-LRP resync
+     *  ({@link com.cloud.network.ovn.manager.OvnReconcilerService}). */
+    public static final Map<String, String> IPV6_RA_CONFIGS = Map.of(
+            "address_mode", "slaac",
             "send_periodic", "true",
             "max_interval", "30");
 

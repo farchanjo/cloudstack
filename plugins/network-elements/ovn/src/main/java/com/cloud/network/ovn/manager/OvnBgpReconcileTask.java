@@ -108,6 +108,11 @@ public class OvnBgpReconcileTask {
             // it self-heals the k8s LB VIP routes on each VPC LR and is a no-op
             // when ovn.lr.ecmp.static.routes is empty and no owned route exists.
             ensureEcmpStaticRoutes(controllers);
+            // PARSEL-V6 RA-config resync — self-heals every dual-stack tier LRP's
+            // ipv6_ra_configs to SLAAC so CKS guests keep autoconfiguring their
+            // GUA across LRP recreate / management restart. No-op for IPv4-only
+            // tiers; independent of the BGP redistribute toggle.
+            resyncTierIpv6RaConfigs(controllers);
             if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value())) {
                 return;
             }
@@ -141,6 +146,17 @@ public class OvnBgpReconcileTask {
                 reconcilerService.ensureEcmpStaticRoutesForZone(ctrl.getZoneId(), false);
             } catch (RuntimeException re) {
                 LOGGER.warn("OvnBgpReconcileTask: zone={} ECMP static-route resync failed: {}",
+                        ctrl.getZoneId(), re.getMessage());
+            }
+        }
+    }
+
+    private void resyncTierIpv6RaConfigs(final List<OvnControllerVO> controllers) {
+        for (final OvnControllerVO ctrl : controllers) {
+            try {
+                reconcilerService.resyncTierIpv6RaConfigsForZone(ctrl.getZoneId(), false);
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnBgpReconcileTask: zone={} tier IPv6 RA-config resync failed: {}",
                         ctrl.getZoneId(), re.getMessage());
             }
         }

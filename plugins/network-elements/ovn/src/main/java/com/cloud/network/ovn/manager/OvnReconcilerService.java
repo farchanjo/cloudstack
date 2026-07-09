@@ -53,6 +53,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnConstants;
+import com.cloud.network.ovn.element.OvnNetworkElement;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.net.NetUtils;
@@ -230,9 +231,17 @@ public class OvnReconcilerService {
         // ConfigKeys are unset (v4-only, zero regression).
         final int v6Public = ensureVpcPublicIpv6ForZone(zoneId, controller, dryRun);
         final int v6Tiers = announceRoutedTiersIpv6ForZone(zoneId, controller, dryRun);
-        if (v6Public > 0 || v6Tiers > 0) {
-            LOGGER.info("OvnReconcilerService: zone={} PARSEL-V6 {} {} VPC public foot(s) + {} tier /64 announce(s)",
-                    zoneId, dryRun ? "would apply" : "applied", v6Public, v6Tiers);
+        // PARSEL-V6 — re-stamp the SLAAC RA config on every dual-stack tier LRP
+        // so an already-running cluster (whose LRP was bound under the legacy
+        // dhcpv6_stateful mode) flips to SLAAC on `cmk run ovnreconciler` /
+        // periodic reconcile WITHOUT recreating VMs — the node then autoconfigures
+        // its GUA from the RA and Calico's bird6 gains a v6 source. Idempotent:
+        // writing the same ipv6_ra_configs map is a NB no-op.
+        final int v6Ra = resyncTierIpv6RaConfigsForZone(zoneId, dryRun);
+        if (v6Public > 0 || v6Tiers > 0 || v6Ra > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} PARSEL-V6 {} {} VPC public foot(s) + {} tier /64 announce(s) "
+                    + "+ {} tier RA-config resync(es)",
+                    zoneId, dryRun ? "would apply" : "applied", v6Public, v6Tiers, v6Ra);
         }
         LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
                 zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
@@ -302,6 +311,54 @@ public class OvnReconcilerService {
             }
         }
         return announced;
+    }
+
+    /**
+     * PARSEL-V6 — re-stamp {@link OvnNetworkElement#IPV6_RA_CONFIGS} (SLAAC) on
+     * every dual-stack tier LRP in the zone. Mirrors
+     * {@link #announceRoutedTiersIpv6ForZone}: iterates the tier LRP mappings
+     * ({@link Kind#PUBLIC_LRP}, keyed by tier network id), resolves the
+     * {@link Network}, and re-applies the RA config to LRPs whose network carries
+     * a v6 gateway/cidr. This repairs already-running clusters whose LRP was
+     * created under the legacy {@code dhcpv6_stateful} mode — flipping them to
+     * SLAAC lets the guest kernel-autoconfigure its GUA (accept_ra=2 + EUI-64)
+     * without recreating VMs. Strict no-op for IPv4-only tiers (blank
+     * {@code getIp6Cidr}) and in {@code dryRun}. Idempotent: {@code
+     * lrpSetIpv6RaConfigs} writing the same map is a NB no-op.
+     *
+     * <p>Public + zone-scoped (resolves its own controller) so it can be driven
+     * BOTH from the on-demand {@code reconcile()} pass and from the periodic
+     * {@link OvnBgpReconcileTask}, exactly like
+     * {@link #resyncLspExtraPortSecurityForZone} — a management restart then
+     * self-heals the RA mode without an explicit {@code cmk run ovnreconciler}.
+     *
+     * @return number of dual-stack tier LRPs re-stamped ({@code 0} in dryRun)
+     */
+    public int resyncTierIpv6RaConfigsForZone(final long zoneId, final boolean dryRun) {
+        if (dryRun) {
+            return 0;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return 0;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        int applied = 0;
+        for (final OvnLogicalIdMapVO tierMapping : logicalIdMapDao.listByKind(Kind.PUBLIC_LRP, controller.getId())) {
+            final Network network = networkDao.findById(tierMapping.getCsId());
+            if (network == null || StringUtils.isBlank(network.getIp6Gateway())
+                    || StringUtils.isBlank(network.getIp6Cidr())) {
+                continue;
+            }
+            try {
+                nb.lrpSetIpv6RaConfigs(tierMapping.getOvnUuid(), OvnNetworkElement.IPV6_RA_CONFIGS);
+                applied++;
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnReconcilerService: tier {} IPv6 RA-config resync failed: {}",
+                        network.getId(), e.getMessage());
+            }
+        }
+        return applied;
     }
 
     /**
