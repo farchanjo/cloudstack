@@ -31,10 +31,13 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnOvsPolicySweepAnswer;
 import com.cloud.agent.api.OvnOvsPolicySweepCommand;
+import com.cloud.network.Network;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnLspAddresses;
+import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnNicConfig;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
@@ -45,6 +48,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnConstants;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.network.vpc.dao.VpcDao;
+import com.cloud.vm.NicVO;
 import com.cloud.vm.dao.NicDao;
 
 /**
@@ -182,9 +186,108 @@ public class OvnReconcilerService {
                         zoneId, OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP, snatFixed);
             }
         }
+        // Per-network extra CIDR port-security resync — repairs EXISTING guest
+        // LSPs so CKS pod / LB-VIP / dual-stack-v6 frames survive OVN's spoof
+        // guard without recreating VMs. Self-gated: no-op when the ConfigKey is
+        // empty; touches only NICs on networks listed in the map.
+        final Map<String, List<String>> extraPs =
+                OvnLspAddresses.parse(OvnNetworkConfig.LspExtraPortSecurityCidrs.value());
+        final int psFixed = resyncLspExtraPortSecurity(nb, controller, extraPs, dryRun);
+        if (psFixed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} extra port-security resync {} {} LSP(s)",
+                    zoneId, dryRun ? "would fix" : "fixed", psFixed);
+        }
         LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
                 zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
         return out;
+    }
+
+    /**
+     * Zone-scoped entry point for the extra-CIDR port-security resync. Reads
+     * the ConfigKey, resolves the controller + {@link OvnNbClient}, and
+     * re-applies the extras to every affected guest LSP. Called from the
+     * periodic reconcile loop ({@link OvnBgpReconcileTask}) so a management
+     * restart or a config change self-heals all ports. Idempotent.
+     *
+     * @param zoneId CloudStack zone id
+     * @param dryRun when {@code true}, count only, do not mutate the NB DB
+     * @return number of LSPs (that would have been) re-stamped
+     */
+    public int resyncLspExtraPortSecurityForZone(final long zoneId, final boolean dryRun) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return 0;
+        }
+        final Map<String, List<String>> extras =
+                OvnLspAddresses.parse(OvnNetworkConfig.LspExtraPortSecurityCidrs.value());
+        if (extras.isEmpty()) {
+            return 0;
+        }
+        final int fixed = resyncLspExtraPortSecurity(pluginManager.nbClient(zoneId), controller, extras, dryRun);
+        if (fixed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} extra port-security resync {} {} LSP(s)",
+                    zoneId, dryRun ? "would fix" : "fixed", fixed);
+        }
+        return fixed;
+    }
+
+    /**
+     * Re-stamp {@code addresses} + {@code port_security} on every guest
+     * ({@link Kind#NIC} / {@link Kind#ORPHAN_NIC}) LSP whose network appears in
+     * {@code extrasByNetworkUuid}, appending that network's extra CIDRs to the
+     * NIC's MAC+IP token. Networks absent from the map are never touched (zero
+     * regression). Empty/{@code null} map returns immediately.
+     *
+     * @return count of LSPs (that would have been) updated
+     */
+    int resyncLspExtraPortSecurity(final OvnNbClient nb, final OvnControllerVO controller,
+                                   final Map<String, List<String>> extrasByNetworkUuid, final boolean dryRun) {
+        if (extrasByNetworkUuid == null || extrasByNetworkUuid.isEmpty()) {
+            return 0;
+        }
+        int fixed = 0;
+        for (final Kind kind : new Kind[]{Kind.NIC, Kind.ORPHAN_NIC}) {
+            for (final OvnLogicalIdMapVO mapping : logicalIdMapDao.listByKind(kind, controller.getId())) {
+                if (applyExtraPortSecurity(nb, mapping, extrasByNetworkUuid, dryRun)) {
+                    fixed++;
+                }
+            }
+        }
+        return fixed;
+    }
+
+    /**
+     * Apply the network's extra CIDRs to a single NIC LSP. No-op (returns
+     * {@code false}) when the NIC/network is gone or the network carries no
+     * configured extras.
+     */
+    private boolean applyExtraPortSecurity(final OvnNbClient nb, final OvnLogicalIdMapVO mapping,
+                                           final Map<String, List<String>> extrasByNetworkUuid, final boolean dryRun) {
+        final NicVO nic = nicDao.findById(mapping.getCsId());
+        if (nic == null) {
+            return false;
+        }
+        final Network network = networkDao.findById(nic.getNetworkId());
+        if (network == null) {
+            return false;
+        }
+        final List<String> extras = extrasByNetworkUuid.get(network.getUuid());
+        if (extras == null || extras.isEmpty()) {
+            return false;
+        }
+        if (dryRun) {
+            return true;
+        }
+        final List<String> addresses = OvnLspAddresses.compose(nic.getMacAddress(),
+                nic.getIPv4Address(), nic.getIPv6Address(), extras);
+        try {
+            nb.updateLogicalSwitchPortAddresses(mapping.getOvnUuid(), addresses);
+            return true;
+        } catch (OvnException e) {
+            LOGGER.warn("OvnReconcilerService: LSP {} extra port-security resync failed: {}",
+                    mapping.getOvnUuid(), e.getMessage());
+            return false;
+        }
     }
 
     /**

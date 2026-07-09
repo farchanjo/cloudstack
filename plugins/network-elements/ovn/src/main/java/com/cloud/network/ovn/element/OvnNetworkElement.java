@@ -67,6 +67,7 @@ import com.cloud.network.element.VpcProvider;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.config.OvnLspAddresses;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnNicConfig;
 import com.cloud.network.ovn.config.OvnNicTunables;
@@ -407,7 +408,7 @@ public class OvnNetworkElement extends AdapterBase
             return true;
         }
         OvnLogicalIdMapVO already = logicalIdMapDao.findByCsId(Kind.NIC, nic.getId(), controller.getId());
-        final List<String> addresses = buildAddresses(nic);
+        final List<String> addresses = buildAddresses(nic, network);
         if (already != null) {
             // Stale-mapping guard — recreate when LSP was deleted out-of-band
             // (manual ovn-nbctl lsp-del, parent LS rebuild, etc).
@@ -1274,18 +1275,15 @@ public class OvnNetworkElement extends AdapterBase
         return guru.createLogicalSwitchFor(network);
     }
 
-    private List<String> buildAddresses(final NicProfile nic) {
-        final StringBuilder s = new StringBuilder();
-        s.append(nic.getMacAddress());
-        if (StringUtils.isNotBlank(nic.getIPv4Address())) {
-            s.append(' ').append(nic.getIPv4Address());
-        }
-        if (StringUtils.isNotBlank(nic.getIPv6Address())) {
-            s.append(' ').append(nic.getIPv6Address());
-        }
-        final List<String> out = new ArrayList<>(1);
-        out.add(s.toString());
-        return out;
+    /**
+     * Compose the LSP {@code addresses}/{@code port_security} token for a NIC.
+     * Appends the network's configured extra CIDRs
+     * ({@link OvnNetworkConfig#LspExtraPortSecurityCidrs}); networks without
+     * extras yield exactly {@code "<mac> [<ip4>] [<ip6>]"} (zero regression).
+     */
+    private List<String> buildAddresses(final NicProfile nic, final Network network) {
+        return OvnLspAddresses.compose(nic.getMacAddress(), nic.getIPv4Address(), nic.getIPv6Address(),
+                OvnLspAddresses.extraCidrsForNetwork(network.getUuid()));
     }
 
     private String buildLspName(final NicProfile nic) {

@@ -62,6 +62,8 @@ public class OvnBgpReconcileTask {
     private OvnControllerDao controllerDao;
     @Inject
     private OvnBgpRedistributeManager bgpRedistributeManager;
+    @Inject
+    private OvnReconcilerService reconcilerService;
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> handle;
@@ -94,11 +96,15 @@ public class OvnBgpReconcileTask {
      */
     void tick() {
         try {
-            if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value())) {
-                return;
-            }
             final List<OvnControllerVO> controllers = controllerDao.listAll();
             if (controllers == null || controllers.isEmpty()) {
+                return;
+            }
+            // Extra-CIDR port-security resync runs independent of the BGP
+            // redistribute toggle: it self-heals guest LSPs (CKS pod / LB-VIP /
+            // dual-stack v6) and is a no-op when its own ConfigKey is empty.
+            resyncLspExtraPortSecurity(controllers);
+            if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value())) {
                 return;
             }
             for (final OvnControllerVO ctrl : controllers) {
@@ -111,6 +117,17 @@ public class OvnBgpReconcileTask {
             }
         } catch (RuntimeException re) {
             LOGGER.warn("OvnBgpReconcileTask: tick failed: {}", re.getMessage());
+        }
+    }
+
+    private void resyncLspExtraPortSecurity(final List<OvnControllerVO> controllers) {
+        for (final OvnControllerVO ctrl : controllers) {
+            try {
+                reconcilerService.resyncLspExtraPortSecurityForZone(ctrl.getZoneId(), false);
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnBgpReconcileTask: zone={} LSP extra port-security resync failed: {}",
+                        ctrl.getZoneId(), re.getMessage());
+            }
         }
     }
 
