@@ -92,23 +92,27 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // bridge, so the LRP next-hop (gatewayIp) is ARP-resolvable and the /32
         // route below can actually install. Non-fatal + idempotent; skipped on
         // withdraw (the anchor is chassis-level, shared across all FIPs).
+        // PARSEL-V6 — the same command carries either an IPv4 or an IPv6
+        // network; the address family is sniffed from the address literal (a
+        // ':' can only appear in an IPv6 address). The v6 path uses `ip -6`,
+        // holds the anchor with `ip -6 addr`, and writes the BGP `network` into
+        // the `address-family ipv6 unicast` block instead of the default v4 AF.
+        final boolean ipv6 = isIpv6(publicIp);
         if (!withdraw) {
-            ensureAnchor(cmd.getAnchorCidr(), cmd.getVlan(), cmd.getNetworkGatewayIp());
+            ensureAnchor(cmd.getAnchorCidr(), cmd.getVlan(), cmd.getNetworkGatewayIp(), ipv6);
         }
 
-        final int prefixLen = resolvePrefixLen(cmd.getPrefixLength());
-        final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn, prefixLen);
+        final int prefixLen = resolvePrefixLen(cmd.getPrefixLength(), ipv6);
+        final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn, prefixLen, ipv6);
         if (routeErr != null) {
             return routeErr;
         }
 
         final String netClause = (withdraw ? "no " : "") + "network " + publicIp + "/" + prefixLen;
-        // Single vtysh -c chain so FRR sees configure -> router bgp -> network
-        // as one transaction (matters when the running config is locked by
-        // another caller; vtysh internally serialises -c chains).
-        final String command = String.format(
-                "%s -c \"configure terminal\" -c \"router bgp %d\" -c \"%s\"",
-                vtysh, asn, netClause);
+        // Single vtysh -c chain so FRR sees configure -> router bgp -> [af] ->
+        // network as one transaction (matters when the running config is locked
+        // by another caller; vtysh internally serialises -c chains).
+        final String command = buildVtyshNetworkCommand(vtysh, asn, netClause, ipv6);
         try {
             final Pair<String, String> result = Script.executeCommand(command);
             // Script.executeCommand surfaces the exit code via stderr presence
@@ -123,18 +127,39 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                 final String lower = stderr.toLowerCase();
                 if (lower.contains("error") || lower.contains("fail") || lower.contains("can't")
                         || lower.contains("invalid")) {
-                    LOGGER.warn("OvnBgpAnnounce {} {}/32: vtysh stderr: {}", operation, publicIp, stderr);
+                    LOGGER.warn("OvnBgpAnnounce {} {}/{}: vtysh stderr: {}", operation, publicIp, prefixLen, stderr);
                     return new OvnBgpAnnounceAnswer(cmd, false, stderr.trim(), asn);
                 }
             }
-            LOGGER.info("OvnBgpAnnounce {} {}/32: ok (asn={}, vtysh={})",
-                    operation, publicIp, asn, vtysh);
+            LOGGER.info("OvnBgpAnnounce {} {}/{}: ok (asn={}, af={}, vtysh={})",
+                    operation, publicIp, prefixLen, ipv6 ? "ipv6" : "ipv4", vtysh);
             return new OvnBgpAnnounceAnswer(cmd, true, "ok", asn);
         } catch (RuntimeException re) {
-            LOGGER.warn("OvnBgpAnnounce {} {}/32: vtysh invocation failed: {}",
-                    operation, publicIp, re.getMessage());
+            LOGGER.warn("OvnBgpAnnounce {} {}/{}: vtysh invocation failed: {}",
+                    operation, publicIp, prefixLen, re.getMessage());
             return new OvnBgpAnnounceAnswer(cmd, false, re.getMessage(), asn);
         }
+    }
+
+    /** {@code true} when the address literal is IPv6 (a {@code ':'} can only
+     *  appear in an IPv6 address, never in a dotted-quad IPv4). */
+    private static boolean isIpv6(final String addr) {
+        return addr != null && addr.indexOf(':') >= 0;
+    }
+
+    /** Build the vtysh {@code -c} chain, injecting {@code address-family ipv6
+     *  unicast} before the {@code network} clause for the v6 path so the prefix
+     *  originates in the IPv6 unicast AF (never the default v4 AF). */
+    private String buildVtyshNetworkCommand(final String vtysh, final long asn, final String netClause,
+                                            final boolean ipv6) {
+        if (ipv6) {
+            return String.format(
+                    "%s -c \"configure terminal\" -c \"router bgp %d\" -c \"address-family ipv6 unicast\" -c \"%s\"",
+                    vtysh, asn, netClause);
+        }
+        return String.format(
+                "%s -c \"configure terminal\" -c \"router bgp %d\" -c \"%s\"",
+                vtysh, asn, netClause);
     }
 
     /**
@@ -167,17 +192,20 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      */
     private Answer applyDatapathRoute(final String publicIp, final String gatewayIp,
                                       final boolean withdraw, final OvnBgpAnnounceCommand cmd,
-                                      final Long asn, final int prefixLen) {
+                                      final Long asn, final int prefixLen, final boolean ipv6) {
+        // `ip -6` for the v6 family; the on-link next-hop (the VPC public LRP's
+        // v6 GUA, held reachable by the pub-anchor v6 foot) auto-resolves the dev.
+        final String ipTool = ipv6 ? "ip -6 route" : "ip route";
         if (withdraw) {
             // Best-effort delete by prefix; ignore "No such process" etc.
-            Script.executeCommand(String.format("ip route del %s/%d", publicIp, prefixLen));
+            Script.executeCommand(String.format("%s del %s/%d", ipTool, publicIp, prefixLen));
             return null;
         }
         if (gatewayIp == null || gatewayIp.isEmpty()) {
             return null; // advertise-only
         }
         final Pair<String, String> result =
-                Script.executeCommand(String.format("ip route replace %s/%d via %s", publicIp, prefixLen, gatewayIp));
+                Script.executeCommand(String.format("%s replace %s/%d via %s", ipTool, publicIp, prefixLen, gatewayIp));
         final String stderr = result == null ? null : result.second();
         if (stderr != null && !stderr.trim().isEmpty()) {
             // Non-fatal: log + fall through to advertise-only (see javadoc).
@@ -204,7 +232,8 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      * hardcoded); the anchor address is supplied by the management server,
      * itself derived from CloudStack's public IP range (never hardcoded).
      */
-    private void ensureAnchor(final String anchorCidr, final String vlan, final String networkGatewayIp) {
+    private void ensureAnchor(final String anchorCidr, final String vlan, final String networkGatewayIp,
+                              final boolean ipv6) {
         if (anchorCidr == null || anchorCidr.trim().isEmpty()) {
             return;
         }
@@ -216,7 +245,9 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         }
         // Create the internal port if missing, then (re)assert its VLAN and
         // addresses. `--may-exist` makes add-port a no-op when the port exists;
-        // the tag / `ip addr replace` steps are idempotent.
+        // the tag / `ip addr replace` steps are idempotent. The SAME pub-anchor
+        // port carries both the v4 and the v6 anchor addresses (dual-stack) — v6
+        // only ADDS its addresses, never disturbing the v4 anchor.
         Script.runSimpleBashScript(String.format(
                 "ovs-vsctl --may-exist add-port %s %s -- set interface %s type=internal",
                 bridge, ANCHOR_PORT, ANCHOR_PORT));
@@ -226,31 +257,35 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // the localnet ingress and are dropped, breaking egress-return and FIP
         // ingress. The tag is set explicitly (not only on --may-exist create)
         // so a pre-existing untagged anchor is corrected in place. Blank/invalid
-        // vlan -> leave untagged (pre-fix behaviour, e.g. untagged providers).
+        // vlan -> leave untagged (pre-fix behaviour, e.g. untagged providers /
+        // the routed v6 public /64 which carries no VLAN, exactly like v4 .89/24).
         if (vlan != null && vlan.trim().matches("\\d+")) {
             Script.runSimpleBashScript(String.format(
                     "ovs-vsctl set port %s tag=%s", ANCHOR_PORT, vlan.trim()));
         }
         Script.runSimpleBashScript("ip link set " + ANCHOR_PORT + " up");
+        final String addrTool = ipv6 ? "ip -6 addr" : "ip addr";
         final Pair<String, String> res = Script.executeCommand(
-                String.format("ip addr replace %s dev %s", anchorCidr, ANCHOR_PORT));
+                String.format("%s replace %s dev %s", addrTool, anchorCidr, ANCHOR_PORT));
         final String stderr = res == null ? null : res.second();
         if (stderr != null && !stderr.trim().isEmpty()) {
-            LOGGER.warn("OvnBgpAnnounce: anchor {} on {} (port {}) — ip addr replace stderr: {}",
-                    anchorCidr, bridge, ANCHOR_PORT, stderr.trim());
+            LOGGER.warn("OvnBgpAnnounce: anchor {} on {} (port {}, af={}) — ip addr replace stderr: {}",
+                    anchorCidr, bridge, ANCHOR_PORT, ipv6 ? "ipv6" : "ipv4", stderr.trim());
         } else {
-            LOGGER.info("OvnBgpAnnounce: anchor {} ensured on {} (port {}, vlan {})",
-                    anchorCidr, bridge, ANCHOR_PORT, vlan);
+            LOGGER.info("OvnBgpAnnounce: anchor {} ensured on {} (port {}, vlan {}, af={})",
+                    anchorCidr, bridge, ANCHOR_PORT, vlan, ipv6 ? "ipv6" : "ipv4");
         }
         // Hold the public network gateway IP on the anchor so the VPC LR's
         // egress next-hop is answered locally — in the BGP-to-host model there
-        // is no physical gateway device on that address — and enable IPv4
-        // forwarding so egress traffic landing on the host is routed upstream
-        // (the FIP /32s are BGP-originated from here). Idempotent.
+        // is no physical gateway device on that address — and enable forwarding
+        // for the matching family so traffic landing on the host is routed
+        // upstream (the routed prefixes are BGP-originated from here). Idempotent.
         if (networkGatewayIp != null && !networkGatewayIp.trim().isEmpty()) {
+            final String hostMask = ipv6 ? "/128" : "/32";
+            final String fwdKey = ipv6 ? "net.ipv6.conf.all.forwarding" : "net.ipv4.ip_forward";
             Script.executeCommand(String.format(
-                    "ip addr replace %s/32 dev %s", networkGatewayIp.trim(), ANCHOR_PORT));
-            Script.runSimpleBashScript("sysctl -w net.ipv4.ip_forward=1");
+                    "%s replace %s%s dev %s", addrTool, networkGatewayIp.trim(), hostMask, ANCHOR_PORT));
+            Script.runSimpleBashScript("sysctl -w " + fwdKey + "=1");
         }
     }
 
@@ -281,13 +316,15 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         return pair.length == 2 ? pair[1].trim() : null;
     }
 
-    /** Resolve the advertised prefix length: the command value when a sane
-     *  1..32 is supplied, else the legacy {@code /32} host-route default. */
-    private int resolvePrefixLen(final Integer fromCommand) {
-        if (fromCommand != null && fromCommand > 0 && fromCommand <= 32) {
+    /** Resolve the advertised prefix length: the command value when in the sane
+     *  family range ({@code 1..32} v4, {@code 1..128} v6), else the host-route
+     *  default ({@code /32} v4, {@code /128} v6). */
+    private int resolvePrefixLen(final Integer fromCommand, final boolean ipv6) {
+        final int max = ipv6 ? 128 : 32;
+        if (fromCommand != null && fromCommand > 0 && fromCommand <= max) {
             return fromCommand;
         }
-        return 32;
+        return max;
     }
 
     private String pickVtysh(final String fromCommand) {
