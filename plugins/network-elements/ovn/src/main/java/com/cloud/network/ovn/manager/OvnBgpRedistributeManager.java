@@ -255,6 +255,111 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
+     * PARSEL-V6 — announce a ROUTED-tier IPv6 subnet ({@code getIp6Cidr}, e.g.
+     * {@code 2a13:8740:0:a::/64}) into the fabric's IPv6 unicast address-family
+     * on the gateway-chassis FRR, and install the matching v6 kernel route via
+     * the VPC public LRP's v6 GUA so fabric return traffic enters OVN. Native
+     * routing only — NO v6 NAT. No-op when the v6 tier toggle is off, the CIDR
+     * is not a v6 prefix, or no gateway-chassis exists yet. Independent of the
+     * tier's v4 network mode (fires for NAT-mode CKS tiers too — their v6 is
+     * natively routed).
+     *
+     * @param ip6Cidr   tier IPv6 CIDR with prefix (e.g. {@code 2a13:8740:0:a::/64})
+     * @param networkId CloudStack tier {@code NetworkVO.id} (cs_id for the
+     *                  {@link Kind#BGP_SUBNET_ANNOUNCE_V6} row)
+     * @param vpcId     owning VPC id
+     * @param zoneId    zone id (selects controller / gateway-chassis)
+     */
+    public void announceSubnet6(final String ip6Cidr, final long networkId, final long vpcId, final long zoneId) {
+        if (!isRoutedAnnounceIpv6Enabled()) {
+            return;
+        }
+        if (StringUtils.isBlank(ip6Cidr) || !ip6Cidr.contains("/") || !ip6Cidr.contains(":")) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            LOGGER.debug("OvnBgpRedistribute.announceSubnet6: no OVN controller for zone {}", zoneId);
+            return;
+        }
+        final Long hostId = findGatewayChassisHostId(zoneId, controller.getId());
+        if (hostId == null) {
+            LOGGER.warn("OvnBgpRedistribute.announceSubnet6: no gateway-chassis for zone={}; skipping {}",
+                    zoneId, ip6Cidr);
+            return;
+        }
+        // v6 datapath next-hop = the VPC public LRP's v6 GUA (its MAC answers NDP
+        // on the localnet); the chassis anchor holds the v6 fabric gateway on
+        // pub-anchor so both the tier kernel route and the ::/0 return resolve.
+        // null gua => advertise-only (v6 public foot not applied yet). vlan=null:
+        // the routed public v6 /64 is untagged, exactly like the v4 217.179.89.0/24.
+        final String v6GatewayIp = publicNetworkManager.getVpcPublicIpv6GatewayIp(zoneId, vpcId);
+        final String v6AnchorCidr = publicNetworkManager.getPublicIpv6AnchorCidr();
+        final String v6NetworkGateway = publicNetworkManager.getPublicIpv6Gateway();
+        if (sendSubnetCommand(hostId, ip6Cidr, v6GatewayIp, v6AnchorCidr, null, v6NetworkGateway,
+                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            persistSubnetAnnounceV6(controller.getId(), networkId, hostId, ip6Cidr);
+            lastHostByIp.put(ip6Cidr, hostId);
+            LOGGER.info("OvnBgpRedistribute.announceSubnet6: {} announced on host {} (net={}, vpc={})",
+                    ip6Cidr, hostId, networkId, vpcId);
+        }
+    }
+
+    /**
+     * PARSEL-V6 — withdraw a previously-announced ROUTED-tier IPv6 subnet.
+     * Best-effort and idempotent: safe when never announced or already withdrawn.
+     */
+    public void withdrawSubnet6(final String ip6Cidr, final long networkId, final long vpcId, final long zoneId) {
+        if (StringUtils.isBlank(ip6Cidr)) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping =
+                logicalIdMapDao.findByCsId(Kind.BGP_SUBNET_ANNOUNCE_V6, networkId, controller.getId());
+        if (mapping == null) {
+            lastHostByIp.remove(ip6Cidr);
+            return;
+        }
+        final Long hostId = parseHostId(mapping.getOvnUuid());
+        if (hostId != null) {
+            sendSubnetCommand(hostId, ip6Cidr, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+        }
+        try {
+            logicalIdMapDao.remove(mapping.getId());
+        } finally {
+            lastHostByIp.remove(ip6Cidr);
+        }
+        LOGGER.info("OvnBgpRedistribute.withdrawSubnet6: {} withdrawn on host {} (net={}, vpc={})",
+                ip6Cidr, hostId, networkId, vpcId);
+    }
+
+    /** PARSEL-V6 toggle — {@code ovn.bgp.redistribute.tier.ipv6}. Parsed
+     *  defensively for the same String-default-vs-Boolean reason as
+     *  {@link #isRoutedAnnounceEnabled()}. Package-visible so unit tests can spy
+     *  the gate without wiring the static {@code ConfigDepot}. */
+    boolean isRoutedAnnounceIpv6Enabled() {
+        return Boolean.parseBoolean(String.valueOf(OvnNetworkConfig.BgpRedistributeTierIpv6.value()));
+    }
+
+    /** Upsert the {@link Kind#BGP_SUBNET_ANNOUNCE_V6} bookkeeping row (cs_id = tier network id). */
+    private void persistSubnetAnnounceV6(final long controllerId, final long networkId, final long hostId,
+                                         final String cidr) {
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                Kind.BGP_SUBNET_ANNOUNCE_V6, networkId, controllerId);
+        if (existing != null) {
+            existing.setOvnUuid(String.valueOf(hostId));
+            existing.setOvnName(cidr);
+            logicalIdMapDao.update(existing.getId(), existing);
+            return;
+        }
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(
+                Kind.BGP_SUBNET_ANNOUNCE_V6, networkId, controllerId, String.valueOf(hostId), cidr));
+    }
+
+    /**
      * Reconcile the live gateway-chassis assignment against the persisted
      * {@link Kind#BGP_ANNOUNCE} rows. When the gateway-chassis migrated,
      * announce on the new host and withdraw from the old. Designed to be

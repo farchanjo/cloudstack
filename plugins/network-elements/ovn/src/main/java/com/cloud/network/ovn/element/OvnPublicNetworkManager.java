@@ -789,6 +789,10 @@ public class OvnPublicNetworkManager {
      * OVSDB strong reference between an LRP and its peer LSP).
      */
     public void unbindVpcFromPublic(final long zoneId, final long vpcId, final String lrUuid) {
+        // PARSEL-V6 — drop the ::/0 v6 default route first (best-effort; no-op
+        // when the v6 path was never applied). The v6 GUA on the public LRP is
+        // reaped together with the LRP row by the unbind below.
+        removeVpcPublicV6DefaultRoute(zoneId, vpcId, lrUuid);
         unbindOwnerFromPublic(zoneId, vpcId, lrUuid,
                 Kind.VPC_PUBLIC_LRP, Kind.VPC_PUBLIC_RSP, Kind.STATIC_ROUTE);
     }
@@ -915,5 +919,230 @@ public class OvnPublicNetworkManager {
             return addr;
         }
         return addr.substring(0, lastDot + 1) + "1";
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* PARSEL-V6 — routed IPv6 public transport (native routing, no v6 NAT) */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * True when both {@code ovn.public.ipv6.prefix} and
+     * {@code ovn.public.ipv6.gateway} resolve — the single gate for the whole
+     * IPv6 public transport path. Blank config => every v6 helper below is a
+     * strict no-op and v4 behaviour is byte-identical (zero regression).
+     */
+    public boolean isPublicIpv6Enabled() {
+        final String prefix = OvnNetworkConfig.PublicIpv6Prefix.value();
+        return parseV6Base(prefix) != null && parseV6PrefixLen(prefix) != null && getPublicIpv6Gateway() != null;
+    }
+
+    /** Bare v6 fabric gateway (e.g. {@code 2a13:8740:0:7::1}); {@code null} when unset. */
+    public String getPublicIpv6Gateway() {
+        final String gw = OvnNetworkConfig.PublicIpv6Gateway.value();
+        return StringUtils.isBlank(gw) ? null : gw.trim();
+    }
+
+    /**
+     * Chassis-level v6 datapath anchor CIDR held on {@code pub-anchor}
+     * ({@code <prefix-base>::2/<plen>}, e.g. {@code 2a13:8740:0:7::2/64}) — the
+     * on-link foot that makes the routed public /64 reachable on the localnet.
+     * {@code null} when the v6 prefix is unset / unparseable.
+     */
+    public String getPublicIpv6AnchorCidr() {
+        return composeV6AnchorCidr(OvnNetworkConfig.PublicIpv6Prefix.value());
+    }
+
+    /**
+     * Per-VPC v6 GUA (WITH prefix, e.g. {@code 2a13:8740:0:7::34/64}) derived
+     * deterministically from the last octet of the VPC's IPv4 public LRP address
+     * ({@code 217.179.89.34 -> 2a13:8740:0:7::34}). Collision-free because each
+     * VPC owns a distinct v4 public octet inside the shared /24. {@code null}
+     * when the v6 prefix is unset or the VPC is not public-bound (no v4 LRP to
+     * derive from).
+     */
+    public String getVpcPublicIpv6Cidr(final long zoneId, final long vpcId) {
+        return composeV6Cidr(OvnNetworkConfig.PublicIpv6Prefix.value(), getVpcPublicGatewayIp(zoneId, vpcId));
+    }
+
+    /** Bare per-VPC v6 GUA (no prefix, e.g. {@code 2a13:8740:0:7::34}) — the
+     *  next-hop the gateway-chassis kernel route for a tier /64 points at, and
+     *  the LRP address that answers NDP on the public localnet. */
+    public String getVpcPublicIpv6GatewayIp(final long zoneId, final long vpcId) {
+        final String cidr = getVpcPublicIpv6Cidr(zoneId, vpcId);
+        if (cidr == null) {
+            return null;
+        }
+        final int slash = cidr.indexOf('/');
+        return slash < 0 ? cidr : cidr.substring(0, slash);
+    }
+
+    /**
+     * Idempotently give a public-bound VPC its routed IPv6 foot: append the
+     * per-VPC v6 GUA to the public LRP {@code networks} and add the
+     * {@code ::/0 -> <v6 gateway>} default static route (egress pinned to the
+     * public LRP). Strict no-op when the v6 path is disabled, the VPC is not
+     * public-bound, or the v6 GUA is already present. NO v6 NAT is programmed —
+     * native routing only.
+     *
+     * @return {@code true} when the NB DB was mutated (GUA appended and/or route
+     *         added), {@code false} on a fully idempotent (already-applied) pass.
+     */
+    public boolean ensureVpcPublicV6(final long zoneId, final long vpcId, final String lrUuid) {
+        if (!isPublicIpv6Enabled()) {
+            return false;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return false;
+        }
+        final OvnLogicalIdMapVO lrpMapping = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (lrpMapping == null) {
+            return false;   // not public-bound yet — the v4 attach must land first
+        }
+        final String v6Cidr = getVpcPublicIpv6Cidr(zoneId, vpcId);
+        if (v6Cidr == null) {
+            return false;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        boolean changed = appendVpcPublicV6Network(nb, lrpMapping.getOvnUuid(), v6Cidr);
+        changed |= ensureVpcPublicV6DefaultRoute(nb, controller, vpcId, lrUuid, lrpMapping.getOvnName());
+        if (changed) {
+            LOGGER.info("OvnPublicNetworkManager: VPC {} IPv6 public foot ensured (gua={}, ::/0 via {})",
+                    vpcId, v6Cidr, getPublicIpv6Gateway());
+        }
+        return changed;
+    }
+
+    /** Append the v6 GUA to the public LRP networks, preserving the v4 entry +
+     *  MAC. No-op when the LRP already carries any IPv6 network (idempotent). */
+    private boolean appendVpcPublicV6Network(final OvnNbClient nb, final String lrpUuid, final String v6Cidr) {
+        final List<String> nets = nb.getLogicalRouterPortNetworks(lrpUuid);
+        if (nets == null || nets.isEmpty()) {
+            return false;
+        }
+        for (final String n : nets) {
+            if (n != null && n.contains(":")) {
+                return false;   // v6 already present
+            }
+        }
+        final List<String> updated = new ArrayList<>(nets);
+        updated.add(v6Cidr);
+        nb.updateLogicalRouterPortNetworks(lrpUuid, updated, null);   // null mac => preserve v4 MAC
+        return true;
+    }
+
+    /** Add the {@code ::/0 -> <v6 gateway>} default route (egress pinned to the
+     *  public LRP), tracked under {@link Kind#STATIC_ROUTE_V6}. No-op when the
+     *  mapping row already exists and its NB row is live (idempotent). */
+    private boolean ensureVpcPublicV6DefaultRoute(final OvnNbClient nb, final OvnControllerVO controller,
+                                                  final long vpcId, final String lrUuid, final String lrpName) {
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE_V6, vpcId, controller.getId());
+        if (existing != null && nb.rowExistsByUuid("Logical_Router_Static_Route", existing.getOvnUuid())) {
+            return false;
+        }
+        if (existing != null) {
+            logicalIdMapDao.remove(existing.getId());   // stale mapping; recreate below
+        }
+        final String routeUuid = nb.addLogicalRouterStaticRoute(lrUuid, "::/0",
+                getPublicIpv6Gateway(), lrpName, "dst-ip",
+                Map.of(OvnConstants.EXT_ID_KIND, Kind.STATIC_ROUTE_V6.name(),
+                        OvnConstants.EXT_ID_ID, String.valueOf(vpcId)));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.STATIC_ROUTE_V6, vpcId, controller.getId(),
+                routeUuid, "default6-vpc" + vpcId));
+        return true;
+    }
+
+    /** Drop the {@code ::/0} v6 default route + its mapping for a VPC (called on
+     *  public unbind). Best-effort + idempotent; no-op when never programmed. */
+    public void removeVpcPublicV6DefaultRoute(final long zoneId, final long vpcId, final String lrUuid) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.STATIC_ROUTE_V6, vpcId, controller.getId());
+        if (mapping == null) {
+            return;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        try {
+            nb.deleteLogicalRouterStaticRoute(lrUuid, mapping.getOvnUuid());
+        } catch (OvnException e) {
+            LOGGER.warn("OvnPublicNetworkManager: VPC {} ::/0 v6 route delete failed: {}", vpcId, e.getMessage());
+        } finally {
+            logicalIdMapDao.remove(mapping.getId());
+        }
+    }
+
+    /* ---- v6 config parsing helpers (pure + package-visible for unit tests) ---- */
+
+    /**
+     * Compose the per-VPC v6 GUA (WITH prefix, e.g. {@code 2a13:8740:0:7::34/64})
+     * from the configured public prefix CIDR and the VPC's IPv4 public LRP
+     * address. Pure: no ConfigKey / DAO access. {@code null} when either input
+     * is unusable.
+     */
+    static String composeV6Cidr(final String prefixCidr, final String v4Ip) {
+        final String base = parseV6Base(prefixCidr);
+        final Integer plen = parseV6PrefixLen(prefixCidr);
+        final String suffix = lastOctet(v4Ip);
+        if (base == null || plen == null || suffix == null) {
+            return null;
+        }
+        return base + "::" + suffix + "/" + plen;
+    }
+
+    /** Compose the chassis-level v6 datapath anchor CIDR ({@code <base>::2/<plen>})
+     *  from the configured public prefix CIDR. Pure. {@code null} when unusable. */
+    static String composeV6AnchorCidr(final String prefixCidr) {
+        final String base = parseV6Base(prefixCidr);
+        final Integer plen = parseV6PrefixLen(prefixCidr);
+        return (base == null || plen == null) ? null : base + "::2/" + plen;
+    }
+
+    /** Prefix base with the trailing {@code ::} group stripped
+     *  ({@code "2a13:8740:0:7::/64" -> "2a13:8740:0:7"}); {@code null} when
+     *  blank or not in the compressed {@code <base>::/<plen>} form. */
+    static String parseV6Base(final String prefixCidr) {
+        if (StringUtils.isBlank(prefixCidr)) {
+            return null;
+        }
+        final String net = prefixCidr.trim();
+        final int slash = net.indexOf('/');
+        final String addr = slash < 0 ? net : net.substring(0, slash);
+        final int dcolon = addr.indexOf("::");
+        if (dcolon <= 0) {
+            return null;   // require the compressed <base>::/<plen> form
+        }
+        return addr.substring(0, dcolon);
+    }
+
+    /** Prefix length off a {@code <base>::/<plen>} CIDR ({@code 64}); {@code null}
+     *  when absent / out of the 1..128 range. */
+    static Integer parseV6PrefixLen(final String prefixCidr) {
+        if (StringUtils.isBlank(prefixCidr)) {
+            return null;
+        }
+        final String trimmed = prefixCidr.trim();
+        final int slash = trimmed.indexOf('/');
+        if (slash < 0 || slash == trimmed.length() - 1) {
+            return null;
+        }
+        try {
+            final int plen = Integer.parseInt(trimmed.substring(slash + 1).trim());
+            return (plen >= 1 && plen <= 128) ? plen : null;
+        } catch (NumberFormatException nfe) {
+            return null;
+        }
+    }
+
+    /** Last dotted-quad octet of an IPv4 address as a decimal string used as the
+     *  v6 host-id group ({@code "217.179.89.34" -> "34"}); {@code null} when the
+     *  argument is not a dotted quad. */
+    static String lastOctet(final String v4) {
+        if (v4 == null || !v4.contains(".")) {
+            return null;
+        }
+        final String oct = v4.substring(v4.lastIndexOf('.') + 1).trim();
+        return oct.matches("\\d{1,3}") ? oct : null;
     }
 }

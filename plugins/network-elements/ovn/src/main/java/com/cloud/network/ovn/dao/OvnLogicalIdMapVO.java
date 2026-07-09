@@ -63,6 +63,11 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
         QOS,
         /** Logical_Router_Static_Route row keyed by VPC id (catch-all default). */
         STATIC_ROUTE,
+        /** PARSEL-V6: the {@code ::/0} IPv6 default Logical_Router_Static_Route on
+         *  a VPC LR, keyed by VPC id. Distinct from {@link #STATIC_ROUTE} (the
+         *  {@code 0.0.0.0/0} v4 default) so the two default routes coexist and
+         *  are torn down independently. */
+        STATIC_ROUTE_V6,
         /** HA_Chassis_Group row keyed by zone id (one per zone). */
         HA_CHASSIS_GROUP,
         /** Load_Balancer row used as 1:1 port-forward, keyed by PF rule id. */
@@ -104,6 +109,13 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  (e.g. {@code 10.90.6.0/24}). Kept distinct from {@link #BGP_ANNOUNCE}
          *  (keyed by public_ip_address.id) so the two id spaces never collide. */
         BGP_SUBNET_ANNOUNCE,
+        /** PARSEL-V6: ROUTED-tier IPv6 subnet BGP announce bookkeeping. cs_id =
+         *  tier {@code NetworkVO.id}; ovn_uuid holds the agent host id (as string)
+         *  that last announced the v6 subnet; ovn_name carries the tier IPv6 CIDR
+         *  (e.g. {@code 2a13:8740:0:a::/64}). Kept distinct from
+         *  {@link #BGP_SUBNET_ANNOUNCE} so the v4 and v6 announce rows for the same
+         *  tier network id never clobber each other. */
+        BGP_SUBNET_ANNOUNCE_V6,
         /** Per-{@link com.cloud.network.rules.FirewallRule} OVN ACL mapping for
          *  a standalone (non-VPC) Isolated network's Firewall service.
          *  <ul>

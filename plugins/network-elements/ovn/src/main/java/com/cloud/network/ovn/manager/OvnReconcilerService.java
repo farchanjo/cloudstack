@@ -125,6 +125,8 @@ public class OvnReconcilerService {
     @Inject
     private OvnPublicNetworkManager publicNetworkManager;
     @Inject
+    private OvnBgpRedistributeManager bgpRedistributeManager;
+    @Inject
     private OvnChassisMapDao chassisMapDao;
     @Inject
     private AgentManager agentManager;
@@ -222,9 +224,84 @@ public class OvnReconcilerService {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", ecmpChanged);
         }
+        // PARSEL-V6 — reconcile the IPv6 public transport on existing VPCs +
+        // routed tiers WITHOUT touching VMs (so `cmk run ovnreconciler` applies
+        // it to already-running clusters). Both self-gate: no-op when the v6
+        // ConfigKeys are unset (v4-only, zero regression).
+        final int v6Public = ensureVpcPublicIpv6ForZone(zoneId, controller, dryRun);
+        final int v6Tiers = announceRoutedTiersIpv6ForZone(zoneId, controller, dryRun);
+        if (v6Public > 0 || v6Tiers > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} PARSEL-V6 {} {} VPC public foot(s) + {} tier /64 announce(s)",
+                    zoneId, dryRun ? "would apply" : "applied", v6Public, v6Tiers);
+        }
         LOGGER.info("OvnReconcilerService: zone={} dryRun={} purgeUntagged={} orphansFound={} staleMappingsFound={}",
                 zoneId, dryRun, purgeUntagged, out.totalOrphans(), out.totalStaleMappings());
         return out;
+    }
+
+    /**
+     * PARSEL-V6 — ensure every public-bound VPC in the zone has its IPv6 public
+     * foot (per-VPC GUA on the public LRP + {@code ::/0} default route). Iterates
+     * the {@link Kind#VPC_PUBLIC_LRP} mappings and delegates to
+     * {@link OvnPublicNetworkManager#ensureVpcPublicV6}. Self-gated: strict no-op
+     * when the v6 ConfigKeys are unset. Idempotent — counts only VPCs actually
+     * mutated, so a second reconcile reports 0 (no dup GUA / route).
+     *
+     * @return number of VPCs whose NB DB was mutated ({@code 0} in dryRun / when off)
+     */
+    int ensureVpcPublicIpv6ForZone(final long zoneId, final OvnControllerVO controller, final boolean dryRun) {
+        if (dryRun || !publicNetworkManager.isPublicIpv6Enabled()) {
+            return 0;
+        }
+        int applied = 0;
+        for (final OvnLogicalIdMapVO lrpMapping : logicalIdMapDao.listByKind(Kind.VPC_PUBLIC_LRP, controller.getId())) {
+            final long vpcId = lrpMapping.getCsId();
+            final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpcId, controller.getId());
+            if (lrMapping == null) {
+                continue;
+            }
+            try {
+                if (publicNetworkManager.ensureVpcPublicV6(zoneId, vpcId, lrMapping.getOvnUuid())) {
+                    applied++;
+                }
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnReconcilerService: VPC {} IPv6 public foot reconcile failed: {}",
+                        vpcId, e.getMessage());
+            }
+        }
+        return applied;
+    }
+
+    /**
+     * PARSEL-V6 — (re)announce the IPv6 /64 of every dual-stack tier in the zone.
+     * Iterates the tier LRP mappings ({@link Kind#PUBLIC_LRP}, keyed by tier
+     * network id), resolves the {@link Network}, and announces its
+     * {@code getIp6Cidr} via {@link OvnBgpRedistributeManager#announceSubnet6}
+     * (which self-gates on {@code ovn.bgp.redistribute.tier.ipv6}). Independent
+     * of the tier's IPv4 network mode — fires for NAT-mode CKS tiers too.
+     *
+     * @return number of dual-stack tiers processed ({@code 0} in dryRun / when off)
+     */
+    int announceRoutedTiersIpv6ForZone(final long zoneId, final OvnControllerVO controller, final boolean dryRun) {
+        if (dryRun || !Boolean.parseBoolean(String.valueOf(OvnNetworkConfig.BgpRedistributeTierIpv6.value()))) {
+            return 0;
+        }
+        int announced = 0;
+        for (final OvnLogicalIdMapVO tierMapping : logicalIdMapDao.listByKind(Kind.PUBLIC_LRP, controller.getId())) {
+            final Network network = networkDao.findById(tierMapping.getCsId());
+            if (network == null || network.getVpcId() == null || StringUtils.isBlank(network.getIp6Cidr())) {
+                continue;
+            }
+            try {
+                bgpRedistributeManager.announceSubnet6(network.getIp6Cidr(), network.getId(),
+                        network.getVpcId(), zoneId);
+                announced++;
+            } catch (RuntimeException e) {
+                LOGGER.warn("OvnReconcilerService: tier {} IPv6 announce reconcile failed: {}",
+                        network.getId(), e.getMessage());
+            }
+        }
+        return announced;
     }
 
     /**

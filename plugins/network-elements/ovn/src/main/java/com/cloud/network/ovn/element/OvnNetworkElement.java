@@ -478,6 +478,11 @@ public class OvnNetworkElement extends AdapterBase
         // the announce installs the datapath route + truly originates. No-op
         // for NATTED VPCs and when the routed-tier toggle is off. Idempotent.
         ensureRoutedTierAnnounce(network);
+        // PARSEL-V6 — dual-stack tier: announce the tier IPv6 /64 to the RRs and
+        // give the VPC public LRP its v6 foot (GUA + ::/0). Independent of the v4
+        // network mode (v6 is natively routed), self-gated on the v6 ConfigKeys.
+        ensureRoutedTierAnnounceV6(network);
+        ensureVpcPublicV6FromTier(network);
         // Phase B — standalone Isolated (non-VPC) L3 retry path. Mirrors the
         // VPC lazy-alloc catch-up above: the source-NAT public IP may have
         // been allocated only after implement() ran, so (re)ensure the
@@ -1606,6 +1611,38 @@ public class OvnNetworkElement extends AdapterBase
         ensureVpcPublicAttached(vpc, lrMapping.getOvnUuid());
     }
 
+    /**
+     * PARSEL-V6 — tier-driven retry for the VPC's IPv6 public foot (GUA on the
+     * public LRP + {@code ::/0}). Same lazy-alloc rationale as
+     * {@link #ensureVpcPublicAttachedFromTier}: runs on every NIC prepare so the
+     * v6 foot lands once the v4 public LRP exists. Fully idempotent + self-gated
+     * (strict no-op when the v6 ConfigKeys are unset or the VPC is not
+     * public-bound yet).
+     */
+    private void ensureVpcPublicV6FromTier(final Network network) {
+        if (network.getVpcId() == null) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(network.getDataCenterId());
+        if (controller == null) {
+            return;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null) {
+            return;
+        }
+        try {
+            publicNetworkManager.ensureVpcPublicV6(vpc.getZoneId(), vpc.getId(), lrMapping.getOvnUuid());
+        } catch (RuntimeException e) {
+            LOGGER.warn("OvnNetworkElement.ensureVpcPublicV6FromTier: VPC id={} v6 foot failed: {}",
+                    vpc.getId(), e.getMessage());
+        }
+    }
+
     /** {@code 02:02:02:XX:XX:XX} derived from the IPv4 last three octets.
      *  Stable across plugin restarts; distinct from tier gateway MACs
      *  ({@code 02:01:01:...}) so a packet capture can tell them apart. */
@@ -1929,6 +1966,29 @@ public class OvnNetworkElement extends AdapterBase
     }
 
     /**
+     * PARSEL-V6 — announce a dual-stack tier's IPv6 /64 to the route reflectors.
+     * Deliberately NOT gated on {@link #isRoutedVpc}/{@link #isRoutedTier}: IPv6
+     * is natively routed (never NATed) irrespective of the tier's IPv4 network
+     * mode, so this fires for NAT-mode (CKS) tiers too. Still honours the
+     * per-tier advertise override; the global {@code ovn.bgp.redistribute.tier.ipv6}
+     * toggle is applied inside {@link OvnBgpRedistributeManager#announceSubnet6}.
+     * Strict no-op for IPv4-only tiers (blank {@code getIp6Cidr}).
+     */
+    private void ensureRoutedTierAnnounceV6(final Network network) {
+        if (network.getVpcId() == null || StringUtils.isBlank(network.getIp6Cidr())) {
+            return;
+        }
+        final Vpc vpc = vpcDao.findById(network.getVpcId());
+        if (vpc == null) {
+            return;
+        }
+        if (!isTierAdvertiseEnabled(network)) {
+            return;
+        }
+        bgpRedistributeManager.announceSubnet6(network.getIp6Cidr(), network.getId(), vpc.getId(), vpc.getZoneId());
+    }
+
+    /**
      * Withdraw this tier's routed-subnet announce on tier teardown. Not gated
      * on {@link #isRoutedVpc} — the offering may already be gone during
      * destroy, and withdrawSubnet is a no-op when no announce row exists.
@@ -1941,10 +2001,14 @@ public class OvnNetworkElement extends AdapterBase
         final long vpcId = vpc != null ? vpc.getId() : network.getVpcId();
         final long zoneId = vpc != null ? vpc.getZoneId() : network.getDataCenterId();
         final String cidr = network.getCidr();
-        if (StringUtils.isBlank(cidr)) {
-            return;
+        if (StringUtils.isNotBlank(cidr)) {
+            bgpRedistributeManager.withdrawSubnet(cidr, network.getId(), vpcId, zoneId);
         }
-        bgpRedistributeManager.withdrawSubnet(cidr, network.getId(), vpcId, zoneId);
+        // PARSEL-V6 — withdraw the dual-stack tier's IPv6 /64 announce too
+        // (best-effort + idempotent, no-op when no v6 announce row exists).
+        if (StringUtils.isNotBlank(network.getIp6Cidr())) {
+            bgpRedistributeManager.withdrawSubnet6(network.getIp6Cidr(), network.getId(), vpcId, zoneId);
+        }
     }
 
     /**

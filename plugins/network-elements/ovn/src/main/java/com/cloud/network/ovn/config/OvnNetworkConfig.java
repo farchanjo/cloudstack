@@ -56,6 +56,20 @@ public class OvnNetworkConfig implements Configurable {
     public static final String OVN_BGP_REDISTRIBUTE_PUBLIC_IPS = "ovn.bgp.redistribute.public_ips";
     public static final String OVN_BGP_REDISTRIBUTE_ROUTED_TIERS = "ovn.bgp.redistribute.routed_tiers";
 
+    /** PARSEL-V6: opt-in toggle for announcing the IPv6 CIDR of dual-stack OVN
+     *  tiers to the fabric route reflectors (native routing, no v6 NAT). */
+    public static final String OVN_BGP_REDISTRIBUTE_TIER_IPV6 = "ovn.bgp.redistribute.tier.ipv6";
+
+    /** PARSEL-V6: routed public IPv6 /64 the VPC public LRP takes a GUA from
+     *  (e.g. {@code 2a13:8740:0:7::/64}). Blank disables the whole v6 public
+     *  transport path (v4-only, byte-identical behaviour). */
+    public static final String OVN_PUBLIC_IPV6_PREFIX = "ovn.public.ipv6.prefix";
+
+    /** PARSEL-V6: the v6 fabric gateway the gateway-chassis pub-anchor answers
+     *  NDP for (e.g. {@code 2a13:8740:0:7::1}); the {@code ::/0} next-hop of the
+     *  VPC public LRP. Blank disables the v6 public transport path. */
+    public static final String OVN_PUBLIC_IPV6_GATEWAY = "ovn.public.ipv6.gateway";
+
     /** Path to vtysh binary on KVM hosts (passed to agent command wrapper). */
     public static final String OVN_BGP_FRR_VTYSH_PATH = "ovn.bgp.frr.vtysh.path";
 
@@ -159,6 +173,31 @@ public class OvnNetworkConfig implements Configurable {
                     + "upstream. Default on (routed mode implies advertising the tier). Kill-switch.",
             true);
 
+    public static final ConfigKey<Boolean> BgpRedistributeTierIpv6 = new ConfigKey<>(CATEGORY, Boolean.class,
+            OVN_BGP_REDISTRIBUTE_TIER_IPV6, "false",
+            "PARSEL-V6: announce the IPv6 CIDR (getIp6Cidr) of every dual-stack OVN tier via host-side "
+                    + "FRR vtysh into the fabric's IPv6 unicast address-family on the gateway-chassis, so the "
+                    + "route reflectors learn the tier /64. Independent of the tier's IPv4 network mode — v6 is "
+                    + "natively routed (never NATed), so this fires for NAT-mode (CKS) tiers too. Gated additionally "
+                    + "on the tier carrying an IPv6 gateway/cidr. Default off.",
+            true);
+
+    public static final ConfigKey<String> PublicIpv6Prefix = new ConfigKey<>(CATEGORY, String.class,
+            OVN_PUBLIC_IPV6_PREFIX, "",
+            "PARSEL-V6: routed public IPv6 /64 the VPC public LRP allocates a per-VPC GUA from (e.g. "
+                    + "'2a13:8740:0:7::/64'). The GUA host id is DERIVED from the last octet of the VPC's IPv4 "
+                    + "public LRP address (217.179.89.34 -> 2a13:8740:0:7::34), so it is collision-free and never "
+                    + "hardcoded. Blank disables the entire IPv6 public transport path (v4-only, zero regression).",
+            true);
+
+    public static final ConfigKey<String> PublicIpv6Gateway = new ConfigKey<>(CATEGORY, String.class,
+            OVN_PUBLIC_IPV6_GATEWAY, "",
+            "PARSEL-V6: the IPv6 fabric gateway the gateway-chassis pub-anchor answers NDP for (e.g. "
+                    + "'2a13:8740:0:7::1') and the '::/0' next-hop programmed on the VPC public LRP. In the "
+                    + "BGP-to-host model there is no physical device on this address — the anchor holds it. Blank "
+                    + "disables the IPv6 public transport path.",
+            true);
+
     public static final ConfigKey<String> BgpFrrVtyshPath = new ConfigKey<>(CATEGORY, String.class,
             OVN_BGP_FRR_VTYSH_PATH, "/usr/bin/vtysh",
             "Path to vtysh binary on KVM hosts.",
@@ -244,6 +283,9 @@ public class OvnNetworkConfig implements Configurable {
                 PublicVlanOverride,
                 BgpRedistributePublicIps,
                 BgpRedistributeRoutedTiers,
+                BgpRedistributeTierIpv6,
+                PublicIpv6Prefix,
+                PublicIpv6Gateway,
                 BgpFrrVtyshPath,
                 BgpFrrAsn,
                 BgpReconcileIntervalSeconds,
