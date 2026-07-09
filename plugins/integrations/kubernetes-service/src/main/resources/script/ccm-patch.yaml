@@ -29,6 +29,19 @@
 # the existing config-volume mount is preserved. The env/volume are inert when no
 # internal CA is configured (the cloudstack-ca ConfigMap is only created by
 # deploy-provider when /opt/csi/cloudstack-ca.crt exists).
+#
+# It also pins the EONF CCM image: v1.2.0-eonf.1 = upstream v1.2.0 (GetZone
+# pod-name fix + canonical providerID) plus a dual-stack nodeAddresses patch that
+# advertises the primary NIC's IPv6 as a second InternalIP, so the v1.2.0 address
+# reconcile does not strip the IPv6 InternalIP from our dual-stack nodes. Pinning
+# here (strategic merge overrides the image from the upstream provider.yaml) keeps
+# the fix durable across a provider re-deploy / cluster scale / upgrade.
+#
+# The image lives in the internal GitLab registry (private-to-instance), so the
+# CCM pod needs a read_registry pull credential. imagePullSecrets references the
+# Secret `eonf-registry-pull` in kube-system; that Secret must exist for the pull
+# to succeed. On the current clusters it was created out-of-band; provisioning it
+# during node bootstrap for freshly-created clusters is a separate follow-up.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,12 +50,15 @@ metadata:
 spec:
   template:
     spec:
+      imagePullSecrets:
+        - name: eonf-registry-pull
       volumes:
         - name: cloudstack-ca
           configMap:
             name: cloudstack-ca
       containers:
         - name: cloud-controller-manager
+          image: registry.eonf.ltd/infra/cloudstack-kubernetes-provider:v1.2.0-eonf.1
           args:
             - "--leader-elect=true"
             - "--cloud-provider=external-cloudstack"
