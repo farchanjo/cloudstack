@@ -255,9 +255,11 @@ public class KubernetesClusterActionWorker {
     protected final String removeNodeFromClusterScript = "remove-node-from-cluster";
     protected final String csiCaPatchNodeFilename = "csi-ca-patch-node.yaml";
     protected final String csiCaPatchControllerFilename = "csi-ca-patch-controller.yaml";
+    protected final String ccmPatchFilename = "ccm-patch.yaml";
     protected final String cloudStackCaTrustFilename = "cloudstack-ca.crt";
     protected final String scriptPath = "/opt/bin/";
     protected final String csiPatchPath = "/opt/csi/";
+    protected final String providerPatchPath = "/opt/provider/";
     protected File deploySecretsScriptFile;
     protected File deployProviderScriptFile;
     protected File deployCsiDriverScriptFile;
@@ -265,6 +267,7 @@ public class KubernetesClusterActionWorker {
     protected File deletePvScriptFile;
     protected File csiCaPatchNodeFile;
     protected File csiCaPatchControllerFile;
+    protected File ccmPatchFile;
     protected KubernetesClusterManagerImpl manager;
     protected String[] keys;
 
@@ -747,6 +750,7 @@ public class KubernetesClusterActionWorker {
         autoscaleScriptFile = retrieveScriptFile(autoscaleScriptFilename);
         csiCaPatchNodeFile = retrieveScriptFile(csiCaPatchNodeFilename);
         csiCaPatchControllerFile = retrieveScriptFile(csiCaPatchControllerFilename);
+        ccmPatchFile = retrieveScriptFile(ccmPatchFilename);
     }
 
     protected void copyScripts(String nodeAddress, final int sshPort) {
@@ -757,6 +761,7 @@ public class KubernetesClusterActionWorker {
         copyScriptFile(nodeAddress, sshPort, autoscaleScriptFile, autoscaleScriptFilename);
         copyFileToControlNode(nodeAddress, sshPort, csiCaPatchNodeFile, csiPatchPath, csiCaPatchNodeFilename);
         copyFileToControlNode(nodeAddress, sshPort, csiCaPatchControllerFile, csiPatchPath, csiCaPatchControllerFilename);
+        copyFileToControlNode(nodeAddress, sshPort, ccmPatchFile, providerPatchPath, ccmPatchFilename);
     }
 
     protected void copyScriptFile(String nodeAddress, final int sshPort, File file, String destination) {
@@ -787,10 +792,11 @@ public class KubernetesClusterActionWorker {
 
     /**
      * Deploys the CloudStack CA certificate chain to the control node so the CKS-managed
-     * CSI driver can trust an internally-signed CloudStack API endpoint. Best-effort: the
-     * {@code deploy-csi-driver} script only patches the CSI workloads when the certificate
-     * file is present on disk, so any failure here safely falls back to today's behaviour
-     * for clouds fronted by a publicly-trusted CA.
+     * cloud-controller-manager and CSI driver can trust an internally-signed CloudStack API
+     * endpoint. Best-effort: the {@code deploy-provider} and {@code deploy-csi-driver} scripts
+     * only create the {@code cloudstack-ca} ConfigMap / patch the workloads when the certificate
+     * file is present on disk, so any failure here safely falls back to today's behaviour for
+     * clouds fronted by a publicly-trusted CA.
      */
     protected void deployCloudStackCaTrust() {
         String caChainPem;

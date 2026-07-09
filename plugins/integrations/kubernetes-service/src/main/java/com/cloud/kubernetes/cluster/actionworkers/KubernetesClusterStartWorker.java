@@ -980,9 +980,14 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
             logTransitStateAndThrow(Level.ERROR, String.format("Failed to setup Kubernetes cluster : %s in usable state as unable to get Dashboard service running for the cluster", kubernetesCluster.getName()), kubernetesCluster.getId(),KubernetesCluster.Event.OperationFailed);
         }
         taintControlNodes();
+        // Push the CloudStack CA chain to the control node before deploying the
+        // provider so deploy-provider can create the cloudstack-ca ConfigMap and
+        // patch the cloud-controller-manager to trust it. Unconditional (both the
+        // CCM and the CSI driver consume /opt/csi/cloudstack-ca.crt); best-effort
+        // + no-op for clouds fronted by a publicly-trusted CA.
+        deployCloudStackCaTrust();
         deployProvider();
         if (kubernetesCluster.isCsiEnabled()) {
-            deployCloudStackCaTrust();
             deployCsiDriver();
         }
         updateLoginUserDetails(clusterVMs.stream().map(InternalIdentity::getId).collect(Collectors.toList()));

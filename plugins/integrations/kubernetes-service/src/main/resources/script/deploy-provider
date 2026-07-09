@@ -16,10 +16,64 @@
 # specific language governing permissions and limitations
 # under the License.
 
-(/opt/bin/kubectl get pods -A | grep cloud-controller-manager) && exit 0
+KUBECTL=/opt/bin/kubectl
+CCM_NAMESPACE=kube-system
+CCM_DEPLOYMENT=cloud-controller-manager
+CCM_CA_FILE=/opt/csi/cloudstack-ca.crt
+CCM_CA_CONFIGMAP=cloudstack-ca
+CCM_PATCH_FILE=/opt/provider/ccm-patch.yaml
+CCM_WORKLOAD_WAIT_ATTEMPTS=12
+CCM_WORKLOAD_WAIT_INTERVAL_SECS=5
+
+# Upsert the cloudstack-ca ConfigMap (shared with the CSI driver) from the CA
+# chain the management server pushed to /opt/csi/cloudstack-ca.crt. No-op when no
+# internal CA is configured — public-CA clouds never get that file. Best-effort:
+# a failure here must not abort provider deployment (the patch re-converges on the
+# next reconcile/start). Upsert (create --dry-run | apply) so CA rotation
+# propagates on a re-run.
+ensure_ccm_ca_configmap() {
+    [ -f "${CCM_CA_FILE}" ] || return 0
+    ${KUBECTL} -n "${CCM_NAMESPACE}" create configmap "${CCM_CA_CONFIGMAP}" \
+        --from-file=ca.crt="${CCM_CA_FILE}" --dry-run=client -o yaml | ${KUBECTL} apply -f - \
+        || echo "WARNING: failed to upsert ${CCM_CA_CONFIGMAP} ConfigMap (will re-converge on next reconcile)"
+}
+
+# Apply the strategic-merge patch that disables the CCM service controller and,
+# when the cloudstack-ca ConfigMap exists, mounts the internal CA. Idempotent:
+# re-applying an already-patched Deployment is a no-op. Waits for the Deployment
+# to appear first (this can run right after the manifest apply, before the object
+# is created). Best-effort: a transient failure must not abort provider
+# deployment; the patch converges on the next run.
+patch_ccm() {
+    [ -f "${CCM_PATCH_FILE}" ] || return 0
+    local attempt
+    for ((attempt = 0; attempt < CCM_WORKLOAD_WAIT_ATTEMPTS; attempt++)); do
+        if ${KUBECTL} -n "${CCM_NAMESPACE}" get deployment "${CCM_DEPLOYMENT}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep "${CCM_WORKLOAD_WAIT_INTERVAL_SECS}"
+    done
+    ${KUBECTL} -n "${CCM_NAMESPACE}" patch deployment "${CCM_DEPLOYMENT}" \
+        --type=strategic --patch-file="${CCM_PATCH_FILE}" \
+        || echo "WARNING: failed to patch ${CCM_DEPLOYMENT} (will re-converge on next reconcile)"
+}
+
+# Converge the CA trust + service-controller patch. Called after every apply path
+# AND when the CCM already exists, so an existing-but-unpatched CCM still gets
+# patched (the previous early-exit-on-existing behaviour skipped this).
+converge_ccm() {
+    ensure_ccm_ca_configmap
+    patch_ccm
+}
+
+if ${KUBECTL} get pods -A | grep -q cloud-controller-manager; then
+    converge_ccm
+    exit 0
+fi
 
 if [ -e /opt/provider/provider.yaml ]; then
-    /opt/bin/kubectl apply -f /opt/provider/provider.yaml
+    ${KUBECTL} apply -f /opt/provider/provider.yaml
+    converge_ccm
     exit 0
 else
     mkdir -p /opt/provider
@@ -30,7 +84,8 @@ else
         echo "Unable to connect to the internet to download the provider deployment and image"
         exit 1
     else
-        /opt/bin/kubectl apply -f /opt/provider/provider.yaml
+        ${KUBECTL} apply -f /opt/provider/provider.yaml
+        converge_ccm
         exit 0
     fi
 fi

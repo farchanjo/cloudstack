@@ -1,0 +1,57 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Strategic merge patch applied by the deploy-provider script to the
+# cloud-controller-manager Deployment. It makes the CCM (1) skip the built-in
+# service (LoadBalancer) controller via --controllers=*,-service, since CKS load
+# balancing is handled by CloudStack/OVN rather than the CCM, and (2) trust an
+# internally-signed CloudStack API endpoint by mounting the cloudstack-ca
+# ConfigMap and pointing SSL_CERT_FILE at it (mirrors csi-ca-patch-controller.yaml).
+#
+# NOTE: Kubernetes strategic merge treats a container's args as an atomic list
+# (no merge key), so the full desired arg set must be listed here. These are the
+# upstream apache/cloudstack-kubernetes-provider deployment.yaml args plus the
+# added --controllers entry. The cloudstack-ca volume/mount/env merge by name, so
+# the existing config-volume mount is preserved. The env/volume are inert when no
+# internal CA is configured (the cloudstack-ca ConfigMap is only created by
+# deploy-provider when /opt/csi/cloudstack-ca.crt exists).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-controller-manager
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cloudstack-ca
+          configMap:
+            name: cloudstack-ca
+      containers:
+        - name: cloud-controller-manager
+          args:
+            - "--leader-elect=true"
+            - "--cloud-provider=external-cloudstack"
+            - "--cloud-config=/config/cloud-config"
+            - "--controllers=*,-service"
+          env:
+            - name: SSL_CERT_FILE
+              value: /etc/cloudstack-ca/ca.crt
+          volumeMounts:
+            - name: cloudstack-ca
+              mountPath: /etc/cloudstack-ca
+              readOnly: true
