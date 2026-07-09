@@ -2038,19 +2038,55 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
-     * Delete a {@code Logical_Router_Static_Route} row directly by UUID without
-     * requiring the parent LR UUID. Used by the pending-deletion processor
-     * when it only has the route UUID (the parent LR may already be gone or
-     * unknown). OVSDB will GC any dangling {@code Logical_Router.static_routes}
-     * reference on the next northd sync.
+     * Delete a {@code Logical_Router_Static_Route} row by UUID when the caller
+     * does not know (or no longer has) the parent LR UUID — used by the ECMP
+     * reconciler's stale-row prune path and the pending-deletion processor.
+     *
+     * <p>{@code Logical_Router.static_routes} is a <em>strong</em> reference set,
+     * so a bare row delete is rejected by OVSDB with a referential-integrity
+     * violation ({@code cannot delete ... because of N remaining reference(s)})
+     * for as long as any router still lists the row — OVSDB does <em>not</em> GC
+     * a strongly-referenced row. This method therefore first discovers the owning
+     * LR ({@link #findLrForStaticRoute}) and detaches + deletes atomically
+     * ({@link #deleteLogicalRouterStaticRoute}); only when no LR references the
+     * row is a direct single-op delete issued (row already detached / orphaned).
+     * Idempotent — a blank UUID or an already-gone row is a no-op.
      */
     public void deleteLogicalRouterStaticRouteDirect(final String routeUuid) {
         if (routeUuid == null || routeUuid.isEmpty()) {
             return;
         }
+        final String lrUuid = findLrForStaticRoute(routeUuid);
+        if (lrUuid != null) {
+            deleteLogicalRouterStaticRoute(lrUuid, routeUuid);
+            return;
+        }
+        // Not referenced by any LR — delete directly (idempotent).
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.delete("Logical_Router_Static_Route", OvnOpFactory.whereUuid(routeUuid)));
         tx.commit();
+    }
+
+    /**
+     * Returns the UUID of the {@code Logical_Router} that holds the given static
+     * route UUID in its {@code static_routes} set, or {@code null} when no router
+     * references it (already detached or the row itself does not exist). Mirrors
+     * {@link #findLsForAcl} for the LR/static-route strong reference.
+     */
+    String findLrForStaticRoute(final String routeUuid) {
+        final OvnTransaction tx = newTransaction();
+        final ArrayNode where = JsonNodeFactory.instance.arrayNode();
+        final ArrayNode condition = JsonNodeFactory.instance.arrayNode();
+        condition.add("static_routes");
+        condition.add("includes");
+        condition.add(OvnRowRef.realUuid(routeUuid));
+        where.add(condition);
+        final ArrayNode cols = JsonNodeFactory.instance.arrayNode();
+        cols.add("_uuid");
+        tx.add(OvnOpFactory.select("Logical_Router", where, cols));
+        final OvnTransaction.Result r = tx.commit();
+        final List<String> uuids = r.selectedUuids(0);
+        return uuids.isEmpty() ? null : uuids.get(0);
     }
 
     /**
