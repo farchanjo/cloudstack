@@ -384,6 +384,14 @@ write_files:
             # manifest before it is applied so all pods get dual IPs from the start.
             sed -i 's/"type": "calico-ipam"/"type": "calico-ipam", "assign_ipv4": "true", "assign_ipv6": "true"/' ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml || true
           fi
+          CALICO_POD_CIDR_V4="{{ k8s.calico.pod.cidr.v4 }}"
+          if [ -n "$CALICO_POD_CIDR_V4" ]; then
+            # Per-cluster IPv4 pod CIDR override (recreate-durable via the calico.pod.cidr.v4
+            # cluster detail). Empty substitution keeps the template default 192.168.0.0/16.
+            # blockSize 26 is the Calico IPv4 default, so only the CIDR needs rewriting.
+            echo "Overriding Calico IPv4 pod CIDR to $CALICO_POD_CIDR_V4"
+            sed -i "s#192.168.0.0/16#${CALICO_POD_CIDR_V4}#g" ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml || true
+          fi
           /opt/bin/kubectl apply -f ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml
           if [[ "{{ k8s.dual.stack }}" == "true" ]]; then
             echo "Enabling Calico IPv6 dual-stack support"

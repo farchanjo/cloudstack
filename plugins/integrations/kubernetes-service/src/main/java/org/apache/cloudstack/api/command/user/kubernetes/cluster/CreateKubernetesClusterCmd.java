@@ -220,6 +220,12 @@ public class CreateKubernetesClusterCmd extends BaseAsyncCreateCmd {
     @Parameter(name=ApiConstants.AS_NUMBER, type=CommandType.LONG, description="the AS Number of the network")
     private Long asNumber;
 
+    @Parameter(name = ApiConstants.POD_CIDR, type = CommandType.STRING,
+            description = "optional Calico IPv4 pod CIDR for the cluster (e.g. 10.100.0.0/16). " +
+                    "When unset the systemVM template default (192.168.0.0/16) is used. " +
+                    "Persisted per cluster so it survives cluster recreate.", since = "4.23.0")
+    private String podCidr;
+
     /////////////////////////////////////////////////////
     /////////////////// Accessors ///////////////////////
     /////////////////////////////////////////////////////
@@ -284,6 +290,10 @@ public class CreateKubernetesClusterCmd extends BaseAsyncCreateCmd {
 
     public String getExternalLoadBalancerIpAddress() {
         return externalLoadBalancerIpAddress;
+    }
+
+    public String getPodCidr() {
+        return podCidr;
     }
 
     public Long getClusterSize() {

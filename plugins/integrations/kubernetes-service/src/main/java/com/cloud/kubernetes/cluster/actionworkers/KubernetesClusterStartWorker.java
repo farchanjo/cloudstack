@@ -262,6 +262,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         final String dualStackKey = "{{ k8s.dual.stack }}";
         final String kubeletNodeIpArgsKey = "{{ k8s.kubelet.node.ip.args }}";
         final String calicoPodCidrV6Key = "{{ k8s.calico.pod.cidr.v6 }}";
+        final String calicoPodCidrV4Key = "{{ k8s.calico.pod.cidr.v4 }}";
 
         final List<String> addresses = getControlNodeCertificateSans(controlNodeIp, serverIp, controlNodeIp6);
 
@@ -314,10 +315,32 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         k8sControlNodeConfig = k8sControlNodeConfig.replace(dualStackKey, String.valueOf(dualStack));
         k8sControlNodeConfig = k8sControlNodeConfig.replace(kubeletNodeIpArgsKey, getKubeletNodeIpArgs());
         k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV6Key, CLUSTER_DUALSTACK_POD_CIDR_V6);
+        k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV4Key, getCalicoPodCidrV4());
 
         k8sControlNodeConfig = updateKubeConfigWithRegistryDetails(k8sControlNodeConfig);
 
         return new Pair<>(k8sControlNodeConfig, controlNodeIp);
+    }
+
+    /**
+     * Per-cluster Calico IPv4 pod CIDR override, read from the
+     * {@link KubernetesClusterService#CALICO_POD_CIDR_V4_DETAIL} cluster detail. Returns an
+     * empty string when unset, so the rendered template performs no {@code CALICO_IPV4POOL_CIDR}
+     * substitution and the systemVM template's baked-in default (192.168.0.0/16) is kept —
+     * byte-identical to the pre-feature output (zero regression).
+     */
+    protected String getCalicoPodCidrV4() {
+        final KubernetesClusterDetailsVO detail =
+                kubernetesClusterDetailsDao.findDetail(kubernetesCluster.getId(), KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL);
+        return resolveCalicoPodCidrV4(detail == null ? null : detail.getValue());
+    }
+
+    /**
+     * Pure resolver for the per-cluster Calico IPv4 pod CIDR detail value: a blank / {@code null}
+     * detail yields an empty string (template no-op), a set value is trimmed and returned.
+     */
+    protected static String resolveCalicoPodCidrV4(final String rawDetailValue) {
+        return StringUtils.isNotBlank(rawDetailValue) ? rawDetailValue.trim() : "";
     }
 
     private Pair<UserVm,String> createKubernetesControlNode(final Network network, String serverIp, List<Network.IpAddresses> etcdIps, Long domainId, Long accountId, Long asNumber) throws ManagementServerException,

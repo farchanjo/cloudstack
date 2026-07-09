@@ -27,7 +27,9 @@ import org.mockito.Mockito;
 import org.mockito.junit.MockitoJUnitRunner;
 
 import com.cloud.kubernetes.cluster.KubernetesCluster;
+import com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
@@ -122,6 +124,40 @@ public class KubernetesClusterStartWorkerTest {
     @Test
     public void testIsNetworkDualStackFalseForNullNetwork() {
         Assert.assertFalse(worker.isNetworkDualStack(null));
+    }
+
+    // ---- per-cluster Calico IPv4 pod CIDR (recreate-durable via cluster detail) ----
+
+    @Test
+    public void testResolveCalicoPodCidrV4DefaultsToEmptyWhenUnset() {
+        // null / blank detail -> empty string -> template performs no substitution (zero regression).
+        Assert.assertEquals("", KubernetesClusterStartWorker.resolveCalicoPodCidrV4(null));
+        Assert.assertEquals("", KubernetesClusterStartWorker.resolveCalicoPodCidrV4(""));
+        Assert.assertEquals("", KubernetesClusterStartWorker.resolveCalicoPodCidrV4("   "));
+    }
+
+    @Test
+    public void testResolveCalicoPodCidrV4TrimsAndReturnsSetValue() {
+        Assert.assertEquals("10.100.0.0/16", KubernetesClusterStartWorker.resolveCalicoPodCidrV4("10.100.0.0/16"));
+        Assert.assertEquals("10.101.0.0/16", KubernetesClusterStartWorker.resolveCalicoPodCidrV4("  10.101.0.0/16  "));
+    }
+
+    @Test
+    public void testGetCalicoPodCidrV4ReadsClusterDetail() {
+        KubernetesClusterDetailsVO detail = Mockito.mock(KubernetesClusterDetailsVO.class);
+        Mockito.when(detail.getValue()).thenReturn("10.100.0.0/16");
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL))
+                .thenReturn(detail);
+
+        Assert.assertEquals("10.100.0.0/16", worker.getCalicoPodCidrV4());
+    }
+
+    @Test
+    public void testGetCalicoPodCidrV4EmptyWhenDetailAbsent() {
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL))
+                .thenReturn(null);
+
+        Assert.assertEquals("", worker.getCalicoPodCidrV4());
     }
 
     // ---- v6 control-node IP is NEVER pre-reserved (EUI-64 auto-assigned at deploy time) ----

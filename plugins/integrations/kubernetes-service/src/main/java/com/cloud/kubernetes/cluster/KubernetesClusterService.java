@@ -52,6 +52,10 @@ public interface KubernetesClusterService extends PluggableService, Configurable
     static final int MIN_KUBERNETES_CLUSTER_NODE_RAM_SIZE = 2048;
     static final String KUBEADMIN_ACCOUNT_NAME = "kubeadmin";
     String PROJECT_KUBEADMIN_ACCOUNT_ROLE_NAME = "Project Kubernetes Service Role";
+    /** Per-cluster detail key holding an optional Calico IPv4 pod CIDR override.
+     *  Empty/absent keeps the systemVM template's baked-in default (192.168.0.0/16),
+     *  so the rendered node config is byte-identical for clusters that do not set it. */
+    String CALICO_POD_CIDR_V4_DETAIL = "calico.pod.cidr.v4";
 
     static final ConfigKey<Boolean> KubernetesServiceEnabled = new ConfigKey<Boolean>("Advanced", Boolean.class,
             "cloud.kubernetes.service.enabled",

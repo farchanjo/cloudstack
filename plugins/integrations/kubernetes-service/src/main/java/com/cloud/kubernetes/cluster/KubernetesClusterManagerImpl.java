@@ -1099,6 +1099,11 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             throw new InvalidParameterValueException("Invalid name for the Kubernetes cluster name: " + name);
         }
 
+        final String podCidr = cmd.getPodCidr();
+        if (StringUtils.isNotBlank(podCidr) && !NetUtils.isValidIp4Cidr(podCidr.trim())) {
+            throw new InvalidParameterValueException("Invalid IPv4 pod CIDR for the Kubernetes cluster: " + podCidr);
+        }
+
         if (controlNodeCount < 1) {
             throw new InvalidParameterValueException("Invalid cluster control nodes count: " + controlNodeCount);
         }
@@ -1284,6 +1289,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         final String dockerRegistryUserName = cmd.getDockerRegistryUserName();
         final String dockerRegistryPassword = cmd.getDockerRegistryPassword();
         final String dockerRegistryUrl = cmd.getDockerRegistryUrl();
+        final String podCidrV4 = StringUtils.trimToNull(cmd.getPodCidr());
         final boolean networkCleanup = cmd.getNetworkId() == null;
         Transaction.execute(new TransactionCallbackNoReturn() {
             @Override
@@ -1298,6 +1304,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, ApiConstants.DOCKER_REGISTRY_USER_NAME, dockerRegistryUserName, true);
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, ApiConstants.DOCKER_REGISTRY_PASSWORD, dockerRegistryPassword, false);
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, ApiConstants.DOCKER_REGISTRY_URL, dockerRegistryUrl, true);
+                addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL, podCidrV4, true);
                 if (kubernetesCluster.getClusterType() == KubernetesCluster.ClusterType.CloudManaged) {
                     details.add(new KubernetesClusterDetailsVO(kubernetesClusterId, "networkCleanup", String.valueOf(networkCleanup), true));
                 }
