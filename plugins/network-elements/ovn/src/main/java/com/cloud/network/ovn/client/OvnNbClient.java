@@ -681,6 +681,39 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * Read the {@code mac} column of a Logical_Router_Port. Used by the BGP
+     * redistribute path so the gateway-chassis agent can install a permanent
+     * neighbour for the LRP next-hop (avoids flaky NDP on multi-LRP localnets).
+     *
+     * @return bare MAC string, or {@code null} when the row / column is absent
+     */
+    public String getLogicalRouterPortMac(final String lrpUuid) {
+        if (lrpUuid == null || lrpUuid.isEmpty()) {
+            return null;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("mac");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Logical_Router_Port", OvnOpFactory.whereUuid(lrpUuid), columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        if (arr == null || arr.size() == 0) {
+            return null;
+        }
+        final var rows = arr.get(0) == null ? null : arr.get(0).get("rows");
+        if (rows == null || rows.size() == 0) {
+            return null;
+        }
+        final var mac = rows.get(0).get("mac");
+        if (mac == null || !mac.isTextual()) {
+            return null;
+        }
+        final String text = mac.asText();
+        return text == null || text.isEmpty() ? null : text;
+    }
+
+    /**
      * Read the {@code networks} column of a Logical_Router_Port (e.g.
      * {@code ["217.179.89.34/24"]}). Used by {@code OvnBgpRedistributeManager}
      * to resolve the VPC public LRP's own IP (the /32 route next-hop). Returns

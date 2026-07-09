@@ -193,17 +193,21 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
     private Answer applyDatapathRoute(final String publicIp, final String gatewayIp,
                                       final boolean withdraw, final OvnBgpAnnounceCommand cmd,
                                       final Long asn, final int prefixLen, final boolean ipv6) {
-        // `ip -6` for the v6 family; the on-link next-hop (the VPC public LRP's
-        // v6 GUA, held reachable by the pub-anchor v6 foot) auto-resolves the dev.
+        // `ip -6` for the v6 family; the on-link next-hop is the VPC public LRP.
         final String ipTool = ipv6 ? "ip -6 route" : "ip route";
         if (withdraw) {
             // Best-effort delete by prefix; ignore "No such process" etc.
+            // Do NOT remove the LRP neighbour — it is shared across tier/FIP announces.
             Script.executeCommand(String.format("%s del %s/%d", ipTool, publicIp, prefixLen));
             return null;
         }
         if (gatewayIp == null || gatewayIp.isEmpty()) {
             return null; // advertise-only
         }
+        // Pin the LRP next-hop L2 address on pub-anchor. Relying on live ARP/NDP
+        // is flaky when multiple CR-LRPs share the localnet (live: snape ::32
+        // stayed INCOMPLETE while salazar ::34 worked — guest→RR v6 blackholed).
+        ensureGatewayNeighbour(gatewayIp, cmd.getGatewayMac(), ipv6);
         final Pair<String, String> result =
                 Script.executeCommand(String.format("%s replace %s/%d via %s", ipTool, publicIp, prefixLen, gatewayIp));
         final String stderr = result == null ? null : result.second();
@@ -216,6 +220,36 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     publicIp, gatewayIp, stderr.trim());
         }
         return null;
+    }
+
+    /**
+     * Install a permanent neighbour for the OVN public LRP next-hop on
+     * {@link #ANCHOR_PORT}. Non-fatal and skipped when {@code gatewayMac} is blank
+     * (older managers / wire-compat). Idempotent.
+     */
+    private void ensureGatewayNeighbour(final String gatewayIp, final String gatewayMac, final boolean ipv6) {
+        if (gatewayIp == null || gatewayIp.isEmpty()
+                || gatewayMac == null || gatewayMac.trim().isEmpty()) {
+            return;
+        }
+        final String mac = gatewayMac.trim();
+        // Loose MAC sanity — avoid shell injection; OVN MACs are colon-hex.
+        if (!mac.matches("(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}")) {
+            LOGGER.warn("OvnBgpAnnounce: refusing neighbour install for {} — bad MAC '{}'", gatewayIp, mac);
+            return;
+        }
+        final String neighTool = ipv6 ? "ip -6 neigh" : "ip neigh";
+        final Pair<String, String> result = Script.executeCommand(String.format(
+                "%s replace %s lladdr %s dev %s nud permanent",
+                neighTool, gatewayIp, mac, ANCHOR_PORT));
+        final String stderr = result == null ? null : result.second();
+        if (stderr != null && !stderr.trim().isEmpty()) {
+            LOGGER.warn("OvnBgpAnnounce: neighbour {} lladdr {} on {} failed ({})",
+                    gatewayIp, mac, ANCHOR_PORT, stderr.trim());
+        } else {
+            LOGGER.info("OvnBgpAnnounce: neighbour {} lladdr {} on {} (permanent, af={})",
+                    gatewayIp, mac, ANCHOR_PORT, ipv6 ? "ipv6" : "ipv4");
+        }
     }
 
     /**

@@ -588,6 +588,25 @@ public class OvnPublicNetworkManager {
     }
 
     /**
+     * MAC of the VPC's public LRP (answers ARP/NDP on the provider localnet).
+     * Used by the BGP redistribute path so the gateway-chassis agent can pin a
+     * permanent neighbour for the LRP next-hop of tier/FIP datapath routes.
+     *
+     * @return bare MAC (e.g. {@code 02:02:02:b3:59:20}), or {@code null}
+     */
+    public String getVpcPublicLrpMac(final long zoneId, final long vpcId) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return null;
+        }
+        final OvnLogicalIdMapVO lrp = logicalIdMapDao.findByCsId(Kind.VPC_PUBLIC_LRP, vpcId, controller.getId());
+        if (lrp == null) {
+            return null;
+        }
+        return pluginManager.nbClient(zoneId).getLogicalRouterPortMac(lrp.getOvnUuid());
+    }
+
+    /**
      * Raw first network CIDR of the VPC's public LRP ({@code ip/prefix}, e.g.
      * {@code 217.179.89.34/24}), or {@code null} when the VPC is not
      * public-bound or the LRP row / its networks are missing.

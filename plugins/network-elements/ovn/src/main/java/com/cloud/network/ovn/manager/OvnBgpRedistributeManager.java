@@ -129,10 +129,12 @@ public class OvnBgpRedistributeManager {
             LOGGER.warn("OvnBgpRedistribute.announce: no public LRP IP for vpc={}; advertise-only "
                     + "(datapath /32 route skipped) for {}/32", vpcId, publicIp);
         }
+        final String gatewayMac = publicNetworkManager.getVpcPublicLrpMac(zoneId, vpcId);
         final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
         final String vlan = resolveVlan(zoneId, vpcId);
         final String networkGatewayIp = resolveNetworkGateway(zoneId, vpcId);
-        if (sendCommand(hostId, publicIp, gatewayIp, anchorCidr, vlan, networkGatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+        if (sendCommand(hostId, publicIp, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
+                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistAnnounce(controller.getId(), ipAddrId, hostId, publicIp);
             lastHostByIp.put(publicIp, hostId);
             LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host {} (ip_id={}, vpc={})",
@@ -164,7 +166,7 @@ public class OvnBgpRedistributeManager {
             // Withdraw needs no next-hop and no anchor: the wrapper deletes the
             // /32 route by prefix and writes `no network <ip>/32`. The chassis
             // anchor is shared across FIPs and is NOT torn down per withdraw.
-            sendCommand(hostId, publicIp, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            sendCommand(hostId, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -211,10 +213,11 @@ public class OvnBgpRedistributeManager {
         // kernel route seeds zebra's RIB so `network <cidr>` truly originates
         // (advertise-only would be inert). null gatewayIp => advertise-only.
         final String gatewayIp = publicNetworkManager.getVpcPublicGatewayIp(zoneId, vpcId);
+        final String gatewayMac = publicNetworkManager.getVpcPublicLrpMac(zoneId, vpcId);
         final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
         final String vlan = resolveVlan(zoneId, vpcId);
         final String networkGatewayIp = resolveNetworkGateway(zoneId, vpcId);
-        if (sendSubnetCommand(hostId, cidr, gatewayIp, anchorCidr, vlan, networkGatewayIp,
+        if (sendSubnetCommand(hostId, cidr, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
                 OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistSubnetAnnounce(controller.getId(), networkId, hostId, cidr);
             lastHostByIp.put(cidr, hostId);
@@ -243,7 +246,7 @@ public class OvnBgpRedistributeManager {
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
         if (hostId != null) {
-            sendSubnetCommand(hostId, cidr, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -294,9 +297,11 @@ public class OvnBgpRedistributeManager {
         // null gua => advertise-only (v6 public foot not applied yet). vlan=null:
         // the routed public v6 /64 is untagged, exactly like the v4 217.179.89.0/24.
         final String v6GatewayIp = publicNetworkManager.getVpcPublicIpv6GatewayIp(zoneId, vpcId);
+        // Same LRP MAC as the v4 public port — answers NDP for the v6 GUA on localnet.
+        final String gatewayMac = publicNetworkManager.getVpcPublicLrpMac(zoneId, vpcId);
         final String v6AnchorCidr = publicNetworkManager.getPublicIpv6AnchorCidr();
         final String v6NetworkGateway = publicNetworkManager.getPublicIpv6Gateway();
-        if (sendSubnetCommand(hostId, ip6Cidr, v6GatewayIp, v6AnchorCidr, null, v6NetworkGateway,
+        if (sendSubnetCommand(hostId, ip6Cidr, v6GatewayIp, gatewayMac, v6AnchorCidr, null, v6NetworkGateway,
                 OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
             persistSubnetAnnounceV6(controller.getId(), networkId, hostId, ip6Cidr);
             lastHostByIp.put(ip6Cidr, hostId);
@@ -325,7 +330,7 @@ public class OvnBgpRedistributeManager {
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
         if (hostId != null) {
-            sendSubnetCommand(hostId, ip6Cidr, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            sendSubnetCommand(hostId, ip6Cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -398,12 +403,14 @@ public class OvnBgpRedistributeManager {
             // route is re-installed on the NEW gateway chassis, not just
             // re-advertised.
             final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, row.getCsId());
+            final String gatewayMac = resolveGatewayMacForIpAddr(zoneId, row.getCsId());
             final String anchorCidr = resolveAnchorForIpAddr(zoneId, row.getCsId());
             final String vlan = resolveVlanForIpAddr(zoneId, row.getCsId());
             final String networkGatewayIp = resolveNetworkGatewayForIpAddr(zoneId, row.getCsId());
-            if (sendCommand(currentGw, publicIp, gatewayIp, anchorCidr, vlan, networkGatewayIp, OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            if (sendCommand(currentGw, publicIp, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
+                    OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
                 if (lastHost != null) {
-                    sendCommand(lastHost, publicIp, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+                    sendCommand(lastHost, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
                 }
                 row.setOvnUuid(String.valueOf(currentGw));
                 logicalIdMapDao.update(row.getId(), row);
@@ -431,6 +438,14 @@ public class OvnBgpRedistributeManager {
             return null;
         }
         return publicNetworkManager.getVpcPublicGatewayIp(zoneId, ip.getVpcId());
+    }
+
+    private String resolveGatewayMacForIpAddr(final long zoneId, final long ipAddrId) {
+        final IpAddress ip = ipAddressDao.findById(ipAddrId);
+        if (ip == null || ip.getVpcId() == null) {
+            return null;
+        }
+        return publicNetworkManager.getVpcPublicLrpMac(zoneId, ip.getVpcId());
     }
 
     /**
@@ -493,7 +508,7 @@ public class OvnBgpRedistributeManager {
     }
 
     private boolean sendCommand(final long hostId, final String publicIp, final String gatewayIp,
-                                final String anchorCidr, final String vlan,
+                                final String gatewayMac, final String anchorCidr, final String vlan,
                                 final String networkGatewayIp, final String operation) {
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                 publicIp,
@@ -504,6 +519,7 @@ public class OvnBgpRedistributeManager {
                 anchorCidr,
                 vlan,
                 networkGatewayIp);
+        cmd.setGatewayMac(gatewayMac);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {
@@ -560,7 +576,7 @@ public class OvnBgpRedistributeManager {
      * #sendCommand} but logs the CIDR verbatim instead of {@code /32}.
      */
     private boolean sendSubnetCommand(final long hostId, final String cidr, final String gatewayIp,
-                                      final String anchorCidr, final String vlan,
+                                      final String gatewayMac, final String anchorCidr, final String vlan,
                                       final String networkGatewayIp, final String operation) {
         final int slash = cidr.indexOf('/');
         final String netAddr = cidr.substring(0, slash);
@@ -581,6 +597,7 @@ public class OvnBgpRedistributeManager {
                 vlan,
                 networkGatewayIp);
         cmd.setPrefixLength(prefixLen);
+        cmd.setGatewayMac(gatewayMac);
         try {
             final Answer answer = agentManager.easySend(hostId, cmd);
             if (answer == null) {

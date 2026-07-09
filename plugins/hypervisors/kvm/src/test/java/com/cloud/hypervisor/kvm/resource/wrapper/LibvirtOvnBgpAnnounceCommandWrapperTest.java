@@ -54,6 +54,7 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
     // next-hop, chassis v6 anchor + v6 fabric gateway.
     private static final String V6_TIER = "2a13:8740:0:a::";
     private static final String V6_LRP_GUA = "2a13:8740:0:7::34";
+    private static final String V6_LRP_MAC = "02:02:02:b3:59:22";
     private static final String V6_ANCHOR = "2a13:8740:0:7::2/64";
     private static final String V6_GW = "2a13:8740:0:7::1";
 
@@ -397,6 +398,7 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
                     V6_TIER, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh",
                     CONFIGURED_ASN, V6_LRP_GUA, V6_ANCHOR, null, V6_GW);
             cmd.setPrefixLength(64);
+            cmd.setGatewayMac(V6_LRP_MAC);
             final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
 
             Assert.assertTrue(answer.getResult());
@@ -409,6 +411,10 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
             Assert.assertTrue("v6 datapath route uses ip -6 via the VPC v6 GUA",
                     issued.stream().anyMatch(s ->
                             s.equals("ip -6 route replace " + V6_TIER + "/64 via " + V6_LRP_GUA)));
+            Assert.assertTrue("permanent LRP neighbour pinned on pub-anchor (PARSEL-V6 ND fix)",
+                    issued.stream().anyMatch(s ->
+                            s.equals("ip -6 neigh replace " + V6_LRP_GUA + " lladdr " + V6_LRP_MAC
+                                    + " dev pub-anchor nud permanent")));
             Assert.assertTrue("v6 datapath anchor held with ip -6 addr",
                     issued.stream().anyMatch(s -> s.equals("ip -6 addr replace " + V6_ANCHOR + " dev pub-anchor")));
             Assert.assertTrue("v6 fabric gateway held as /128 on pub-anchor",
@@ -418,6 +424,31 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
             scriptMock.verify(() -> Script.runSimpleBashScript(shell.capture()), atLeastOnce());
             Assert.assertTrue("v6 forwarding enabled on the gateway chassis",
                     shell.getAllValues().stream().anyMatch(s -> s.contains("net.ipv6.conf.all.forwarding=1")));
+        }
+    }
+
+    @Test
+    public void announceIpv6WithoutGatewayMacStillInstallsRouteButSkipsNeigh() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString()))
+                    .thenReturn("\"physnet1:br-cluster\"");
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    V6_TIER, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh",
+                    CONFIGURED_ASN, V6_LRP_GUA, V6_ANCHOR, null, V6_GW);
+            cmd.setPrefixLength(64);
+            // no setGatewayMac — wire-compat with older managers
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            final ArgumentCaptor<String> exec = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(exec.capture()), atLeast(2));
+            final java.util.List<String> issued = exec.getAllValues();
+            Assert.assertTrue(issued.stream().anyMatch(s ->
+                    s.equals("ip -6 route replace " + V6_TIER + "/64 via " + V6_LRP_GUA)));
+            Assert.assertTrue("no neigh install without gatewayMac",
+                    issued.stream().noneMatch(s -> s.contains("ip -6 neigh")));
         }
     }
 

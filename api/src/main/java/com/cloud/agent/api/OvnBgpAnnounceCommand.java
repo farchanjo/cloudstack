@@ -58,6 +58,14 @@ public class OvnBgpAnnounceCommand extends Command {
      *  announce); a value like {@code 24} lets the same command carry a whole
      *  ROUTED-tier subnet (e.g. {@code 10.90.6.0/24}). */
     private Integer prefixLength;
+    /**
+     * OVN public LRP MAC (e.g. {@code 02:02:02:b3:59:20}) for {@link #gatewayIp}.
+     * When set, the agent installs a permanent neighbour entry on
+     * {@code pub-anchor} so the datapath {@code via <gatewayIp>} route does not
+     * depend on flaky ARP/NDP (PARSEL-V6: incomplete ND to the snape LRP broke
+     * return path / guest→RR). Optional for wire-compat with older managers.
+     */
+    private String gatewayMac;
 
     /** No-arg constructor for serialization frameworks. */
     public OvnBgpAnnounceCommand() {
@@ -198,5 +206,15 @@ public class OvnBgpAnnounceCommand extends Command {
      *  subnet). Leave unset for the {@code /32} FIP host-route behaviour. */
     public void setPrefixLength(final Integer prefixLength) {
         this.prefixLength = prefixLength;
+    }
+
+    /** @return public LRP MAC for {@link #getGatewayIp()}, or {@code null}. */
+    public String getGatewayMac() {
+        return gatewayMac;
+    }
+
+    /** Optional MAC of the OVN public LRP that owns {@link #getGatewayIp()}. */
+    public void setGatewayMac(final String gatewayMac) {
+        this.gatewayMac = gatewayMac;
     }
 }
