@@ -40,6 +40,14 @@ bootcmd:
       sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
       mkdir -p /etc/sysctl.d
       printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv6.conf.default.forwarding = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/99-cks-dualstack.conf
+      # /etc/sysctl.conf ships disable_ipv6=1 and systemd-sysctl applies it as
+      # 99-sysctl.conf, which sorts AFTER 99-cks-dualstack.conf and would re-disable
+      # IPv6 on the next boot / `sysctl --system`. Neutralize the base file so the
+      # drop-in wins persistently (mirrors the arp_* seds in setup-kube-system).
+      if [ -f /etc/sysctl.conf ]; then
+        sed -i 's/^[[:space:]]*net.ipv6.conf.all.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.all.disable_ipv6 = 0/' /etc/sysctl.conf
+        sed -i 's/^[[:space:]]*net.ipv6.conf.default.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.default.disable_ipv6 = 0/' /etc/sysctl.conf
+      fi
       ENI=/etc/network/interfaces.d/50-cloud-init
       if [ -f "$ENI" ]; then
         V6IF=$(awk '$1=="iface" && $3=="inet6" {print $2; exit}' "$ENI")
