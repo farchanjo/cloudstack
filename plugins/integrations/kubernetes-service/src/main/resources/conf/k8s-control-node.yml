@@ -33,22 +33,56 @@ bootcmd:
   - |
     if [ "{{ k8s.dual.stack }}" = "true" ]; then
       echo "Enabling IPv6 for dual-stack Kubernetes networking"
+      # Runtime: full image "Disable IPv6" block (not just disable_ipv6).
+      # accept_ra=2 is mandatory when forwarding=1 so OVN SLAAC RAs still apply.
       sysctl -w net.ipv6.conf.all.disable_ipv6=0
       sysctl -w net.ipv6.conf.default.disable_ipv6=0
       sysctl -w net.ipv6.conf.all.forwarding=1
       sysctl -w net.ipv6.conf.default.forwarding=1
+      sysctl -w net.ipv6.conf.all.accept_ra=2
+      sysctl -w net.ipv6.conf.default.accept_ra=2
+      sysctl -w net.ipv6.conf.all.autoconf=1
+      sysctl -w net.ipv6.conf.default.autoconf=1
       modprobe br_netfilter || true
       sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
       mkdir -p /etc/sysctl.d
-      printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv6.conf.default.forwarding = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/99-cks-dualstack.conf
-      # /etc/sysctl.conf ships disable_ipv6=1 and systemd-sysctl applies it as
-      # 99-sysctl.conf, which sorts AFTER 99-cks-dualstack.conf and would re-disable
-      # IPv6 on the next boot / `sysctl --system`. Neutralize the base file so the
-      # drop-in wins persistently (mirrors the arp_* seds in setup-kube-system).
+      # 99-cks-dualstack.conf sorted BEFORE 99-sysctl.conf (symlink to
+      # /etc/sysctl.conf) and lost on reboot. zz-* always wins after 99-*.
+      rm -f /etc/sysctl.d/99-cks-dualstack.conf
+      printf '%s\n' \
+        'net.ipv6.conf.all.disable_ipv6 = 0' \
+        'net.ipv6.conf.default.disable_ipv6 = 0' \
+        'net.ipv6.conf.all.forwarding = 1' \
+        'net.ipv6.conf.default.forwarding = 1' \
+        'net.ipv6.conf.all.accept_ra = 2' \
+        'net.ipv6.conf.default.accept_ra = 2' \
+        'net.ipv6.conf.all.autoconf = 1' \
+        'net.ipv6.conf.default.autoconf = 1' \
+        'net.bridge.bridge-nf-call-ip6tables = 1' \
+        > /etc/sysctl.d/zz-cks-dualstack.conf
+      # Neutralize every line of the image IPv6-disable block so 99-sysctl.conf
+      # cannot re-disable v6 / RA / autoconf on the next boot.
       if [ -f /etc/sysctl.conf ]; then
-        sed -i 's/^[[:space:]]*net.ipv6.conf.all.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.all.disable_ipv6 = 0/' /etc/sysctl.conf
-        sed -i 's/^[[:space:]]*net.ipv6.conf.default.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.default.disable_ipv6 = 0/' /etc/sysctl.conf
+        sed -i \
+          -e 's/^[[:space:]]*net.ipv6.conf.all.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.all.disable_ipv6 = 0/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.default.disable_ipv6[[:space:]]*=.*/net.ipv6.conf.default.disable_ipv6 = 0/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.all.forwarding[[:space:]]*=.*/net.ipv6.conf.all.forwarding = 1/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.default.forwarding[[:space:]]*=.*/net.ipv6.conf.default.forwarding = 1/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.all.accept_ra[[:space:]]*=.*/net.ipv6.conf.all.accept_ra = 2/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.default.accept_ra[[:space:]]*=.*/net.ipv6.conf.default.accept_ra = 2/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.all.autoconf[[:space:]]*=.*/net.ipv6.conf.all.autoconf = 1/' \
+          -e 's/^[[:space:]]*net.ipv6.conf.default.autoconf[[:space:]]*=.*/net.ipv6.conf.default.autoconf = 1/' \
+          /etc/sysctl.conf
       fi
+      # Per-iface: all/default alone leave eth0.disable_ipv6 stuck at 1 after a
+      # prior boot with the image defaults (live salazar-node failure mode).
+      for iface in eth0 ens3 ens35; do
+        [ -e "/proc/sys/net/ipv6/conf/${iface}/disable_ipv6" ] || continue
+        sysctl -w "net.ipv6.conf.${iface}.disable_ipv6=0" || true
+        sysctl -w "net.ipv6.conf.${iface}.forwarding=1" || true
+        sysctl -w "net.ipv6.conf.${iface}.accept_ra=2" || true
+        sysctl -w "net.ipv6.conf.${iface}.autoconf=1" || true
+      done
       ENI=/etc/network/interfaces.d/50-cloud-init
       if [ -f "$ENI" ]; then
         V6IF=$(awk '$1=="iface" && $3=="inet6" {print $2; exit}' "$ENI")
