@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 import javax.inject.Inject;
 
@@ -56,7 +57,10 @@ import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
+import com.cloud.vm.VMInstanceVO;
+import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.dao.NicDao;
+import com.cloud.vm.dao.VMInstanceDao;
 
 /**
  * Periodic / on-demand reconciler. Walks every NB table and the mapping
@@ -114,6 +118,8 @@ public class OvnReconcilerService {
     private VpcDao vpcDao;
     @Inject
     private NicDao nicDao;
+    @Inject
+    private VMInstanceDao vmInstanceDao;
     @Inject
     private IPAddressDao ipAddressDao;
     @Inject
@@ -395,13 +401,64 @@ public class OvnReconcilerService {
                     networkUuid, network.getVpcId());
             return null;
         }
-        final List<String> hops = nextHopsInCidr(route.getNextHops(), network.getCidr(), networkUuid);
+        final List<String> cidrHops = nextHopsInCidr(route.getNextHops(), network.getCidr(), networkUuid);
+        final List<String> hops = filterRunningNextHops(cidrHops, nh -> nextHopVmState(nh, network.getId()));
         if (hops.isEmpty()) {
-            LOGGER.warn("OvnReconcilerService: ECMP route network {} — no next-hop inside CIDR {}; skipping",
-                    networkUuid, network.getCidr());
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} — no in-CIDR Running next-hop (CIDR {}); "
+                    + "keeping existing owned rows to avoid flapping", networkUuid, network.getCidr());
             return null;
         }
         return new ResolvedRoute(lr.getOvnUuid(), route.getPrefix(), hops);
+    }
+
+    /**
+     * Filter a next-hop list down to hops whose owning VM is Running. The
+     * {@code stateResolver} maps a next-hop IP to the {@link VirtualMachine.State}
+     * of the VM owning the NIC that carries that IP, or {@code null} when the hop
+     * does not resolve to any VM NIC. Running hops (and unresolvable non-VM hops,
+     * which the plugin cannot prove dead) are kept; any other resolvable state is
+     * dropped (WARN) so a stopped / destroyed worker stops black-holing 1/N of
+     * the ECMP set until the next reconcile pass restores it on VM start.
+     *
+     * @param hops          next-hops already validated as inside the network CIDR
+     * @param stateResolver next-hop IP -&gt; owning VM state (or {@code null})
+     * @return the subset to program (Running + non-VM hops)
+     */
+    static List<String> filterRunningNextHops(final List<String> hops,
+                                              final Function<String, VirtualMachine.State> stateResolver) {
+        final List<String> out = new ArrayList<>();
+        for (final String nh : hops) {
+            final VirtualMachine.State state = stateResolver.apply(nh);
+            if (state == null) {
+                LOGGER.debug("OvnReconcilerService: ECMP next-hop {} not a VM NIC; keeping (non-VM hop)", nh);
+                out.add(nh);
+            } else if (state == VirtualMachine.State.Running) {
+                out.add(nh);
+            } else {
+                LOGGER.warn("OvnReconcilerService: ECMP next-hop {} VM state={} not Running; pruning from ECMP set",
+                        nh, state);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Resolve a next-hop IP to the state of the VM owning the NIC that carries it
+     * on {@code networkId}, or {@code null} when the IP is not an IPv4 NIC on that
+     * network, the NIC has no VM, or the VM row is gone. IPv6 next-hops have no
+     * per-network NIC finder here, so they resolve to {@code null} (treated as
+     * non-VM hops and kept).
+     */
+    private VirtualMachine.State nextHopVmState(final String nh, final long networkId) {
+        if (!NetUtils.isValidIp4(nh)) {
+            return null;
+        }
+        final NicVO nic = nicDao.findByIp4AddressAndNetworkId(nh, networkId);
+        if (nic == null) {
+            return null;
+        }
+        final VMInstanceVO vm = vmInstanceDao.findById(nic.getInstanceId());
+        return vm == null ? null : vm.getState();
     }
 
     /** Keep only next-hops that fall inside the network's CIDR; WARN + drop the
