@@ -197,6 +197,50 @@ public class KubernetesClusterStartWorkerTest {
         Assert.assertEquals(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6, worker.getCalicoPodCidrV6());
     }
 
+    // ---- dual-stack podcidr: BOTH placeholders are filled from their own details ----
+
+    @Test
+    public void testDualStackPodCidrFillsBothV4AndV6FromDetails() {
+        // REGRESSION (dual-stack podcidr): a "v4,v6" create param stores both cluster details, and the
+        // render must fill BOTH pod CIDR placeholders from their own detail - previously only the v6
+        // pool was honored while the v4 pool silently fell back to Calico's default 192.168.0.0/16.
+        KubernetesClusterDetailsVO v4Detail = Mockito.mock(KubernetesClusterDetailsVO.class);
+        Mockito.when(v4Detail.getValue()).thenReturn("10.101.0.0/16");
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL))
+                .thenReturn(v4Detail);
+        KubernetesClusterDetailsVO v6Detail = Mockito.mock(KubernetesClusterDetailsVO.class);
+        Mockito.when(v6Detail.getValue()).thenReturn("fd00:cafe:3::/64");
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V6_DETAIL))
+                .thenReturn(v6Detail);
+
+        Assert.assertEquals("10.101.0.0/16", worker.getCalicoPodCidrV4());
+        Assert.assertEquals("fd00:cafe:3::/64", worker.getCalicoPodCidrV6());
+    }
+
+    // ---- control-node template: the v4 override must actually take effect ----
+
+    @Test
+    public void testControlNodeTemplateV4OverrideUncommentsCalicoEnv() throws java.io.IOException {
+        final String template;
+        try (java.io.InputStream is =
+                     KubernetesClusterStartWorker.class.getResourceAsStream("/conf/k8s-control-node.yml")) {
+            Assert.assertNotNull("k8s-control-node.yml must be on the classpath", is);
+            template = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+
+        // Both pod CIDR placeholders must exist so the render can fill v4 and v6 independently.
+        Assert.assertTrue("v4 pod CIDR placeholder missing", template.contains("{{ k8s.calico.pod.cidr.v4 }}"));
+        Assert.assertTrue("v6 pod CIDR placeholder missing", template.contains("{{ k8s.calico.pod.cidr.v6 }}"));
+
+        // REGRESSION: the upstream Calico manifest ships CALICO_IPV4POOL_CIDR commented out, so the
+        // override must uncomment/set that env var. The previous mechanism only swapped the value on
+        // the dead commented line, which never set the pool - guard against it coming back.
+        Assert.assertTrue("v4 override must target the CALICO_IPV4POOL_CIDR env var",
+                template.contains("CALICO_IPV4POOL_CIDR"));
+        Assert.assertFalse("v4 override must not rely on swapping the commented default value only",
+                template.contains("s#192.168.0.0/16#${CALICO_POD_CIDR_V4}#g"));
+    }
+
     // ---- v6 control-node IP is NEVER pre-reserved (EUI-64 auto-assigned at deploy time) ----
 
     @Test

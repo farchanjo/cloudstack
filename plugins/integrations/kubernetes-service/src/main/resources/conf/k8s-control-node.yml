@@ -395,10 +395,14 @@ write_files:
           CALICO_POD_CIDR_V4="{{ k8s.calico.pod.cidr.v4 }}"
           if [ -n "$CALICO_POD_CIDR_V4" ]; then
             # Per-cluster IPv4 pod CIDR override (recreate-durable via the calico.pod.cidr.v4
-            # cluster detail). Empty substitution keeps the template default 192.168.0.0/16.
-            # blockSize 26 is the Calico IPv4 default, so only the CIDR needs rewriting.
+            # cluster detail). The upstream Calico manifest ships CALICO_IPV4POOL_CIDR commented
+            # out, so a plain value swap on that dead line had no effect and calico-node kept
+            # auto-creating the built-in default 192.168.0.0/16 pool. Uncomment the env var and set
+            # our CIDR so calico-node creates default-ipv4-ippool with the desired range at startup
+            # (the env is read before the default pool is created, so it is race-free on a fresh
+            # cluster). blockSize 26 is the Calico IPv4 default, so only the CIDR is set.
             echo "Overriding Calico IPv4 pod CIDR to $CALICO_POD_CIDR_V4"
-            sed -i "s#192.168.0.0/16#${CALICO_POD_CIDR_V4}#g" ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml || true
+            sed -i -E -e 's|^([[:space:]]*)#[[:space:]]*- name: CALICO_IPV4POOL_CIDR|\1- name: CALICO_IPV4POOL_CIDR|' -e "s|^([[:space:]]*)#[[:space:]]*value: \"192\.168\.0\.0/16\"|\1  value: \"${CALICO_POD_CIDR_V4}\"|" ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml || true
           fi
           /opt/bin/kubectl apply -f ${K8S_CONFIG_SCRIPTS_COPY_DIR}/network.yaml
           if [[ "{{ k8s.dual.stack }}" == "true" ]]; then
