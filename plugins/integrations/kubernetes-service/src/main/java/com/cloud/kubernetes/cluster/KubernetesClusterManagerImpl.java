@@ -1099,10 +1099,8 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             throw new InvalidParameterValueException("Invalid name for the Kubernetes cluster name: " + name);
         }
 
-        final String podCidr = cmd.getPodCidr();
-        if (StringUtils.isNotBlank(podCidr) && !NetUtils.isValidIp4Cidr(podCidr.trim())) {
-            throw new InvalidParameterValueException("Invalid IPv4 pod CIDR for the Kubernetes cluster: " + podCidr);
-        }
+        // Validates the optional (dual-stack) podcidr create parameter; throws on malformed input.
+        parsePodCidr(cmd.getPodCidr());
 
         if (controlNodeCount < 1) {
             throw new InvalidParameterValueException("Invalid cluster control nodes count: " + controlNodeCount);
@@ -1284,12 +1282,54 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         }
     }
 
+    /**
+     * Parse the optional dual-stack {@code podcidr} create parameter into its IPv4 and IPv6 parts.
+     * Accepts a single IPv4 CIDR (legacy, byte-identical behavior), a single IPv6 CIDR, or a
+     * comma-separated pair in either order (documented order is v4,v6). Each non-blank token is
+     * classified by validation, so ordering is tolerant. A token that is neither a valid IPv4 nor
+     * IPv6 CIDR, or a second token of a family already seen, is rejected with a clear API error.
+     *
+     * @param rawPodCidr the raw create-param value (may be {@code null}/blank)
+     * @return a {@link Pair} of (IPv4 CIDR or {@code null}, IPv6 CIDR or {@code null}); a blank input
+     *         yields {@code (null, null)} so no pod CIDR detail is persisted
+     * @throws InvalidParameterValueException when a token is malformed or a family is supplied twice
+     */
+    protected static Pair<String, String> parsePodCidr(final String rawPodCidr) {
+        String podCidrV4 = null;
+        String podCidrV6 = null;
+        if (StringUtils.isBlank(rawPodCidr)) {
+            return new Pair<>(null, null);
+        }
+        for (final String token : rawPodCidr.split(",")) {
+            final String cidr = token.trim();
+            if (cidr.isEmpty()) {
+                continue;
+            }
+            if (NetUtils.isValidIp4Cidr(cidr)) {
+                if (podCidrV4 != null) {
+                    throw new InvalidParameterValueException("Multiple IPv4 pod CIDRs supplied in podcidr: " + rawPodCidr);
+                }
+                podCidrV4 = cidr;
+            } else if (NetUtils.isValidIp6Cidr(cidr)) {
+                if (podCidrV6 != null) {
+                    throw new InvalidParameterValueException("Multiple IPv6 pod CIDRs supplied in podcidr: " + rawPodCidr);
+                }
+                podCidrV6 = cidr;
+            } else {
+                throw new InvalidParameterValueException("Invalid pod CIDR '" + cidr + "' in podcidr: " + rawPodCidr);
+            }
+        }
+        return new Pair<>(podCidrV4, podCidrV6);
+    }
+
     private void addKubernetesClusterDetails(final KubernetesCluster kubernetesCluster, final Network network, final CreateKubernetesClusterCmd cmd) {
         final String externalLoadBalancerIpAddress = cmd.getExternalLoadBalancerIpAddress();
         final String dockerRegistryUserName = cmd.getDockerRegistryUserName();
         final String dockerRegistryPassword = cmd.getDockerRegistryPassword();
         final String dockerRegistryUrl = cmd.getDockerRegistryUrl();
-        final String podCidrV4 = StringUtils.trimToNull(cmd.getPodCidr());
+        final Pair<String, String> podCidr = parsePodCidr(cmd.getPodCidr());
+        final String podCidrV4 = podCidr.first();
+        final String podCidrV6 = podCidr.second();
         final boolean networkCleanup = cmd.getNetworkId() == null;
         Transaction.execute(new TransactionCallbackNoReturn() {
             @Override
@@ -1305,6 +1345,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, ApiConstants.DOCKER_REGISTRY_PASSWORD, dockerRegistryPassword, false);
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, ApiConstants.DOCKER_REGISTRY_URL, dockerRegistryUrl, true);
                 addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, KubernetesClusterService.CALICO_POD_CIDR_V4_DETAIL, podCidrV4, true);
+                addKubernetesClusterDetailIfIsNotEmpty(details, kubernetesClusterId, KubernetesClusterService.CALICO_POD_CIDR_V6_DETAIL, podCidrV6, true);
                 if (kubernetesCluster.getClusterType() == KubernetesCluster.ClusterType.CloudManaged) {
                     details.add(new KubernetesClusterDetailsVO(kubernetesClusterId, "networkCleanup", String.valueOf(networkCleanup), true));
                 }

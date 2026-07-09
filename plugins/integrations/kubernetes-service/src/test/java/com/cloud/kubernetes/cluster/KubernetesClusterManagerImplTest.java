@@ -914,4 +914,70 @@ public class KubernetesClusterManagerImplTest {
         Mockito.verify(kubernetesClusterAffinityGroupMapDao).listAffinityGroupIdsByClusterIdAndNodeType(1L, WORKER.name());
     }
 
+    // ---- dual-stack podcidr create-param parsing/validation ----
+
+    @Test
+    public void testParsePodCidrBlankYieldsNoDetails() {
+        for (String raw : new String[] {null, "", "   "}) {
+            Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr(raw);
+            Assert.assertNull(parsed.first());
+            Assert.assertNull(parsed.second());
+        }
+    }
+
+    @Test
+    public void testParsePodCidrV4OnlyIsByteIdentical() {
+        Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr("10.100.0.0/16");
+        Assert.assertEquals("10.100.0.0/16", parsed.first());
+        Assert.assertNull(parsed.second());
+    }
+
+    @Test
+    public void testParsePodCidrV4OnlyTrimsWhitespace() {
+        Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr("  10.100.0.0/16  ");
+        Assert.assertEquals("10.100.0.0/16", parsed.first());
+        Assert.assertNull(parsed.second());
+    }
+
+    @Test
+    public void testParsePodCidrV6Only() {
+        Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr("fd00:cafe:3::/64");
+        Assert.assertNull(parsed.first());
+        Assert.assertEquals("fd00:cafe:3::/64", parsed.second());
+    }
+
+    @Test
+    public void testParsePodCidrDualStackV4First() {
+        Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr("10.101.0.0/16,fd00:cafe:3::/64");
+        Assert.assertEquals("10.101.0.0/16", parsed.first());
+        Assert.assertEquals("fd00:cafe:3::/64", parsed.second());
+    }
+
+    @Test
+    public void testParsePodCidrDualStackOrderTolerant() {
+        Pair<String, String> parsed = KubernetesClusterManagerImpl.parsePodCidr("fd00:cafe:3::/64, 10.101.0.0/16");
+        Assert.assertEquals("10.101.0.0/16", parsed.first());
+        Assert.assertEquals("fd00:cafe:3::/64", parsed.second());
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testParsePodCidrRejectsMalformedToken() {
+        KubernetesClusterManagerImpl.parsePodCidr("not-a-cidr");
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testParsePodCidrRejectsMalformedInDualStack() {
+        KubernetesClusterManagerImpl.parsePodCidr("10.101.0.0/16,garbage");
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testParsePodCidrRejectsTwoV4() {
+        KubernetesClusterManagerImpl.parsePodCidr("10.100.0.0/16,10.101.0.0/16");
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testParsePodCidrRejectsTwoV6() {
+        KubernetesClusterManagerImpl.parsePodCidr("fd00:cafe:2::/64,fd00:cafe:3::/64");
+    }
+
 }

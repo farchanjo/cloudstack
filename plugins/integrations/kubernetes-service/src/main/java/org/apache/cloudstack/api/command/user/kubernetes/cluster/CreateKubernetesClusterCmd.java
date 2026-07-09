@@ -221,9 +221,12 @@ public class CreateKubernetesClusterCmd extends BaseAsyncCreateCmd {
     private Long asNumber;
 
     @Parameter(name = ApiConstants.POD_CIDR, type = CommandType.STRING,
-            description = "optional Calico IPv4 pod CIDR for the cluster (e.g. 10.100.0.0/16). " +
-                    "When unset the systemVM template default (192.168.0.0/16) is used. " +
-                    "Persisted per cluster so it survives cluster recreate.", since = "4.23.0")
+            description = "optional Calico pod CIDR(s) for the cluster. Accepts an IPv4 CIDR " +
+                    "(e.g. 10.100.0.0/16), an IPv6 CIDR, or a comma-separated dual-stack pair " +
+                    "in v4,v6 order (e.g. 10.101.0.0/16,fd00:cafe:3::/64); order is tolerant. " +
+                    "When a family is unset its template default is used (192.168.0.0/16 for IPv4, " +
+                    "fd00:cafe:1::/64 for IPv6). Persisted per cluster so it survives cluster recreate.",
+            since = "4.23.0")
     private String podCidr;
 
     /////////////////////////////////////////////////////

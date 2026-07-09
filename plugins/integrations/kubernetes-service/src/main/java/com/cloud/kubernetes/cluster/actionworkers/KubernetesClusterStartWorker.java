@@ -314,7 +314,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         k8sControlNodeConfig = k8sControlNodeConfig.replace(setupCsiDriver, String.valueOf(setupCsi));
         k8sControlNodeConfig = k8sControlNodeConfig.replace(dualStackKey, String.valueOf(dualStack));
         k8sControlNodeConfig = k8sControlNodeConfig.replace(kubeletNodeIpArgsKey, getKubeletNodeIpArgs());
-        k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV6Key, CLUSTER_DUALSTACK_POD_CIDR_V6);
+        k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV6Key, getCalicoPodCidrV6());
         k8sControlNodeConfig = k8sControlNodeConfig.replace(calicoPodCidrV4Key, getCalicoPodCidrV4());
 
         k8sControlNodeConfig = updateKubeConfigWithRegistryDetails(k8sControlNodeConfig);
@@ -341,6 +341,29 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
      */
     protected static String resolveCalicoPodCidrV4(final String rawDetailValue) {
         return StringUtils.isNotBlank(rawDetailValue) ? rawDetailValue.trim() : "";
+    }
+
+    /**
+     * Per-cluster Calico IPv6 pod CIDR override, read from the
+     * {@link KubernetesClusterService#CALICO_POD_CIDR_V6_DETAIL} cluster detail. Unlike the v4
+     * path (a conditional in-template sed over the baked-in default), the v6 IPPool CIDR is always
+     * rendered from the {@code {{ k8s.calico.pod.cidr.v6 }}} placeholder, so an unset detail must
+     * fall back to {@link #CLUSTER_DUALSTACK_POD_CIDR_V6} (fd00:cafe:1::/64) to keep the rendered
+     * config byte-identical to the pre-feature output (zero regression).
+     */
+    protected String getCalicoPodCidrV6() {
+        final KubernetesClusterDetailsVO detail =
+                kubernetesClusterDetailsDao.findDetail(kubernetesCluster.getId(), KubernetesClusterService.CALICO_POD_CIDR_V6_DETAIL);
+        return resolveCalicoPodCidrV6(detail == null ? null : detail.getValue());
+    }
+
+    /**
+     * Pure resolver for the per-cluster Calico IPv6 pod CIDR detail value: a blank / {@code null}
+     * detail yields the built-in dual-stack default {@link #CLUSTER_DUALSTACK_POD_CIDR_V6}, a set
+     * value is trimmed and returned.
+     */
+    protected static String resolveCalicoPodCidrV6(final String rawDetailValue) {
+        return StringUtils.isNotBlank(rawDetailValue) ? rawDetailValue.trim() : CLUSTER_DUALSTACK_POD_CIDR_V6;
     }
 
     private Pair<UserVm,String> createKubernetesControlNode(final Network network, String serverIp, List<Network.IpAddresses> etcdIps, Long domainId, Long accountId, Long asNumber) throws ManagementServerException,

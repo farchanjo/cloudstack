@@ -160,6 +160,43 @@ public class KubernetesClusterStartWorkerTest {
         Assert.assertEquals("", worker.getCalicoPodCidrV4());
     }
 
+    // ---- per-cluster Calico IPv6 pod CIDR (recreate-durable via cluster detail) ----
+
+    @Test
+    public void testResolveCalicoPodCidrV6DefaultsToBuiltInWhenUnset() {
+        // null / blank detail -> built-in dual-stack default -> byte-identical to pre-feature output.
+        Assert.assertEquals(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6,
+                KubernetesClusterStartWorker.resolveCalicoPodCidrV6(null));
+        Assert.assertEquals(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6,
+                KubernetesClusterStartWorker.resolveCalicoPodCidrV6(""));
+        Assert.assertEquals(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6,
+                KubernetesClusterStartWorker.resolveCalicoPodCidrV6("   "));
+    }
+
+    @Test
+    public void testResolveCalicoPodCidrV6TrimsAndReturnsSetValue() {
+        Assert.assertEquals("fd00:cafe:3::/64", KubernetesClusterStartWorker.resolveCalicoPodCidrV6("fd00:cafe:3::/64"));
+        Assert.assertEquals("fd00:cafe:3::/64", KubernetesClusterStartWorker.resolveCalicoPodCidrV6("  fd00:cafe:3::/64  "));
+    }
+
+    @Test
+    public void testGetCalicoPodCidrV6ReadsClusterDetail() {
+        KubernetesClusterDetailsVO detail = Mockito.mock(KubernetesClusterDetailsVO.class);
+        Mockito.when(detail.getValue()).thenReturn("fd00:cafe:3::/64");
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V6_DETAIL))
+                .thenReturn(detail);
+
+        Assert.assertEquals("fd00:cafe:3::/64", worker.getCalicoPodCidrV6());
+    }
+
+    @Test
+    public void testGetCalicoPodCidrV6DefaultsToBuiltInWhenDetailAbsent() {
+        Mockito.when(kubernetesClusterDetailsDao.findDetail(1L, KubernetesClusterService.CALICO_POD_CIDR_V6_DETAIL))
+                .thenReturn(null);
+
+        Assert.assertEquals(KubernetesClusterStartWorker.CLUSTER_DUALSTACK_POD_CIDR_V6, worker.getCalicoPodCidrV6());
+    }
+
     // ---- v6 control-node IP is NEVER pre-reserved (EUI-64 auto-assigned at deploy time) ----
 
     @Test

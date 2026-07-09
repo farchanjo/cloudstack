@@ -56,6 +56,12 @@ public interface KubernetesClusterService extends PluggableService, Configurable
      *  Empty/absent keeps the systemVM template's baked-in default (192.168.0.0/16),
      *  so the rendered node config is byte-identical for clusters that do not set it. */
     String CALICO_POD_CIDR_V4_DETAIL = "calico.pod.cidr.v4";
+    /** Per-cluster detail key holding an optional Calico IPv6 pod CIDR override.
+     *  Empty/absent keeps the built-in dual-stack default (fd00:cafe:1::/64), so the
+     *  rendered v6 IPPool is byte-identical for clusters that do not set it. Distinct
+     *  per-cluster values avoid overlapping pod prefixes when several clusters export
+     *  their pod blocks over BGP to the same route reflectors. */
+    String CALICO_POD_CIDR_V6_DETAIL = "calico.pod.cidr.v6";
 
     static final ConfigKey<Boolean> KubernetesServiceEnabled = new ConfigKey<Boolean>("Advanced", Boolean.class,
             "cloud.kubernetes.service.enabled",
