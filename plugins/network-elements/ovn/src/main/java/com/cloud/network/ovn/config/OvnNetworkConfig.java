@@ -118,6 +118,18 @@ public class OvnNetworkConfig implements Configurable {
      *  See {@link com.cloud.network.ovn.config.OvnLspAddresses}. */
     public static final String OVN_LSP_EXTRA_PORT_SECURITY_CIDRS = "ovn.lsp.extra.port.security.cidrs";
 
+    /** Per-network ECMP static routes programmed on the VPC
+     *  {@code Logical_Router} that owns each network. One
+     *  {@code Logical_Router_Static_Route} row is created per next-hop for the
+     *  same destination prefix (OVN native ECMP), so k8s LB VIP ranges route
+     *  from the OVN gateway to the CKS worker nodes. Map syntax:
+     *  {@code <network-uuid>=<prefix>-><nh1>|<nh2>|<nh3>;<network-uuid>=...}.
+     *  Every managed row is tagged {@code external_ids:cs-ecmp-route=<network-uuid>}
+     *  so the reconciler touches ONLY plugin-owned routes. A network absent from
+     *  the map has no route managed on its LR (zero regression).
+     *  See {@link com.cloud.network.ovn.config.OvnEcmpRoutes}. */
+    public static final String OVN_LR_ECMP_STATIC_ROUTES = "ovn.lr.ecmp.static.routes";
+
     /* ---------- ConfigKeys ---------- */
 
     public static final ConfigKey<Boolean> PublicVlanAuto = new ConfigKey<>(CATEGORY, Boolean.class,
@@ -206,6 +218,18 @@ public class OvnNetworkConfig implements Configurable {
                     + "Empty disables the feature entirely.",
             true);
 
+    public static final ConfigKey<String> LrEcmpStaticRoutes = new ConfigKey<>(CATEGORY, String.class,
+            OVN_LR_ECMP_STATIC_ROUTES, "",
+            "Per-network ECMP static routes programmed on the VPC Logical_Router that owns each "
+                    + "network. One Logical_Router_Static_Route row is created per next-hop for the same "
+                    + "destination prefix (OVN native ECMP), tagged external_ids:cs-ecmp-route=<network-uuid> "
+                    + "so the reconciler manages ONLY plugin-owned routes. Syntax: "
+                    + "'<network-uuid>=<prefix>-><nexthop1>|<nexthop2>|...;<network-uuid>=...'. Next-hops "
+                    + "must be valid IPs inside the network's CIDR; out-of-range next-hops and malformed "
+                    + "entries are logged and skipped. Empty disables the feature entirely (no route is "
+                    + "ever touched). Used to route k8s LB VIP ranges from the OVN gateway to CKS workers.",
+            true);
+
     /* ---------- Configurable contract ---------- */
 
     @Override
@@ -227,7 +251,8 @@ public class OvnNetworkConfig implements Configurable {
                 BgpRespectManual,
                 BgpPublicAnchorEnabled,
                 SnatExemptedDestinations,
-                LspExtraPortSecurityCidrs
+                LspExtraPortSecurityCidrs,
+                LrEcmpStaticRoutes
         };
     }
 
