@@ -108,6 +108,16 @@ public class OvnNetworkConfig implements Configurable {
      *  when disabled — see {@code OvnSourceNatService.applySnatDestinationExemption}. */
     public static final String OVN_SNAT_EXEMPTED_DESTINATIONS = "ovn.snat.exempted.destinations";
 
+    /** Per-network extra CIDRs appended to every guest-NIC
+     *  {@code Logical_Switch_Port}'s {@code addresses} and {@code port_security}
+     *  columns, so raw pod / LB-VIP frames (e.g. Calico {@code ipipMode: Never},
+     *  cross-node dual-stack pod v6) are not dropped by OVN's L3 port-security
+     *  spoof guard. Map syntax:
+     *  {@code <network-uuid>=cidr1,cidr2;<network-uuid>=cidr3,...}. A network
+     *  absent from the map keeps EXACTLY the legacy behaviour (MAC + NIC IPs).
+     *  See {@link com.cloud.network.ovn.config.OvnLspAddresses}. */
+    public static final String OVN_LSP_EXTRA_PORT_SECURITY_CIDRS = "ovn.lsp.extra.port.security.cidrs";
+
     /* ---------- ConfigKeys ---------- */
 
     public static final ConfigKey<Boolean> PublicVlanAuto = new ConfigKey<>(CATEGORY, Boolean.class,
@@ -186,6 +196,16 @@ public class OvnNetworkConfig implements Configurable {
                     + "Empty disables the exemption.",
             true);
 
+    public static final ConfigKey<String> LspExtraPortSecurityCidrs = new ConfigKey<>(CATEGORY, String.class,
+            OVN_LSP_EXTRA_PORT_SECURITY_CIDRS, "",
+            "Per-network extra CIDRs appended to every guest-NIC Logical_Switch_Port addresses and "
+                    + "port_security columns so raw pod / LB-VIP frames survive OVN's spoof guard "
+                    + "(e.g. Calico ipipMode Never, cross-node dual-stack pod v6). Syntax: "
+                    + "'<network-uuid>=cidr1,cidr2;<network-uuid>=cidr3,...'. Networks absent from the "
+                    + "map keep the legacy MAC+NIC-IP behaviour. Malformed CIDRs are logged and skipped. "
+                    + "Empty disables the feature entirely.",
+            true);
+
     /* ---------- Configurable contract ---------- */
 
     @Override
@@ -206,7 +226,8 @@ public class OvnNetworkConfig implements Configurable {
                 BgpFrrInstanceTag,
                 BgpRespectManual,
                 BgpPublicAnchorEnabled,
-                SnatExemptedDestinations
+                SnatExemptedDestinations,
+                LspExtraPortSecurityCidrs
         };
     }
 
