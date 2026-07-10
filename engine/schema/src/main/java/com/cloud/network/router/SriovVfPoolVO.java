@@ -194,12 +194,15 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public void setState(State newState) {
         this.state = newState.name();
-        this.updated = new Date();
+        // Route through setUpdated so createForUpdate() proxies capture the
+        // column in their change map (direct field assign is invisible to
+        // UpdateBuilder).
+        setUpdated(new Date());
     }
 
     public void setState(String state) {
         this.state = state;
-        this.updated = new Date();
+        setUpdated(new Date());
     }
 
     public Long getAllocatedToNicId() {
@@ -218,6 +221,16 @@ public class SriovVfPoolVO implements InternalIdentity {
         return updated;
     }
 
+    /**
+     * Explicit setter for {@code updated}. Required so
+     * {@code createForUpdate()} CGLib proxies record the column: UpdateBuilder
+     * only tracks intercepted setter arguments, not side-effect field writes
+     * inside other setters. Every state / vdpa mutation should call this.
+     */
+    public void setUpdated(Date updated) {
+        this.updated = updated;
+    }
+
     public String getVdpaKind() {
         return vdpaKind;
     }
@@ -228,7 +241,7 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public void setVdpaKind(VdpaKind kind) {
         this.vdpaKind = kind.name();
-        this.updated = new Date();
+        setUpdated(new Date());
     }
 
     /**
@@ -250,7 +263,7 @@ public class SriovVfPoolVO implements InternalIdentity {
      */
     public void setVdpaKind(String kind) {
         this.vdpaKind = kind;
-        this.updated = new Date();
+        setUpdated(new Date());
     }
 
     public String getVdpaName() {
@@ -259,7 +272,7 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public void setVdpaName(String vdpaName) {
         this.vdpaName = vdpaName;
-        this.updated = new Date();
+        setUpdated(new Date());
     }
 
     public String getVdpaDevice() {
@@ -268,7 +281,7 @@ public class SriovVfPoolVO implements InternalIdentity {
 
     public void setVdpaDevice(String vdpaDevice) {
         this.vdpaDevice = vdpaDevice;
-        this.updated = new Date();
+        setUpdated(new Date());
     }
 
     public Date getLastSeen() {

@@ -55,19 +55,25 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
     private static final String SQL_RELEASE_BY_VM_ID =
             "UPDATE sriov_vf_pool p " +
             "JOIN nics n ON n.id = p.allocated_to_nic_id " +
-            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, p.updated = NOW() " +
+            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, " +
+            "    p.vdpa_kind = 'PASSTHROUGH', p.vdpa_name = NULL, p.vdpa_device = NULL, " +
+            "    p.updated = NOW() " +
             "WHERE n.instance_id = ? AND p.state = 'ALLOCATED'";
 
     /**
      * Orphan sweep — any ALLOCATED VF whose NIC is gone (nics.removed IS NOT NULL)
      * or whose VM is gone (vm_instance.removed IS NOT NULL) gets freed. Safety net
      * for the race where the listener missed the VR state transition window.
+     * Also blanks vdpa_* so a subsequent hostdev PASSTHROUGH allocate cannot
+     * inherit a stale VDPA kind/name from a prior vDPA occupant.
      */
     private static final String SQL_SWEEP_ORPHANS =
             "UPDATE sriov_vf_pool p " +
             "LEFT JOIN nics n ON n.id = p.allocated_to_nic_id " +
             "LEFT JOIN vm_instance v ON v.id = n.instance_id " +
-            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, p.updated = NOW() " +
+            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, " +
+            "    p.vdpa_kind = 'PASSTHROUGH', p.vdpa_name = NULL, p.vdpa_device = NULL, " +
+            "    p.updated = NOW() " +
             "WHERE p.state = 'ALLOCATED' " +
             "  AND ( p.allocated_to_nic_id IS NULL " +
             "     OR n.id IS NULL " +
@@ -266,15 +272,23 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (vf == null) {
                     return null;
                 }
-                // createForUpdate() returns a clean VO (no CGLIB proxy) for partial update.
-                // This avoids the enum serialization issue that occurs when calling
-                // update() on the proxy object returned by lockOneRandomRow().
+                // createForUpdate() returns a CGLib proxy for partial update.
+                // Pass String for enum-backed columns (state, vdpa_kind) — the
+                // enum overload would store the enum object and trigger
+                // Java-serialization BLOB output that MySQL utf8mb4 rejects.
+                //
+                // Hostdev PASSTHROUGH allocate must stamp vdpa_kind=PASSTHROUGH
+                // and blank vdpa_name/vdpa_device so a row previously used as
+                // VDPA (and incompletely freed) cannot keep kind=VDPA and
+                // confuse HypervisorGuruBase.isVdpaBoundVf / toNicTO.
                 SriovVfPoolVO updateVo = createForUpdate();
-                updateVo.setState(State.ALLOCATED.name());
-                updateVo.setAllocatedToNicId(nicId);
+                applyPassthroughAllocated(updateVo, nicId);
                 update(vf.getId(), updateVo);
                 vf.setState(State.ALLOCATED.name());
                 vf.setAllocatedToNicId(nicId);
+                vf.setVdpaKind(VdpaKind.PASSTHROUGH);
+                vf.setVdpaName(null);
+                vf.setVdpaDevice(null);
                 // Dual-write nics.vf_pool_id so the recoverHostVfs JOIN can
                 // re-bind the row after a force-release. See SQL_BIND_NIC_VF_POOL_ID.
                 bindNicVfPoolId(nicId, vf.getId());
@@ -294,8 +308,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 }
                 Long boundNic = vf.getAllocatedToNicId();
                 SriovVfPoolVO updateVo = createForUpdate();
-                updateVo.setState(State.FREE.name());
-                updateVo.setAllocatedToNicId(null);
+                applyFreeState(updateVo);
                 update(vf.getId(), updateVo);
                 // Mirror the unbind on the NIC side so a future
                 // recoverHostVfs JOIN does not resurrect a stale link.
@@ -321,8 +334,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 SearchCriteria<SriovVfPoolVO> sc = nicIdSearch.create();
                 sc.setParameters("allocatedToNicId", nicId);
                 SriovVfPoolVO updateVo = createForUpdate();
-                updateVo.setState(State.FREE.name());
-                updateVo.setAllocatedToNicId(null);
+                applyFreeState(updateVo);
                 int affected = update(updateVo, sc);
                 // Same-tx reverse-pointer clear so the NIC stops referring
                 // to the freed pool row.
@@ -453,29 +465,42 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
 
     @Override
     public boolean releaseVdpa(final long vfPoolId) {
-        return Transaction.execute(new TransactionCallback<Boolean>() {
-            @Override
-            public Boolean doInTransaction(TransactionStatus status) {
-                SriovVfPoolVO vf = lockRow(vfPoolId, false);
-                if (vf == null) {
-                    return false;
-                }
-                Long boundNic = vf.getAllocatedToNicId();
-                // createForUpdate() proxy demands String for enum-backed
-                // columns — see allocateForVdpa() for the failure mode.
-                SriovVfPoolVO updateVo = createForUpdate();
-                updateVo.setState(State.FREE.name());
-                updateVo.setAllocatedToNicId(null);
-                updateVo.setVdpaKind(VdpaKind.PASSTHROUGH.name());
-                updateVo.setVdpaName(null);
-                updateVo.setVdpaDevice(null);
-                update(vf.getId(), updateVo);
-                if (boundNic != null) {
-                    unbindNicVfPoolIdByNic(boundNic);
-                }
-                return true;
-            }
-        });
+        // Same free-state wipe as release() — kept as a named API for
+        // call-sites that know they held a vDPA binding.
+        return release(vfPoolId);
+    }
+
+    /**
+     * Stamp a {@code createForUpdate()} proxy (or real VO) with the FREE
+     * bookkeeping: clear nic binding + blank every vdpa_* column and force
+     * {@code vdpa_kind=PASSTHROUGH}. Shared by every release path so a row
+     * that once hosted a vDPA mgmt-device cannot leak kind/name into the
+     * next hostdev PASSTHROUGH allocation.
+     *
+     * <p>Enum-backed columns receive their {@code .name()} String so the
+     * createForUpdate proxy never stores an enum object (MySQL utf8mb4
+     * rejects the resulting serialized blob).
+     */
+    static void applyFreeState(SriovVfPoolVO updateVo) {
+        updateVo.setState(State.FREE.name());
+        updateVo.setAllocatedToNicId(null);
+        updateVo.setVdpaKind(VdpaKind.PASSTHROUGH.name());
+        updateVo.setVdpaName(null);
+        updateVo.setVdpaDevice(null);
+    }
+
+    /**
+     * Stamp a hostdev PASSTHROUGH allocation onto a {@code createForUpdate()}
+     * proxy: ALLOCATED + nic binding + forced PASSTHROUGH kind with blank
+     * vdpa_name/device. setState routes through setUpdated so the proxy's
+     * change map includes {@code updated}.
+     */
+    static void applyPassthroughAllocated(SriovVfPoolVO updateVo, long nicId) {
+        updateVo.setState(State.ALLOCATED.name());
+        updateVo.setAllocatedToNicId(nicId);
+        updateVo.setVdpaKind(VdpaKind.PASSTHROUGH.name());
+        updateVo.setVdpaName(null);
+        updateVo.setVdpaDevice(null);
     }
 
     /**

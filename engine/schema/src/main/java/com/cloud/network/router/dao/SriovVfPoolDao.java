@@ -34,23 +34,32 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     SriovVfPoolVO findByHostAndPci(long hostId, String pciAddress);
 
     /**
-     * Atomically take a free VF on the host and bind it to a NIC.
-     * Returns null if no FREE VF is available.
+     * Atomically take a free VF on the host and bind it to a NIC as hostdev
+     * PASSTHROUGH ({@code vdpa_kind=PASSTHROUGH}, blank vdpa_name/device,
+     * {@code updated} bumped). Returns null if no FREE VF is available.
      * Caller is responsible for calling release on failure of subsequent steps.
      */
     SriovVfPoolVO allocate(long hostId, long nicId);
 
-    /** Release a VF back to the FREE pool, clearing nic binding. Idempotent. */
+    /**
+     * Release a VF back to the FREE pool: clear nic binding, blank
+     * {@code vdpa_name}/{@code vdpa_device}, force {@code vdpa_kind=PASSTHROUGH},
+     * bump {@code updated}. Idempotent.
+     */
     boolean release(long vfPoolId);
 
-    /** Release VF by NIC id (used when NIC is being removed). */
+    /**
+     * Release VF by NIC id (used when NIC is being removed). Same free-state
+     * wipe as {@link #release(long)} (including vdpa_* blanking).
+     */
     boolean releaseByNicId(long nicId);
 
     /**
      * Release every VF whose {@code allocated_to_nic_id} refers to any NIC of
      * the given VM. Uses a JOIN into {@code nics} so removed NIC rows
      * ({@code nics.removed IS NOT NULL}) are still matched — covers the case
-     * where a listener has already removed NICs before our hook ran.
+     * where a listener has already removed NICs before our hook ran. Also
+     * blanks vdpa_* and forces {@code vdpa_kind=PASSTHROUGH}.
      *
      * @return number of rows updated.
      */
@@ -59,8 +68,8 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     /**
      * Sweep ALLOCATED VFs whose {@code allocated_to_nic_id} points at a NIC
      * that has {@code nics.removed IS NOT NULL} or whose VM has been removed.
-     * Returns the number of rows swept back to FREE. Used by the periodic
-     * orphan GC.
+     * Returns the number of rows swept back to FREE (with vdpa_* wiped).
+     * Used by the periodic orphan GC.
      */
     int sweepOrphans();
 
