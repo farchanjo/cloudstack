@@ -53,6 +53,15 @@ public class HostVfPurgeOrphansAnswer extends Answer {
     /** PCI BDFs of rebound VFs (capped to the first 64). */
     private List<String> vfsReboundBdfs = new ArrayList<>();
 
+    /** OVS Interfaces with iface-id scanned for residual FREE-rep heal. */
+    private int ovsRepsScanned;
+
+    /** FREE VF representors actually freed (external_ids + del-port). */
+    private int ovsRepsFreed;
+
+    /** Names of freed OVS representors (capped to the first 64). */
+    private List<String> ovsRepsFreedNames = new ArrayList<>();
+
     /** No-arg constructor for serialization frameworks. */
     public HostVfPurgeOrphansAnswer() {
         // No-op.
@@ -132,5 +141,30 @@ public class HostVfPurgeOrphansAnswer extends Answer {
 
     public void setVfsReboundBdfs(final List<String> vfsReboundBdfs) {
         this.vfsReboundBdfs = vfsReboundBdfs == null ? new ArrayList<>() : new ArrayList<>(vfsReboundBdfs);
+    }
+
+    public int getOvsRepsScanned() {
+        return ovsRepsScanned;
+    }
+
+    public void setOvsRepsScanned(final int ovsRepsScanned) {
+        this.ovsRepsScanned = ovsRepsScanned;
+    }
+
+    public int getOvsRepsFreed() {
+        return ovsRepsFreed;
+    }
+
+    public void setOvsRepsFreed(final int ovsRepsFreed) {
+        this.ovsRepsFreed = ovsRepsFreed;
+    }
+
+    public List<String> getOvsRepsFreedNames() {
+        return ovsRepsFreedNames;
+    }
+
+    public void setOvsRepsFreedNames(final List<String> ovsRepsFreedNames) {
+        this.ovsRepsFreedNames = ovsRepsFreedNames == null
+                ? new ArrayList<>() : new ArrayList<>(ovsRepsFreedNames);
     }
 }

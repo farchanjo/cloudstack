@@ -143,7 +143,61 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         if (affected > 0) {
             LOGGER.info(String.format("Swept %d orphan VF(s) back to FREE", affected));
         }
+        // Residual Chaos-B heal: FREE pool rows (including ones just swept
+        // above, and ones that were FREE long before unplug started clearing
+        // external_ids) may still carry iface-id on their OVS representor.
+        // Dispatch an OVS-only HostVfPurgeOrphans to every host that owns pool
+        // rows — agent-side FREE heuristic never touches ALLOCATED VFs.
+        reconcileStaleOvsRepresentors();
         return affected;
+    }
+
+    /**
+     * Best-effort OVS residual free on every host that has sriov_vf_pool rows.
+     * Uses HostVfPurgeOrphans with vdpa/vfio paths off so live ALLOCATED
+     * bindings are never unbound; only FREE VF representors with iface-id
+     * are cleared. Failures log and continue — never aborts the sweep.
+     */
+    private void reconcileStaleOvsRepresentors() {
+        final Set<Long> hostIds = new HashSet<>();
+        final List<SriovVfPoolVO> all = vfPoolDao.listAll();
+        if (all == null || all.isEmpty()) {
+            return;
+        }
+        for (final SriovVfPoolVO row : all) {
+            hostIds.add(row.getHostId());
+        }
+        for (final Long hostId : hostIds) {
+            HostVfPurgeOrphansCommand cmd = new HostVfPurgeOrphansCommand(
+                    new HashSet<>(), new HashSet<>(), false);
+            cmd.setPurgeVdpa(false);
+            cmd.setRebindPassthroughVfs(false);
+            cmd.setPurgeStaleOvsReps(true);
+            try {
+                Answer answer = agentMgr.send(hostId, cmd);
+                if (answer instanceof HostVfPurgeOrphansAnswer) {
+                    HostVfPurgeOrphansAnswer purge = (HostVfPurgeOrphansAnswer) answer;
+                    if (purge.getOvsRepsFreed() > 0) {
+                        LOGGER.info(
+                                "HostVfPurgeOrphans OVS residual heal on host {}: scanned={} freed={}",
+                                hostId, purge.getOvsRepsScanned(), purge.getOvsRepsFreed());
+                    } else {
+                        LOGGER.debug(
+                                "HostVfPurgeOrphans OVS residual heal on host {}: scanned={} freed=0",
+                                hostId, purge.getOvsRepsScanned());
+                    }
+                } else if (answer != null) {
+                    LOGGER.debug("HostVfPurgeOrphans OVS residual on host {}: agent answered {} ({})",
+                            hostId, answer.getClass().getSimpleName(), answer.getDetails());
+                }
+            } catch (AgentUnavailableException e) {
+                LOGGER.debug("HostVfPurgeOrphans OVS residual on host {}: agent unavailable ({})",
+                        hostId, e.getMessage());
+            } catch (OperationTimedoutException e) {
+                LOGGER.debug("HostVfPurgeOrphans OVS residual on host {}: timed out ({})",
+                        hostId, e.getMessage());
+            }
+        }
     }
 
     @Override
@@ -220,10 +274,12 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
             if (answer instanceof HostVfPurgeOrphansAnswer) {
                 HostVfPurgeOrphansAnswer purge = (HostVfPurgeOrphansAnswer) answer;
                 LOGGER.info(
-                        "HostVfPurgeOrphans on host {}: vdpa[found={} kept={} deleted={}] vfio[scanned={} bound={} kept={} rebound={}] dryRun={}",
+                        "HostVfPurgeOrphans on host {}: vdpa[found={} kept={} deleted={}] vfio[scanned={} bound={} kept={} rebound={}] "
+                                + "ovs[scanned={} freed={}] dryRun={}",
                         hostId,
                         purge.getVdpaFound(), purge.getVdpaKept(), purge.getVdpaDeleted(),
                         purge.getVfsScanned(), purge.getVfsBoundVfio(), purge.getVfsKept(), purge.getVfsRebound(),
+                        purge.getOvsRepsScanned(), purge.getOvsRepsFreed(),
                         dryRun);
             } else if (answer != null) {
                 LOGGER.warn("HostVfPurgeOrphans on host {}: agent answered {} (unexpected): {}",

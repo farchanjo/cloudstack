@@ -18,7 +18,16 @@
  */
 package com.cloud.hypervisor.kvm.resource;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -254,6 +263,12 @@ public class OvnVifDriver extends VifDriverBase {
     /** Matches a VF representor's {@code phys_port_name} (eg. {@code pf0vf4}). */
     private static final Pattern REP_PHYS_PORT_PATTERN = Pattern.compile("pf(\\d+)vf(\\d+)");
 
+    /** sysfs PCI devices root used by FREE-VF residual reconcile. */
+    private static final Path SYS_PCI_DEVICES = Paths.get("/sys/bus/pci/devices");
+
+    /** Driver name that marks a VF as hostdev-passthrough ALLOCATED. */
+    private static final String DRV_VFIO = "vfio-pci";
+
     /**
      * Free a VF representor for reuse: neutralize OVN binding
      * ({@code external_ids} including {@code iface-id}/{@code attached-mac}/
@@ -270,8 +285,11 @@ public class OvnVifDriver extends VifDriverBase {
      * drops the OVN binding even if del-port fails for another reason.
      *
      * <p>Idempotent — safe when the Interface/port is already gone.
+     *
+     * <p>Public so {@code HostVfPurgeOrphans} / startup residual reconcile can
+     * share the exact unplug free path.
      */
-    static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName) {
+    public static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName) {
         if (StringUtils.isBlank(repName)) {
             return;
         }
@@ -282,6 +300,210 @@ public class OvnVifDriver extends VifDriverBase {
             "ovs-vsctl --if-exists del-port %s", repName));
         log.info("{}: freed OVS representor {} (cleared external_ids + del-port)",
                 callerLabel, repName);
+    }
+
+    /**
+     * Residual Chaos-B heal: free every switchdev VF representor that still
+     * carries {@code external_ids:iface-id} while the underlying VF is
+     * kernel-FREE (not bound to {@code vfio-pci}, no vDPA mgmtdev).
+     *
+     * <p>Unplug already clears external_ids (post-{@code 3d07ad52e1}); this
+     * path reclaims VFs that were released <em>before</em> that fix and still
+     * hold a live OVN binding in OVSDB. ALLOCATED VFs are never touched:
+     * passthrough guests keep {@code vfio-pci}, vDPA guests keep a
+     * {@code vdpa-*} mgmtdev on the same PCI BDF.
+     *
+     * <p>vnet / TAP interfaces (no {@code phys_port_name=pfNvfM}) are skipped
+     * — they are live guest taps and must keep their iface-id.
+     *
+     * @param log caller logger
+     * @param callerLabel log prefix (eg. {@code HostVfPurgeOrphans})
+     * @param dryRun when true, report only — no ovs-vsctl mutations
+     * @return summary counts + freed names (capped)
+     */
+    public static FreeStaleOvsResult freeStaleFreeVfRepresentors(final Logger log, final String callerLabel,
+                                                                  final boolean dryRun) {
+        final FreeStaleOvsResult result = new FreeStaleOvsResult();
+        final String listCmd = "ovs-vsctl --no-headings --bare --columns=name find Interface "
+                + "external_ids:iface-id!=[] 2>/dev/null";
+        final String raw = Script.runSimpleBashScriptWithFullResult(listCmd, 30);
+        final List<String> candidates = parseOvsIfaceNames(raw);
+        result.scanned = candidates.size();
+        if (candidates.isEmpty()) {
+            return result;
+        }
+
+        final Set<String> vdpaPci = listVdpaMgmtPciAddresses(log);
+
+        for (final String iface : candidates) {
+            if (!isVfRepresentor(iface)) {
+                result.skippedNonRep++;
+                continue;
+            }
+            final String vfPci = resolveVfPciFromRepresentor(iface);
+            if (StringUtils.isBlank(vfPci)) {
+                log.debug("{}: cannot resolve VF PCI for rep={}; skipping", callerLabel, iface);
+                result.skippedUnresolved++;
+                continue;
+            }
+            final String driver = readPciDriver(vfPci);
+            final boolean hasVdpa = vdpaPci.contains(vfPci);
+            if (!isSafeToFreeStaleRep(driver, hasVdpa)) {
+                result.skippedAllocated++;
+                log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} (ALLOCATED)",
+                        callerLabel, iface, vfPci, driver, hasVdpa);
+                continue;
+            }
+            if (dryRun) {
+                result.freed++;
+                if (result.freedNames.size() < 64) {
+                    result.freedNames.add(iface);
+                }
+                continue;
+            }
+            try {
+                freeRepresentorOnOvs(log, callerLabel, iface);
+                result.freed++;
+                if (result.freedNames.size() < 64) {
+                    result.freedNames.add(iface);
+                }
+            } catch (RuntimeException re) {
+                log.warn("{}: failed to free stale FREE rep={}: {}", callerLabel, iface, re.getMessage());
+            }
+        }
+        log.info("{}: freeStaleFreeVfRepresentors scanned={} freed={} skippedNonRep={} "
+                        + "skippedAllocated={} skippedUnresolved={} dryRun={}",
+                callerLabel, result.scanned, result.freed, result.skippedNonRep,
+                result.skippedAllocated, result.skippedUnresolved, dryRun);
+        return result;
+    }
+
+    /**
+     * Pure decision: a representor with iface-id is safe to free only when the
+     * VF is kernel-FREE — not on {@code vfio-pci} and not hosting a vDPA
+     * mgmtdev. Package-private for unit tests.
+     */
+    static boolean isSafeToFreeStaleRep(final String pciDriver, final boolean hasVdpaOnPci) {
+        if (hasVdpaOnPci) {
+            return false;
+        }
+        return !DRV_VFIO.equals(pciDriver);
+    }
+
+    /**
+     * Parse {@code ovs-vsctl --bare --columns=name find Interface …} output
+     * into interface names (one per non-blank line, quotes stripped).
+     * Package-private pure helper for unit tests.
+     */
+    static List<String> parseOvsIfaceNames(final String raw) {
+        final List<String> out = new ArrayList<>();
+        if (StringUtils.isBlank(raw)) {
+            return out;
+        }
+        for (final String line : raw.split("\\R")) {
+            final String name = line.trim().replaceAll("^\"|\"$", "");
+            if (StringUtils.isNotBlank(name)) {
+                out.add(name);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * True when {@code iface} is a switchdev VF representor
+     * ({@code phys_port_name} matches {@code pfNvfM}).
+     */
+    static boolean isVfRepresentor(final String iface) {
+        if (StringUtils.isBlank(iface)) {
+            return false;
+        }
+        final String phys = VfPassthroughVifDriver.readPhysPortName(iface);
+        return phys != null && REP_PHYS_PORT_PATTERN.matcher(phys).matches();
+    }
+
+    /**
+     * Resolve the VF PCI BDF for a switchdev representor via phys_port_name
+     * ({@code pfNvfM}) → parent PF PCI → {@code virtfnM}.
+     */
+    static String resolveVfPciFromRepresentor(final String repName) {
+        final String phys = VfPassthroughVifDriver.readPhysPortName(repName);
+        final Matcher matcher = phys == null ? null : REP_PHYS_PORT_PATTERN.matcher(phys);
+        if (matcher == null || !matcher.matches()) {
+            return null;
+        }
+        final int vfId = Integer.parseInt(matcher.group(2));
+        // Representor netdev's device symlink is the parent PF in switchdev.
+        final File devLink = new File("/sys/class/net/" + repName + "/device");
+        if (!devLink.exists()) {
+            return null;
+        }
+        try {
+            final String pfPci = devLink.getCanonicalFile().getName();
+            final File virtfn = new File("/sys/bus/pci/devices/" + pfPci + "/virtfn" + vfId);
+            if (!virtfn.exists()) {
+                return null;
+            }
+            return virtfn.getCanonicalFile().getName();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Read the bound PCI driver basename for {@code bdf}, or {@code null}
+     * when unbound / missing.
+     */
+    static String readPciDriver(final String bdf) {
+        if (StringUtils.isBlank(bdf)) {
+            return null;
+        }
+        final Path driverLink = SYS_PCI_DEVICES.resolve(bdf).resolve("driver");
+        try {
+            if (!Files.exists(driverLink)) {
+                return null;
+            }
+            return driverLink.toRealPath().getFileName().toString();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * PCI BDFs currently hosting a vDPA mgmtdev, parsed from
+     * {@code vdpa dev show}. Empty when the binary is absent.
+     */
+    static Set<String> listVdpaMgmtPciAddresses(final Logger log) {
+        final Set<String> out = new HashSet<>();
+        final String raw = Script.runSimpleBashScript("vdpa dev show 2>/dev/null", 5_000);
+        if (StringUtils.isBlank(raw)) {
+            return out;
+        }
+        // "vdpa-XXXX: type network mgmtdev pci/0000:01:00.3 ..."
+        for (final String line : raw.split("\\R")) {
+            final int idx = line.indexOf("mgmtdev pci/");
+            if (idx < 0) {
+                continue;
+            }
+            String rest = line.substring(idx + "mgmtdev pci/".length()).trim();
+            final int sp = rest.indexOf(' ');
+            if (sp > 0) {
+                rest = rest.substring(0, sp);
+            }
+            if (StringUtils.isNotBlank(rest)) {
+                out.add(rest);
+            }
+        }
+        return out;
+    }
+
+    /** Counters returned by {@link #freeStaleFreeVfRepresentors}. */
+    public static final class FreeStaleOvsResult {
+        public int scanned;
+        public int freed;
+        public int skippedNonRep;
+        public int skippedAllocated;
+        public int skippedUnresolved;
+        public final List<String> freedNames = new ArrayList<>();
     }
 
     /**

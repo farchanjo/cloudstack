@@ -1601,29 +1601,37 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         setupMemoryBalloonStatsPeriod(conn);
 
-        // OVN iface stamp reconcile (Bug 25): on agent startup walk every OVS
-        // Interface that carries an iface-id matching ^lsp-<uuid> and re-stamp
-        // external_ids:ovn-installed=true + iface-status=active. The fresh-plug
-        // post-stamp (applyPostPlugTunables / applyVdpaPostPlugTunables /
-        // OvnVfPassthroughVifDriver) only fires when a NIC is newly plugged;
-        // pre-existing running VMs lose the flag when ovn-controller re-syncs
-        // on agent restart and decides no re-bind is needed (chassis owns the
-        // same Port_Binding from before the restart). Without ovn-installed=true
-        // the OpenFlow ingress action stays unset and east-west traffic from
-        // the VR silently drops. Reapplying the stamp here is idempotent on
-        // every Interface that already has it and load-bearing on every
-        // Interface that lost it after the agent recycle. The walk runs on
-        // a worker thread so a slow ovs-vsctl path does not delay the configure
-        // return.
+        // Residual FREE VF OVS heal (Chaos B) MUST run before Bug 25 re-stamp.
+        // Bug 25 walks every Interface with iface-id=lsp-* and re-stamps
+        // ovn-installed=true — that would re-activate FREE representors that
+        // still hold a stale iface-id from pre-fix unplug. Free them first
+        // (agent-local FREE heuristic: not vfio, no vdpa), then re-stamp the
+        // remaining ALLOCATED ports. Both walks run on one worker so configure
+        // is not delayed by ovs-vsctl.
         try {
-            new Thread(this::reconcileOvnInstalledOnStartup,
-                    "ovn-installed-startup-reconcile").start();
+            new Thread(this::reconcileFreeVfOvsThenOvnInstalled,
+                    "ovn-free-vf-and-installed-startup-reconcile").start();
         } catch (RuntimeException reconcileErr) {
-            LOGGER.warn("reconcileOvnInstalledOnStartup: failed to spawn worker: {}",
+            LOGGER.warn("reconcileFreeVfOvsThenOvnInstalled: failed to spawn worker: {}",
                     reconcileErr.getMessage());
         }
 
         return true;
+    }
+
+    /**
+     * Startup sequence: free residual FREE VF representors that still carry
+     * {@code external_ids:iface-id}, then re-stamp {@code ovn-installed} on
+     * remaining OVN ports (Bug 25). Order is load-bearing — see configure().
+     */
+    void reconcileFreeVfOvsThenOvnInstalled() {
+        try {
+            OvnVifDriver.freeStaleFreeVfRepresentors(LOGGER,
+                    "startup-free-stale-free-vf", false);
+        } catch (final Exception freeErr) {
+            LOGGER.warn("startup freeStaleFreeVfRepresentors failed: {}", freeErr.getMessage());
+        }
+        reconcileOvnInstalledOnStartup();
     }
 
     /**

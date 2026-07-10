@@ -39,16 +39,18 @@ import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
 import com.cloud.agent.api.HostVfPurgeOrphansCommand;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
+import com.cloud.hypervisor.kvm.resource.OvnVifDriver;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
 import com.cloud.utils.script.OutputInterpreter;
 import com.cloud.utils.script.Script;
 
 /**
- * Purge orphan host-level NIC bindings: delete stranded vdpa-net devs and
- * rebind VFs stuck on {@code vfio-pci} back to {@code mlx5_core}.
+ * Purge orphan host-level NIC bindings: delete stranded vdpa-net devs,
+ * rebind VFs stuck on {@code vfio-pci} back to {@code mlx5_core}, and free
+ * residual OVS external_ids on FREE VF representors (Chaos B heal).
  *
- * <p>Two paths run inside one round-trip — see
+ * <p>Three paths run inside one round-trip — see
  * {@link HostVfPurgeOrphansCommand} javadoc for the failure modes each
  * path is built to clear.
  *
@@ -102,11 +104,38 @@ public final class LibvirtHostVfPurgeOrphansCommandWrapper extends
             }
         }
 
-        LOGGER.info("HostVfPurgeOrphans: vdpa[found={} kept={} deleted={}] vfio[scanned={} bound={} kept={} rebound={}] dryRun={}",
+        // Step 3 runs AFTER vdpa delete + vfio rebind so force-release (empty
+        // keep) has already unbound every previously-ALLOCATED VF; the FREE
+        // heuristic then frees their residual OVS external_ids too. Periodic
+        // sweep (vdpa/vfio flags off) only heals already-FREE residual leaks
+        // and never touches live ALLOCATED bindings.
+        if (cmd.isPurgeStaleOvsReps()) {
+            try {
+                purgeStaleOvsReps(dryRun, answer);
+            } catch (RuntimeException re) {
+                LOGGER.warn("HostVfPurgeOrphans: stale OVS FREE-rep purge failed: {}", re.getMessage());
+            }
+        }
+
+        LOGGER.info("HostVfPurgeOrphans: vdpa[found={} kept={} deleted={}] vfio[scanned={} bound={} kept={} rebound={}] "
+                        + "ovs[scanned={} freed={}] dryRun={}",
                 answer.getVdpaFound(), answer.getVdpaKept(), answer.getVdpaDeleted(),
                 answer.getVfsScanned(), answer.getVfsBoundVfio(), answer.getVfsKept(), answer.getVfsRebound(),
+                answer.getOvsRepsScanned(), answer.getOvsRepsFreed(),
                 dryRun);
         return answer;
+    }
+
+    /**
+     * Step 3: free residual Chaos-B OVS bindings on FREE VF representors.
+     * See {@link OvnVifDriver#freeStaleFreeVfRepresentors}.
+     */
+    private void purgeStaleOvsReps(final boolean dryRun, final HostVfPurgeOrphansAnswer answer) {
+        final OvnVifDriver.FreeStaleOvsResult r =
+                OvnVifDriver.freeStaleFreeVfRepresentors(LOGGER, "HostVfPurgeOrphans", dryRun);
+        answer.setOvsRepsScanned(r.scanned);
+        answer.setOvsRepsFreed(r.freed);
+        answer.setOvsRepsFreedNames(r.freedNames);
     }
 
     // -------------------------------------------------------------------- vDPA

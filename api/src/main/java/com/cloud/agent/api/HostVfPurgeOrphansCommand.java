@@ -25,7 +25,7 @@ import java.util.Set;
  * have been flipped to {@code FREE}, so kernel state is brought back
  * into agreement with the management database.
  *
- * <p>Two cleanup paths run inside one round-trip:
+ * <p>Three cleanup paths run inside one round-trip:
  *
  * <ul>
  *   <li><b>vDPA</b> — every {@code vdpa dev show} entry whose name is NOT
@@ -40,18 +40,29 @@ import java.util.Set;
  *       unbound and re-bound to {@code mlx5_core}. Without this, a VF
  *       stranded in {@code vfio-pci} after an abnormal VM termination
  *       cannot host a fresh hostdev passthrough on the next deploy.</li>
+ *   <li><b>OVS FREE representors</b> — every switchdev VF representor that
+ *       still carries {@code external_ids:iface-id} while the VF is
+ *       kernel-FREE (not on {@code vfio-pci}, no vDPA) gets
+ *       {@code external_ids} cleared and the port deleted. Heals residual
+ *       Chaos-B leaks left by pre-fix unplug paths. ALLOCATED VFs are
+ *       never touched (agent-local FREE heuristic).</li>
  * </ul>
  *
- * <p>Both keep-sets default to empty: empty ⇒ wipe everything. The
- * caller (force-release path) typically passes empty sets because the DB
- * rows have already been flipped to {@code FREE}; in operator-controlled
- * paths a non-empty keep-set protects active bindings.
+ * <p>Both keep-sets default to empty: empty ⇒ wipe everything on the
+ * vDPA/vfio paths. The OVS path always uses the FREE heuristic so live
+ * ALLOCATED bindings stay intact even with empty keep-sets. The caller
+ * (force-release path) typically passes empty sets because the DB rows
+ * have already been flipped to {@code FREE}; in operator-controlled
+ * paths a non-empty keep-set protects active bindings on the first two
+ * paths. Periodic orphan sweep sets {@link #purgeVdpa}/{@link #rebindPassthroughVfs}
+ * false and only runs the OVS residual heal.
  *
  * <p>{@code dryRun} reports without mutating.
  *
  * <p>Wire-compat: agents predating the matching wrapper return
  * {@code Unsupported command}; the management caller logs the warning
- * and keeps going (DB-only release is the legacy semantic).
+ * and keeps going (DB-only release is the legacy semantic). Agents that
+ * know the command but pre-date the OVS path simply skip that step.
  */
 public class HostVfPurgeOrphansCommand extends Command {
 
@@ -69,6 +80,12 @@ public class HostVfPurgeOrphansCommand extends Command {
 
     /** When {@code true}, run the VF passthrough rebind step. */
     private boolean rebindPassthroughVfs = true;
+
+    /**
+     * When {@code true}, free OVS external_ids/del-port on FREE VF
+     * representors that still carry iface-id (residual Chaos B).
+     */
+    private boolean purgeStaleOvsReps = true;
 
     /** No-arg constructor for serialization frameworks. */
     public HostVfPurgeOrphansCommand() {
@@ -125,5 +142,13 @@ public class HostVfPurgeOrphansCommand extends Command {
 
     public void setRebindPassthroughVfs(final boolean rebindPassthroughVfs) {
         this.rebindPassthroughVfs = rebindPassthroughVfs;
+    }
+
+    public boolean isPurgeStaleOvsReps() {
+        return purgeStaleOvsReps;
+    }
+
+    public void setPurgeStaleOvsReps(final boolean purgeStaleOvsReps) {
+        this.purgeStaleOvsReps = purgeStaleOvsReps;
     }
 }
