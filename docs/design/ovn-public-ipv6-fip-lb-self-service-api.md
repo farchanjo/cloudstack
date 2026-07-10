@@ -3,7 +3,8 @@
 > **Status:** DESIGN / PROPOSED. Living document — the source of truth for this
 > feature (no speckit for this repo). Update the **Progress** table every phase.
 > Date: **2026-07-10**. Deploy path: **jar-direct** only (no `.deb` promotion).
-> Sibling design: [[ovn-complete-networking]]. Operator ConfigKey runbook today:
+> Sibling design: [[ovn-complete-networking]]. Sprint 3 cutover runbook:
+> [[ovn-public-ipv6-cutover-runbook]]. Operator ConfigKey (Phase-1 / break-glass):
 > CKS docs `cks-salazar` / `cks-snape` `docs/ovn-public-ipv6-lb.md` (cmk
 > `ovn.lr.public.ipv6.lb`).
 
@@ -289,12 +290,16 @@ Per standing CloudStack deploy rules (jar-direct, **all 3** control nodes
 | Design | ✅ done | this document (2026-07-10) |
 | Sprint 1 — IPAM (`user_public_ipv6_address`) | ✅ foundation + API complete (code); live schema/cmk smoke still pending deploy | table `user_public_ipv6_address`; APIs list/associate/disassociatePublicIpv6Address; 13 unit tests; no OVN yet |
 | Sprint 2 — LB API + OVN dual-read | ✅ code complete (schema `public_ipv6_address_id`, `publicipv6id` API, dual-read reconciler, unit tests); live cmk/OVN smoke pending jar-direct | `publicipv6id`; reconciler union |
-| Sprint 3 — migrate / cutover | Proposed / not started | empty ConfigKey after inventory |
+| Sprint 3 — migrate / cutover | 🔄 **IN PROGRESS** | Runbook: [[ovn-public-ipv6-cutover-runbook]]. Next: jar-direct S1–S2 on all 3 mgmt → backup ConfigKey → import `::100`/`::101` → LB rules + assign workers → dual-read verify → clear ConfigKey → smoke. **Do not clear ConfigKey until dual-read plan ≈ 0.** |
 | Sprint 4 — StaticNAT / PF (optional) | Proposed / not started | deferred until LB path stable |
-| CKS ops doc update | Proposed / not started | after Sprint 3 |
+| CKS ops doc update | 🔄 **IN PROGRESS** (preferred-path note) | inventory API preferred; ConfigKey break-glass — full post-cutover rewrite after ConfigKey empty |
 | Phase-1 ConfigKey dataplane | ✅ live | salazar `::100`, snape `::101` |
 
 ## 9. Migration (dual-read + cutover)
+
+**Operator procedure:** [[ovn-public-ipv6-cutover-runbook]] (inventory tables,
+backup, import, LB create/assign, dual-read gate, clear ConfigKey, smoke,
+rollback).
 
 ```
   Phase-1 only          Sprint 2+ dual-read              Sprint 3 cutover
