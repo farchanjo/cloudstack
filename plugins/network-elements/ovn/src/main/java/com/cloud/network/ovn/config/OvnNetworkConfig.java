@@ -172,9 +172,9 @@ public class OvnNetworkConfig implements Configurable {
 
     public static final ConfigKey<Boolean> BgpRedistributePublicIps = new ConfigKey<>(CATEGORY, Boolean.class,
             OVN_BGP_REDISTRIBUTE_PUBLIC_IPS, "false",
-            "Opt-in: announce /32 per allocated public IP (sourceNAT / StaticNAT / PortForward) "
-                    + "via host-side FRR vtysh on the OVN gateway-chassis. Default off so VRRP / "
-                    + "static setups stay non-disruptive.",
+            "Opt-in: announce /32 per allocated public IP (sourceNAT / StaticNAT / PortForward / "
+                    + "LoadBalancer) via host-side FRR vtysh on the OVN gateway-chassis. Default off "
+                    + "so VRRP / static setups stay non-disruptive.",
             true);
 
     public static final ConfigKey<Boolean> BgpRedistributeRoutedTiers = new ConfigKey<>(CATEGORY, Boolean.class,

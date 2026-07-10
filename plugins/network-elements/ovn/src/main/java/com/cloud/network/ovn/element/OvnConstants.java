@@ -46,6 +46,16 @@ public final class OvnConstants {
      *  the routes it created and never disturb manual or other static routes. */
     public static final String EXT_ID_ECMP_ROUTE = "cs-ecmp-route";
 
+    /** external_ids key marking a plugin-owned VPC {@code createStaticRoute}
+     *  {@code Logical_Router_Static_Route} row. The value is the CloudStack
+     *  {@code static_routes.uuid}, so {@code OvnNetworkElement.applyStaticRoutes}
+     *  can add / diff / remove ONLY the routes it created. Distinct from
+     *  {@link #EXT_ID_ECMP_ROUTE} (ConfigKey namespace) — the two namespaces
+     *  must never touch each other's rows. Multi-NH ECMP is expressed as
+     *  multiple rows sharing the same {@code ip_prefix} with different
+     *  {@code nexthop} and different ownership UUIDs (OVN dst-ip ECMP). */
+    public static final String EXT_ID_STATIC_ROUTE = "cs-static-route";
+
     /** external_ids key marking a plugin-owned public IPv6 {@code Load_Balancer}
      *  row (see {@code ovn.lr.public.ipv6.lb}). The value is a stable entry key
      *  {@code <network-uuid>|<vip>|<port>} so the reconciler can add / update /

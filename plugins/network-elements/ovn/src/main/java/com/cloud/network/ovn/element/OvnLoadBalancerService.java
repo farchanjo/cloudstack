@@ -458,6 +458,9 @@ public class OvnLoadBalancerService extends AdapterBase {
         // after member remove / destroy+recreate on their next apply touch.
         attachToTierLs(nb, controller, network, lbUuid);
         configureHealthCheck(nb, network, rule, lbUuid);
+        // Self-heal BGP /32 for the VIP on every re-apply (idempotent; keyed by
+        // public IP id so multi-rule VIPs collapse to one BGP_ANNOUNCE row).
+        announceLbVip(network, rule);
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller, final String lrUuid,
@@ -503,9 +506,8 @@ public class OvnLoadBalancerService extends AdapterBase {
             throw oe;
         }
         LOGGER.info("OvnLoadBalancerService: LB {} revoked (rule id={})", mapping.getOvnUuid(), rule.getId());
-        // Best-effort withdraw — if another LB or NAT rule shares the public
-        // IP, the announce path on its next applyOne() touch re-creates the
-        // BGP_ANNOUNCE row.
+        // Refcount-gated: withdraw only when no remaining LB / PF / StaticNat /
+        // SNAT still uses this public IP (see OvnBgpRedistributeManager.withdraw).
         withdrawLbVip(network, rule);
     }
 

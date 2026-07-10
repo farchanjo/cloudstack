@@ -17,9 +17,12 @@
 package com.cloud.network.ovn.element;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -67,6 +70,7 @@ import com.cloud.network.element.VpcProvider;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
 import com.cloud.network.ovn.config.OvnLspAddresses;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnNicConfig;
@@ -90,6 +94,7 @@ import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.rules.StaticNat;
 import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.PrivateGateway;
+import com.cloud.network.vpc.StaticRoute;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
 import com.cloud.network.vpc.VpcOffering;
@@ -2119,17 +2124,200 @@ public class OvnNetworkElement extends AdapterBase
 
     @Override
     public boolean applyStaticRoutes(final Vpc vpc, final List<StaticRouteProfile> routes) {
-        // Static routes via Logical_Router_Static_Route — already supported in
-        // OvnNbClient.addLogicalRouterStaticRoute. Wiring routes from the
-        // CloudStack StaticRoute table to OVN is layered when the Phase F.x
-        // public network manager goes live; for now accept the call so the
-        // VPC orchestration does not fail.
+        // Push createStaticRoute rows onto the VPC LR as OVN
+        // Logical_Router_Static_Route. Multi-NH ECMP is native OVN dst-ip
+        // (policy=null): multiple rows share ip_prefix with different nexthop.
+        // Ownership external_ids:cs-static-route=<static_route_uuid> — never
+        // touch cs-ecmp-route (ConfigKey) rows.
         if (routes == null || routes.isEmpty()) {
             return true;
         }
-        LOGGER.debug("OvnNetworkElement.applyStaticRoutes: vpc id={} {} route(s) accepted as no-op",
-                vpc.getId(), routes.size());
-        return true;
+        if (vpc == null) {
+            return false;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(vpc.getZoneId());
+        if (controller == null) {
+            LOGGER.warn("OvnNetworkElement.applyStaticRoutes: vpc id={} no controller for zone {}; skip",
+                    vpc.getId(), vpc.getZoneId());
+            return true;
+        }
+        final OvnLogicalIdMapVO lrMapping = logicalIdMapDao.findByCsId(Kind.VPC, vpc.getId(), controller.getId());
+        if (lrMapping == null || StringUtils.isBlank(lrMapping.getOvnUuid())) {
+            LOGGER.warn("OvnNetworkElement.applyStaticRoutes: vpc id={} no VPC LR mapping; skip",
+                    vpc.getId());
+            return true;
+        }
+        final OvnNbClient nb = pluginManager.nbClient(vpc.getZoneId());
+        if (nb == null) {
+            LOGGER.error("OvnNetworkElement.applyStaticRoutes: vpc id={} nb client unavailable",
+                    vpc.getId());
+            return false;
+        }
+        try {
+            final List<EcmpStaticRoute> existing = nb.listEcmpStaticRoutes(OvnConstants.EXT_ID_STATIC_ROUTE);
+            final StaticRoutePlan plan = planStaticRoutes(routes, existing);
+            applyStaticRoutePlan(nb, lrMapping.getOvnUuid(), plan);
+            LOGGER.info("OvnNetworkElement.applyStaticRoutes: vpc id={} lr={} +{} -{} (desired={})",
+                    vpc.getId(), lrMapping.getOvnUuid(), plan.getToAdd().size(),
+                    plan.getToRemove().size(), plan.getDesiredCount());
+            return true;
+        } catch (OvnException e) {
+            LOGGER.error("OvnNetworkElement.applyStaticRoutes: vpc id={} failed: {}",
+                    vpc.getId(), e.getMessage());
+            return false;
+        } catch (RuntimeException e) {
+            LOGGER.error("OvnNetworkElement.applyStaticRoutes: vpc id={} unexpected failure: {}",
+                    vpc.getId(), e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Diff CloudStack {@link StaticRouteProfile}s against owned NB rows
+     * ({@link OvnConstants#EXT_ID_STATIC_ROUTE}). Pure planner — no NB I/O.
+     * Only considers existing rows whose owner UUID appears in {@code routes}
+     * so ConfigKey ECMP ({@code cs-ecmp-route}) and other VPCs' routes are
+     * never in scope. Multi-NH same CIDR produces multiple desired entries.
+     */
+    static StaticRoutePlan planStaticRoutes(final List<StaticRouteProfile> routes,
+                                            final List<EcmpStaticRoute> existingOwned) {
+        final Map<String, DesiredStaticRoute> desired = new HashMap<>();
+        final Set<String> managedOwners = new HashSet<>();
+        if (routes != null) {
+            for (final StaticRouteProfile profile : routes) {
+                if (profile == null || StringUtils.isBlank(profile.getUuid())) {
+                    continue;
+                }
+                managedOwners.add(profile.getUuid());
+                if (!isDesiredStaticRouteState(profile.getState())) {
+                    continue;
+                }
+                final String prefix = profile.getCidr();
+                final String nh = nextHopOf(profile);
+                if (StringUtils.isBlank(prefix) || StringUtils.isBlank(nh)) {
+                    continue;
+                }
+                desired.put(profile.getUuid(), new DesiredStaticRoute(profile.getUuid(), prefix, nh));
+            }
+        }
+        final List<DesiredStaticRoute> toAdd = new ArrayList<>();
+        final List<String> toRemove = new ArrayList<>();
+        final Set<String> matchedOwners = new HashSet<>();
+        if (existingOwned != null) {
+            for (final EcmpStaticRoute row : existingOwned) {
+                if (row == null || StringUtils.isBlank(row.getOwner())) {
+                    continue;
+                }
+                if (!managedOwners.contains(row.getOwner())) {
+                    // Other VPC / unknown owner — leave alone.
+                    continue;
+                }
+                final DesiredStaticRoute want = desired.get(row.getOwner());
+                if (want == null) {
+                    // Revoked or no longer desired — drop the NB row.
+                    toRemove.add(row.getUuid());
+                    continue;
+                }
+                if (Objects.equals(want.getPrefix(), row.getPrefix())
+                        && Objects.equals(want.getNexthop(), row.getNexthop())) {
+                    matchedOwners.add(row.getOwner());
+                } else {
+                    // Prefix/nh drift — replace.
+                    toRemove.add(row.getUuid());
+                }
+            }
+        }
+        for (final DesiredStaticRoute want : desired.values()) {
+            if (!matchedOwners.contains(want.getOwner())) {
+                toAdd.add(want);
+            }
+        }
+        return new StaticRoutePlan(toAdd, toRemove, desired.size());
+    }
+
+    /** Apply a {@link StaticRoutePlan}: adds stamp {@code cs-static-route}; removes by UUID. */
+    private void applyStaticRoutePlan(final OvnNbClient nb, final String lrUuid, final StaticRoutePlan plan) {
+        for (final DesiredStaticRoute add : plan.getToAdd()) {
+            nb.addLogicalRouterStaticRoute(lrUuid, add.getPrefix(), add.getNexthop(), null, null,
+                    Collections.singletonMap(OvnConstants.EXT_ID_STATIC_ROUTE, add.getOwner()));
+        }
+        for (final String routeUuid : plan.getToRemove()) {
+            nb.deleteLogicalRouterStaticRouteDirect(routeUuid);
+        }
+    }
+
+    /** Next hop for a profile: prefer {@link StaticRouteProfile#getGateway()}
+     *  (populated for both gateway- and next-hop-based constructors), else
+     *  {@link StaticRouteProfile#getNextHop()}. */
+    static String nextHopOf(final StaticRouteProfile profile) {
+        if (profile == null) {
+            return null;
+        }
+        if (StringUtils.isNotBlank(profile.getGateway())) {
+            return profile.getGateway();
+        }
+        return profile.getNextHop();
+    }
+
+    private static boolean isDesiredStaticRouteState(final StaticRoute.State state) {
+        return state == StaticRoute.State.Add
+                || state == StaticRoute.State.Active
+                || state == StaticRoute.State.Update;
+    }
+
+    /** Desired createStaticRoute row to install on the VPC LR. */
+    static final class DesiredStaticRoute {
+        private final String owner;
+        private final String prefix;
+        private final String nexthop;
+
+        DesiredStaticRoute(final String owner, final String prefix, final String nexthop) {
+            this.owner = owner;
+            this.prefix = prefix;
+            this.nexthop = nexthop;
+        }
+
+        String getOwner() {
+            return owner;
+        }
+
+        String getPrefix() {
+            return prefix;
+        }
+
+        String getNexthop() {
+            return nexthop;
+        }
+    }
+
+    /** Diff result for VPC static routes: rows to insert and NB UUIDs to delete. */
+    static final class StaticRoutePlan {
+        private final List<DesiredStaticRoute> toAdd;
+        private final List<String> toRemove;
+        private final int desiredCount;
+
+        StaticRoutePlan(final List<DesiredStaticRoute> toAdd, final List<String> toRemove,
+                        final int desiredCount) {
+            this.toAdd = toAdd == null ? List.of() : List.copyOf(toAdd);
+            this.toRemove = toRemove == null ? List.of() : List.copyOf(toRemove);
+            this.desiredCount = desiredCount;
+        }
+
+        List<DesiredStaticRoute> getToAdd() {
+            return toAdd;
+        }
+
+        List<String> getToRemove() {
+            return toRemove;
+        }
+
+        int getDesiredCount() {
+            return desiredCount;
+        }
+
+        int size() {
+            return toAdd.size() + toRemove.size();
+        }
     }
 
     @Override

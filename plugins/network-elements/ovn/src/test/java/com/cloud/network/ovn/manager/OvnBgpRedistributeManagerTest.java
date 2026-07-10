@@ -17,17 +17,22 @@
 package com.cloud.network.ovn.manager;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
+import java.util.Collections;
 import java.util.List;
 
 import org.junit.Before;
@@ -38,7 +43,12 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceAnswer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.network.IpAddress;
+import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
+import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
@@ -47,6 +57,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
+import com.cloud.utils.net.Ip;
 
 /**
  * Unit tests for the BGP /32 redistribute manager. Mocks the agent surface
@@ -70,6 +81,7 @@ public class OvnBgpRedistributeManagerTest {
     private OvnChassisMapDao chassisMapDao;
     private OvnPublicNetworkManager publicNetworkManager;
     private IPAddressDao ipAddressDao;
+    private FirewallRulesDao firewallRulesDao;
     private OvnNbClient nbClient;
     private OvnBgpRedistributeManager manager;
 
@@ -81,6 +93,7 @@ public class OvnBgpRedistributeManagerTest {
         chassisMapDao = mock(OvnChassisMapDao.class);
         publicNetworkManager = mock(OvnPublicNetworkManager.class);
         ipAddressDao = mock(IPAddressDao.class);
+        firewallRulesDao = mock(FirewallRulesDao.class);
         nbClient = mock(OvnNbClient.class);
 
         final OvnControllerVO controller = mock(OvnControllerVO.class);
@@ -101,6 +114,10 @@ public class OvnBgpRedistributeManagerTest {
         when(chassisRow.getHostId()).thenReturn(HOST_ID);
         when(chassisMapDao.findByChassisUuid(CHASSIS_NAME)).thenReturn(chassisRow);
 
+        // Default: no remaining SNAT/StaticNat/LB/PF users so withdraw is free.
+        when(ipAddressDao.findById(anyLong())).thenReturn(null);
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(anyLong(), any())).thenReturn(Collections.emptyList());
+
         manager = new OvnBgpRedistributeManager();
         injectField(manager, "agentManager", agentManager);
         injectField(manager, "pluginManager", pluginManager);
@@ -108,6 +125,7 @@ public class OvnBgpRedistributeManagerTest {
         injectField(manager, "chassisMapDao", chassisMapDao);
         injectField(manager, "publicNetworkManager", publicNetworkManager);
         injectField(manager, "ipAddressDao", ipAddressDao);
+        injectField(manager, "firewallRulesDao", firewallRulesDao);
     }
 
     @Test
@@ -203,6 +221,112 @@ public class OvnBgpRedistributeManagerTest {
         assertEquals(PUBLIC_IP, captor.getValue().getPublicIp());
 
         verify(logicalIdMapDao, times(1)).remove(eq(99L));
+    }
+
+    @Test
+    public void withdrawSkippedWhenSiblingLbStillUsesPublicIp() {
+        final FirewallRuleVO sibling = mock(FirewallRuleVO.class);
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.LoadBalancing)))
+                .thenReturn(List.of(sibling));
+
+        final OvnLogicalIdMapVO row = mock(OvnLogicalIdMapVO.class);
+        when(logicalIdMapDao.findByCsId(eq(Kind.BGP_ANNOUNCE), eq(IP_ADDR_ID), eq(CONTROLLER_ID)))
+                .thenReturn(row);
+
+        manager.withdraw(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        verify(agentManager, never()).easySend(any(), any());
+        verify(logicalIdMapDao, never()).remove(anyLong());
+    }
+
+    @Test
+    public void withdrawSkippedWhenSourceNatStillUsesPublicIp() {
+        final IPAddressVO ip = mock(IPAddressVO.class);
+        when(ip.isSourceNat()).thenReturn(true);
+        when(ipAddressDao.findById(eq(IP_ADDR_ID))).thenReturn(ip);
+
+        manager.withdraw(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        verify(agentManager, never()).easySend(any(), any());
+        verify(logicalIdMapDao, never()).remove(anyLong());
+    }
+
+    @Test
+    public void publicIpHasActiveUsersTrueForOneToOneNat() {
+        final IPAddressVO ip = mock(IPAddressVO.class);
+        when(ip.isSourceNat()).thenReturn(false);
+        when(ip.isOneToOneNat()).thenReturn(true);
+        when(ipAddressDao.findById(eq(IP_ADDR_ID))).thenReturn(ip);
+        assertTrue(manager.publicIpHasActiveUsers(IP_ADDR_ID));
+    }
+
+    @Test
+    public void publicIpHasActiveUsersTrueForPortForward() {
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.PortForwarding)))
+                .thenReturn(List.of(mock(FirewallRuleVO.class)));
+        assertTrue(manager.publicIpHasActiveUsers(IP_ADDR_ID));
+    }
+
+    @Test
+    public void publicIpHasActiveUsersFalseWhenIdle() {
+        assertFalse(manager.publicIpHasActiveUsers(IP_ADDR_ID));
+    }
+
+    @Test
+    public void inventMissingAnnouncesOnlyAbsentBgpRows() {
+        manager = spy(manager);
+        doReturn(true).when(manager).isPublicRedistributeEnabled();
+
+        final IPAddressVO missing = mock(IPAddressVO.class);
+        when(missing.getId()).thenReturn(IP_ADDR_ID);
+        when(missing.getVpcId()).thenReturn(VPC_ID);
+        when(missing.getState()).thenReturn(IpAddress.State.Allocated);
+        when(missing.getAddress()).thenReturn(new Ip(PUBLIC_IP));
+        when(missing.isSourceNat()).thenReturn(true);
+        when(ipAddressDao.findById(eq(IP_ADDR_ID))).thenReturn(missing);
+        when(ipAddressDao.listByDcId(eq(ZONE_ID))).thenReturn(List.of(missing));
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        // No BGP_ANNOUNCE row yet.
+        when(logicalIdMapDao.findByCsId(eq(Kind.BGP_ANNOUNCE), eq(IP_ADDR_ID), eq(CONTROLLER_ID)))
+                .thenReturn(null);
+        when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
+
+        final int attempted = manager.ensurePublicIpv4AnnouncesForZone(ZONE_ID);
+        assertEquals(1, attempted);
+        verify(agentManager, times(1)).easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class));
+        verify(logicalIdMapDao, times(1)).persist(any(OvnLogicalIdMapVO.class));
+    }
+
+    @Test
+    public void inventMissingSkipsAlreadyAnnouncedIp() {
+        manager = spy(manager);
+        doReturn(true).when(manager).isPublicRedistributeEnabled();
+
+        final IPAddressVO present = mock(IPAddressVO.class);
+        when(present.getId()).thenReturn(IP_ADDR_ID);
+        when(present.getVpcId()).thenReturn(VPC_ID);
+        when(present.getState()).thenReturn(IpAddress.State.Allocated);
+        when(present.getAddress()).thenReturn(new Ip(PUBLIC_IP));
+        when(present.isSourceNat()).thenReturn(true);
+        when(ipAddressDao.findById(eq(IP_ADDR_ID))).thenReturn(present);
+        when(ipAddressDao.listByDcId(eq(ZONE_ID))).thenReturn(List.of(present));
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        when(logicalIdMapDao.findByCsId(eq(Kind.BGP_ANNOUNCE), eq(IP_ADDR_ID), eq(CONTROLLER_ID)))
+                .thenReturn(mock(OvnLogicalIdMapVO.class));
+
+        final int attempted = manager.ensurePublicIpv4AnnouncesForZone(ZONE_ID);
+        assertEquals(0, attempted);
+        verify(agentManager, never()).easySend(any(), any());
+    }
+
+    @Test
+    public void inventMissingNoOpWhenGlobalToggleOff() {
+        manager = spy(manager);
+        doReturn(false).when(manager).isPublicRedistributeEnabled();
+        final int attempted = manager.ensurePublicIpv4AnnouncesForZone(ZONE_ID);
+        assertEquals(0, attempted);
+        verify(ipAddressDao, never()).listByDcId(anyLong());
     }
 
     @Test

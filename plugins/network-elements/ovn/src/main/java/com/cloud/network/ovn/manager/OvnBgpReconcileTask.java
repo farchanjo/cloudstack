@@ -127,6 +127,15 @@ public class OvnBgpReconcileTask {
                     LOGGER.warn("OvnBgpReconcileTask: zone={} reconcile failed: {}",
                             ctrl.getZoneId(), re.getMessage());
                 }
+                // Invent-missing /32 announces (SNAT + StaticNat + LB + PF VIPs)
+                // after gateway-chassis migration reconcile so a lost BGP_ANNOUNCE
+                // row self-heals without waiting for a service re-apply.
+                try {
+                    bgpRedistributeManager.ensurePublicIpv4AnnouncesForZone(ctrl.getZoneId());
+                } catch (RuntimeException re) {
+                    LOGGER.warn("OvnBgpReconcileTask: zone={} public IPv4 invent-missing failed: {}",
+                            ctrl.getZoneId(), re.getMessage());
+                }
             }
         } catch (RuntimeException re) {
             LOGGER.warn("OvnBgpReconcileTask: tick failed: {}", re.getMessage());

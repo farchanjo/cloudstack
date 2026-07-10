@@ -42,6 +42,7 @@ import org.mockito.ArgumentCaptor;
 
 import com.cloud.network.Network;
 import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.lb.LoadBalancingRule;
 import com.cloud.network.lb.LoadBalancingRule.LbDestination;
 import com.cloud.network.ovn.client.OvnNbClient;
@@ -71,12 +72,17 @@ public class OvnLoadBalancerServiceTest {
     private static final long VPC_ID = 9L;
     private static final String LR_UUID = "lr-uuid-vpc-9";
 
+    private static final long IP_ADDR_ID = 77L;
+    private static final String PUBLIC_IP = "192.168.100.40";
+
     private OvnPluginManager pluginManager;
     private OvnLogicalIdMapDao logicalIdMapDao;
     private OvnNbClient nbClient;
     private OvnControllerVO controller;
     private Network network;
     private NicDao nicDao;
+    private IPAddressDao ipAddressDao;
+    private OvnBgpRedistributeManager bgpRedistributeManager;
     private OvnLoadBalancerService service;
 
     @Before
@@ -87,6 +93,8 @@ public class OvnLoadBalancerServiceTest {
         controller = mock(OvnControllerVO.class);
         network = mock(Network.class);
         nicDao = mock(NicDao.class);
+        ipAddressDao = mock(IPAddressDao.class);
+        bgpRedistributeManager = mock(OvnBgpRedistributeManager.class);
 
         when(controller.getId()).thenReturn(CONTROLLER_ID);
         when(pluginManager.findControllerForZone(ZONE_ID)).thenReturn(controller);
@@ -108,8 +116,8 @@ public class OvnLoadBalancerServiceTest {
         service = new OvnLoadBalancerService();
         injectField(service, "pluginManager", pluginManager);
         injectField(service, "logicalIdMapDao", logicalIdMapDao);
-        injectField(service, "ipAddressDao", mock(IPAddressDao.class));
-        injectField(service, "bgpRedistributeManager", mock(OvnBgpRedistributeManager.class));
+        injectField(service, "ipAddressDao", ipAddressDao);
+        injectField(service, "bgpRedistributeManager", bgpRedistributeManager);
         injectField(service, "pendingDeletionDao", mock(OvnPendingDeletionDao.class));
         injectField(service, "nicDao", nicDao);
     }
@@ -185,8 +193,9 @@ public class OvnLoadBalancerServiceTest {
         // The OVN row must still exist so applyOne takes the update-backends
         // fast path instead of falling through to recreate.
         when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-existing"))).thenReturn(true);
+        stubSourceIpRow(PUBLIC_IP, IP_ADDR_ID);
 
-        final LoadBalancingRule rule = lbRule(404L, "192.168.100.40", 80, 80,
+        final LoadBalancingRule rule = lbRule(404L, PUBLIC_IP, 80, 80,
                 List.of(dest("10.0.0.5", 80, false), dest("10.0.0.6", 80, false), dest("10.0.0.7", 80, false)),
                 "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
 
@@ -196,6 +205,38 @@ public class OvnLoadBalancerServiceTest {
         final ArgumentCaptor<Map<String, String>> capt = mapCaptor();
         verify(nbClient, times(1)).updateLoadBalancerBackends(eq("lb-uuid-existing"), capt.capture());
         assertEquals("10.0.0.5:80,10.0.0.6:80,10.0.0.7:80", capt.getValue().get("192.168.100.40:80"));
+        // Update path must self-heal the BGP /32 announce for the VIP.
+        verify(bgpRedistributeManager, times(1)).announce(eq(PUBLIC_IP), eq(IP_ADDR_ID), eq(VPC_ID), eq(ZONE_ID));
+    }
+
+    @Test
+    public void createPathAnnouncesLbVip() throws Exception {
+        when(nbClient.createLoadBalancer(anyString(), anyMap(), anyString(), anyList(), anyMap(), anyMap()))
+                .thenReturn("lb-uuid-create");
+        stubSourceIpRow("192.168.100.10", IP_ADDR_ID);
+
+        final LoadBalancingRule rule = lbRule(401L, "192.168.100.10", 80, 80,
+                List.of(dest("10.0.0.5", 80, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
+
+        assertTrue(service.applyLBRules(network, List.of(rule)));
+        verify(bgpRedistributeManager, times(1)).announce(eq("192.168.100.10"), eq(IP_ADDR_ID), eq(VPC_ID), eq(ZONE_ID));
+    }
+
+    @Test
+    public void revokePathWithdrawsLbVip() throws Exception {
+        final OvnLogicalIdMapVO mapping = mock(OvnLogicalIdMapVO.class);
+        when(mapping.getId()).thenReturn(909L);
+        when(mapping.getOvnUuid()).thenReturn("lb-uuid-revoke");
+        when(logicalIdMapDao.findByCsId(eq(Kind.LOAD_BALANCER), eq(405L), eq(CONTROLLER_ID))).thenReturn(mapping);
+        stubSourceIpRow("192.168.100.50", IP_ADDR_ID);
+
+        final LoadBalancingRule rule = lbRule(405L, "192.168.100.50", 80, 80,
+                List.of(dest("10.0.0.5", 80, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Revoke, List.of());
+
+        assertTrue(service.applyLBRules(network, List.of(rule)));
+        verify(bgpRedistributeManager, times(1)).withdraw(eq("192.168.100.50"), eq(IP_ADDR_ID), eq(VPC_ID), eq(ZONE_ID));
     }
 
     /**
@@ -386,12 +427,20 @@ public class OvnLoadBalancerServiceTest {
         when(lb.getAlgorithm()).thenReturn(algorithm);
         when(lb.getState()).thenReturn(state);
         when(lb.getNetworkId()).thenReturn(NETWORK_ID);
+        when(lb.getSourceIpAddressId()).thenReturn(IP_ADDR_ID);
 
         return new LoadBalancingRule(lb, dests, stickiness, List.of(), new Ip(vipIp), null, lbProtocol);
     }
 
     private static LbDestination dest(final String ip, final int port, final boolean revoked) {
         return new LbDestination(port, port, ip, revoked);
+    }
+
+    private void stubSourceIpRow(final String addr, final long ipId) {
+        final IPAddressVO row = mock(IPAddressVO.class);
+        when(row.getId()).thenReturn(ipId);
+        when(row.getAddress()).thenReturn(new Ip(addr));
+        when(ipAddressDao.findById(eq(ipId))).thenReturn(row);
     }
 
     private void stubBackendNic(final String ip, final String nicUuid) {

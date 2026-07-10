@@ -35,7 +35,11 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
 import com.cloud.network.IpAddress;
+import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
+import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
@@ -99,6 +103,8 @@ public class OvnBgpRedistributeManager {
     private OvnPublicNetworkManager publicNetworkManager;
     @Inject
     private IPAddressDao ipAddressDao;
+    @Inject
+    private FirewallRulesDao firewallRulesDao;
 
     /**
      * Announce the supplied public IP as a {@code /32} via the gateway-chassis
@@ -150,9 +156,19 @@ public class OvnBgpRedistributeManager {
      * Withdraw the supplied public IP from FRR on whatever host last
      * announced it. Removes the bookkeeping row regardless of agent
      * success — best-effort cleanup. Safe to call multiple times.
+     *
+     * <p><b>Refcount safety</b>: if any remaining SourceNAT / StaticNAT /
+     * LoadBalancer / PortForward still uses {@code ipAddrId}, the withdraw is
+     * skipped so a sibling rule does not black-hole inbound traffic. The
+     * periodic invent-missing pass re-announces if a race still drops the row.
      */
     public void withdraw(final String publicIp, final long ipAddrId, final long vpcId, final long zoneId) {
         if (StringUtils.isBlank(publicIp)) {
+            return;
+        }
+        if (publicIpHasActiveUsers(ipAddrId)) {
+            LOGGER.info("OvnBgpRedistribute.withdraw: {}/32 retained (ip_id={} still used by SNAT/StaticNat/LB/PF)",
+                    publicIp, ipAddrId);
             return;
         }
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
@@ -179,6 +195,94 @@ public class OvnBgpRedistributeManager {
         }
         LOGGER.info("OvnBgpRedistribute.withdraw: {}/32 withdrawn on host {} (ip_id={}, vpc={})",
                 publicIp, hostId, ipAddrId, vpcId);
+    }
+
+    /**
+     * Invent-missing: for every allocated public IPv4 in {@code zoneId} that
+     * is still used by SNAT / StaticNat / LB / PF on a VPC with redistribute
+     * enabled, ensure a BGP {@code /32} announce exists. Skips IPs that already
+     * have a {@link Kind#BGP_ANNOUNCE} mapping (gateway migration is handled
+     * by {@link #reconcileZone}).
+     *
+     * @return number of IPs for which {@link #announce} was attempted
+     */
+    public int ensurePublicIpv4AnnouncesForZone(final long zoneId) {
+        if (!isPublicRedistributeEnabled()) {
+            return 0;
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null || ipAddressDao == null) {
+            return 0;
+        }
+        final List<IPAddressVO> ips = ipAddressDao.listByDcId(zoneId);
+        if (ips == null || ips.isEmpty()) {
+            return 0;
+        }
+        int attempted = 0;
+        for (final IPAddressVO ip : ips) {
+            if (ip == null || ip.getVpcId() == null) {
+                continue;
+            }
+            if (ip.getState() != IpAddress.State.Allocated) {
+                continue;
+            }
+            final String publicIp = ip.getAddress() == null ? null : ip.getAddress().addr();
+            if (StringUtils.isBlank(publicIp)) {
+                continue;
+            }
+            if (!publicIpHasActiveUsers(ip.getId())) {
+                continue;
+            }
+            if (!isEnabled(ip.getVpcId())) {
+                continue;
+            }
+            final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                    Kind.BGP_ANNOUNCE, ip.getId(), controller.getId());
+            if (existing != null) {
+                continue;
+            }
+            announce(publicIp, ip.getId(), ip.getVpcId(), zoneId);
+            attempted++;
+        }
+        if (attempted > 0) {
+            LOGGER.info("OvnBgpRedistribute.ensurePublicIpv4AnnouncesForZone: zone={} attempted {} missing /32 announce(s)",
+                    zoneId, attempted);
+        }
+        return attempted;
+    }
+
+    /**
+     * True when the public IP still needs a BGP /32: SourceNAT flag, StaticNAT
+     * (one-to-one) flag, or any non-revoked LoadBalancing / PortForwarding /
+     * StaticNat firewall purpose rule.
+     *
+     * <p>Package-visible for unit tests.
+     */
+    boolean publicIpHasActiveUsers(final long ipAddrId) {
+        if (ipAddressDao != null) {
+            final IPAddressVO ip = ipAddressDao.findById(ipAddrId);
+            if (ip != null) {
+                if (ip.isSourceNat() || ip.isOneToOneNat()) {
+                    return true;
+                }
+            }
+        }
+        if (firewallRulesDao == null) {
+            return false;
+        }
+        if (hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.LoadBalancing)) {
+            return true;
+        }
+        if (hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.PortForwarding)) {
+            return true;
+        }
+        return hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.StaticNat);
+    }
+
+    private boolean hasNonRevokedPurpose(final long ipAddrId, final FirewallRule.Purpose purpose) {
+        final List<FirewallRuleVO> rules =
+                firewallRulesDao.listByIpAndPurposeAndNotRevoked(ipAddrId, purpose);
+        return rules != null && !rules.isEmpty();
     }
 
     /**
@@ -520,8 +624,16 @@ public class OvnBgpRedistributeManager {
      * announce on the new host and withdraw from the old. Designed to be
      * invoked periodically (see {@link OvnNetworkConfig#BgpReconcileIntervalSeconds}).
      */
+    /**
+     * Global public-IP /32 toggle. Package-visible so unit tests can spy the
+     * gate without wiring the static {@code ConfigDepot}.
+     */
+    boolean isPublicRedistributeEnabled() {
+        return Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value());
+    }
+
     public void reconcileZone(final long zoneId) {
-        if (!Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value())) {
+        if (!isPublicRedistributeEnabled()) {
             // Global toggle off — even VPC-level overrides only matter if
             // the operator explicitly turns the global on. This avoids
             // surprise announces when the global default is left at false.
