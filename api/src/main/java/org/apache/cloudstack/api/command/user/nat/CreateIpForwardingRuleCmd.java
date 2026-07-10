@@ -200,6 +200,11 @@ public class CreateIpForwardingRuleCmd extends BaseAsyncCreateCmd implements Sta
     }
 
     @Override
+    public Long getPublicIpv6AddressId() {
+        return null;
+    }
+
+    @Override
     public Integer getSourcePortStart() {
         return startPort;
     }

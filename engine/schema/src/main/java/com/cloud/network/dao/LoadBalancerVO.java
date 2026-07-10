@@ -69,7 +69,12 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
     public LoadBalancerVO() {
     }
 
-    public LoadBalancerVO(String xId, String name, String description, long srcIpId, int srcPort, int dstPort, String algorithm, long networkId, long accountId,
+    /**
+     * Public LB bound to an IPv4 public IP ({@code srcIpId} non-null) and/or a
+     * public IPv6 inventory row. Either source may be null for dual-stack prep,
+     * but production IPv4 path always passes a non-null {@code srcIpId}.
+     */
+    public LoadBalancerVO(String xId, String name, String description, Long srcIpId, int srcPort, int dstPort, String algorithm, long networkId, long accountId,
             long domainId, String lbProtocol, String cidrList) {
         super(xId, srcIpId, srcPort, NetUtils.TCP_PROTO, networkId, accountId, domainId, Purpose.LoadBalancing, null, null, null, null);
         this.name = name;
@@ -80,6 +85,28 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
         this.scheme = Scheme.Public;
         this.lbProtocol = lbProtocol;
         this.cidrList = cidrList;
+    }
+
+    /**
+     * Public LB optionally bound to IPv4 ({@code srcIpId}) and/or public IPv6
+     * ({@code publicIpv6AddressId}). Both may not be required simultaneously —
+     * IPv6-only rules pass {@code srcIpId == null} (must use the Long-accepting
+     * {@link FirewallRuleVO} constructor; do not unbox to primitive long).
+     */
+    public LoadBalancerVO(String xId, String name, String description, Long srcIpId, Long publicIpv6AddressId, int srcPort, int dstPort,
+            String algorithm, long networkId, long accountId, long domainId, String lbProtocol, String cidrList) {
+        // Long ipAddressId path — null-safe for IPv6-only public VIP rules
+        super(xId, srcIpId, srcPort, srcPort, NetUtils.TCP_PROTO, networkId, accountId, domainId, Purpose.LoadBalancing,
+                null, null, null, null, null);
+        this.name = name;
+        this.description = description;
+        this.algorithm = algorithm;
+        this.defaultPortStart = dstPort;
+        this.defaultPortEnd = dstPort;
+        this.scheme = Scheme.Public;
+        this.lbProtocol = lbProtocol;
+        this.cidrList = cidrList;
+        setPublicIpv6AddressId(publicIpv6AddressId);
     }
 
     @Override

@@ -28,13 +28,17 @@ import org.springframework.stereotype.Component;
 import com.cloud.network.rules.FirewallRule.State;
 import com.cloud.network.rules.LoadBalancerContainer.Scheme;
 import com.cloud.utils.db.GenericDaoBase;
+import com.cloud.utils.db.GenericSearchBuilder;
 import com.cloud.utils.db.SearchBuilder;
 import com.cloud.utils.db.SearchCriteria;
+import com.cloud.utils.db.SearchCriteria.Func;
 import com.cloud.utils.db.SearchCriteria.Op;
 
 @Component
 public class LoadBalancerDaoImpl extends GenericDaoBase<LoadBalancerVO, Long> implements LoadBalancerDao {
     private final SearchBuilder<LoadBalancerVO> ListByIp;
+    private final SearchBuilder<LoadBalancerVO> ListByPublicIpv6;
+    private final GenericSearchBuilder<LoadBalancerVO, Long> CountNotRevokedByPublicIpv6;
     protected final SearchBuilder<LoadBalancerVO> TransitionStateSearch;
     private SearchBuilder<LoadBalancerVO> ListByVpcId;
 
@@ -63,6 +67,16 @@ public class LoadBalancerDaoImpl extends GenericDaoBase<LoadBalancerVO, Long> im
         ListByIp.and("scheme", ListByIp.entity().getScheme(), SearchCriteria.Op.EQ);
         ListByIp.done();
 
+        ListByPublicIpv6 = createSearchBuilder();
+        ListByPublicIpv6.and("publicIpv6AddressId", ListByPublicIpv6.entity().getPublicIpv6AddressId(), Op.EQ);
+        ListByPublicIpv6.done();
+
+        CountNotRevokedByPublicIpv6 = createSearchBuilder(Long.class);
+        CountNotRevokedByPublicIpv6.select(null, Func.COUNT, CountNotRevokedByPublicIpv6.entity().getId());
+        CountNotRevokedByPublicIpv6.and("publicIpv6AddressId", CountNotRevokedByPublicIpv6.entity().getPublicIpv6AddressId(), Op.EQ);
+        CountNotRevokedByPublicIpv6.and("state", CountNotRevokedByPublicIpv6.entity().getState(), Op.NEQ);
+        CountNotRevokedByPublicIpv6.done();
+
         TransitionStateSearch = createSearchBuilder();
         TransitionStateSearch.and("networkId", TransitionStateSearch.entity().getNetworkId(), Op.EQ);
         TransitionStateSearch.and("state", TransitionStateSearch.entity().getState(), Op.IN);
@@ -75,6 +89,21 @@ public class LoadBalancerDaoImpl extends GenericDaoBase<LoadBalancerVO, Long> im
         SearchCriteria<LoadBalancerVO> sc = ListByIp.create();
         sc.setParameters("ipAddressId", ipAddressId);
         return listBy(sc);
+    }
+
+    @Override
+    public List<LoadBalancerVO> listByPublicIpv6AddressId(long publicIpv6AddressId) {
+        SearchCriteria<LoadBalancerVO> sc = ListByPublicIpv6.create();
+        sc.setParameters("publicIpv6AddressId", publicIpv6AddressId);
+        return listBy(sc);
+    }
+
+    @Override
+    public long countNotRevokedByPublicIpv6AddressId(long publicIpv6AddressId) {
+        SearchCriteria<Long> sc = CountNotRevokedByPublicIpv6.create();
+        sc.setParameters("publicIpv6AddressId", publicIpv6AddressId);
+        sc.setParameters("state", State.Revoke);
+        return customSearch(sc, null).get(0);
     }
 
     @Override

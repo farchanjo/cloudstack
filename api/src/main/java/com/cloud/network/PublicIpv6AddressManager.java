@@ -70,8 +70,15 @@ public interface PublicIpv6AddressManager extends Manager {
 
     /**
      * Release an allocated address back to Free (clears account/network/vpc).
+     * Fails if non-revoked load-balancer rules still reference this address.
      */
     boolean release(long id) throws ConcurrentOperationException, ResourceUnavailableException;
+
+    /**
+     * @return true if any load-balancer rule bound to this public IPv6 is not
+     *         in {@code Revoke} state.
+     */
+    boolean hasActiveLbRules(long publicIpv6AddressId);
 
     /**
      * Import a grandfathered address (e.g. {@code ::100}/{@code ::101}) as Allocated.

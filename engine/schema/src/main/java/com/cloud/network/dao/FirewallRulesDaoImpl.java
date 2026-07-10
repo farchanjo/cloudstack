@@ -51,6 +51,7 @@ public class FirewallRulesDaoImpl extends GenericDaoBase<FirewallRuleVO, Long> i
     protected SearchBuilder<FirewallRuleVO> FirewallByPortsAndNetwork;
     protected final SearchBuilder<FirewallRuleVO> SystemRuleSearch;
     protected final GenericSearchBuilder<FirewallRuleVO, Long> RulesByIpCount;
+    protected final GenericSearchBuilder<FirewallRuleVO, Long> RulesByPublicIpv6Count;
     protected final SearchBuilder<FirewallRuleVO> RoutingFirewallRulesSearch;
 
     @Inject
@@ -67,6 +68,7 @@ public class FirewallRulesDaoImpl extends GenericDaoBase<FirewallRuleVO, Long> i
 
         AllFieldsSearch = createSearchBuilder();
         AllFieldsSearch.and("ipId", AllFieldsSearch.entity().getSourceIpAddressId(), Op.EQ);
+        AllFieldsSearch.and("publicIpv6AddressId", AllFieldsSearch.entity().getPublicIpv6AddressId(), Op.EQ);
         AllFieldsSearch.and("protocol", AllFieldsSearch.entity().getProtocol(), Op.EQ);
         AllFieldsSearch.and("state", AllFieldsSearch.entity().getState(), Op.EQ);
         AllFieldsSearch.and("purpose", AllFieldsSearch.entity().getPurpose(), Op.EQ);
@@ -106,6 +108,12 @@ public class FirewallRulesDaoImpl extends GenericDaoBase<FirewallRuleVO, Long> i
         RulesByIpCount.and("ipAddressId", RulesByIpCount.entity().getSourceIpAddressId(), Op.EQ);
         RulesByIpCount.and("state", RulesByIpCount.entity().getState(), Op.EQ);
         RulesByIpCount.done();
+
+        RulesByPublicIpv6Count = createSearchBuilder(Long.class);
+        RulesByPublicIpv6Count.select(null, Func.COUNT, RulesByPublicIpv6Count.entity().getId());
+        RulesByPublicIpv6Count.and("publicIpv6AddressId", RulesByPublicIpv6Count.entity().getPublicIpv6AddressId(), Op.EQ);
+        RulesByPublicIpv6Count.and("state", RulesByPublicIpv6Count.entity().getState(), Op.NEQ);
+        RulesByPublicIpv6Count.done();
 
         FirewallByPortsAndNetwork = createSearchBuilder();
         FirewallByPortsAndNetwork.and("networkId", FirewallByPortsAndNetwork.entity().getNetworkId(), Op.EQ);
@@ -338,6 +346,21 @@ public class FirewallRulesDaoImpl extends GenericDaoBase<FirewallRuleVO, Long> i
     public long countRulesByIpId(long sourceIpId) {
         SearchCriteria<Long> sc = RulesByIpCount.create();
         sc.setParameters("ipAddressId", sourceIpId);
+        return customSearch(sc, null).get(0);
+    }
+
+    @Override
+    public List<FirewallRuleVO> listByPublicIpv6AddressId(long publicIpv6AddressId) {
+        SearchCriteria<FirewallRuleVO> sc = AllFieldsSearch.create();
+        sc.setParameters("publicIpv6AddressId", publicIpv6AddressId);
+        return listBy(sc);
+    }
+
+    @Override
+    public long countNotRevokedByPublicIpv6AddressId(long publicIpv6AddressId) {
+        SearchCriteria<Long> sc = RulesByPublicIpv6Count.create();
+        sc.setParameters("publicIpv6AddressId", publicIpv6AddressId);
+        sc.setParameters("state", State.Revoke);
         return customSearch(sc, null).get(0);
     }
 

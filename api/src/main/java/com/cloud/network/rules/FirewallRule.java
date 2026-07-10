@@ -73,6 +73,12 @@ public interface FirewallRule extends ControlledEntity, Identity, InternalIdenti
 
     Long getSourceIpAddressId();
 
+    /**
+     * @return id of the public IPv6 inventory row ({@code user_public_ipv6_address}),
+     *         or null when this rule is bound to an IPv4 public IP only.
+     */
+    Long getPublicIpv6AddressId();
+
     Integer getIcmpCode();
 
     Integer getIcmpType();

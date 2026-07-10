@@ -25,6 +25,17 @@ public interface LoadBalancerDao extends GenericDao<LoadBalancerVO, Long> {
 
     List<LoadBalancerVO> listByIpAddress(long ipAddressId);
 
+    /**
+     * Public LB rules bound to a public IPv6 inventory row (any state).
+     */
+    List<LoadBalancerVO> listByPublicIpv6AddressId(long publicIpv6AddressId);
+
+    /**
+     * Count of public LB rules on the public IPv6 inventory row whose state is
+     * not {@link com.cloud.network.rules.FirewallRule.State#Revoke}.
+     */
+    long countNotRevokedByPublicIpv6AddressId(long publicIpv6AddressId);
+
     List<LoadBalancerVO> listByNetworkIdAndScheme(long networkId, Scheme scheme);
 
     List<LoadBalancerVO> listByVpcIdAndScheme(long vpcId, Scheme scheme);

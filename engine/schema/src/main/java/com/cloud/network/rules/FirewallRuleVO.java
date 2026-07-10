@@ -62,6 +62,14 @@ public class FirewallRuleVO implements FirewallRule {
     @Column(name = "ip_address_id", updatable = false)
     Long sourceIpAddressId;
 
+    /**
+     * Optional FK to {@code user_public_ipv6_address.id}. Mutually exclusive with
+     * {@link #sourceIpAddressId} for public VIP-bound rules (IPv4 vs public IPv6).
+     * Null for IPv4-only / system / ACL rules that do not use a public IPv6 VIP.
+     */
+    @Column(name = "public_ipv6_address_id", updatable = false)
+    Long publicIpv6AddressId;
+
     @Column(name = "start_port", updatable = false)
     Integer sourcePortStart;
 
@@ -158,6 +166,15 @@ public class FirewallRuleVO implements FirewallRule {
     @Override
     public Long getSourceIpAddressId() {
         return sourceIpAddressId;
+    }
+
+    @Override
+    public Long getPublicIpv6AddressId() {
+        return publicIpv6AddressId;
+    }
+
+    public void setPublicIpv6AddressId(Long publicIpv6AddressId) {
+        this.publicIpv6AddressId = publicIpv6AddressId;
     }
 
     @Override

@@ -35,6 +35,7 @@ import com.cloud.exception.InsufficientAddressCapacityException;
 import com.cloud.exception.InvalidParameterValueException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.UserPublicIpv6Address.State;
+import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.UserPublicIpv6AddressDao;
 import com.cloud.user.Account;
 import com.cloud.user.dao.AccountDao;
@@ -61,6 +62,8 @@ public class PublicIpv6AddressManagerImpl extends ManagerBase implements PublicI
     private ConfigurationDao configDao;
     @Inject
     private AccountDao accountDao;
+    @Inject
+    private LoadBalancerDao loadBalancerDao;
 
     @Override
     public boolean configure(String name, Map<String, Object> params) throws ConfigurationException {
@@ -318,6 +321,11 @@ public class PublicIpv6AddressManagerImpl extends ManagerBase implements PublicI
     }
 
     @Override
+    public boolean hasActiveLbRules(long publicIpv6AddressId) {
+        return loadBalancerDao.countNotRevokedByPublicIpv6AddressId(publicIpv6AddressId) > 0;
+    }
+
+    @Override
     @DB
     public boolean release(long id) throws ConcurrentOperationException, ResourceUnavailableException {
         UserPublicIpv6AddressVO vo = userPublicIpv6AddressDao.lockRow(id, true);
@@ -326,6 +334,12 @@ public class PublicIpv6AddressManagerImpl extends ManagerBase implements PublicI
         }
         if (vo.getState() == State.Free) {
             return true;
+        }
+        if (hasActiveLbRules(id)) {
+            throw new ResourceUnavailableException(
+                    "Cannot disassociate public IPv6 " + vo.getAddress()
+                            + " (id=" + id + "): active load balancer rules still reference it",
+                    UserPublicIpv6Address.class, id);
         }
         Long accountId = vo.getAccountIdObject();
         Account locked = null;

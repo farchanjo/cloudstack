@@ -192,6 +192,11 @@ public class CreateFirewallRuleCmd extends BaseAsyncCreateCmd implements Firewal
     }
 
     @Override
+    public Long getPublicIpv6AddressId() {
+        return null;
+    }
+
+    @Override
     public Integer getSourcePortStart() {
         if (publicStartPort != null) {
             return publicStartPort;

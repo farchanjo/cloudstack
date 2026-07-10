@@ -255,6 +255,11 @@ public class CreatePortForwardingRuleCmd extends BaseAsyncCreateCmd implements P
     }
 
     @Override
+    public Long getPublicIpv6AddressId() {
+        return null;
+    }
+
+    @Override
     public Integer getSourcePortStart() {
         return publicStartPort.intValue();
     }

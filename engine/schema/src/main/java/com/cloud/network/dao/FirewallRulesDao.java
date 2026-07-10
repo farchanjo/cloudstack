@@ -65,6 +65,17 @@ public interface FirewallRulesDao extends GenericDao<FirewallRuleVO, Long> {
 
     long countRulesByIpIdAndState(long sourceIpId, FirewallRule.State state);
 
+    /**
+     * All firewall rules (any purpose/state) bound to a public IPv6 inventory row.
+     */
+    List<FirewallRuleVO> listByPublicIpv6AddressId(long publicIpv6AddressId);
+
+    /**
+     * Count of rules bound to the public IPv6 inventory row whose state is not
+     * {@link FirewallRule.State#Revoke}.
+     */
+    long countNotRevokedByPublicIpv6AddressId(long publicIpv6AddressId);
+
     List<FirewallRuleVO> listByNetworkPurposeTrafficTypeAndNotRevoked(long networkId, FirewallRule.Purpose purpose, FirewallRule.TrafficType trafficType);
 
     List<FirewallRuleVO> listByNetworkPurposeTrafficType(long networkId, FirewallRule.Purpose purpose, FirewallRule.TrafficType trafficType);

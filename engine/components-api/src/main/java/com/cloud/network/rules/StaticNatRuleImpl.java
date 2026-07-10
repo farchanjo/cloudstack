@@ -30,6 +30,7 @@ public class StaticNatRuleImpl implements StaticNatRule {
     long domainId;
     long networkId;
     long sourceIpAddressId;
+    Long publicIpv6AddressId;
     String destIpAddress;
     boolean forDisplay;
 
@@ -45,6 +46,7 @@ public class StaticNatRuleImpl implements StaticNatRule {
         domainId = rule.getDomainId();
         networkId = rule.getNetworkId();
         sourceIpAddressId = rule.getSourceIpAddressId();
+        publicIpv6AddressId = rule.getPublicIpv6AddressId();
         destIpAddress = dstIp;
         forDisplay = rule.isDisplay();
     }
@@ -97,6 +99,11 @@ public class StaticNatRuleImpl implements StaticNatRule {
     @Override
     public Long getSourceIpAddressId() {
         return sourceIpAddressId;
+    }
+
+    @Override
+    public Long getPublicIpv6AddressId() {
+        return publicIpv6AddressId;
     }
 
     @Override
