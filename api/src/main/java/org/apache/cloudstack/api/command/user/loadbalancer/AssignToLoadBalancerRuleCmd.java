@@ -74,7 +74,9 @@ public class AssignToLoadBalancerRuleCmd extends BaseAsyncCmd {
 
     @Parameter(name = ApiConstants.VIRTUAL_MACHINE_ID_IP,
             type = CommandType.MAP,
-            description = "VM ID and IP map, vmidipmap[0].vmid=1 vmidipmap[0].vmip=10.1.1.75. (Optional, for VPC Conserve Mode) Pass vmnetworkid. Example: vmidipmap[0].vmnetworkid=NETWORK_TIER_UUID",
+            description = "VM ID and IP map, vmidipmap[0].vmid=1 vmidipmap[0].vmip=10.1.1.75. "
+                    + "IPv6 backends accepted when vmip is a valid IPv6 (e.g. public IPv6 LB VIP path). "
+                    + "(Optional, for VPC Conserve Mode) Pass vmnetworkid. Example: vmidipmap[0].vmnetworkid=NETWORK_TIER_UUID",
             since = "4.4")
     private Map vmIdIpMap;
 
@@ -135,10 +137,10 @@ public class AssignToLoadBalancerRuleCmd extends BaseAsyncCmd {
                     throw new InvalidParameterValueException("Unable to find Instance ID: " + vmId);
                 }
 
-                //check whether the given ip is valid ip or not
-                if (vmIp == null || !NetUtils.isValidIp4(vmIp)) {
-                    throw new InvalidParameterValueException("Invalid ip address "+ vmIp +" passed in vmidipmap for " +
-                            "vmid " + vmId);
+                // Accept IPv4 or IPv6 backend (public IPv6 LB VIP rules need IPv6 backends)
+                if (vmIp == null || !(NetUtils.isValidIp4(vmIp) || NetUtils.isValidIp6(vmIp))) {
+                    throw new InvalidParameterValueException("Invalid ip address " + vmIp + " passed in vmidipmap for "
+                            + "vmid " + vmId);
                 }
                 Long longVmId = lbvm.getId();
 
