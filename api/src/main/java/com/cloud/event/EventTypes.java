@@ -55,6 +55,7 @@ import com.cloud.host.Host;
 import com.cloud.network.GuestVlan;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
+import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.PhysicalNetwork;
 import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.PhysicalNetworkTrafficType;
@@ -181,6 +182,10 @@ public class EventTypes {
     public static final String EVENT_NET_IP6_ASSIGN = "NET.IP6ASSIGN";
     public static final String EVENT_NET_IP6_RELEASE = "NET.IP6RELEASE";
     public static final String EVENT_NET_IP6_UPDATE = "NET.IP6UPDATE";
+
+    /** Public IPv6 VIP/FIP inventory (user_public_ipv6_address), not guest SLAAC. */
+    public static final String EVENT_PUBLIC_IPV6_ASSIGN = "PUBLIC.IPV6.ASSIGN";
+    public static final String EVENT_PUBLIC_IPV6_RELEASE = "PUBLIC.IPV6.RELEASE";
 
     public static final String EVENT_FIREWALL_EGRESS_OPEN = "FIREWALL.EGRESS.OPEN";
     public static final String EVENT_FIREWALL_EGRESS_CLOSE = "FIREWALL.EGRESS.CLOSE";
@@ -940,6 +945,8 @@ public class EventTypes {
         entityEventDetails.put(EVENT_NET_IP6_ASSIGN, Network.class);
         entityEventDetails.put(EVENT_NET_IP6_RELEASE, Network.class);
         entityEventDetails.put(EVENT_NET_IP6_UPDATE, Network.class);
+        entityEventDetails.put(EVENT_PUBLIC_IPV6_ASSIGN, UserPublicIpv6Address.class);
+        entityEventDetails.put(EVENT_PUBLIC_IPV6_RELEASE, UserPublicIpv6Address.class);
 
         // Nic Events
         entityEventDetails.put(EVENT_NIC_CREATE, Nic.class);
