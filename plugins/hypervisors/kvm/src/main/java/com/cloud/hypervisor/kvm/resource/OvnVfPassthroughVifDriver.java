@@ -176,9 +176,12 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         if (StringUtils.isNotBlank(pciAddress)) {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                Script.runSimpleBashScript(String.format(
-                    "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
-                logger.info("OvnVfPassthroughVifDriver.unplug: removed rep {} from {}", repName, integrationBridge);
+                OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.unplug", repName);
+            } else {
+                logger.warn("OvnVfPassthroughVifDriver.unplug: rep not found for pci={} mac={}; "
+                        + "falling back to attached-mac rep lookup", pciAddress, mac);
+                OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVfPassthroughVifDriver.unplug",
+                        integrationBridge, mac);
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);

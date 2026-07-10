@@ -255,6 +255,36 @@ public class OvnVifDriver extends VifDriverBase {
     private static final Pattern REP_PHYS_PORT_PATTERN = Pattern.compile("pf(\\d+)vf(\\d+)");
 
     /**
+     * Free a VF representor for reuse: neutralize OVN binding
+     * ({@code external_ids} including {@code iface-id}/{@code attached-mac}/
+     * {@code iface-status}) then remove the port from whichever bridge it is
+     * on.
+     *
+     * <p><b>Bridge-agnostic {@code del-port}</b>: callers historically issued
+     * {@code ovs-vsctl --if-exists del-port &lt;bridge&gt; &lt;rep&gt;}. When
+     * {@code bridge} was wrong (fleet {@code br-overlay} vs driver default
+     * {@code br-int}), {@code --if-exists} silently no-op'd and left the
+     * Interface row stamped {@code iface-id=lsp-... iface-status=active}
+     * after destroy/expunge (Chaos B). Omitting the bridge argument deletes
+     * the port from any bridge; clearing {@code external_ids} first still
+     * drops the OVN binding even if del-port fails for another reason.
+     *
+     * <p>Idempotent — safe when the Interface/port is already gone.
+     */
+    static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName) {
+        if (StringUtils.isBlank(repName)) {
+            return;
+        }
+        Script.runSimpleBashScript(String.format(
+            "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
+        // No bridge arg: remove from whatever bridge currently owns the port.
+        Script.runSimpleBashScript(String.format(
+            "ovs-vsctl --if-exists del-port %s", repName));
+        log.info("{}: freed OVS representor {} (cleared external_ids + del-port)",
+                callerLabel, repName);
+    }
+
+    /**
      * Fallback representor teardown shared by {@link OvnVfPassthroughVifDriver#unplug}
      * and {@link OvnVdpaVifDriver#unplug} for when their VF-PCI reverse lookup
      * by guest MAC fails. libvirt zeroes the VF MAC during managed hostdev
@@ -268,19 +298,20 @@ public class OvnVifDriver extends VifDriverBase {
      * each class); that stamp lives in OVSDB, not on the netdev, so it
      * survives the MAC zeroing and is used here as the fallback lookup key.
      *
-     * <p>For every representor OVS returns, the port is removed from
-     * {@code integrationBridge} and a best-effort attempt is made to also
-     * clear the VF identity (MAC + VLAN) on the parent PF — see
-     * {@link #clearVfIdentityForRepBestEffort}. Idempotent — safe to call
-     * when no representor carries the given {@code attached-mac}.
+     * <p>For every representor OVS returns, {@link #freeRepresentorOnOvs}
+     * clears external_ids and removes the port (bridge-agnostic). A
+     * best-effort attempt is also made to clear the VF identity (MAC + VLAN)
+     * on the parent PF — see {@link #clearVfIdentityForRepBestEffort}.
+     * Idempotent — safe when no representor carries the given
+     * {@code attached-mac}.
      *
      * @param log the calling driver's own logger instance, so log lines carry
      *            that driver's class name.
      * @param callerLabel short label identifying the calling driver + method
      *                    (eg. {@code "OvnVdpaVifDriver.unplug"}), used as a
      *                    log-line prefix.
-     * @param integrationBridge the OVS bridge the orphan representor(s) are
-     *                          attached to.
+     * @param integrationBridge retained as a log hint only; free path no
+     *                          longer scopes del-port to a single bridge.
      * @param mac the guest MAC stamped as {@code attached-mac} at plug time.
      */
     static void clearOrphanRepsByAttachedMac(final Logger log, final String callerLabel,
@@ -300,9 +331,8 @@ public class OvnVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(repName)) {
                 continue;
             }
-            Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
-            log.info("{}: attached-mac fallback removed orphan rep={} from {} (mac={})",
+            freeRepresentorOnOvs(log, callerLabel, repName);
+            log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
                     callerLabel, repName, integrationBridge, mac);
             clearVfIdentityForRepBestEffort(log, callerLabel, repName);
         }

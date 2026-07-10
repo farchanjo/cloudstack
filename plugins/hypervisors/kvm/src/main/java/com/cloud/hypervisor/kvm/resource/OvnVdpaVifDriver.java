@@ -154,8 +154,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             nic.setVfRepName(repName);
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin());
             final String repFinal = repName;
-            rollback.push(() -> Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repFinal)));
+            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(
+                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal));
 
             // (4) Domain XML <interface type='vdpa'>. queues defaults to
             //     max_vqs / 2 (TX+RX pair count); operator can override
@@ -251,14 +251,19 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             logger.warn("OvnVdpaVifDriver.unplug: could not resolve vdpa name from vhost={}; skipping vdpa dev del", vhostDev);
         }
 
-        // (2) Drop representor from br-int and clear PF-side VF identity.
+        // (2) Free the representor for OVN reuse: clear external_ids (iface-id /
+        //     attached-mac / iface-status) and del-port in a bridge-agnostic way
+        //     so a wrong integration-bridge name cannot leave a live OVN binding
+        //     after destroy/expunge (Chaos B). Prefer PCI reverse lookup; if that
+        //     misses (libvirt zeroed the VF MAC) or the rep is unresolved, fall
+        //     back to OVSDB attached-mac.
+        boolean repFreed = false;
         final String pciAddress = lookupVfPciByMac(mac);
         if (StringUtils.isNotBlank(pciAddress)) {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                Script.runSimpleBashScript(String.format(
-                    "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
-                logger.info("OvnVdpaVifDriver.unplug: removed rep {} from {}", repName, integrationBridge);
+                OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.unplug", repName);
+                repFreed = true;
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
@@ -266,8 +271,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 Script.runSimpleBashScript(String.format(
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
-        } else {
-            logger.warn("OvnVdpaVifDriver.unplug: VF MAC reverse lookup failed for mac={}; "
+        }
+        if (!repFreed) {
+            logger.warn("OvnVdpaVifDriver.unplug: VF MAC reverse lookup failed or rep missing for mac={}; "
                     + "falling back to attached-mac rep lookup", mac);
             OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVdpaVifDriver.unplug", integrationBridge, mac);
         }
@@ -414,9 +420,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
     private void removeRepresentorAndClearVf(final String pciAddress) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
-            Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repName));
-            logger.info("OvnVdpaVifDriver.releaseVdpaOnRollback: removed rep {} from {}", repName, integrationBridge);
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback", repName);
         }
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
