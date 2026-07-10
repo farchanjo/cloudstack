@@ -7,10 +7,12 @@
 > **Design:** [[ovn-public-ipv6-fip-lb-self-service-api]] §5 Sprint 3 / §9.
 > **Scope:** LAX ("slytherin") only. **Deploy path:** jar-direct (no `.deb`).
 > **Date:** 2026-07-10.
+> **Status:** ✅ **COMPLETE** (2026-07-10) — Sprint 3 cutover done; ConfigKey
+> empty; inventory owns public v6 VIP + LB for salazar/snape.
 
-Do **not** run this until Sprint 1–2 jars are live on all three management
-nodes and dual-read has been smoke-checked. Cutover is an **operator once**
-procedure; backends remain operator-refreshed after CKS recreate (Q7).
+Historical procedure below. Do **not** re-run import/clear unless rolling back
+or re-onboarding. Cutover was **operator once**; backends remain
+operator-refreshed after CKS recreate (Q7).
 
 ---
 
@@ -309,12 +311,12 @@ Post-rollback:
 
 ## 10. Exit criteria (Sprint 3)
 
-- [ ] ConfigKey `ovn.lr.public.ipv6.lb` empty (or unused).
-- [ ] salazar `::100` and snape `::101` still live (OVN LB + BGP `/128`).
-- [ ] Reconciler plan size ≈ 0 before **and** after clear.
-- [ ] Smoke 301 (or expected TLS) on both VIPs with correct Host headers.
-- [ ] Rollback path verified on paper (backup file retained).
-- [ ] CKS ops docs updated: inventory preferred; ConfigKey break-glass.
+- [x] ConfigKey `ovn.lr.public.ipv6.lb` empty (or unused). — **done 2026-07-10**
+- [x] salazar `::100` and snape `::101` still live (OVN LB + BGP `/128`).
+- [x] Reconciler plan size ≈ 0 before **and** after clear.
+- [x] Smoke 301 (or expected TLS) on both VIPs with correct Host headers.
+- [x] Rollback path verified on paper (backup file retained).
+- [x] CKS ops docs updated: inventory preferred; ConfigKey break-glass.
 
 ---
 

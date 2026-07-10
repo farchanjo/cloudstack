@@ -1,12 +1,15 @@
 # OVN Public IPv6 FIP + LB — self-service API (inventory, not ConfigKey)
 
-> **Status:** DESIGN / PROPOSED. Living document — the source of truth for this
-> feature (no speckit for this repo). Update the **Progress** table every phase.
-> Date: **2026-07-10**. Deploy path: **jar-direct** only (no `.deb` promotion).
-> Sibling design: [[ovn-complete-networking]]. Sprint 3 cutover runbook:
-> [[ovn-public-ipv6-cutover-runbook]]. Operator ConfigKey (Phase-1 / break-glass):
-> CKS docs `cks-salazar` / `cks-snape` `docs/ovn-public-ipv6-lb.md` (cmk
-> `ovn.lr.public.ipv6.lb`).
+> **Status:** Sprints 1–3 **LIVE**. Sprint 3 cutover **DONE** 2026-07-10
+> (ConfigKey empty; inventory owns `::100`/`::101`). Living document — the
+> source of truth for this feature (no speckit for this repo). Update the
+> **Progress** table every phase. Date: **2026-07-10**. Deploy path:
+> **jar-direct** only (no `.deb` promotion). Sibling design:
+> [[ovn-complete-networking]]. Sprint 3 cutover runbook:
+> [[ovn-public-ipv6-cutover-runbook]]. ConfigKey `ovn.lr.public.ipv6.lb` is
+> **empty** post-cutover (break-glass restore only). Day-2 ops: CKS docs
+> `cks-salazar` / `cks-snape` `docs/ovn-public-ipv6-lb.md` (inventory /
+> `publicipv6id`).
 
 ## 1. Goal
 
@@ -234,12 +237,15 @@ explicit exit criteria.
 
 **Exit criteria:**
 
-- [ ] ConfigKey empty (or unused); salazar `::100` and snape `::101` still live.
-- [ ] Reconciler dry-run delta = 0 before and after emptying ConfigKey.
-- [ ] CKS recreate checklist no longer requires editing ConfigKey for VIP
+- [x] ConfigKey empty (or unused); salazar `::100` and snape `::101` still live.
+- [x] Reconciler dry-run delta = 0 before and after emptying ConfigKey.
+- [x] CKS recreate checklist no longer requires editing ConfigKey for VIP
       identity (backend IP refresh may still be manual — Q7).
-- [ ] Rollback documented: re-fill ConfigKey; dual-read still available for one
+- [x] Rollback documented: re-fill ConfigKey; dual-read still available for one
       release window if needed.
+
+**Live result (2026-07-10):** ConfigKey empty; inventory owns `::100` / `::101`;
+HTTP 301 both VIPs; **4** OVN `cs-pub6-lb` rows (80+443 × salazar+snape).
 
 ### Sprint 4 — Optional StaticNAT / PortForward (public IPv6)
 
@@ -288,12 +294,12 @@ Per standing CloudStack deploy rules (jar-direct, **all 3** control nodes
 | Phase | Status | Notes |
 |---|---|---|
 | Design | ✅ done | this document (2026-07-10) |
-| Sprint 1 — IPAM (`user_public_ipv6_address`) | ✅ foundation + API complete (code); live schema/cmk smoke still pending deploy | table `user_public_ipv6_address`; APIs list/associate/disassociatePublicIpv6Address; 13 unit tests; no OVN yet |
-| Sprint 2 — LB API + OVN dual-read | ✅ code complete (schema `public_ipv6_address_id`, `publicipv6id` API, dual-read reconciler, unit tests); live cmk/OVN smoke pending jar-direct | `publicipv6id`; reconciler union |
-| Sprint 3 — migrate / cutover | 🔄 **IN PROGRESS** | Runbook: [[ovn-public-ipv6-cutover-runbook]]. Next: jar-direct S1–S2 on all 3 mgmt → backup ConfigKey → import `::100`/`::101` → LB rules + assign workers → dual-read verify → clear ConfigKey → smoke. **Do not clear ConfigKey until dual-read plan ≈ 0.** |
+| Sprint 1 — IPAM (`user_public_ipv6_address`) | ✅ **LIVE** | table `user_public_ipv6_address`; list/associate/disassociate + grandfather import; jar-direct all 3 mgmt |
+| Sprint 2 — LB API + OVN dual-read | ✅ **LIVE** | `publicipv6id` on `createLoadBalancerRule`; reconciler dual-read ConfigKey ∪ inventory |
+| Sprint 3 — migrate / cutover | ✅ **CUTOVER DONE** live **2026-07-10** | ConfigKey **empty**; inventory owns `::100`/`::101`; HTTP **301** both VIPs; **4** OVN `cs-pub6-lb` rows. Runbook: [[ovn-public-ipv6-cutover-runbook]] |
 | Sprint 4 — StaticNAT / PF (optional) | Proposed / not started | deferred until LB path stable |
-| CKS ops doc update | 🔄 **IN PROGRESS** (preferred-path note) | inventory API preferred; ConfigKey break-glass — full post-cutover rewrite after ConfigKey empty |
-| Phase-1 ConfigKey dataplane | ✅ live | salazar `::100`, snape `::101` |
+| CKS ops doc update | ✅ post-cutover | inventory preferred; ConfigKey empty + break-glass restore from backup only |
+| Phase-1 ConfigKey dataplane | ✅ superseded | VIP/LB path now inventory-only; ConfigKey kept empty as break-glass |
 
 ## 9. Migration (dual-read + cutover)
 
@@ -308,13 +314,13 @@ rollback).
   (ConfigKey)           (prefer API on conflict)         (CK empty)
 ```
 
-1. **Before Sprint 2:** production stays ConfigKey-only (today).
+1. **Before Sprint 2:** production was ConfigKey-only.
 2. **Sprint 2 ship:** dual-read on; no forced ConfigKey change.
 3. **Import:** create `user_public_ipv6_address` rows for `::100` / `::101` +
    equivalent LB rules; backends match live ConfigKey.
 4. **Observe:** reconciler plan size ≈ 0 for pub6 (idempotent).
-5. **Cutover:** clear `ovn.lr.public.ipv6.lb`; re-check plan size 0 and live
-   HTTP on both VIPs.
+5. **Cutover (DONE 2026-07-10):** clear `ovn.lr.public.ipv6.lb`; re-check plan
+   size 0 and live HTTP on both VIPs — **verified**.
 6. **Rollback:** restore ConfigKey string from backup; dual-read still unions
    until inventory rows are removed (prefer leave inventory and restore CK only
    if inventory path is broken).
@@ -361,7 +367,7 @@ rollback).
 | UX | **cmk-first** | Matches fleet ops |
 | Non-goals | no `.deb`; no private ECMP replace; no full dual-stack rewrite; no NYC | Standing scope |
 | Sibling design | [[ovn-complete-networking]] | Shared OVN/BGP/deploy discipline |
-| Ops today | CKS `docs/ovn-public-ipv6-lb.md` | Operator ConfigKey until Sprint 3 |
+| Ops today | CKS `docs/ovn-public-ipv6-lb.md` | Inventory API preferred; ConfigKey break-glass post Sprint 3 |
 
 ---
 
