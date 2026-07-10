@@ -299,7 +299,9 @@ public class OvnBgpRedistributeManagerTest {
     }
 
     @Test
-    public void inventMissingSkipsAlreadyAnnouncedIp() {
+    public void inventMissingReassertsAlreadyAnnouncedIp() {
+        // FRR may have dropped network x/32 while BGP_ANNOUNCE row remains —
+        // invent must re-send OP_ANNOUNCE (idempotent), not skip.
         manager = spy(manager);
         doReturn(true).when(manager).isPublicRedistributeEnabled();
 
@@ -314,10 +316,12 @@ public class OvnBgpRedistributeManagerTest {
         when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
         when(logicalIdMapDao.findByCsId(eq(Kind.BGP_ANNOUNCE), eq(IP_ADDR_ID), eq(CONTROLLER_ID)))
                 .thenReturn(mock(OvnLogicalIdMapVO.class));
+        when(agentManager.easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
 
         final int attempted = manager.ensurePublicIpv4AnnouncesForZone(ZONE_ID);
-        assertEquals(0, attempted);
-        verify(agentManager, never()).easySend(any(), any());
+        assertEquals(1, attempted);
+        verify(agentManager, times(1)).easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class));
     }
 
     @Test

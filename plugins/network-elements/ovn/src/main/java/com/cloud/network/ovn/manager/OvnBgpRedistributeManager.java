@@ -198,11 +198,15 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
-     * Invent-missing: for every allocated public IPv4 in {@code zoneId} that
-     * is still used by SNAT / StaticNat / LB / PF on a VPC with redistribute
-     * enabled, ensure a BGP {@code /32} announce exists. Skips IPs that already
-     * have a {@link Kind#BGP_ANNOUNCE} mapping (gateway migration is handled
-     * by {@link #reconcileZone}).
+     * Invent-missing + self-heal: for every allocated public IPv4 in
+     * {@code zoneId} that is still used by SNAT / StaticNat / LB / PF on a VPC
+     * with redistribute enabled, ensure a BGP {@code /32} is present in FRR.
+     *
+     * <p>Always re-sends {@code OP_ANNOUNCE} (idempotent on the agent) even when
+     * a {@link Kind#BGP_ANNOUNCE} mapping already exists. Bookkeeping alone is
+     * not enough: FRR restarts / Puppet rewrites drop {@code network x/32}
+     * while the map row remains, so invent must re-assert FRR. Gateway-chassis
+     * migration still uses {@link #reconcileZone}.
      *
      * @return number of IPs for which {@link #announce} was attempted
      */
@@ -219,6 +223,7 @@ public class OvnBgpRedistributeManager {
             return 0;
         }
         int attempted = 0;
+        int firstTime = 0;
         for (final IPAddressVO ip : ips) {
             if (ip == null || ip.getVpcId() == null) {
                 continue;
@@ -238,15 +243,17 @@ public class OvnBgpRedistributeManager {
             }
             final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
                     Kind.BGP_ANNOUNCE, ip.getId(), controller.getId());
-            if (existing != null) {
-                continue;
+            if (existing == null) {
+                firstTime++;
             }
+            // Re-assert FRR every tick (same pattern as IPv6 host announces).
             announce(publicIp, ip.getId(), ip.getVpcId(), zoneId);
             attempted++;
         }
         if (attempted > 0) {
-            LOGGER.info("OvnBgpRedistribute.ensurePublicIpv4AnnouncesForZone: zone={} attempted {} missing /32 announce(s)",
-                    zoneId, attempted);
+            LOGGER.info("OvnBgpRedistribute.ensurePublicIpv4AnnouncesForZone: zone={} reasserted {} /32 "
+                            + "announce(s) ({} without prior mapping)",
+                    zoneId, attempted, firstTime);
         }
         return attempted;
     }
