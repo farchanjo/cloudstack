@@ -3667,21 +3667,56 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
 
     protected void detectRoutesConflict(final StaticRoute newRoute) throws NetworkRuleConflictException {
         // Multiple private gateways can exist within Vpc. Check for conflicts
-        // for all static routes in Vpc
-        // and not just the gateway
+        // for all static routes in Vpc and not just the gateway.
+        // Same destination CIDR with a different next hop is allowed (multi-NH
+        // ECMP via createStaticRoute); same CIDR + same hop is a duplicate.
         final List<? extends StaticRoute> routes = _staticRouteDao.listByVpcIdAndNotRevoked(newRoute.getVpcId());
         assert routes.size() >= 1 : "For static routes, we now always first persist the route and then check for "
                 + "network conflicts so we should at least have one rule at this point.";
 
+        final String newHop = effectiveNextHop(newRoute);
         for (final StaticRoute route : routes) {
             if (route.getId() == newRoute.getId()) {
                 continue; // Skips my own route.
+            }
+
+            if (Objects.equals(route.getCidr(), newRoute.getCidr())) {
+                final String existingHop = effectiveNextHop(route);
+                if (Objects.equals(newHop, existingHop)
+                        || (newHop != null && newHop.equalsIgnoreCase(existingHop))) {
+                    throw new NetworkRuleConflictException("New static route duplicates existing route " + route
+                            + " (same cidr and next hop)");
+                }
+                // Same cidr, different next hop — multi-NH ECMP, allowed.
+                continue;
             }
 
             if (NetUtils.isNetworksOverlap(route.getCidr(), newRoute.getCidr())) {
                 throw new NetworkRuleConflictException("New static route cidr conflicts with existing route " + route);
             }
         }
+    }
+
+    /**
+     * Effective next hop for a static route: the {@code next_hop} column when set,
+     * otherwise the private gateway's gateway IP when the route is bound to a VPC
+     * gateway. Used by multi-NH ECMP conflict detection so gateway-based and
+     * next-hop-based routes compare on the same hop IP.
+     */
+    protected String effectiveNextHop(final StaticRoute route) {
+        if (route == null) {
+            return null;
+        }
+        final String nextHop = route.getNextHop();
+        if (org.apache.commons.lang3.StringUtils.isNotBlank(nextHop)) {
+            return nextHop;
+        }
+        final Long gatewayId = route.getVpcGatewayId();
+        if (gatewayId == null) {
+            return null;
+        }
+        final VpcGateway gateway = _vpcGatewayDao.findById(gatewayId);
+        return gateway == null ? null : gateway.getGateway();
     }
 
     protected void markStaticRouteForRevoke(final StaticRouteVO route, final Account caller) {

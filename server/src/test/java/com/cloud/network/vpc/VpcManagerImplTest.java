@@ -47,9 +47,12 @@ import com.cloud.network.router.CommandSetupHelper;
 import com.cloud.network.router.NetworkHelper;
 import com.cloud.network.router.VirtualRouter;
 import com.cloud.network.vpc.dao.NetworkACLDao;
+import com.cloud.network.vpc.dao.StaticRouteDao;
 import com.cloud.network.vpc.dao.VpcDao;
+import com.cloud.network.vpc.dao.VpcGatewayDao;
 import com.cloud.network.vpc.dao.VpcOfferingDao;
 import com.cloud.network.vpc.dao.VpcOfferingServiceMapDao;
+import com.cloud.exception.NetworkRuleConflictException;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.NetworkOfferingServiceMapVO;
 import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
@@ -166,6 +169,10 @@ public class VpcManagerImplTest {
     NetworkACLVO networkACLVOMock;
     @Mock
     RoutedIpv4Manager routedIpv4Manager;
+    @Mock
+    StaticRouteDao staticRouteDao;
+    @Mock
+    VpcGatewayDao vpcGatewayDao;
 
     public static final long ACCOUNT_ID = 1;
     private AccountVO account;
@@ -226,6 +233,8 @@ public class VpcManagerImplTest {
         manager._firewallDao = firewallDao;
         manager._networkAclDao = networkACLDaoMock;
         manager.routedIpv4Manager = routedIpv4Manager;
+        manager._staticRouteDao = staticRouteDao;
+        manager._vpcGatewayDao = vpcGatewayDao;
         CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
         registerCallContext();
         overrideDefaultConfigValue(NetworkService.AllowUsersToSpecifyVRMtu, "_defaultValue", "false");
@@ -599,6 +608,72 @@ public class VpcManagerImplTest {
         Mockito.when(vpcOfferingDao.findById(Mockito.eq(vpcOfferingId))).thenReturn(vpcOffering);
         Mockito.when(vpcOffering.isConserveMode()).thenReturn(true);
         Assert.assertTrue(manager.isNetworkOnVpcEnabledConserveMode(network));
+    }
+
+    // ---------- multi-NH ECMP createStaticRoute conflict detection ----------
+
+    private static StaticRouteVO staticRoute(long id, long vpcId, String cidr, String nextHop) {
+        StaticRouteVO route = new StaticRouteVO(null, cidr, vpcId, ACCOUNT_ID, 1L, nextHop);
+        ReflectionTestUtils.setField(route, "id", id);
+        return route;
+    }
+
+    @Test
+    public void detectRoutesConflict_allowsSameCidrDifferentNextHop() throws NetworkRuleConflictException {
+        StaticRouteVO existing = staticRoute(1L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        StaticRouteVO candidate = staticRoute(2L, vpcId, "10.140.0.0/24", "10.45.0.159");
+        List<? extends StaticRoute> listed = Arrays.asList(existing, candidate);
+        Mockito.doReturn(listed).when(staticRouteDao).listByVpcIdAndNotRevoked(vpcId);
+
+        manager.detectRoutesConflict(candidate);
+        // no exception — multi-NH ECMP allowed
+    }
+
+    @Test
+    public void detectRoutesConflict_rejectsSameCidrSameNextHop() {
+        StaticRouteVO existing = staticRoute(1L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        StaticRouteVO candidate = staticRoute(2L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        List<? extends StaticRoute> listed = Arrays.asList(existing, candidate);
+        Mockito.doReturn(listed).when(staticRouteDao).listByVpcIdAndNotRevoked(vpcId);
+
+        Assert.assertThrows(NetworkRuleConflictException.class, () -> manager.detectRoutesConflict(candidate));
+    }
+
+    @Test
+    public void detectRoutesConflict_rejectsOverlappingUnequalCidrs() {
+        StaticRouteVO existing = staticRoute(1L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        StaticRouteVO candidate = staticRoute(2L, vpcId, "10.140.0.0/25", "10.45.0.159");
+        List<? extends StaticRoute> listed = Arrays.asList(existing, candidate);
+        Mockito.doReturn(listed).when(staticRouteDao).listByVpcIdAndNotRevoked(vpcId);
+
+        Assert.assertThrows(NetworkRuleConflictException.class, () -> manager.detectRoutesConflict(candidate));
+    }
+
+    @Test
+    public void detectRoutesConflict_allowsNonOverlappingCidrs() throws NetworkRuleConflictException {
+        StaticRouteVO existing = staticRoute(1L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        StaticRouteVO candidate = staticRoute(2L, vpcId, "10.141.0.0/24", "10.45.0.14");
+        List<? extends StaticRoute> listed = Arrays.asList(existing, candidate);
+        Mockito.doReturn(listed).when(staticRouteDao).listByVpcIdAndNotRevoked(vpcId);
+
+        manager.detectRoutesConflict(candidate);
+    }
+
+    @Test
+    public void effectiveNextHop_prefersNextHopColumn() {
+        StaticRouteVO route = staticRoute(1L, vpcId, "10.140.0.0/24", "10.45.0.14");
+        Assert.assertEquals("10.45.0.14", manager.effectiveNextHop(route));
+    }
+
+    @Test
+    public void effectiveNextHop_fallsBackToPrivateGateway() {
+        StaticRouteVO route = new StaticRouteVO(99L, "10.140.0.0/24", vpcId, ACCOUNT_ID, 1L, null);
+        ReflectionTestUtils.setField(route, "id", 1L);
+        VpcGatewayVO gateway = mock(VpcGatewayVO.class);
+        Mockito.when(gateway.getGateway()).thenReturn("10.45.0.1");
+        Mockito.when(vpcGatewayDao.findById(99L)).thenReturn(gateway);
+
+        Assert.assertEquals("10.45.0.1", manager.effectiveNextHop(route));
     }
 
 }
