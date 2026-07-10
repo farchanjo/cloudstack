@@ -94,4 +94,38 @@ public class OvnReconcilerEcmpVmStateTest {
                 java.util.Collections.emptyList(), resolver(Map.of()));
         assertTrue(kept.isEmpty());
     }
+
+    @Test
+    public void ipv6NextHopsUseSameRunningFilter() {
+        // Dual-stack: nextHopVmState now resolves IPv6 via NIC scan; the filter
+        // policy is family-agnostic — Stopped IPv6 hops must prune exactly like v4.
+        final String nh6Running = "2a13:8740:0:a::14";
+        final String nh6Stopped = "2a13:8740:0:a::159";
+        final String nh6Unknown = "2a13:8740:0:a::253";
+        final List<String> hops = Arrays.asList(nh6Running, nh6Stopped, nh6Unknown);
+        final List<String> kept = OvnReconcilerService.filterRunningNextHops(hops, resolver(Map.of(
+                nh6Running, VirtualMachine.State.Running,
+                nh6Stopped, VirtualMachine.State.Stopped)));
+        assertEquals(Arrays.asList(nh6Running, nh6Unknown), kept);
+    }
+
+    @Test
+    public void allStoppedYieldsEmptyHopSet() {
+        // Mirrors resolveOneEcmpRoute empty-hop outcome: every VM-owned hop
+        // pruned → empty list (caller still marks owner|prefix resolved).
+        final List<String> hops = Arrays.asList(NH_RUNNING, NH_STOPPED);
+        final List<String> kept = OvnReconcilerService.filterRunningNextHops(hops, resolver(Map.of(
+                NH_RUNNING, VirtualMachine.State.Stopped,
+                NH_STOPPED, VirtualMachine.State.Destroyed)));
+        assertTrue(kept.isEmpty());
+    }
+
+    @Test
+    public void standardizeIp6QuietCollapsesCompressedForms() {
+        assertEquals(
+                OvnReconcilerService.standardizeIp6Quiet("2a13:8740:0:a::14"),
+                OvnReconcilerService.standardizeIp6Quiet("2a13:8740:0000:000a:0000:0000:0000:0014"));
+        assertEquals(null, OvnReconcilerService.standardizeIp6Quiet("not-an-ip"));
+        assertEquals(null, OvnReconcilerService.standardizeIp6Quiet(null));
+    }
 }

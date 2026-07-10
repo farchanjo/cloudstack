@@ -46,6 +46,13 @@ public final class OvnConstants {
      *  the routes it created and never disturb manual or other static routes. */
     public static final String EXT_ID_ECMP_ROUTE = "cs-ecmp-route";
 
+    /** external_ids key marking a plugin-owned public IPv6 {@code Load_Balancer}
+     *  row (see {@code ovn.lr.public.ipv6.lb}). The value is a stable entry key
+     *  {@code <network-uuid>|<vip>|<port>} so the reconciler can add / update /
+     *  remove ONLY the LBs it created and never disturb CloudStack rule LBs or
+     *  manual rows. */
+    public static final String EXT_ID_PUBLIC_IPV6_LB = "cs-pub6-lb";
+
     private OvnConstants() {
     }
 }

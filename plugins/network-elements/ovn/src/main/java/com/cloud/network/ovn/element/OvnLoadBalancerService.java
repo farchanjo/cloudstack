@@ -529,13 +529,24 @@ public class OvnLoadBalancerService extends AdapterBase {
         return row == null ? null : row.getOvnUuid();
     }
 
+    /**
+     * Format an OVN {@code Load_Balancer.vips} map key / backend token.
+     * IPv6 addresses are bracketed ({@code [addr]:port}); IPv4 stays unbracketed.
+     * Shared with the public IPv6 LB ConfigKey path
+     * ({@link com.cloud.network.ovn.config.OvnPublicIpv6Lb#formatVipKey}).
+     */
+    public static String formatVipKey(final String ip, final int port) {
+        return com.cloud.network.ovn.config.OvnPublicIpv6Lb.formatVipKey(ip, port);
+    }
+
     /** Visible for testing. */
     public static Map<String, String> buildVipsMap(final LoadBalancingRule rule) {
         final Map<String, String> out = new HashMap<>();
         if (rule.getSourceIp() == null) {
             return out;
         }
-        final String vipKey = rule.getSourceIp().addr() + ":" + rule.getSourcePortStart();
+        final String addr = rule.getSourceIp().addr();
+        final String vipKey = formatVipKey(addr, rule.getSourcePortStart());
         final List<? extends LbDestination> dests = rule.getDestinations();
         if (dests == null || dests.isEmpty()) {
             return out;
@@ -545,7 +556,7 @@ public class OvnLoadBalancerService extends AdapterBase {
             if (d.isRevoked()) {
                 continue;
             }
-            backends.add(d.getIpAddress() + ":" + d.getDestinationPortStart());
+            backends.add(formatVipKey(d.getIpAddress(), d.getDestinationPortStart()));
         }
         if (backends.isEmpty()) {
             return out;

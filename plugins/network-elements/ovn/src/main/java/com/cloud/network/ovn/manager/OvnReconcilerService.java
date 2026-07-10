@@ -42,9 +42,11 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
+import com.cloud.network.ovn.client.OvnNbClient.OwnedLoadBalancer;
 import com.cloud.network.ovn.config.OvnEcmpRoutes;
 import com.cloud.network.ovn.config.OvnLspAddresses;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
+import com.cloud.network.ovn.config.OvnPublicIpv6Lb;
 import com.cloud.network.ovn.config.OvnNicConfig;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
@@ -218,12 +220,22 @@ public class OvnReconcilerService {
         // the OVN gateway forwards VIP traffic to the CKS workers. Self-gated:
         // no-op when ovn.lr.ecmp.static.routes is empty and no owned route
         // exists; removes only rows tagged cs-ecmp-route when the config drops.
-        final Map<String, OvnEcmpRoutes.Route> desiredEcmp =
+        // Multi-stanza same UUID supports dual-stack (v4 + v6 VIP prefixes).
+        final Map<String, List<OvnEcmpRoutes.Route>> desiredEcmp =
                 OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
         final int ecmpChanged = ensureEcmpStaticRoutes(nb, controller, desiredEcmp, dryRun);
         if (ecmpChanged > 0) {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", ecmpChanged);
+        }
+        // Public IPv6 LB resync — programs operator-declared VIPs as OVN
+        // Load_Balancer rows on the VPC LR (+ tier LS) and announces each VIP
+        // as a BGP /128. Self-gated: empty config removes only owned rows.
+        final int pub6Changed = ensurePublicIpv6Lb(nb, controller, zoneId,
+                OvnPublicIpv6Lb.parse(OvnNetworkConfig.LrPublicIpv6Lb.value()), dryRun);
+        if (pub6Changed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} public IPv6 LB resync {} {} LB row(s)",
+                    zoneId, dryRun ? "would change" : "changed", pub6Changed);
         }
         // PARSEL-V6 — reconcile the IPv6 public transport on existing VPCs +
         // routed tiers WITHOUT touching VMs (so `cmk run ovnreconciler` applies
@@ -470,7 +482,7 @@ public class OvnReconcilerService {
         if (controller == null) {
             return 0;
         }
-        final Map<String, OvnEcmpRoutes.Route> desired =
+        final Map<String, List<OvnEcmpRoutes.Route>> desired =
                 OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
         final int changed = ensureEcmpStaticRoutes(pluginManager.nbClient(zoneId), controller, desired, dryRun);
         if (changed > 0) {
@@ -482,37 +494,65 @@ public class OvnReconcilerService {
 
     /**
      * Ensure the configured ECMP static routes on their owning VPC LRs. Resolves
-     * each network to its LR + CIDR, reads the plugin-owned routes currently in
-     * the NB DB (tagged {@code cs-ecmp-route}), diffs, and applies the delta.
+     * each network to its LR + CIDR(s), reads the plugin-owned routes currently
+     * in the NB DB (tagged {@code cs-ecmp-route}), diffs, and applies the delta.
      * Only rows carrying the marker are ever touched, so manual / other static
      * routes are safe. A {@code null} client/controller is a strict no-op.
+     * Multi-prefix per owner (dual-stack) is supported.
      *
      * @return count of route rows (that would have been) added + removed
      */
     int ensureEcmpStaticRoutes(final OvnNbClient nb, final OvnControllerVO controller,
-                               final Map<String, OvnEcmpRoutes.Route> desired, final boolean dryRun) {
+                               final Map<String, List<OvnEcmpRoutes.Route>> desired, final boolean dryRun) {
         if (nb == null || controller == null) {
             return 0;
         }
-        final Map<String, ResolvedRoute> resolved = resolveEcmpRoutes(desired, controller);
+        final Map<String, List<ResolvedRoute>> resolved = resolveEcmpRoutes(desired, controller);
         final List<EcmpStaticRoute> existing = nb.listEcmpStaticRoutes(OvnConstants.EXT_ID_ECMP_ROUTE);
-        final EcmpPlan plan = planEcmp(resolved, desired.keySet(), existing);
+        final EcmpPlan plan = planEcmp(resolved, configuredOwnerPrefixes(desired), existing);
         if (dryRun) {
             return plan.size();
         }
         return applyEcmpPlan(nb, plan);
     }
 
-    /** Resolve every well-formed config entry to its owning VPC LR + validated
-     *  next-hops. Entries whose network / VPC / LR cannot be resolved, or whose
-     *  next-hops all fall outside the network CIDR, are skipped (WARN). */
-    private Map<String, ResolvedRoute> resolveEcmpRoutes(final Map<String, OvnEcmpRoutes.Route> desired,
-                                                         final OvnControllerVO controller) {
-        final Map<String, ResolvedRoute> out = new LinkedHashMap<>();
-        for (final Map.Entry<String, OvnEcmpRoutes.Route> e : desired.entrySet()) {
-            final ResolvedRoute rr = resolveOneEcmpRoute(e.getKey(), e.getValue(), controller);
-            if (rr != null) {
-                out.put(e.getKey(), rr);
+    /** Build the set of {@code owner|prefix} keys present in the raw parse
+     *  (all stanzas), used by the anti-flap removal path. */
+    static Set<String> configuredOwnerPrefixes(final Map<String, List<OvnEcmpRoutes.Route>> desired) {
+        final Set<String> out = new HashSet<>();
+        if (desired == null) {
+            return out;
+        }
+        for (final Map.Entry<String, List<OvnEcmpRoutes.Route>> e : desired.entrySet()) {
+            if (e.getValue() == null) {
+                continue;
+            }
+            for (final OvnEcmpRoutes.Route r : e.getValue()) {
+                out.add(ownerPrefixKey(e.getKey(), r.getPrefix()));
+            }
+        }
+        return out;
+    }
+
+    /** Resolve every well-formed config route independently to its owning VPC
+     *  LR + validated next-hops. A network may yield multiple
+     *  {@link ResolvedRoute}s (dual-stack). Empty hops after successful network+LR
+     *  resolution still produce a {@link ResolvedRoute} (empty hop list) so
+     *  {@link #planEcmp} removes stale owned rows; only infra failures (network/LR
+     *  missing) return {@code null} and anti-flap-keep existing rows. */
+    private Map<String, List<ResolvedRoute>> resolveEcmpRoutes(
+            final Map<String, List<OvnEcmpRoutes.Route>> desired, final OvnControllerVO controller) {
+        final Map<String, List<ResolvedRoute>> out = new LinkedHashMap<>();
+        for (final Map.Entry<String, List<OvnEcmpRoutes.Route>> e : desired.entrySet()) {
+            final List<ResolvedRoute> resolved = new ArrayList<>();
+            for (final OvnEcmpRoutes.Route route : e.getValue()) {
+                final ResolvedRoute rr = resolveOneEcmpRoute(e.getKey(), route, controller);
+                if (rr != null) {
+                    resolved.add(rr);
+                }
+            }
+            if (!resolved.isEmpty()) {
+                out.put(e.getKey(), resolved);
             }
         }
         return out;
@@ -535,12 +575,15 @@ public class OvnReconcilerService {
                     networkUuid, network.getVpcId());
             return null;
         }
-        final List<String> cidrHops = nextHopsInCidr(route.getNextHops(), network.getCidr(), networkUuid);
+        final List<String> cidrHops = nextHopsInCidr(route.getNextHops(), network.getCidr(),
+                network.getIp6Cidr(), networkUuid);
         final List<String> hops = filterRunningNextHops(cidrHops, nh -> nextHopVmState(nh, network.getId()));
         if (hops.isEmpty()) {
-            LOGGER.warn("OvnReconcilerService: ECMP route network {} — no in-CIDR Running next-hop (CIDR {}); "
-                    + "keeping existing owned rows to avoid flapping", networkUuid, network.getCidr());
-            return null;
+            // Still resolved: empty hop set must drive removal of owned rows for
+            // this owner|prefix. Returning null would anti-flap-keep blackholes forever.
+            LOGGER.warn("OvnReconcilerService: ECMP route network {} prefix {} — no in-CIDR Running next-hop "
+                    + "(v4={}, v6={}); resolving empty hop set so owned rows are removed",
+                    networkUuid, route.getPrefix(), network.getCidr(), network.getIp6Cidr());
         }
         return new ResolvedRoute(lr.getOvnUuid(), route.getPrefix(), hops);
     }
@@ -578,16 +621,14 @@ public class OvnReconcilerService {
 
     /**
      * Resolve a next-hop IP to the state of the VM owning the NIC that carries it
-     * on {@code networkId}, or {@code null} when the IP is not an IPv4 NIC on that
-     * network, the NIC has no VM, or the VM row is gone. IPv6 next-hops have no
-     * per-network NIC finder here, so they resolve to {@code null} (treated as
-     * non-VM hops and kept).
+     * on {@code networkId}, or {@code null} when the IP is not a NIC on that
+     * network, the NIC has no VM, or the VM row is gone. Supports IPv4 (DAO
+     * finder) and IPv6 (scan nics on the network, standardized address match).
+     * Unresolvable hops are treated as non-VM and kept by
+     * {@link #filterRunningNextHops}.
      */
     private VirtualMachine.State nextHopVmState(final String nh, final long networkId) {
-        if (!NetUtils.isValidIp4(nh)) {
-            return null;
-        }
-        final NicVO nic = nicDao.findByIp4AddressAndNetworkId(nh, networkId);
+        final NicVO nic = findNicForNextHop(nh, networkId);
         if (nic == null) {
             return null;
         }
@@ -595,16 +636,69 @@ public class OvnReconcilerService {
         return vm == null ? null : vm.getState();
     }
 
-    /** Keep only next-hops that fall inside the network's CIDR; WARN + drop the
-     *  rest so a mis-scoped worker IP never lands on the LR. */
-    private List<String> nextHopsInCidr(final List<String> nextHops, final String cidr, final String networkUuid) {
+    /** Locate the NIC that carries {@code nh} on {@code networkId}, dual-stack. */
+    private NicVO findNicForNextHop(final String nh, final long networkId) {
+        if (StringUtils.isBlank(nh)) {
+            return null;
+        }
+        if (NetUtils.isValidIp4(nh)) {
+            return nicDao.findByIp4AddressAndNetworkId(nh, networkId);
+        }
+        if (NetUtils.isValidIp6(nh)) {
+            return findNicByIp6AddressAndNetworkId(nh, networkId);
+        }
+        return null;
+    }
+
+    /**
+     * Match an IPv6 next-hop against nics on the network. CloudStack has no
+     * {@code findByIp6AddressAndNetworkId}; iterate {@link NicDao#listByNetworkId}
+     * and compare via {@link NetUtils#standardizeIp6Address}.
+     */
+    private NicVO findNicByIp6AddressAndNetworkId(final String ip6, final long networkId) {
+        final String want = standardizeIp6Quiet(ip6);
+        if (want == null) {
+            return null;
+        }
+        final List<NicVO> nics = nicDao.listByNetworkId(networkId);
+        if (nics == null || nics.isEmpty()) {
+            return null;
+        }
+        for (final NicVO nic : nics) {
+            final String have = standardizeIp6Quiet(nic.getIPv6Address());
+            if (want.equals(have)) {
+                return nic;
+            }
+        }
+        return null;
+    }
+
+    /** {@link NetUtils#standardizeIp6Address} or {@code null} when blank/invalid. */
+    static String standardizeIp6Quiet(final String ip6) {
+        if (StringUtils.isBlank(ip6) || !NetUtils.isValidIp6(ip6)) {
+            return null;
+        }
+        try {
+            return NetUtils.standardizeIp6Address(ip6);
+        } catch (RuntimeException re) {
+            return null;
+        }
+    }
+
+    /**
+     * Keep only next-hops that fall inside the network's matching-family CIDR
+     * (IPv4 hop vs {@code cidr4}, IPv6 hop vs {@code cidr6}). WARN + drop the
+     * rest so a mis-scoped worker IP never lands on the LR.
+     */
+    private List<String> nextHopsInCidr(final List<String> nextHops, final String cidr4, final String cidr6,
+                                        final String networkUuid) {
         final List<String> out = new ArrayList<>();
         for (final String nh : nextHops) {
-            if (isNextHopInCidr(nh, cidr)) {
+            if (isNextHopInCidr(nh, cidr4) || isNextHopInCidr(nh, cidr6)) {
                 out.add(nh);
             } else {
-                LOGGER.warn("OvnReconcilerService: ECMP next-hop {} outside network {} CIDR {}; skipping",
-                        nh, networkUuid, cidr);
+                LOGGER.warn("OvnReconcilerService: ECMP next-hop {} outside network {} CIDRs (v4={}, v6={}); skipping",
+                        nh, networkUuid, cidr4, cidr6);
             }
         }
         return out;
@@ -631,32 +725,41 @@ public class OvnReconcilerService {
      * Pure diff between the desired ECMP routes and the plugin-owned routes
      * present in the NB DB. A route is keyed by {@code (owner, prefix, nexthop)}.
      * Desired tuples absent from the NB DB become adds; owned rows absent from
-     * the desired set become removes — but only when their owner was dropped
-     * from config OR is still resolvable (so a transiently-unresolvable network
-     * keeps its rows rather than flapping). Never returns a row lacking the
-     * marker, because the caller only ever passes marked rows in.
+     * the desired set become removes — but only when their {@code owner|prefix}
+     * was dropped from config OR was resolved this pass (so a
+     * transiently-unresolvable prefix keeps its rows rather than flapping, even
+     * when a sibling prefix on the same owner resolves). An empty hop list on a
+     * resolved route still marks the owner|prefix resolved, so all owned rows
+     * for that prefix are removed (no blackhole retention). Never returns a row
+     * lacking the marker, because the caller only ever passes marked rows in.
      *
-     * @param resolvedDesired  owner -&gt; resolved route (LR + validated hops)
-     * @param configuredOwners owners present in the raw config (may be unresolved)
-     * @param existingOwned    plugin-owned static-route rows read from the NB DB
+     * @param resolvedDesired         owner -&gt; list of resolved routes (LR + hops;
+     *                                hops may be empty after prune)
+     * @param configuredOwnerPrefixes {@code owner|prefix} keys from the raw parse
+     *                                (all stanzas; may be unresolved this tick)
+     * @param existingOwned           plugin-owned static-route rows from the NB DB
      * @return the add / remove plan
      */
-    static EcmpPlan planEcmp(final Map<String, ResolvedRoute> resolvedDesired,
-                             final Set<String> configuredOwners,
+    static EcmpPlan planEcmp(final Map<String, List<ResolvedRoute>> resolvedDesired,
+                             final Set<String> configuredOwnerPrefixes,
                              final List<EcmpStaticRoute> existingOwned) {
         final Map<String, String> existingByKey = new LinkedHashMap<>();
         for (final EcmpStaticRoute r : existingOwned) {
             existingByKey.put(tupleKey(r.getOwner(), r.getPrefix(), r.getNexthop()), r.getUuid());
         }
         final Set<String> desiredKeys = new HashSet<>();
+        final Set<String> resolvedOwnerPrefixes = new HashSet<>();
         final List<PlannedRoute> toAdd = new ArrayList<>();
-        for (final Map.Entry<String, ResolvedRoute> e : resolvedDesired.entrySet()) {
-            final ResolvedRoute rr = e.getValue();
-            for (final String nh : rr.getNextHops()) {
-                final String key = tupleKey(e.getKey(), rr.getPrefix(), nh);
-                desiredKeys.add(key);
-                if (!existingByKey.containsKey(key)) {
-                    toAdd.add(new PlannedRoute(rr.getLrUuid(), rr.getPrefix(), nh, e.getKey()));
+        for (final Map.Entry<String, List<ResolvedRoute>> e : resolvedDesired.entrySet()) {
+            for (final ResolvedRoute rr : e.getValue()) {
+                // Empty hops still count as resolved → plan removes all owned rows.
+                resolvedOwnerPrefixes.add(ownerPrefixKey(e.getKey(), rr.getPrefix()));
+                for (final String nh : rr.getNextHops()) {
+                    final String key = tupleKey(e.getKey(), rr.getPrefix(), nh);
+                    desiredKeys.add(key);
+                    if (!existingByKey.containsKey(key)) {
+                        toAdd.add(new PlannedRoute(rr.getLrUuid(), rr.getPrefix(), nh, e.getKey()));
+                    }
                 }
             }
         }
@@ -666,7 +769,10 @@ public class OvnReconcilerService {
             if (desiredKeys.contains(key)) {
                 continue;
             }
-            if (!configuredOwners.contains(r.getOwner()) || resolvedDesired.containsKey(r.getOwner())) {
+            final String ownerPrefix = ownerPrefixKey(r.getOwner(), r.getPrefix());
+            // Remove when not desired AND (owner|prefix not configured OR was resolved).
+            // KEEP if still configured but unresolved this tick (anti-flap / infra failure).
+            if (!configuredOwnerPrefixes.contains(ownerPrefix) || resolvedOwnerPrefixes.contains(ownerPrefix)) {
                 toRemove.add(r.getUuid());
             }
         }
@@ -675,6 +781,398 @@ public class OvnReconcilerService {
 
     private static String tupleKey(final String owner, final String prefix, final String nexthop) {
         return owner + '|' + prefix + '|' + nexthop;
+    }
+
+    static String ownerPrefixKey(final String owner, final String prefix) {
+        return owner + '|' + prefix;
+    }
+
+    /**
+     * Ensure public IPv6 Load_Balancer rows for every entry in
+     * {@code ovn.lr.public.ipv6.lb} for this zone. Called from the periodic
+     * reconcile loop ({@link OvnBgpReconcileTask}) so a management restart or
+     * a config change self-heals. Idempotent.
+     *
+     * @param zoneId CloudStack zone id
+     * @param dryRun when {@code true}, count only, do not mutate the NB DB
+     * @return number of LB rows (that would have been) created + updated + removed
+     */
+    public int ensurePublicIpv6LbForZone(final long zoneId, final boolean dryRun) {
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return 0;
+        }
+        final List<OvnPublicIpv6Lb.Entry> desired =
+                OvnPublicIpv6Lb.parse(OvnNetworkConfig.LrPublicIpv6Lb.value());
+        final int changed = ensurePublicIpv6Lb(pluginManager.nbClient(zoneId), controller, zoneId, desired, dryRun);
+        if (changed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} public IPv6 LB resync {} {} LB row(s)",
+                    zoneId, dryRun ? "would change" : "changed", changed);
+        }
+        return changed;
+    }
+
+    /**
+     * Ensure the configured public IPv6 LBs on their owning VPC LRs (+ tier LS).
+     * Only rows carrying {@link OvnConstants#EXT_ID_PUBLIC_IPV6_LB} are ever
+     * touched. A {@code null} client/controller is a strict no-op.
+     *
+     * <p>Backend filtering: hops must fall inside the tier's {@code ip6Cidr}.
+     * There is no per-network IPv6 NIC finder in CloudStack, so Running-state
+     * pruning is not applied (all in-CIDR hops are kept). Documented limitation.
+     *
+     * @return count of LB rows (that would have been) created + updated + removed
+     */
+    int ensurePublicIpv6Lb(final OvnNbClient nb, final OvnControllerVO controller, final long zoneId,
+                           final List<OvnPublicIpv6Lb.Entry> desired, final boolean dryRun) {
+        if (nb == null || controller == null) {
+            return 0;
+        }
+        final Map<String, ResolvedPub6Lb> resolved = resolvePublicIpv6Lbs(desired, controller, zoneId);
+        final Set<String> configuredKeys = configuredPublicIpv6LbKeys(desired, zoneId);
+        final List<OwnedLoadBalancer> existing = nb.listOwnedLoadBalancers(OvnConstants.EXT_ID_PUBLIC_IPV6_LB);
+        final Pub6LbPlan plan = planPublicIpv6Lb(resolved, configuredKeys, existing);
+        if (dryRun) {
+            return plan.size();
+        }
+        return applyPublicIpv6LbPlan(nb, plan, resolved, zoneId);
+    }
+
+    /**
+     * Config keys that belong to {@code zoneId} for anti-flap. Entries whose
+     * network resolves to another zone are excluded so a global config cannot
+     * freeze foreign/orphan rows in this zone's NB. Unresolvable networks stay
+     * in the set (anti-flap) — same as a transient DAO miss.
+     */
+    Set<String> configuredPublicIpv6LbKeys(final List<OvnPublicIpv6Lb.Entry> desired, final long zoneId) {
+        final Set<String> out = new HashSet<>();
+        if (desired == null) {
+            return out;
+        }
+        for (final OvnPublicIpv6Lb.Entry e : desired) {
+            final Network network = networkDao.findByUuid(e.getNetworkUuid());
+            if (network != null && network.getDataCenterId() != zoneId) {
+                continue;
+            }
+            out.add(e.entryKey());
+        }
+        return out;
+    }
+
+    private Map<String, ResolvedPub6Lb> resolvePublicIpv6Lbs(final List<OvnPublicIpv6Lb.Entry> desired,
+                                                             final OvnControllerVO controller,
+                                                             final long zoneId) {
+        final Map<String, ResolvedPub6Lb> out = new LinkedHashMap<>();
+        for (final OvnPublicIpv6Lb.Entry entry : desired) {
+            final ResolvedPub6Lb rr = resolveOnePublicIpv6Lb(entry, controller, zoneId);
+            if (rr != null) {
+                out.put(entry.entryKey(), rr);
+            }
+        }
+        return out;
+    }
+
+    private ResolvedPub6Lb resolveOnePublicIpv6Lb(final OvnPublicIpv6Lb.Entry entry,
+                                                  final OvnControllerVO controller,
+                                                  final long zoneId) {
+        final Network network = networkDao.findByUuid(entry.getNetworkUuid());
+        if (network == null) {
+            LOGGER.warn("OvnReconcilerService: public IPv6 LB network {} not found; skipping",
+                    entry.getNetworkUuid());
+            return null;
+        }
+        if (network.getDataCenterId() != zoneId) {
+            // Config is global; only program LBs whose network lives in this zone.
+            return null;
+        }
+        if (network.getVpcId() == null) {
+            LOGGER.warn("OvnReconcilerService: public IPv6 LB network {} has no VPC; skipping",
+                    entry.getNetworkUuid());
+            return null;
+        }
+        final OvnLogicalIdMapVO lr = logicalIdMapDao.findByCsId(Kind.VPC, network.getVpcId(), controller.getId());
+        if (lr == null) {
+            LOGGER.warn("OvnReconcilerService: public IPv6 LB network {} — no OVN LR for VPC {}; skipping",
+                    entry.getNetworkUuid(), network.getVpcId());
+            return null;
+        }
+        final List<OvnPublicIpv6Lb.HostPort> hops =
+                backendsInIp6Cidr(entry.getBackends(), network.getIp6Cidr(), entry.getNetworkUuid());
+        if (hops.isEmpty()) {
+            LOGGER.warn("OvnReconcilerService: public IPv6 LB network {} VIP {} — no in-ip6Cidr backend "
+                    + "(CIDR {}); keeping existing owned rows to avoid flapping",
+                    entry.getNetworkUuid(), entry.getVip(), network.getIp6Cidr());
+            return null;
+        }
+        // No IPv6 NIC-by-address finder fleet-wide — keep all in-CIDR hops
+        // (cannot prune non-Running without a large NicDao change).
+        final OvnLogicalIdMapVO ls = logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), controller.getId());
+        return new ResolvedPub6Lb(entry.entryKey(), entry.getNetworkUuid(), lr.getOvnUuid(),
+                ls == null ? null : ls.getOvnUuid(), entry.getVip(), entry.getVipPort(), hops,
+                network.getVpcId(), zoneId);
+    }
+
+    /** Keep only backends whose IPv6 address falls inside the tier ip6Cidr. */
+    private List<OvnPublicIpv6Lb.HostPort> backendsInIp6Cidr(final List<OvnPublicIpv6Lb.HostPort> backends,
+                                                             final String ip6Cidr,
+                                                             final String networkUuid) {
+        final List<OvnPublicIpv6Lb.HostPort> out = new ArrayList<>();
+        for (final OvnPublicIpv6Lb.HostPort be : backends) {
+            if (StringUtils.isBlank(ip6Cidr) || !NetUtils.isValidIp6Cidr(ip6Cidr)) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB network {} has no ip6Cidr; dropping backends",
+                        networkUuid);
+                return out;
+            }
+            try {
+                if (NetUtils.isIp6InNetwork(be.getHost(), ip6Cidr)) {
+                    out.add(be);
+                } else {
+                    LOGGER.warn("OvnReconcilerService: public IPv6 LB backend {} outside network {} ip6Cidr {}; "
+                            + "skipping", be.getHost(), networkUuid, ip6Cidr);
+                }
+            } catch (RuntimeException re) {
+                LOGGER.debug("OvnReconcilerService: public IPv6 LB CIDR check failed be={} cidr={}: {}",
+                        be.getHost(), ip6Cidr, re.getMessage());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Pure diff between desired public IPv6 LBs and plugin-owned LB rows in the
+     * NB DB. Keyed by the marker value ({@code networkUuid|vip|port}). Desired
+     * keys absent from NB become creates; owned rows absent from desired become
+     * removes — but only when their owner was dropped from config OR is still
+     * resolvable (transient resolve failure keeps rows). Existing rows with
+     * matching key but different vips map become updates.
+     */
+    static Pub6LbPlan planPublicIpv6Lb(final Map<String, ResolvedPub6Lb> resolvedDesired,
+                                       final Set<String> configuredKeys,
+                                       final List<OwnedLoadBalancer> existingOwned) {
+        final Map<String, OwnedLoadBalancer> existingByKey = new LinkedHashMap<>();
+        for (final OwnedLoadBalancer lb : existingOwned) {
+            existingByKey.put(lb.getOwner(), lb);
+        }
+        final List<ResolvedPub6Lb> toCreate = new ArrayList<>();
+        final List<Pub6LbUpdate> toUpdate = new ArrayList<>();
+        for (final Map.Entry<String, ResolvedPub6Lb> e : resolvedDesired.entrySet()) {
+            final OwnedLoadBalancer existing = existingByKey.get(e.getKey());
+            if (existing == null) {
+                toCreate.add(e.getValue());
+            } else if (!e.getValue().toVipsMap().equals(existing.getVips())) {
+                toUpdate.add(new Pub6LbUpdate(existing.getUuid(), e.getValue()));
+            }
+        }
+        return new Pub6LbPlan(toCreate, toUpdate, collectPub6Removals(resolvedDesired, configuredKeys, existingOwned));
+    }
+
+    private static List<OwnedLoadBalancer> collectPub6Removals(final Map<String, ResolvedPub6Lb> resolvedDesired,
+                                                               final Set<String> configuredKeys,
+                                                               final List<OwnedLoadBalancer> existingOwned) {
+        final List<OwnedLoadBalancer> toRemove = new ArrayList<>();
+        for (final OwnedLoadBalancer lb : existingOwned) {
+            if (resolvedDesired.containsKey(lb.getOwner())) {
+                continue;
+            }
+            // Keep when still configured but transiently unresolvable.
+            if (configuredKeys.contains(lb.getOwner()) && !resolvedDesired.containsKey(lb.getOwner())) {
+                continue;
+            }
+            toRemove.add(lb);
+        }
+        return toRemove;
+    }
+
+    private int applyPublicIpv6LbPlan(final OvnNbClient nb, final Pub6LbPlan plan,
+                                      final Map<String, ResolvedPub6Lb> resolved, final long zoneId) {
+        int changed = 0;
+        final Set<String> touched = new HashSet<>();
+        for (final ResolvedPub6Lb rr : plan.getToCreate()) {
+            try {
+                createPublicIpv6Lb(nb, rr);
+                touched.add(rr.getEntryKey());
+                changed++;
+            } catch (OvnException ex) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB create {} failed: {}",
+                        rr.getEntryKey(), ex.getMessage());
+            }
+        }
+        for (final Pub6LbUpdate up : plan.getToUpdate()) {
+            try {
+                nb.updateLoadBalancerBackends(up.getUuid(), up.getResolved().toVipsMap());
+                bgpRedistributeManager.announceHost6(up.getResolved().getVip(),
+                        up.getResolved().getVpcId(), up.getResolved().getZoneId());
+                touched.add(up.getResolved().getEntryKey());
+                changed++;
+            } catch (OvnException ex) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB update {} failed: {}",
+                        up.getUuid(), ex.getMessage());
+            }
+        }
+        for (final OwnedLoadBalancer lb : plan.getToRemove()) {
+            try {
+                removePublicIpv6Lb(nb, lb, zoneId);
+                changed++;
+            } catch (OvnException ex) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB remove {} failed: {}",
+                        lb.getUuid(), ex.getMessage());
+            }
+        }
+        // Re-announce /128 for stable (unchanged) LBs so gateway-chassis
+        // migration still pulls the VIP toward the current chassis.
+        for (final ResolvedPub6Lb rr : resolved.values()) {
+            if (touched.contains(rr.getEntryKey())) {
+                continue;
+            }
+            try {
+                bgpRedistributeManager.announceHost6(rr.getVip(), rr.getVpcId(), rr.getZoneId());
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB /128 re-announce {} failed: {}",
+                        rr.getVip(), re.getMessage());
+            }
+        }
+        return changed;
+    }
+
+    private void createPublicIpv6Lb(final OvnNbClient nb, final ResolvedPub6Lb rr) {
+        final Map<String, String> ext = new LinkedHashMap<>();
+        ext.put(OvnConstants.EXT_ID_PUBLIC_IPV6_LB, rr.getEntryKey());
+        ext.put(OvnConstants.EXT_ID_KIND, "PUBLIC_IPV6_LB");
+        ext.put(OvnConstants.EXT_ID_ZONE, String.valueOf(rr.getZoneId()));
+        final Map<String, String> options = Collections.singletonMap("hairpin_snat_ip", rr.getVip());
+        final String name = "cs-pub6-lb-" + Integer.toHexString(rr.getEntryKey().hashCode());
+        final String lbUuid = nb.createLoadBalancer(name, rr.toVipsMap(), OvnNbClient.LB_PROTOCOL_TCP,
+                Collections.emptyList(), ext, options);
+        try {
+            nb.attachLoadBalancerToLogicalRouter(rr.getLrUuid(), lbUuid);
+        } catch (OvnException oe) {
+            try {
+                nb.deleteLoadBalancer(lbUuid);
+            } catch (OvnException ignored) {
+                // Already swallowed.
+            }
+            throw oe;
+        }
+        if (StringUtils.isNotBlank(rr.getLsUuid())) {
+            try {
+                nb.attachLoadBalancerToLogicalSwitch(rr.getLsUuid(), lbUuid);
+            } catch (OvnException e) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB {} LS attach failed (east-west degraded): {}",
+                        lbUuid, e.getMessage());
+            }
+        }
+        bgpRedistributeManager.announceHost6(rr.getVip(), rr.getVpcId(), rr.getZoneId());
+        LOGGER.info("OvnReconcilerService: public IPv6 LB {} created (key={}, vip={}, backends={})",
+                lbUuid, rr.getEntryKey(), rr.getVip(), rr.getBackends());
+    }
+
+    private void removePublicIpv6Lb(final OvnNbClient nb, final OwnedLoadBalancer lb, final long zoneId) {
+        // Best-effort detach: re-resolve LR/LS from the marker's network UUID.
+        final String networkUuid = networkUuidFromEntryKey(lb.getOwner());
+        long vpcId = 0L;
+        long withdrawZoneId = zoneId;
+        if (networkUuid != null) {
+            final Network network = networkDao.findByUuid(networkUuid);
+            if (network != null) {
+                withdrawZoneId = network.getDataCenterId();
+                if (network.getVpcId() != null) {
+                    vpcId = network.getVpcId();
+                }
+                final OvnControllerVO ctrl = pluginManager.findControllerForZone(withdrawZoneId);
+                if (ctrl != null && network.getVpcId() != null) {
+                    final OvnLogicalIdMapVO lr =
+                            logicalIdMapDao.findByCsId(Kind.VPC, network.getVpcId(), ctrl.getId());
+                    if (lr != null) {
+                        try {
+                            nb.detachLoadBalancerFromLogicalRouter(lr.getOvnUuid(), lb.getUuid());
+                        } catch (OvnException e) {
+                            LOGGER.warn("OvnReconcilerService: detach public IPv6 LB {} from LR failed: {}",
+                                    lb.getUuid(), e.getMessage());
+                        }
+                    }
+                    final OvnLogicalIdMapVO ls =
+                            logicalIdMapDao.findByCsId(Kind.NETWORK, network.getId(), ctrl.getId());
+                    if (ls != null) {
+                        try {
+                            nb.detachLoadBalancerFromLogicalSwitch(ls.getOvnUuid(), lb.getUuid());
+                        } catch (OvnException e) {
+                            LOGGER.warn("OvnReconcilerService: detach public IPv6 LB {} from LS failed: {}",
+                                    lb.getUuid(), e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
+        // Always withdraw the /128 when we can parse the VIP — even if the
+        // network row is gone (stale NB row / deleted CS network).
+        final String vip = vipFromOwnedLb(lb);
+        if (vip != null) {
+            try {
+                bgpRedistributeManager.withdrawHost6(vip, vpcId, withdrawZoneId);
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnReconcilerService: public IPv6 LB /128 withdraw {} failed: {}",
+                        vip, re.getMessage());
+            }
+        }
+        nb.deleteLoadBalancer(lb.getUuid());
+        LOGGER.info("OvnReconcilerService: public IPv6 LB {} removed (owner={})", lb.getUuid(), lb.getOwner());
+    }
+
+    /**
+     * VIP for withdraw: prefer marker mid-segment; fall back to the first
+     * {@code vips} map key (strip {@code [addr]:port} form).
+     */
+    static String vipFromOwnedLb(final OwnedLoadBalancer lb) {
+        if (lb == null) {
+            return null;
+        }
+        final String fromMarker = vipFromEntryKey(lb.getOwner());
+        if (fromMarker != null) {
+            return fromMarker;
+        }
+        if (lb.getVips() == null || lb.getVips().isEmpty()) {
+            return null;
+        }
+        return vipFromVipsMapKey(lb.getVips().keySet().iterator().next());
+    }
+
+    /** Parse {@code [ipv6]:port} or {@code ipv4:port} down to the bare address. */
+    static String vipFromVipsMapKey(final String vipKey) {
+        if (StringUtils.isBlank(vipKey)) {
+            return null;
+        }
+        if (vipKey.startsWith("[")) {
+            final int close = vipKey.indexOf(']');
+            if (close > 1) {
+                return vipKey.substring(1, close);
+            }
+            return null;
+        }
+        final int colon = vipKey.lastIndexOf(':');
+        return colon <= 0 ? vipKey : vipKey.substring(0, colon);
+    }
+
+    static String networkUuidFromEntryKey(final String entryKey) {
+        if (StringUtils.isBlank(entryKey)) {
+            return null;
+        }
+        final int bar = entryKey.indexOf('|');
+        return bar <= 0 ? null : entryKey.substring(0, bar);
+    }
+
+    static String vipFromEntryKey(final String entryKey) {
+        if (StringUtils.isBlank(entryKey)) {
+            return null;
+        }
+        final int first = entryKey.indexOf('|');
+        if (first < 0) {
+            return null;
+        }
+        final int second = entryKey.indexOf('|', first + 1);
+        if (second < 0) {
+            return null;
+        }
+        return entryKey.substring(first + 1, second);
     }
 
     /** Apply an {@link EcmpPlan} to the NB DB. Each add stamps the
@@ -704,7 +1202,8 @@ public class OvnReconcilerService {
     }
 
     /** A network's ECMP route resolved to its owning VPC LR UUID and the
-     *  next-hops that passed the CIDR-membership check. */
+     *  next-hops that passed CIDR + Running filters. Hop list may be empty
+     *  (all pruned) — still counts as resolved so owned rows are removed. */
     static final class ResolvedRoute {
         private final String lrUuid;
         private final String prefix;
@@ -781,6 +1280,127 @@ public class OvnReconcilerService {
 
         int size() {
             return toAdd.size() + toRemove.size();
+        }
+    }
+
+    /** One public IPv6 LB entry resolved to LR/LS UUIDs and in-CIDR backends. */
+    static final class ResolvedPub6Lb {
+        private final String entryKey;
+        private final String networkUuid;
+        private final String lrUuid;
+        private final String lsUuid;
+        private final String vip;
+        private final int vipPort;
+        private final List<OvnPublicIpv6Lb.HostPort> backends;
+        private final long vpcId;
+        private final long zoneId;
+
+        ResolvedPub6Lb(final String entryKey, final String networkUuid, final String lrUuid,
+                       final String lsUuid, final String vip, final int vipPort,
+                       final List<OvnPublicIpv6Lb.HostPort> backends, final long vpcId, final long zoneId) {
+            this.entryKey = entryKey;
+            this.networkUuid = networkUuid;
+            this.lrUuid = lrUuid;
+            this.lsUuid = lsUuid;
+            this.vip = vip;
+            this.vipPort = vipPort;
+            this.backends = Collections.unmodifiableList(new ArrayList<>(backends));
+            this.vpcId = vpcId;
+            this.zoneId = zoneId;
+        }
+
+        String getEntryKey() {
+            return entryKey;
+        }
+
+        String getNetworkUuid() {
+            return networkUuid;
+        }
+
+        String getLrUuid() {
+            return lrUuid;
+        }
+
+        String getLsUuid() {
+            return lsUuid;
+        }
+
+        String getVip() {
+            return vip;
+        }
+
+        int getVipPort() {
+            return vipPort;
+        }
+
+        List<OvnPublicIpv6Lb.HostPort> getBackends() {
+            return backends;
+        }
+
+        long getVpcId() {
+            return vpcId;
+        }
+
+        long getZoneId() {
+            return zoneId;
+        }
+
+        Map<String, String> toVipsMap() {
+            final List<String> tokens = new ArrayList<>(backends.size());
+            for (final OvnPublicIpv6Lb.HostPort be : backends) {
+                tokens.add(be.toVipToken());
+            }
+            return Collections.singletonMap(
+                    OvnPublicIpv6Lb.formatVipKey(vip, vipPort), String.join(",", tokens));
+        }
+    }
+
+    /** Existing LB UUID whose vips map needs rewriting to match desired. */
+    static final class Pub6LbUpdate {
+        private final String uuid;
+        private final ResolvedPub6Lb resolved;
+
+        Pub6LbUpdate(final String uuid, final ResolvedPub6Lb resolved) {
+            this.uuid = uuid;
+            this.resolved = resolved;
+        }
+
+        String getUuid() {
+            return uuid;
+        }
+
+        ResolvedPub6Lb getResolved() {
+            return resolved;
+        }
+    }
+
+    /** Result of {@link #planPublicIpv6Lb}: creates, updates, and removes. */
+    static final class Pub6LbPlan {
+        private final List<ResolvedPub6Lb> toCreate;
+        private final List<Pub6LbUpdate> toUpdate;
+        private final List<OwnedLoadBalancer> toRemove;
+
+        Pub6LbPlan(final List<ResolvedPub6Lb> toCreate, final List<Pub6LbUpdate> toUpdate,
+                   final List<OwnedLoadBalancer> toRemove) {
+            this.toCreate = toCreate;
+            this.toUpdate = toUpdate;
+            this.toRemove = toRemove;
+        }
+
+        List<ResolvedPub6Lb> getToCreate() {
+            return toCreate;
+        }
+
+        List<Pub6LbUpdate> getToUpdate() {
+            return toUpdate;
+        }
+
+        List<OwnedLoadBalancer> getToRemove() {
+            return toRemove;
+        }
+
+        int size() {
+            return toCreate.size() + toUpdate.size() + toRemove.size();
         }
     }
 

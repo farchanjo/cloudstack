@@ -16,6 +16,9 @@
 // under the License.
 package com.cloud.network.ovn.manager;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +45,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
+import com.cloud.utils.net.NetUtils;
 
 /**
  * Announces / withdraws a {@code /32} host route per allocated public IP via
@@ -308,6 +312,148 @@ public class OvnBgpRedistributeManager {
             LOGGER.info("OvnBgpRedistribute.announceSubnet6: {} announced on host {} (net={}, vpc={})",
                     ip6Cidr, hostId, networkId, vpcId);
         }
+    }
+
+    /**
+     * Announce a public IPv6 LB VIP as a BGP {@code /128} host route on the
+     * gateway-chassis FRR (IPv6 unicast AF), with a matching kernel route via
+     * the VPC public LRP GUA so inbound N-S enters OVN. Used by
+     * {@code ovn.lr.public.ipv6.lb} — VIPs sit outside CloudStack
+     * {@code user_ip_address}, so bookkeeping uses
+     * {@link Kind#BGP_HOST_ANNOUNCE_V6} with a stable negative hash of the VIP
+     * string (never collides with positive {@code public_ip_address.id}).
+     *
+     * @param vip   bare IPv6 VIP (no prefix length)
+     * @param vpcId owning VPC id (public LRP GUA / MAC resolution)
+     * @param zoneId zone id (controller / gateway-chassis)
+     */
+    public void announceHost6(final String vip, final long vpcId, final long zoneId) {
+        if (StringUtils.isBlank(vip) || !vip.contains(":") || !NetUtils.isValidIp6(vip)) {
+            return;
+        }
+        final String canonicalVip = canonicalizeHost6Vip(vip);
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            LOGGER.debug("OvnBgpRedistribute.announceHost6: no OVN controller for zone {}", zoneId);
+            return;
+        }
+        final Long hostId = findGatewayChassisHostId(zoneId, controller.getId());
+        if (hostId == null) {
+            LOGGER.warn("OvnBgpRedistribute.announceHost6: no gateway-chassis for zone={}; skipping {}/128",
+                    zoneId, canonicalVip);
+            return;
+        }
+        final String cidr = canonicalVip + "/128";
+        final String v6GatewayIp = publicNetworkManager.getVpcPublicIpv6GatewayIp(zoneId, vpcId);
+        final String gatewayMac = publicNetworkManager.getVpcPublicLrpMac(zoneId, vpcId);
+        final String v6AnchorCidr = publicNetworkManager.getPublicIpv6AnchorCidr();
+        final String v6NetworkGateway = publicNetworkManager.getPublicIpv6Gateway();
+        if (sendSubnetCommand(hostId, cidr, v6GatewayIp, gatewayMac, v6AnchorCidr, null, v6NetworkGateway,
+                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+            final long csId = host6CsId(canonicalVip);
+            persistHostAnnounceV6(controller.getId(), csId, hostId, canonicalVip);
+            lastHostByIp.put(cidr, hostId);
+            LOGGER.info("OvnBgpRedistribute.announceHost6: {}/128 announced on host {} (vpc={})",
+                    canonicalVip, hostId, vpcId);
+        }
+    }
+
+    /**
+     * Withdraw a previously-announced public IPv6 LB VIP {@code /128}.
+     * Best-effort and idempotent. Accepts any textual form of the VIP;
+     * canonicalization inside {@link #host6CsId} keeps the bookkeeping key stable.
+     */
+    public void withdrawHost6(final String vip, final long vpcId, final long zoneId) {
+        if (StringUtils.isBlank(vip)) {
+            return;
+        }
+        final String canonicalVip = canonicalizeHost6Vip(vip);
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            return;
+        }
+        final long csId = host6CsId(canonicalVip);
+        final OvnLogicalIdMapVO mapping =
+                logicalIdMapDao.findByCsId(Kind.BGP_HOST_ANNOUNCE_V6, csId, controller.getId());
+        final String cidr = canonicalVip + "/128";
+        if (mapping == null) {
+            lastHostByIp.remove(cidr);
+            return;
+        }
+        final Long hostId = parseHostId(mapping.getOvnUuid());
+        if (hostId != null) {
+            sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+        }
+        try {
+            logicalIdMapDao.remove(mapping.getId());
+        } finally {
+            lastHostByIp.remove(cidr);
+        }
+        LOGGER.info("OvnBgpRedistribute.withdrawHost6: {}/128 withdrawn on host {} (vpc={})",
+                canonicalVip, hostId, vpcId);
+    }
+
+    /**
+     * Stable negative cs_id for a public IPv6 VIP so
+     * {@link Kind#BGP_HOST_ANNOUNCE_V6} never collides with positive
+     * {@code public_ip_address.id} rows under {@link Kind#BGP_ANNOUNCE}.
+     *
+     * <p>Canonicalizes the VIP via {@link NetUtils#standardizeIp6Address} so
+     * compressed/expanded forms of the same address share one id, then mixes
+     * the 16 address bytes (not {@link String#hashCode}) and forces the
+     * signed-INT sign bit. The result always sits in
+     * {@code [Integer.MIN_VALUE, -1]} so it fits a signed 32-bit
+     * {@code cs_id} column — {@code Arrays.hashCode | Long.MIN_VALUE} used to
+     * overflow that column with values around {@code -2^63}.
+     */
+    static long host6CsId(final String vip) {
+        final String canonical = canonicalizeHost6Vip(vip);
+        final byte[] addrBytes = host6AddressBytes(canonical);
+        // Arrays.hashCode is a stable 32-bit mix of the address bytes; OR with
+        // Integer.MIN_VALUE forces the int sign bit so the id is always
+        // negative and still within signed INT range for the cs_id column.
+        final int h = Arrays.hashCode(addrBytes);
+        return (long) (h | Integer.MIN_VALUE);
+    }
+
+    /** Prefer standardized IPv6 form; fall back to the raw string. */
+    static String canonicalizeHost6Vip(final String vip) {
+        if (StringUtils.isBlank(vip)) {
+            return vip;
+        }
+        if (!NetUtils.isValidIp6(vip)) {
+            return vip;
+        }
+        try {
+            return NetUtils.standardizeIp6Address(vip);
+        } catch (RuntimeException re) {
+            return vip;
+        }
+    }
+
+    private static byte[] host6AddressBytes(final String vip) {
+        if (StringUtils.isBlank(vip)) {
+            return new byte[0];
+        }
+        try {
+            return InetAddress.getByName(vip).getAddress();
+        } catch (UnknownHostException | RuntimeException e) {
+            return vip.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    private void persistHostAnnounceV6(final long controllerId, final long csId, final long hostId,
+                                       final String vip) {
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                Kind.BGP_HOST_ANNOUNCE_V6, csId, controllerId);
+        if (existing != null) {
+            existing.setOvnUuid(String.valueOf(hostId));
+            existing.setOvnName(vip);
+            logicalIdMapDao.update(existing.getId(), existing);
+            return;
+        }
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(
+                Kind.BGP_HOST_ANNOUNCE_V6, csId, controllerId, String.valueOf(hostId), vip));
     }
 
     /**

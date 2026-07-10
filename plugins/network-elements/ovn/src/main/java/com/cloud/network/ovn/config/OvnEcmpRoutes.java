@@ -32,23 +32,32 @@ import com.cloud.utils.net.NetUtils;
 /**
  * Pure parser for {@link OvnNetworkConfig#LrEcmpStaticRoutes}
  * ({@code ovn.lr.ecmp.static.routes}). Turns the per-network map value into a
- * {@code network-uuid -> Route} structure, where each {@link Route} is a single
- * destination prefix plus the list of ECMP next-hops that should back it on the
- * owning VPC {@code Logical_Router}.
+ * {@code network-uuid -> List&lt;Route&gt;} structure, where each {@link Route}
+ * is a single destination prefix plus the list of ECMP next-hops that should
+ * back it on the owning VPC {@code Logical_Router}.
  *
  * <p>Value syntax:
- * {@code <network-uuid>=<prefix>-><nh1>|<nh2>|<nh3>;<network-uuid>=...}. The
- * {@code ;} separates per-network entries, {@code =} splits the network UUID
- * from its route spec, {@code ->} splits the destination prefix from the
- * next-hop list, and {@code |} separates next-hops. Example:
- * {@code a4226ad6-...=10.140.0.0/24->10.45.0.14|10.45.0.159|10.45.0.253}.
+ * {@code <network-uuid>=<prefix>-><nh1>|<nh2>;...}. The {@code ;} separates
+ * stanzas (per-network entries), {@code =} splits the network UUID from its
+ * route spec, {@code ->} splits the destination prefix from the next-hop list,
+ * and {@code |} separates next-hops. Multiple stanzas may reuse the same
+ * network UUID so dual-stack can declare an IPv4 and an IPv6 prefix
+ * independently, e.g.
+ * {@code a4226ad6-...=10.140.0.0/24->10.45.0.14|10.45.0.159;a4226ad6-...=fd00:cafe:2::/108->2a13:8740:0:a::5}.
+ * A single stanza remains valid and yields a list of length 1.
+ *
+ * <p>When the same UUID appears more than once:
+ * <ul>
+ *   <li>same prefix — next-hops are merged (order-stable {@link LinkedHashSet});</li>
+ *   <li>different prefixes — each becomes its own {@link Route} in the list.</li>
+ * </ul>
  *
  * <p>Validation is IP-shape only and deterministic (so a resync re-parses
  * identically): the prefix must be a valid IPv4 or IPv6 CIDR and each next-hop a
- * valid IPv4 or IPv6 address. Malformed prefixes drop the whole entry; malformed
- * next-hops are dropped individually; an entry left with no valid next-hop is
+ * valid IPv4 or IPv6 address. Malformed prefixes drop that stanza; malformed
+ * next-hops are dropped individually; a stanza left with no valid next-hop is
  * dropped. Next-hop-inside-the-network-CIDR is a network-specific check the
- * caller performs (it needs the live network CIDR), not this pure parser. A
+ * caller performs (it needs the live network CIDR(s)), not this pure parser. A
  * blank/null input yields an empty map (feature disabled). Insertion order is
  * preserved for deterministic logging.
  */
@@ -74,14 +83,16 @@ public final class OvnEcmpRoutes {
 
     /**
      * Parse the {@code ovn.lr.ecmp.static.routes} value into a
-     * {@code network-uuid -> Route} map. Malformed entries are logged at WARN and
+     * {@code network-uuid -> List&lt;Route&gt;} map. Multi-stanza entries for the
+     * same UUID accumulate into one list (same-prefix next-hops merge;
+     * different prefixes append). Malformed stanzas are logged at WARN and
      * skipped; a blank/null input yields an empty map (feature disabled).
      *
      * @param cfg raw ConfigKey value
-     * @return per-network ECMP route map, never {@code null}
+     * @return per-network ECMP route lists, never {@code null}
      */
-    public static Map<String, Route> parse(final String cfg) {
-        final Map<String, Route> out = new LinkedHashMap<>();
+    public static Map<String, List<Route>> parse(final String cfg) {
+        final Map<String, List<Route>> out = new LinkedHashMap<>();
         if (StringUtils.isBlank(cfg)) {
             return out;
         }
@@ -91,7 +102,7 @@ public final class OvnEcmpRoutes {
         return out;
     }
 
-    private static void parseEntry(final String rawEntry, final Map<String, Route> out) {
+    private static void parseEntry(final String rawEntry, final Map<String, List<Route>> out) {
         final String entry = StringUtils.trimToEmpty(rawEntry);
         if (entry.isEmpty()) {
             return;
@@ -107,7 +118,24 @@ public final class OvnEcmpRoutes {
             LOGGER.warn("OvnEcmpRoutes: skipping entry with blank uuid or no valid route: {}", entry);
             return;
         }
-        out.put(networkUuid, route);
+        mergeOrAppend(out.computeIfAbsent(networkUuid, k -> new ArrayList<>()), route);
+    }
+
+    /**
+     * Same prefix merges next-hops (order-stable); different prefixes append a
+     * new {@link Route}.
+     */
+    private static void mergeOrAppend(final List<Route> routes, final Route route) {
+        for (int i = 0; i < routes.size(); i++) {
+            final Route existing = routes.get(i);
+            if (existing.getPrefix().equals(route.getPrefix())) {
+                final LinkedHashSet<String> hops = new LinkedHashSet<>(existing.getNextHops());
+                hops.addAll(route.getNextHops());
+                routes.set(i, new Route(existing.getPrefix(), new ArrayList<>(hops)));
+                return;
+            }
+        }
+        routes.add(route);
     }
 
     private static Route parseRoute(final String spec) {

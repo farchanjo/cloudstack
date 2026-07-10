@@ -20,6 +20,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.Test;
@@ -29,65 +30,113 @@ import com.cloud.network.ovn.config.OvnEcmpRoutes.Route;
 /**
  * Unit tests for {@link OvnEcmpRoutes} — the per-network ECMP static-route
  * parser backing {@code ovn.lr.ecmp.static.routes} (PARSEL P5 LB-VIP routing).
+ * Multi-stanza same UUID supports dual-stack (v4 + v6 VIP prefixes).
  */
 public class OvnEcmpRoutesTest {
 
     private static final String SALAZAR = "a4226ad6-604a-4cd6-883e-777958562fe1";
     private static final String SNAPE = "d46c5f93-4f6f-47fc-89ad-b4b10fb30f90";
 
+    private static Route first(final Map<String, List<Route>> map, final String uuid) {
+        return map.get(uuid).get(0);
+    }
+
     // ---------- parse: valid ----------
 
     @Test
     public void parseSingleNetworkThreeNextHops() {
-        final Map<String, Route> map =
+        final Map<String, List<Route>> map =
                 OvnEcmpRoutes.parse(SALAZAR + "=10.140.0.0/24->10.45.0.14|10.45.0.159|10.45.0.253");
         assertEquals(1, map.size());
-        final Route r = map.get(SALAZAR);
+        assertEquals(1, map.get(SALAZAR).size());
+        final Route r = first(map, SALAZAR);
         assertEquals("10.140.0.0/24", r.getPrefix());
         assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159", "10.45.0.253"), r.getNextHops());
     }
 
     @Test
     public void parseMultipleNetworksSemicolonSeparated() {
-        final Map<String, Route> map = OvnEcmpRoutes.parse(
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
                 SALAZAR + "=10.140.0.0/24->10.45.0.14|10.45.0.159;"
                         + SNAPE + "=10.141.0.0/24->10.45.4.73|10.45.4.214|10.45.4.18");
         assertEquals(2, map.size());
-        assertEquals("10.140.0.0/24", map.get(SALAZAR).getPrefix());
-        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), map.get(SALAZAR).getNextHops());
-        assertEquals(Arrays.asList("10.45.4.73", "10.45.4.214", "10.45.4.18"), map.get(SNAPE).getNextHops());
+        assertEquals(1, map.get(SALAZAR).size());
+        assertEquals(1, map.get(SNAPE).size());
+        assertEquals("10.140.0.0/24", first(map, SALAZAR).getPrefix());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), first(map, SALAZAR).getNextHops());
+        assertEquals(Arrays.asList("10.45.4.73", "10.45.4.214", "10.45.4.18"), first(map, SNAPE).getNextHops());
     }
 
     @Test
     public void parseIpv6PrefixAndNextHop() {
-        final Map<String, Route> map =
+        final Map<String, List<Route>> map =
                 OvnEcmpRoutes.parse(SALAZAR + "=fd00:cafe:2::/108->2a13:8740:0:a::5|2a13:8740:0:a::6");
-        assertEquals("fd00:cafe:2::/108", map.get(SALAZAR).getPrefix());
-        assertEquals(Arrays.asList("2a13:8740:0:a::5", "2a13:8740:0:a::6"), map.get(SALAZAR).getNextHops());
+        assertEquals("fd00:cafe:2::/108", first(map, SALAZAR).getPrefix());
+        assertEquals(Arrays.asList("2a13:8740:0:a::5", "2a13:8740:0:a::6"), first(map, SALAZAR).getNextHops());
+    }
+
+    @Test
+    public void parseDualStackSameUuidTwoPrefixes() {
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
+                SALAZAR + "=10.140.0.0/24->10.45.0.14|10.45.0.159;"
+                        + SALAZAR + "=fd00:cafe:2::/108->2a13:8740:0:a::5|2a13:8740:0:a::6");
+        assertEquals(1, map.size());
+        final List<Route> routes = map.get(SALAZAR);
+        assertEquals(2, routes.size());
+        assertEquals("10.140.0.0/24", routes.get(0).getPrefix());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), routes.get(0).getNextHops());
+        assertEquals("fd00:cafe:2::/108", routes.get(1).getPrefix());
+        assertEquals(Arrays.asList("2a13:8740:0:a::5", "2a13:8740:0:a::6"), routes.get(1).getNextHops());
+    }
+
+    @Test
+    public void parseMergesSamePrefixNextHopsOrderStable() {
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
+                SALAZAR + "=10.140.0.0/24->10.45.0.14|10.45.0.159;"
+                        + SALAZAR + "=10.140.0.0/24->10.45.0.159|10.45.0.253");
+        assertEquals(1, map.get(SALAZAR).size());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159", "10.45.0.253"),
+                first(map, SALAZAR).getNextHops());
+    }
+
+    @Test
+    public void parseMultiNetworkEachDualStack() {
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
+                SALAZAR + "=10.140.0.0/24->10.45.0.14;"
+                        + SNAPE + "=10.141.0.0/24->10.45.4.73;"
+                        + SALAZAR + "=fd00:cafe:2::/108->2a13:8740:0:a::5;"
+                        + SNAPE + "=fd00:cafe:2::/108->2a13:8740:0:9::5");
+        assertEquals(2, map.size());
+        assertEquals(2, map.get(SALAZAR).size());
+        assertEquals(2, map.get(SNAPE).size());
+        assertEquals("10.140.0.0/24", map.get(SALAZAR).get(0).getPrefix());
+        assertEquals("fd00:cafe:2::/108", map.get(SALAZAR).get(1).getPrefix());
+        assertEquals("10.141.0.0/24", map.get(SNAPE).get(0).getPrefix());
+        assertEquals(Arrays.asList("2a13:8740:0:9::5"), map.get(SNAPE).get(1).getNextHops());
     }
 
     @Test
     public void parseToleratesWhitespaceAroundTokens() {
-        final Map<String, Route> map =
+        final Map<String, List<Route>> map =
                 OvnEcmpRoutes.parse("  " + SALAZAR + " = 10.140.0.0/24 -> 10.45.0.14 | 10.45.0.159 ");
-        assertEquals("10.140.0.0/24", map.get(SALAZAR).getPrefix());
-        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), map.get(SALAZAR).getNextHops());
+        assertEquals("10.140.0.0/24", first(map, SALAZAR).getPrefix());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), first(map, SALAZAR).getNextHops());
     }
 
     @Test
     public void parseDeduplicatesRepeatedNextHops() {
-        final Map<String, Route> map =
+        final Map<String, List<Route>> map =
                 OvnEcmpRoutes.parse(SALAZAR + "=10.140.0.0/24->10.45.0.14|10.45.0.14|10.45.0.159");
-        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), map.get(SALAZAR).getNextHops());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.159"), first(map, SALAZAR).getNextHops());
     }
 
     // ---------- parse: malformed ----------
 
     @Test
     public void parseSkipsMalformedNextHopsKeepsValidOnes() {
-        final Map<String, Route> map =
+        final Map<String, List<Route>> map =
                 OvnEcmpRoutes.parse(SALAZAR + "=10.140.0.0/24->10.45.0.14|not-an-ip|999.0.0.1|10.45.0.253");
-        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.253"), map.get(SALAZAR).getNextHops());
+        assertEquals(Arrays.asList("10.45.0.14", "10.45.0.253"), first(map, SALAZAR).getNextHops());
     }
 
     @Test
@@ -120,10 +169,20 @@ public class OvnEcmpRoutesTest {
 
     @Test
     public void parseKeepsGoodEntryWhenAnotherIsMalformed() {
-        final Map<String, Route> map = OvnEcmpRoutes.parse(
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
                 SALAZAR + "=bad-prefix->10.45.0.14;" + SNAPE + "=10.141.0.0/24->10.45.4.73");
         assertEquals(1, map.size());
-        assertEquals("10.141.0.0/24", map.get(SNAPE).getPrefix());
+        assertEquals("10.141.0.0/24", first(map, SNAPE).getPrefix());
+    }
+
+    @Test
+    public void parseKeepsGoodPrefixWhenSiblingStanzaMalformed() {
+        final Map<String, List<Route>> map = OvnEcmpRoutes.parse(
+                SALAZAR + "=10.140.0.0/24->10.45.0.14;"
+                        + SALAZAR + "=not-a-cidr->2a13:8740:0:a::5");
+        assertEquals(1, map.size());
+        assertEquals(1, map.get(SALAZAR).size());
+        assertEquals("10.140.0.0/24", first(map, SALAZAR).getPrefix());
     }
 
     // ---------- Route value semantics ----------

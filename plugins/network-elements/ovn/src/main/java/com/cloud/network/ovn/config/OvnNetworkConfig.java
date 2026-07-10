@@ -137,12 +137,24 @@ public class OvnNetworkConfig implements Configurable {
      *  {@code Logical_Router_Static_Route} row is created per next-hop for the
      *  same destination prefix (OVN native ECMP), so k8s LB VIP ranges route
      *  from the OVN gateway to the CKS worker nodes. Map syntax:
-     *  {@code <network-uuid>=<prefix>-><nh1>|<nh2>|<nh3>;<network-uuid>=...}.
-     *  Every managed row is tagged {@code external_ids:cs-ecmp-route=<network-uuid>}
-     *  so the reconciler touches ONLY plugin-owned routes. A network absent from
-     *  the map has no route managed on its LR (zero regression).
+     *  {@code <network-uuid>=<prefix>-><nh1>|<nh2>|<nh3>;...}. Multi-stanza
+     *  entries may reuse the same network UUID so dual-stack can declare an
+     *  IPv4 and an IPv6 VIP prefix independently (same-prefix stanzas merge
+     *  next-hops; different prefixes append). Every managed row is tagged
+     *  {@code external_ids:cs-ecmp-route=<network-uuid>} so the reconciler
+     *  touches ONLY plugin-owned routes. A network absent from the map has no
+     *  route managed on its LR (zero regression).
      *  See {@link com.cloud.network.ovn.config.OvnEcmpRoutes}. */
     public static final String OVN_LR_ECMP_STATIC_ROUTES = "ovn.lr.ecmp.static.routes";
+
+    /** Per-network public IPv6 Load_Balancer rows on the VPC Logical_Router
+     *  (and tier LS). Map syntax:
+     *  {@code <network-uuid>=[vip]:vport->[be]:p|[be]:p;...}. IPv6 VIP/backends
+     *  MUST use brackets when ports are present. Every managed row is tagged
+     *  {@code external_ids:cs-pub6-lb=<network-uuid>|<vip>|<port>} so the
+     *  reconciler touches ONLY plugin-owned LBs. Empty disables the feature
+     *  (owned rows are removed). See {@link com.cloud.network.ovn.config.OvnPublicIpv6Lb}. */
+    public static final String OVN_LR_PUBLIC_IPV6_LB = "ovn.lr.public.ipv6.lb";
 
     /* ---------- ConfigKeys ---------- */
 
@@ -263,10 +275,26 @@ public class OvnNetworkConfig implements Configurable {
                     + "network. One Logical_Router_Static_Route row is created per next-hop for the same "
                     + "destination prefix (OVN native ECMP), tagged external_ids:cs-ecmp-route=<network-uuid> "
                     + "so the reconciler manages ONLY plugin-owned routes. Syntax: "
-                    + "'<network-uuid>=<prefix>-><nexthop1>|<nexthop2>|...;<network-uuid>=...'. Next-hops "
-                    + "must be valid IPs inside the network's CIDR; out-of-range next-hops and malformed "
-                    + "entries are logged and skipped. Empty disables the feature entirely (no route is "
-                    + "ever touched). Used to route k8s LB VIP ranges from the OVN gateway to CKS workers.",
+                    + "'<network-uuid>=<prefix>-><nexthop1>|<nexthop2>|...;...'. Multi-stanza same UUID is "
+                    + "supported for dual-stack (IPv4 + IPv6 VIP prefixes on one network); same-prefix "
+                    + "stanzas merge next-hops, different prefixes append. Next-hops must be valid IPs "
+                    + "inside the network's matching-family CIDR (IPv4 cidr / IPv6 ip6cidr); out-of-range "
+                    + "next-hops and malformed entries are logged and skipped. Empty disables the feature "
+                    + "entirely (no route is ever touched). Used to route k8s LB VIP ranges from the OVN "
+                    + "gateway to CKS workers.",
+            true);
+
+    public static final ConfigKey<String> LrPublicIpv6Lb = new ConfigKey<>(CATEGORY, String.class,
+            OVN_LR_PUBLIC_IPV6_LB, "",
+            "Per-network public IPv6 OVN Load_Balancer rows on the VPC Logical_Router (and tier LS). "
+                    + "Each entry is one VIP:port with one or more IPv6 backends; tagged "
+                    + "external_ids:cs-pub6-lb=<network-uuid>|<vip>|<port> so the reconciler manages ONLY "
+                    + "plugin-owned LBs. Syntax: "
+                    + "'<network-uuid>=[vip]:vport->[be]:p|[be]:p;...'. IPv6 VIP and backends MUST use "
+                    + "brackets when ports are present. Backends outside the tier ip6Cidr and malformed "
+                    + "entries are logged and skipped. Empty disables the feature (owned rows removed). "
+                    + "Also announces each VIP as a BGP /128 on the gateway-chassis. Prefer VIP host ids "
+                    + "::100+ in the public IPv6 /64; avoid transport GUAs (::1, per-VPC LRP ids).",
             true);
 
     /* ---------- Configurable contract ---------- */
@@ -294,7 +322,8 @@ public class OvnNetworkConfig implements Configurable {
                 BgpPublicAnchorEnabled,
                 SnatExemptedDestinations,
                 LspExtraPortSecurityCidrs,
-                LrEcmpStaticRoutes
+                LrEcmpStaticRoutes,
+                LrPublicIpv6Lb
         };
     }
 

@@ -2209,6 +2209,114 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * List every {@code Load_Balancer} row whose {@code external_ids} carries
+     * the supplied marker key (e.g. {@code cs-pub6-lb}), returning UUID, name,
+     * vips map, protocol, and the marker value. Used by the public IPv6 LB
+     * reconciler to diff desired entries against plugin-owned rows only.
+     *
+     * <p>Walks the table client-side (same rationale as
+     * {@link #listEcmpStaticRoutes} / {@link #findUuidsByExternalIds}).
+     *
+     * @param markerKey the {@code external_ids} key that tags an owned row
+     * @return owned LB descriptors, never {@code null}
+     */
+    public List<OwnedLoadBalancer> listOwnedLoadBalancers(final String markerKey) {
+        final List<OwnedLoadBalancer> out = new ArrayList<>();
+        if (markerKey == null || markerKey.isEmpty()) {
+            return out;
+        }
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("name");
+        columns.add("vips");
+        columns.add("protocol");
+        columns.add("external_ids");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("Load_Balancer", OvnOpFactory.whereAll(), columns));
+        final OvnTransaction.Result r;
+        try {
+            r = tx.commit();
+        } catch (OvnException e) {
+            return out;
+        }
+        final ArrayNode arr = r.raw();
+        final var entry = arr == null || arr.size() == 0 ? null : arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            addOwnedLoadBalancer(out, rows.get(i), markerKey);
+        }
+        return out;
+    }
+
+    private void addOwnedLoadBalancer(final List<OwnedLoadBalancer> out, final JsonNode row,
+                                      final String markerKey) {
+        if (row == null) {
+            return;
+        }
+        final String owner = mapValue(row.get("external_ids"), markerKey);
+        if (owner == null) {
+            return;
+        }
+        final var uuidNode = row.get("_uuid");
+        if (uuidNode == null || uuidNode.size() < 2) {
+            return;
+        }
+        final JsonNode nameNode = row.get("name");
+        final JsonNode protocolNode = row.get("protocol");
+        out.add(new OwnedLoadBalancer(
+                uuidNode.get(1).asText(),
+                nameNode == null || nameNode.isNull() ? "" : nameNode.asText(),
+                OvnNbReader.decodeMap(row.get("vips")),
+                protocolNode == null || protocolNode.isNull() ? "" : protocolNode.asText(),
+                owner));
+    }
+
+    /**
+     * Immutable descriptor of a plugin-owned {@code Load_Balancer} as read from
+     * the NB DB: row UUID, name, vips map, protocol, and the marker value
+     * ({@code external_ids:cs-pub6-lb}) identifying the stable entry key.
+     */
+    public static final class OwnedLoadBalancer {
+        private final String uuid;
+        private final String name;
+        private final Map<String, String> vips;
+        private final String protocol;
+        private final String owner;
+
+        public OwnedLoadBalancer(final String uuid, final String name, final Map<String, String> vips,
+                                 final String protocol, final String owner) {
+            this.uuid = uuid;
+            this.name = name;
+            this.vips = vips == null ? Map.of() : Map.copyOf(vips);
+            this.protocol = protocol;
+            this.owner = owner;
+        }
+
+        public String getUuid() {
+            return uuid;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public Map<String, String> getVips() {
+            return vips;
+        }
+
+        public String getProtocol() {
+            return protocol;
+        }
+
+        public String getOwner() {
+            return owner;
+        }
+    }
+
+    /**
      * Immutable descriptor of a plugin-owned ECMP static route as read from the
      * NB DB: the route row UUID, destination {@code ip_prefix}, {@code nexthop},
      * and the marker value ({@code external_ids:cs-ecmp-route}) identifying the
