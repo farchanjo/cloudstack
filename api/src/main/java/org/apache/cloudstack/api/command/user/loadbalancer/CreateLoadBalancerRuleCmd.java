@@ -31,6 +31,7 @@ import org.apache.cloudstack.api.response.DomainResponse;
 import org.apache.cloudstack.api.response.IPAddressResponse;
 import org.apache.cloudstack.api.response.LoadBalancerResponse;
 import org.apache.cloudstack.api.response.NetworkResponse;
+import org.apache.cloudstack.api.response.PublicIpv6AddressResponse;
 import org.apache.cloudstack.api.response.ZoneResponse;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.commons.lang3.StringUtils;
@@ -45,6 +46,7 @@ import com.cloud.exception.ResourceAllocationException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
+import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.rules.LoadBalancer;
 import com.cloud.user.Account;
 import com.cloud.utils.net.NetUtils;
@@ -76,8 +78,16 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     @Parameter(name = ApiConstants.PUBLIC_IP_ID,
                type = CommandType.UUID,
                entityType = IPAddressResponse.class,
-               description = "Public IP address ID from where the network traffic will be load balanced from")
+               description = "Public IP address ID from where the network traffic will be load balanced from. "
+                       + "Mutually exclusive with publicipv6id.")
     private Long publicIpId;
+
+    @Parameter(name = ApiConstants.PUBLIC_IPV6_ADDRESS_ID,
+               type = CommandType.UUID,
+               entityType = PublicIpv6AddressResponse.class,
+               description = "Public IPv6 inventory address ID (user_public_ipv6_address) for the VIP. "
+                       + "Mutually exclusive with publicipid. No IPv4 firewall is opened for this path.")
+    private Long publicIpv6Id;
 
     @Parameter(name = ApiConstants.ZONE_ID,
                type = CommandType.UUID,
@@ -149,6 +159,9 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     }
 
     public Long getSourceIpAddressId() {
+        if (isPublicIpv6Path()) {
+            return null;
+        }
         if (publicIpId != null) {
             IpAddress ipAddr = _networkService.getIp(publicIpId);
             if (ipAddr == null || !ipAddr.readyToUse()) {
@@ -162,7 +175,41 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
         return publicIpId;
     }
 
+    public Long getPublicIpv6AddressId() {
+        return publicIpv6Id;
+    }
+
+    public boolean isPublicIpv6Path() {
+        return publicIpv6Id != null;
+    }
+
+    private UserPublicIpv6Address getPublicIpv6Address() {
+        if (publicIpv6Id == null) {
+            return null;
+        }
+        UserPublicIpv6Address addr = publicIpv6AddressManager.findById(publicIpv6Id);
+        if (addr == null) {
+            throw new InvalidParameterValueException("Unable to find public IPv6 address id=" + publicIpv6Id);
+        }
+        return addr;
+    }
+
     private Long getVpcId() {
+        if (isPublicIpv6Path()) {
+            UserPublicIpv6Address addr = getPublicIpv6Address();
+            if (addr.getVpcId() != null) {
+                return addr.getVpcId();
+            }
+            if (addr.getNetworkId() != null) {
+                Network ntwk = _entityMgr.findById(Network.class, addr.getNetworkId());
+                return ntwk != null ? ntwk.getVpcId() : null;
+            }
+            if (networkId != null) {
+                Network ntwk = _entityMgr.findById(Network.class, networkId);
+                return ntwk != null ? ntwk.getVpcId() : null;
+            }
+            return null;
+        }
         if (publicIpId != null) {
             IpAddress ipAddr = _networkService.getIp(publicIpId);
             if (ipAddr == null || !ipAddr.readyToUse()) {
@@ -178,12 +225,20 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
         if (networkId != null) {
             return networkId;
         }
+        if (isPublicIpv6Path()) {
+            UserPublicIpv6Address addr = getPublicIpv6Address();
+            if (addr.getNetworkId() != null) {
+                return addr.getNetworkId();
+            }
+            throw new InvalidParameterValueException(
+                    "publicipv6id is not associated with a network; specify networkId for the load balancer rule");
+        }
         Long zoneId = getZoneId();
 
         if (zoneId == null) {
             Long ipId = getSourceIpAddressId();
             if (ipId == null) {
-                throw new InvalidParameterValueException("Either networkId or zoneId or publicIpId has to be specified");
+                throw new InvalidParameterValueException("Either networkId or zoneId or publicIpId or publicipv6id has to be specified");
             }
         }
 
@@ -231,6 +286,10 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     }
 
     public Boolean getOpenFirewall() {
+        // Public IPv6 VIP path never opens IPv4 firewall rules
+        if (isPublicIpv6Path()) {
+            return false;
+        }
         boolean isVpc = getVpcId() == null ? false : true;
         if (openFirewall != null) {
             if (isVpc && openFirewall) {
@@ -301,10 +360,17 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     @Override
     public void create() {
         try {
-            LoadBalancer result =
-                _lbService.createPublicLoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(), getSourcePortEnd(), getDefaultPortStart(),
-                    getDefaultPortEnd(), getSourceIpAddressId(), getProtocol(), getAlgorithm(), getNetworkId(), getEntityOwnerId(), getOpenFirewall(), getLbProtocol(), isDisplay(),
+            validatePublicVipXor();
+            LoadBalancer result;
+            if (isPublicIpv6Path()) {
+                result = _lbService.createPublicIpv6LoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(),
+                        getSourcePortEnd(), getDefaultPortStart(), getDefaultPortEnd(), publicIpv6Id, getProtocol(), getAlgorithm(),
+                        getNetworkId(), getEntityOwnerId(), getLbProtocol(), isDisplay(), getCidrList());
+            } else {
+                result = _lbService.createPublicLoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(), getSourcePortEnd(), getDefaultPortStart(),
+                        getDefaultPortEnd(), getSourceIpAddressId(), getProtocol(), getAlgorithm(), getNetworkId(), getEntityOwnerId(), getOpenFirewall(), getLbProtocol(), isDisplay(),
                         getCidrList());
+            }
             this.setEntityId(result.getId());
             this.setEntityUuid(result.getUuid());
         } catch (NetworkRuleConflictException e) {
@@ -315,6 +381,18 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
             throw new ServerApiException(ApiErrorCode.INSUFFICIENT_CAPACITY_ERROR, e.getMessage());
         } catch (InvalidParameterValueException e) {
             throw new ServerApiException(ApiErrorCode.PARAM_ERROR, e.getMessage());
+        }
+    }
+
+    /**
+     * Public LB requires exactly one of publicipid / publicipv6id (elastic-LB
+     * system-IP allocation is still allowed when neither is set and zone/network
+     * resolve for the IPv4 path).
+     */
+    private void validatePublicVipXor() {
+        if (publicIpId != null && publicIpv6Id != null) {
+            throw new InvalidParameterValueException(
+                    "Specify either publicipid or publicipv6id, not both");
         }
     }
 
@@ -331,6 +409,14 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     }
 
     public long getAccountId() {
+        if (isPublicIpv6Path()) {
+            UserPublicIpv6Address addr = getPublicIpv6Address();
+            if (addr.getAccountId() > 0) {
+                return addr.getAccountId();
+            }
+            throw new InvalidParameterValueException(
+                    "Public IPv6 address is not allocated to an account; allocate it first");
+        }
         if (publicIpId != null)
             return _networkService.getIp(getSourceIpAddressId()).getAccountId();
 
@@ -343,11 +429,21 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
                 throw new InvalidParameterValueException("Unable to find Account " + accountName + " in domain ID=" + domainId);
             }
         } else {
-            throw new InvalidParameterValueException("Can't define IP owner. Either specify Account/domainId or publicIpId");
+            throw new InvalidParameterValueException("Can't define IP owner. Either specify Account/domainId or publicIpId or publicipv6id");
         }
     }
 
     public long getDomainId() {
+        if (isPublicIpv6Path()) {
+            UserPublicIpv6Address addr = getPublicIpv6Address();
+            if (addr.getDomainId() > 0) {
+                return addr.getDomainId();
+            }
+            if (domainId != null) {
+                return domainId;
+            }
+            return CallContext.current().getCallingAccount().getDomainId();
+        }
         if (publicIpId != null)
             return _networkService.getIp(getSourceIpAddressId()).getDomainId();
         if (domainId != null) {

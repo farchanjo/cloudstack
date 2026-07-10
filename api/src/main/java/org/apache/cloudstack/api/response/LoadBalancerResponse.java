@@ -47,6 +47,14 @@ public class LoadBalancerResponse extends BaseResponse implements ControlledEnti
     @Param(description = "The public IP address")
     private String publicIp;
 
+    @SerializedName(ApiConstants.PUBLIC_IPV6_ADDRESS_ID)
+    @Param(description = "The public IPv6 address inventory ID (user_public_ipv6_address)", since = "4.24.1.29")
+    private String publicIpv6Id;
+
+    @SerializedName(ApiConstants.PUBLIC_IPV6_ADDRESS)
+    @Param(description = "The public IPv6 VIP address", since = "4.24.1.29")
+    private String publicIpv6Address;
+
     @SerializedName(ApiConstants.PUBLIC_PORT)
     @Param(description = "The public port")
     private String publicPort;
@@ -173,6 +181,14 @@ public class LoadBalancerResponse extends BaseResponse implements ControlledEnti
 
     public void setPublicIpId(String publicIpId) {
         this.publicIpId = publicIpId;
+    }
+
+    public void setPublicIpv6Id(String publicIpv6Id) {
+        this.publicIpv6Id = publicIpv6Id;
+    }
+
+    public void setPublicIpv6Address(String publicIpv6Address) {
+        this.publicIpv6Address = publicIpv6Address;
     }
 
     public void setZoneId(String zoneId) {
