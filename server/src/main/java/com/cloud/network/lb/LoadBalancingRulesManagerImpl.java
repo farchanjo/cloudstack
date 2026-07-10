@@ -83,6 +83,8 @@ import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
 import com.cloud.network.Network.Service;
 import com.cloud.network.NetworkModel;
+import com.cloud.network.PublicIpv6AddressManager;
+import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.addr.PublicIp;
 import com.cloud.network.as.AutoScaleManager;
 import com.cloud.network.as.AutoScalePolicy;
@@ -156,6 +158,7 @@ import com.cloud.user.dao.UserDao;
 import com.cloud.uservm.UserVm;
 import com.cloud.utils.Pair;
 import com.cloud.utils.Ternary;
+import com.cloud.utils.component.ComponentContext;
 import com.cloud.utils.component.ManagerBase;
 import com.cloud.utils.db.DB;
 import com.cloud.utils.db.EntityManager;
@@ -278,7 +281,12 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     @Inject
     NicSecondaryIpDao _nicSecondaryIpDao;
 
+    @Inject
+    PublicIpv6AddressManager publicIpv6AddressManager;
+
     private static final int DNS_PORT = 53;
+    private static final String OVN_RECONCILER_CLASS = "com.cloud.network.ovn.manager.OvnReconcilerService";
+    private static final String OVN_ENSURE_PUB6_LB_METHOD = "ensurePublicIpv6LbForZone";
     // Will return a string. For LB Stickiness this will be a json, for
     // autoscale this will be "," separated values
     @Override
@@ -453,12 +461,23 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     private Ip getSourceIp(LoadBalancer lb) {
         Ip sourceIp = null;
         if (lb.getScheme() == Scheme.Public) {
+            // Public IPv6 VIP rules have null sourceIpAddressId; Ip is IPv4-only
+            if (lb.getSourceIpAddressId() == null) {
+                return null;
+            }
             sourceIp = _networkModel.getPublicIpAddress(lb.getSourceIpAddressId()).getAddress();
         } else if (lb.getScheme() == Scheme.Internal) {
             ApplicationLoadBalancerRuleVO appLbRule = _appLbRuleDao.findById(lb.getId());
             sourceIp = appLbRule.getSourceIp();
         }
         return sourceIp;
+    }
+
+    /**
+     * True when the LB is bound to a public IPv6 inventory VIP only (no IPv4 public IP).
+     */
+    protected boolean isPublicIpv6LoadBalancer(LoadBalancer lb) {
+        return lb != null && lb.getPublicIpv6AddressId() != null && lb.getSourceIpAddressId() == null;
     }
 
     @Override
@@ -716,6 +735,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         if (purpose != Purpose.LoadBalancing) {
             logger.debug("Unable to validate network rules for purpose: " + purpose.toString());
             return false;
+        }
+        // Public IPv6 VIP rules are not validated by IPv4 LB providers
+        if (lbRule.getLb() != null && isPublicIpv6LoadBalancer(lbRule.getLb())) {
+            return true;
         }
         for (LoadBalancingServiceProvider ne : _lbProviders) {
             boolean validated = ne.validateLBRule(network, lbRule);
@@ -1098,7 +1121,8 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
 
             Nic vmNicInLb = getVmNicInLoadBalancer(vm, loadBalancer, loadBalancerNetwork, vmIdNetworkMap, vmOwner);
 
-            String priIp = vmNicInLb.getIPv4Address();
+            final boolean pub6Lb = isPublicIpv6LoadBalancer(loadBalancer);
+            String priIp = resolvePrimaryBackendIp(vmNicInLb, pub6Lb, instanceId);
 
             if (existingVmIdIps.containsKey(instanceId)) {
                 // now check for ip address
@@ -1118,20 +1142,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             }
 
             List<String> vmIpsList = vmIdIpMap.get(instanceId);
-            String vmLbIp = null;
 
             if (vmIpsList != null) {
-
-                //check if the ips belongs to nic secondary ip
                 for (String ip: vmIpsList) {
-                    // skip the primary ip from vm secondary ip comparisions
-                    if (ip.equals(priIp)) {
-                        continue;
-                    }
-                    if(_nicSecondaryIpDao.findByIp4AddressAndNicId(ip,vmNicInLb.getId()) == null) {
-                        throw new InvalidParameterValueException("Instance IP "+ ip + " specified does not belong to " +
-                                "NIC in Network " + vmNicInLb.getNetworkId());
-                    }
+                    validateBackendIpForLoadBalancer(ip, priIp, vmNicInLb, pub6Lb);
                 }
             } else {
                 vmIpsList = new ArrayList<String>();
@@ -1237,6 +1251,53 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             throw ex;
         }
         return vmNicInLb;
+    }
+
+    /**
+     * Primary backend address for assignment: IPv6 GUA for public-IPv6 LBs, IPv4 otherwise.
+     */
+    protected String resolvePrimaryBackendIp(Nic vmNicInLb, boolean pub6Lb, long instanceId) {
+        if (pub6Lb) {
+            String ipv6 = vmNicInLb.getIPv6Address();
+            if (StringUtils.isBlank(ipv6)) {
+                throw new InvalidParameterValueException(
+                        "VM " + instanceId + " has no IPv6 address on the load balancer network; "
+                                + "public IPv6 LB backends must be IPv6 GUAs");
+            }
+            return ipv6;
+        }
+        return vmNicInLb.getIPv4Address();
+    }
+
+    /**
+     * Validate a backend IP listed in vmidipmap for the LB family (v4 vs pub6).
+     */
+    protected void validateBackendIpForLoadBalancer(String ip, String primaryIp, Nic vmNicInLb, boolean pub6Lb) {
+        if (pub6Lb) {
+            if (NetUtils.isValidIp4(ip)) {
+                throw new InvalidParameterValueException(
+                        "IPv4 backend " + ip + " is not allowed on a public IPv6 load balancer rule");
+            }
+            if (!NetUtils.isValidIp6(ip)) {
+                throw new InvalidParameterValueException("Instance IP " + ip + " is not a valid IPv6 address");
+            }
+            if (ip.equals(primaryIp)) {
+                return;
+            }
+            if (_nicSecondaryIpDao.findByIp6AddressAndNetworkId(ip, vmNicInLb.getNetworkId()) == null) {
+                throw new InvalidParameterValueException("Instance IP " + ip + " specified does not belong to "
+                        + "NIC in Network " + vmNicInLb.getNetworkId());
+            }
+            return;
+        }
+        // IPv4 public / internal LB path (unchanged semantics)
+        if (ip.equals(primaryIp)) {
+            return;
+        }
+        if (_nicSecondaryIpDao.findByIp4AddressAndNicId(ip, vmNicInLb.getId()) == null) {
+            throw new InvalidParameterValueException("Instance IP " + ip + " specified does not belong to "
+                    + "NIC in Network " + vmNicInLb.getNetworkId());
+        }
     }
 
     /**
@@ -1722,6 +1783,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
 
         logger.debug("Load balancer {} is removed successfully", lb);
 
+        if (isPublicIpv6LoadBalancer(lb)) {
+            kickPublicIpv6LbReconcilerForNetwork(lb.getNetworkId());
+        }
+
         return true;
     }
 
@@ -1836,6 +1901,163 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         }
 
         return result;
+    }
+
+    @Override
+    @DB
+    @ActionEvent(eventType = EventTypes.EVENT_LOAD_BALANCER_CREATE, eventDescription = "creating public IPv6 load balancer")
+    public LoadBalancer createPublicIpv6LoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
+            long publicIpv6AddressId, String protocol, String algorithm, long networkId, long lbOwnerId, String lbProtocol, Boolean forDisplay, List<String> cidrList)
+            throws NetworkRuleConflictException {
+        if (srcPortStart != srcPortEnd) {
+            throw new InvalidParameterValueException("Port ranges are not supported by the load balancer");
+        }
+        if (!NetUtils.isValidPort(defPortStart)) {
+            throw new InvalidParameterValueException("privatePort is an invalid value: " + defPortStart);
+        }
+        if ((algorithm == null) || !NetUtils.isValidAlgorithm(algorithm)) {
+            throw new InvalidParameterValueException("Invalid algorithm: " + algorithm);
+        }
+
+        UserPublicIpv6Address pub6 = publicIpv6AddressManager.findById(publicIpv6AddressId);
+        if (pub6 == null) {
+            throw new InvalidParameterValueException("Unable to find public IPv6 address id=" + publicIpv6AddressId);
+        }
+        if (pub6.getState() != UserPublicIpv6Address.State.Allocated) {
+            throw new InvalidParameterValueException(
+                    "Public IPv6 address " + pub6.getAddress() + " is not Allocated (state=" + pub6.getState() + ")");
+        }
+
+        CallContext caller = CallContext.current();
+        _accountMgr.checkAccess(caller.getCallingAccount(), null, true, pub6);
+
+        Network network = _networkModel.getNetwork(networkId);
+        if (network == null) {
+            throw new InvalidParameterValueException("Unable to find network id=" + networkId);
+        }
+        if (StringUtils.isBlank(network.getIp6Cidr())) {
+            throw new InvalidParameterValueException(
+                    "Network " + network + " has no ip6Cidr; public IPv6 LB requires an IPv6-enabled guest network");
+        }
+        verifyPublicIpv6LoadBalancerNetwork(name, network, pub6);
+
+        isLbServiceSupportedInNetwork(networkId, Scheme.Public);
+
+        checkPublicIpv6PortConflict(publicIpv6AddressId, srcPortStart, null);
+
+        String cidrString = generateCidrString(cidrList);
+        long accountId = pub6.getAccountId() > 0 ? pub6.getAccountId() : lbOwnerId;
+        long domainId = pub6.getDomainId() > 0 ? pub6.getDomainId() : caller.getCallingAccount().getDomainId();
+
+        LoadBalancerVO newRule = Transaction.execute((TransactionCallbackWithException<LoadBalancerVO, NetworkRuleConflictException>) status -> {
+            LoadBalancerVO rule = new LoadBalancerVO(xId, name, description, null, publicIpv6AddressId, srcPortStart, defPortStart,
+                    algorithm, networkId, accountId, domainId, lbProtocol, cidrString);
+            if (forDisplay != null) {
+                rule.setDisplay(forDisplay);
+            }
+
+            // Skip IPv4 provider validateLbRule (source IP is IPv4-only); pub6 applies via OVN reconciler
+            rule = _lbDao.persist(rule);
+
+            try {
+                if (!_firewallDao.setStateToAdd(rule)) {
+                    throw new CloudRuntimeException("Unable to update the state to add for " + rule);
+                }
+                logger.debug("Public IPv6 load balancer {} for VIP {}, public port {}, private port {} is added successfully.",
+                        rule, pub6.getAddress(), srcPortStart, defPortStart);
+                CallContext.current().setEventDetails("Load balancer ID: " + rule.getUuid());
+                UsageEventUtils.publishUsageEvent(EventTypes.EVENT_LOAD_BALANCER_CREATE, accountId, pub6.getDataCenterId(),
+                        rule.getId(), null, LoadBalancingRule.class.getName(), rule.getUuid());
+                return rule;
+            } catch (Exception e) {
+                if (rule != null) {
+                    removeLBRule(rule);
+                }
+                if (e instanceof NetworkRuleConflictException) {
+                    throw (NetworkRuleConflictException) e;
+                }
+                if (e instanceof InvalidParameterValueException) {
+                    throw (InvalidParameterValueException) e;
+                }
+                throw new CloudRuntimeException("Unable to add public IPv6 load balancer rule for address id=" + publicIpv6AddressId, e);
+            }
+        });
+
+        kickPublicIpv6LbReconciler(pub6.getDataCenterId());
+        return newRule;
+    }
+
+    protected void verifyPublicIpv6LoadBalancerNetwork(String lbName, Network network, UserPublicIpv6Address pub6) {
+        if (pub6.getNetworkId() != null && pub6.getNetworkId() != network.getId()) {
+            boolean sameVpc = pub6.getVpcId() != null && network.getVpcId() != null
+                    && pub6.getVpcId().longValue() == network.getVpcId().longValue();
+            if (!sameVpc) {
+                throw new InvalidParameterValueException(String.format(
+                        "Cannot create Load Balancer rule %s: public IPv6 %s is associated with network id=%s, not network %s",
+                        lbName, pub6.getAddress(), pub6.getNetworkId(), network.getUuid()));
+            }
+        }
+        if (pub6.getVpcId() != null && network.getVpcId() != null
+                && pub6.getVpcId().longValue() != network.getVpcId().longValue()) {
+            throw new InvalidParameterValueException(String.format(
+                    "Cannot create Load Balancer rule %s: public IPv6 %s is associated with a different VPC",
+                    lbName, pub6.getAddress()));
+        }
+        if (pub6.getDataCenterId() != network.getDataCenterId()) {
+            throw new InvalidParameterValueException(String.format(
+                    "Cannot create Load Balancer rule %s: public IPv6 %s is in a different zone than network %s",
+                    lbName, pub6.getAddress(), network.getUuid()));
+        }
+    }
+
+    /**
+     * Reject another non-revoked LB on the same public IPv6 VIP and public port.
+     */
+    protected void checkPublicIpv6PortConflict(long publicIpv6AddressId, int srcPort, Long excludeRuleId)
+            throws NetworkRuleConflictException {
+        List<LoadBalancerVO> existing = _lbDao.listByPublicIpv6AddressId(publicIpv6AddressId);
+        if (existing == null) {
+            return;
+        }
+        for (LoadBalancerVO rule : existing) {
+            if (rule.getState() == FirewallRule.State.Revoke) {
+                continue;
+            }
+            if (excludeRuleId != null && rule.getId() == excludeRuleId.longValue()) {
+                continue;
+            }
+            if (rule.getSourcePortStart() != null && rule.getSourcePortStart() == srcPort) {
+                throw new NetworkRuleConflictException(String.format(
+                        "Public port %d is already used by load balancer rule %s on the same public IPv6 address",
+                        srcPort, rule.getUuid()));
+            }
+        }
+    }
+
+    /**
+     * Soft-kick OVN public IPv6 LB reconciler when the OVN plugin is present.
+     * Dual-read merge of inventory is implemented elsewhere — this only triggers
+     * {@code ensurePublicIpv6LbForZone} if the method exists.
+     */
+    protected void kickPublicIpv6LbReconciler(long zoneId) {
+        try {
+            Class<?> clazz = Class.forName(OVN_RECONCILER_CLASS);
+            Object reconciler = ComponentContext.getComponent(clazz);
+            java.lang.reflect.Method method = clazz.getMethod(OVN_ENSURE_PUB6_LB_METHOD, long.class, boolean.class);
+            method.invoke(reconciler, zoneId, false);
+            logger.debug("Kicked {} for zone {}", OVN_ENSURE_PUB6_LB_METHOD, zoneId);
+        } catch (ClassNotFoundException | org.springframework.beans.factory.NoSuchBeanDefinitionException e) {
+            logger.debug("OvnReconcilerService not available; skipping public IPv6 LB ensure for zone {}", zoneId);
+        } catch (Throwable t) {
+            logger.warn("Failed to kick public IPv6 LB reconciler for zone {}: {}", zoneId, t.getMessage());
+        }
+    }
+
+    protected void kickPublicIpv6LbReconcilerForNetwork(long networkId) {
+        Network network = _networkModel.getNetwork(networkId);
+        if (network != null) {
+            kickPublicIpv6LbReconciler(network.getDataCenterId());
+        }
     }
 
     protected void verifyLoadBalancerRuleNetwork(String lbName, Network network, IPAddressVO ipVO) {
@@ -2076,14 +2298,28 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
 
     @DB
     protected boolean applyLoadBalancerRules(List<LoadBalancerVO> lbs, boolean updateRulesInDB) throws ResourceUnavailableException {
-        List<LoadBalancingRule> rules = new ArrayList<LoadBalancingRule>();
+        // Public IPv6 VIP rules are programmed by OvnReconcilerService, not by
+        // IPv4-oriented LoadBalancingServiceProvider (e.g. OvnLoadBalancerService).
+        List<LoadBalancerVO> ipv4Lbs = new ArrayList<>();
+        List<LoadBalancerVO> pub6Lbs = new ArrayList<>();
         for (LoadBalancerVO lb : lbs) {
-            rules.add(getLoadBalancerRuleToApply(lb));
+            if (isPublicIpv6LoadBalancer(lb)) {
+                pub6Lbs.add(lb);
+            } else {
+                ipv4Lbs.add(lb);
+            }
         }
 
-        if (!applyLbRules(rules, false)) {
-            logger.debug("LB rules are not completely applied");
-            return false;
+        if (!ipv4Lbs.isEmpty()) {
+            List<LoadBalancingRule> rules = new ArrayList<LoadBalancingRule>();
+            for (LoadBalancerVO lb : ipv4Lbs) {
+                rules.add(getLoadBalancerRuleToApply(lb));
+            }
+
+            if (!applyLbRules(rules, false)) {
+                logger.debug("LB rules are not completely applied");
+                return false;
+            }
         }
 
         if (updateRulesInDB) {
@@ -2167,6 +2403,21 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
                 if (lb.getSourceIpAddressId() != null) {
                     _vpcMgr.unassignIPFromVpcNetwork(lb.getSourceIpAddressId(), lb.getNetworkId());
                 }
+            }
+        }
+
+        // After DB state is updated, soft-kick OVN reconciler for pub6 rules
+        if (!pub6Lbs.isEmpty()) {
+            Long zoneId = null;
+            for (LoadBalancerVO lb : pub6Lbs) {
+                Network ntwk = _networkModel.getNetwork(lb.getNetworkId());
+                if (ntwk != null) {
+                    zoneId = ntwk.getDataCenterId();
+                    break;
+                }
+            }
+            if (zoneId != null) {
+                kickPublicIpv6LbReconciler(zoneId);
             }
         }
 
@@ -2261,7 +2512,13 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         for (LoadBalancerVMMapVO lbVmMap : lbVmMaps) {
             UserVm vm = _vmDao.findById(lbVmMap.getInstanceId());
             Nic nic = _nicDao.findByInstanceIdAndNetworkIdIncludingRemoved(lb.getNetworkId(), vm.getId());
-            dstIp = lbVmMap.getInstanceIp() == null ? nic.getIPv4Address(): lbVmMap.getInstanceIp();
+            if (lbVmMap.getInstanceIp() != null) {
+                dstIp = lbVmMap.getInstanceIp();
+            } else if (isPublicIpv6LoadBalancer(lb)) {
+                dstIp = nic != null ? nic.getIPv6Address() : null;
+            } else {
+                dstIp = nic != null ? nic.getIPv4Address() : null;
+            }
             LbDestination lbDst = new LbDestination(lb.getDefaultPortStart(), lb.getDefaultPortEnd(), dstIp, lbVmMap.isRevoke());
             dstList.add(lbDst);
         }

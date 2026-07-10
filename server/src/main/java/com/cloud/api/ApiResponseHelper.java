@@ -324,6 +324,7 @@ import com.cloud.network.GuestVlanRange;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Ipv6Service;
 import com.cloud.network.Network;
+import com.cloud.network.PublicIpv6AddressManager;
 import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
@@ -471,6 +472,8 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
 
     @Inject
     private EntityManager _entityMgr;
+    @Inject
+    private PublicIpv6AddressManager publicIpv6AddressManager;
     @Inject
     private UsageService _usageSvc;
     @Inject
@@ -1348,9 +1351,25 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
         List<String> cidrs = ApiDBUtils.findFirewallSourceCidrs(loadBalancer.getId());
         lbResponse.setCidrList(StringUtils.join(cidrs, ","));
 
-        IPAddressVO publicIp = ApiDBUtils.findIpAddressById(loadBalancer.getSourceIpAddressId());
-        lbResponse.setPublicIpId(publicIp.getUuid());
-        lbResponse.setPublicIp(publicIp.getAddress().addr());
+        DataCenter zone = null;
+        if (loadBalancer.getSourceIpAddressId() != null) {
+            IPAddressVO publicIp = ApiDBUtils.findIpAddressById(loadBalancer.getSourceIpAddressId());
+            if (publicIp != null) {
+                lbResponse.setPublicIpId(publicIp.getUuid());
+                lbResponse.setPublicIp(publicIp.getAddress().addr());
+                zone = ApiDBUtils.findZoneById(publicIp.getDataCenterId());
+            }
+        }
+        if (loadBalancer.getPublicIpv6AddressId() != null && publicIpv6AddressManager != null) {
+            UserPublicIpv6Address pub6 = publicIpv6AddressManager.findById(loadBalancer.getPublicIpv6AddressId());
+            if (pub6 != null) {
+                lbResponse.setPublicIpv6Id(pub6.getUuid());
+                lbResponse.setPublicIpv6Address(pub6.getAddress());
+                if (zone == null) {
+                    zone = ApiDBUtils.findZoneById(pub6.getDataCenterId());
+                }
+            }
+        }
         lbResponse.setPublicPort(Integer.toString(loadBalancer.getSourcePortStart()));
         lbResponse.setPrivatePort(Integer.toString(loadBalancer.getDefaultPortStart()));
         lbResponse.setAlgorithm(loadBalancer.getAlgorithm());
@@ -1363,7 +1382,10 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
         }
         lbResponse.setState(stateToSet);
         populateOwner(lbResponse, loadBalancer);
-        DataCenter zone = ApiDBUtils.findZoneById(publicIp.getDataCenterId());
+        Network ntwk = ApiDBUtils.findNetworkById(loadBalancer.getNetworkId());
+        if (zone == null && ntwk != null) {
+            zone = ApiDBUtils.findZoneById(ntwk.getDataCenterId());
+        }
         if (zone != null) {
             lbResponse.setZoneId(zone.getUuid());
             lbResponse.setZoneName(zone.getName());
@@ -1378,8 +1400,9 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
         }
         lbResponse.setTags(tagResponses);
 
-        Network ntwk = ApiDBUtils.findNetworkById(loadBalancer.getNetworkId());
-        lbResponse.setNetworkId(ntwk.getUuid());
+        if (ntwk != null) {
+            lbResponse.setNetworkId(ntwk.getUuid());
+        }
 
         lbResponse.setCidrList(loadBalancer.getCidrList());
 
