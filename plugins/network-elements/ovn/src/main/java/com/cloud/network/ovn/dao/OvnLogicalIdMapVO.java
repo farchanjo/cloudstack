@@ -117,10 +117,10 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
          *  tier network id never clobber each other. */
         BGP_SUBNET_ANNOUNCE_V6,
         /** Public IPv6 LB VIP host-route ({@code /128}) BGP announce bookkeeping
-         *  for {@code ovn.lr.public.ipv6.lb}. cs_id is a stable hash of the VIP
-         *  string (always negative — never collides with positive
-         *  {@code public_ip_address.id} used by {@link #BGP_ANNOUNCE}); ovn_uuid
-         *  holds the agent host id; ovn_name carries the bare IPv6 VIP. */
+         *  for {@code ovn.lr.public.ipv6.lb}. cs_id is a stable positive hash of
+         *  the VIP address bytes (must be &gt; 0 — column is
+         *  {@code bigint unsigned}; kind-isolated from {@link #BGP_ANNOUNCE});
+         *  ovn_uuid holds the agent host id; ovn_name carries the bare IPv6 VIP. */
         BGP_HOST_ANNOUNCE_V6,
         /** Per-{@link com.cloud.network.rules.FirewallRule} OVN ACL mapping for
          *  a standalone (non-VPC) Isolated network's Firewall service.

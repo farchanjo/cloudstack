@@ -320,8 +320,9 @@ public class OvnBgpRedistributeManager {
      * the VPC public LRP GUA so inbound N-S enters OVN. Used by
      * {@code ovn.lr.public.ipv6.lb} — VIPs sit outside CloudStack
      * {@code user_ip_address}, so bookkeeping uses
-     * {@link Kind#BGP_HOST_ANNOUNCE_V6} with a stable negative hash of the VIP
-     * string (never collides with positive {@code public_ip_address.id}).
+     * {@link Kind#BGP_HOST_ANNOUNCE_V6} with a stable positive hash of the VIP
+     * (kind-isolated from {@link Kind#BGP_ANNOUNCE}; must stay &gt; 0 because
+     * {@code ovn_logical_id_map.cs_id} is {@code bigint unsigned}).
      *
      * @param vip   bare IPv6 VIP (no prefix length)
      * @param vpcId owning VPC id (public LRP GUA / MAC resolution)
@@ -394,26 +395,29 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
-     * Stable negative cs_id for a public IPv6 VIP so
-     * {@link Kind#BGP_HOST_ANNOUNCE_V6} never collides with positive
-     * {@code public_ip_address.id} rows under {@link Kind#BGP_ANNOUNCE}.
+     * Stable positive cs_id for a public IPv6 VIP under
+     * {@link Kind#BGP_HOST_ANNOUNCE_V6}.
      *
      * <p>Canonicalizes the VIP via {@link NetUtils#standardizeIp6Address} so
      * compressed/expanded forms of the same address share one id, then mixes
-     * the 16 address bytes (not {@link String#hashCode}) and forces the
-     * signed-INT sign bit. The result always sits in
-     * {@code [Integer.MIN_VALUE, -1]} so it fits a signed 32-bit
-     * {@code cs_id} column — {@code Arrays.hashCode | Long.MIN_VALUE} used to
-     * overflow that column with values around {@code -2^63}.
+     * the 16 address bytes (not {@link String#hashCode}) and clears the sign
+     * bit so the result is always in {@code [1, Integer.MAX_VALUE]}.
+     *
+     * <p><b>Must never be negative</b>: {@code ovn_logical_id_map.cs_id} is
+     * {@code bigint unsigned}; a negative value is rejected with
+     * {@code MysqlDataTruncation: Out of range value for column 'cs_id'}
+     * (live fail: {@code BGP_HOST_ANNOUNCE_V6 cs_id=-357727063}). Kind already
+     * isolates this namespace from {@link Kind#BGP_ANNOUNCE}
+     * ({@code public_ip_address.id}), so positivity alone is enough.
      */
     static long host6CsId(final String vip) {
         final String canonical = canonicalizeHost6Vip(vip);
         final byte[] addrBytes = host6AddressBytes(canonical);
-        // Arrays.hashCode is a stable 32-bit mix of the address bytes; OR with
-        // Integer.MIN_VALUE forces the int sign bit so the id is always
-        // negative and still within signed INT range for the cs_id column.
-        final int h = Arrays.hashCode(addrBytes);
-        return (long) (h | Integer.MIN_VALUE);
+        // Arrays.hashCode is a stable 32-bit mix of the address bytes. Mask to
+        // clear the sign bit so the id always fits bigint unsigned / signed
+        // positive Java long. Zero is reserved (ambiguous / empty sentinel).
+        final long id = Arrays.hashCode(addrBytes) & 0x7fff_ffffL;
+        return id == 0L ? 1L : id;
     }
 
     /** Prefer standardized IPv6 form; fall back to the raw string. */
