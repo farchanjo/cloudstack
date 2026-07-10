@@ -221,6 +221,42 @@ public class OvnNbClientLbTest {
     }
 
     @Test
+    public void updateIpPortMappingsEmitsFullReplace() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+
+        // Desired state after member destroy+recreate: old IP gone, new LSP.
+        client.updateLoadBalancerIpPortMappings("lb-uuid-hc",
+                Map.of("10.45.0.200", "lsp-new:10.45.0.254"));
+
+        final ArrayNode params = captureTransactCall();
+        final JsonNode update = params.get(1);
+        assertEquals("update", update.get("op").asText());
+        assertEquals("Load_Balancer", update.get("table").asText());
+        final JsonNode mappings = update.get("row").get("ip_port_mappings");
+        assertEquals("map", mappings.get(0).asText());
+        assertEquals(1, mappings.get(1).size());
+        assertEquals("10.45.0.200", mappings.get(1).get(0).get(0).asText());
+        assertEquals("lsp-new:10.45.0.254", mappings.get(1).get(0).get(1).asText());
+    }
+
+    @Test
+    public void updateIpPortMappingsEmptyClearsColumn() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+
+        client.updateLoadBalancerIpPortMappings("lb-uuid-hc", Map.of());
+
+        final ArrayNode params = captureTransactCall();
+        final JsonNode mappings = params.get(1).get("row").get("ip_port_mappings");
+        assertEquals("map", mappings.get(0).asText());
+        assertEquals(0, mappings.get(1).size());
+    }
+
+    @Test(expected = OvnException.class)
+    public void updateIpPortMappingsNullMapFails() {
+        client.updateLoadBalancerIpPortMappings("lb-uuid", null);
+    }
+
+    @Test
     public void updateBackendsEmitsUpdateWithVips() {
         when(pool.call(anyString(), any())).thenReturn(emptyReply());
 

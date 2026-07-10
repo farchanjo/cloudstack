@@ -241,13 +241,16 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
                     .thenReturn("dx6p0vf4");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("clear Interface")))
+                    .thenReturn("");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
                     .thenReturn("");
 
             driver.unplug(iface, true);
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p0vf4")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("clear Interface dx6p0vf4 external_ids")),
+                    times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf4")), times(1));
         }
     }
 

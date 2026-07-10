@@ -49,11 +49,14 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
 import com.cloud.network.ovn.manager.OvnBgpRedistributeManager;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.LoadBalancer;
 import com.cloud.utils.net.Ip;
+import com.cloud.vm.NicVO;
+import com.cloud.vm.dao.NicDao;
 
 /**
  * Asserts the CloudStack {@link LoadBalancingRule} -> OVN load_balancer
@@ -73,6 +76,7 @@ public class OvnLoadBalancerServiceTest {
     private OvnNbClient nbClient;
     private OvnControllerVO controller;
     private Network network;
+    private NicDao nicDao;
     private OvnLoadBalancerService service;
 
     @Before
@@ -82,6 +86,7 @@ public class OvnLoadBalancerServiceTest {
         nbClient = mock(OvnNbClient.class);
         controller = mock(OvnControllerVO.class);
         network = mock(Network.class);
+        nicDao = mock(NicDao.class);
 
         when(controller.getId()).thenReturn(CONTROLLER_ID);
         when(pluginManager.findControllerForZone(ZONE_ID)).thenReturn(controller);
@@ -90,6 +95,10 @@ public class OvnLoadBalancerServiceTest {
         when(network.getId()).thenReturn(NETWORK_ID);
         when(network.getDataCenterId()).thenReturn(ZONE_ID);
         when(network.getVpcId()).thenReturn(VPC_ID);
+        // /24 with free top hosts for health-check probe source IP.
+        when(network.getCidr()).thenReturn("10.0.0.0/24");
+        // No NICs occupy the probe-source candidates by default.
+        when(nicDao.findByIp4AddressAndNetworkId(anyString(), eq(NETWORK_ID))).thenReturn(null);
 
         // VPC -> LR mapping must exist in the DAO for the LB to be attached.
         final OvnLogicalIdMapVO vpcMap = mock(OvnLogicalIdMapVO.class);
@@ -101,6 +110,8 @@ public class OvnLoadBalancerServiceTest {
         injectField(service, "logicalIdMapDao", logicalIdMapDao);
         injectField(service, "ipAddressDao", mock(IPAddressDao.class));
         injectField(service, "bgpRedistributeManager", mock(OvnBgpRedistributeManager.class));
+        injectField(service, "pendingDeletionDao", mock(OvnPendingDeletionDao.class));
+        injectField(service, "nicDao", nicDao);
     }
 
     @Test
@@ -153,7 +164,8 @@ public class OvnLoadBalancerServiceTest {
         assertEquals("tcp", protoCaptor.getValue());
         assertFalse("selection_fields must be present", selCaptor.getValue().isEmpty());
         assertTrue(selCaptor.getValue().contains("ip_src"));
-        assertTrue(selCaptor.getValue().contains("tcp_src"));
+        // OVN selection_fields use tp_src / tp_dst (not tcp_*), see ovn-nb(5).
+        assertTrue(selCaptor.getValue().contains("tp_src"));
     }
 
     @Test
@@ -184,6 +196,93 @@ public class OvnLoadBalancerServiceTest {
         final ArgumentCaptor<Map<String, String>> capt = mapCaptor();
         verify(nbClient, times(1)).updateLoadBalancerBackends(eq("lb-uuid-existing"), capt.capture());
         assertEquals("10.0.0.5:80,10.0.0.6:80,10.0.0.7:80", capt.getValue().get("192.168.100.40:80"));
+    }
+
+    /**
+     * Chaos regression: destroy+recreate of an LB member updates {@code vips}
+     * correctly but previously left {@code ip_port_mappings} stale because
+     * health-check configure early-returned when an HC row already existed.
+     * Every re-apply must full-replace mappings from current destinations only.
+     */
+    @Test
+    public void existingLbWithHealthCheckFullReplacesIpPortMappingsOnMemberRecreate() throws Exception {
+        final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
+        when(existing.getOvnUuid()).thenReturn("lb-uuid-hc");
+        when(logicalIdMapDao.findByCsId(eq(Kind.LOAD_BALANCER), eq(430L), eq(CONTROLLER_ID))).thenReturn(existing);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-hc"))).thenReturn(true);
+        when(nbClient.loadBalancerHasHealthCheck(eq("lb-uuid-hc"))).thenReturn(true);
+
+        // Old member 10.0.0.5 gone; recreated member is 10.0.0.8 with a new NIC.
+        stubBackendNic("10.0.0.6", "nic-keep");
+        stubBackendNic("10.0.0.8", "nic-recreated");
+
+        final LoadBalancingRule rule = lbRule(430L, "192.168.100.40", 6443, 6443,
+                List.of(dest("10.0.0.6", 6443, false), dest("10.0.0.8", 6443, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
+
+        assertTrue(service.applyLBRules(network, List.of(rule)));
+
+        final ArgumentCaptor<Map<String, String>> vipsCapt = mapCaptor();
+        verify(nbClient).updateLoadBalancerBackends(eq("lb-uuid-hc"), vipsCapt.capture());
+        assertEquals("10.0.0.6:6443,10.0.0.8:6443", vipsCapt.getValue().get("192.168.100.40:6443"));
+
+        final ArgumentCaptor<Map<String, String>> mapCapt = mapCaptor();
+        verify(nbClient, times(1)).updateLoadBalancerIpPortMappings(eq("lb-uuid-hc"), mapCapt.capture());
+        // Full desired state only — stale 10.0.0.5 must not appear, new 10.0.0.8 must.
+        final Map<String, String> mappings = mapCapt.getValue();
+        assertEquals(2, mappings.size());
+        assertFalse(mappings.containsKey("10.0.0.5"));
+        assertEquals("lsp-nic-keep:10.0.0.254", mappings.get("10.0.0.6"));
+        assertEquals("lsp-nic-recreated:10.0.0.254", mappings.get("10.0.0.8"));
+        // Must not re-insert a second HC row when one already exists.
+        verify(nbClient, never()).configureLoadBalancerHealthCheck(
+                anyString(), anyString(), anyMap(), anyMap(), anyMap());
+    }
+
+    @Test
+    public void existingLbWithHealthCheckDropsMappingWhenMemberRemoved() throws Exception {
+        final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
+        when(existing.getOvnUuid()).thenReturn("lb-uuid-drop");
+        when(logicalIdMapDao.findByCsId(eq(Kind.LOAD_BALANCER), eq(431L), eq(CONTROLLER_ID))).thenReturn(existing);
+        when(nbClient.rowExistsByUuid(eq("Load_Balancer"), eq("lb-uuid-drop"))).thenReturn(true);
+        when(nbClient.loadBalancerHasHealthCheck(eq("lb-uuid-drop"))).thenReturn(true);
+
+        stubBackendNic("10.0.0.6", "nic-keep");
+        // 10.0.0.5 is revoked — must leave the rebuilt map.
+
+        final LoadBalancingRule rule = lbRule(431L, "192.168.100.40", 80, 80,
+                List.of(dest("10.0.0.5", 80, true), dest("10.0.0.6", 80, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
+
+        assertTrue(service.applyLBRules(network, List.of(rule)));
+
+        final ArgumentCaptor<Map<String, String>> mapCapt = mapCaptor();
+        verify(nbClient).updateLoadBalancerIpPortMappings(eq("lb-uuid-drop"), mapCapt.capture());
+        final Map<String, String> mappings = mapCapt.getValue();
+        assertEquals(1, mappings.size());
+        assertNull(mappings.get("10.0.0.5"));
+        assertEquals("lsp-nic-keep:10.0.0.254", mappings.get("10.0.0.6"));
+    }
+
+    @Test
+    public void buildIpPortMappingsReturnsEmptyWhenAllDestinationsRevoked() {
+        final LoadBalancingRule rule = lbRule(432L, "192.168.100.40", 80, 80,
+                List.of(dest("10.0.0.5", 80, true), dest("10.0.0.6", 80, true)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
+
+        final Map<String, String> mappings = service.buildIpPortMappings(network, rule);
+        assertNotNull(mappings);
+        assertTrue(mappings.isEmpty());
+    }
+
+    @Test
+    public void buildIpPortMappingsReturnsNullWhenLiveBackendNicMissing() {
+        // Default nicDao returns null for all IPs — live dest cannot resolve.
+        final LoadBalancingRule rule = lbRule(433L, "192.168.100.40", 80, 80,
+                List.of(dest("10.0.0.5", 80, false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
+
+        assertNull(service.buildIpPortMappings(network, rule));
     }
 
     @Test
@@ -293,6 +392,12 @@ public class OvnLoadBalancerServiceTest {
 
     private static LbDestination dest(final String ip, final int port, final boolean revoked) {
         return new LbDestination(port, port, ip, revoked);
+    }
+
+    private void stubBackendNic(final String ip, final String nicUuid) {
+        final NicVO nic = mock(NicVO.class);
+        when(nic.getUuid()).thenReturn(nicUuid);
+        when(nicDao.findByIp4AddressAndNetworkId(eq(ip), eq(NETWORK_ID))).thenReturn(nic);
     }
 
     @SuppressWarnings("unchecked")
