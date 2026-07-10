@@ -367,9 +367,9 @@ rollback).
 | UX | **cmk-first** | Matches fleet ops |
 | Non-goals | no `.deb`; no private ECMP replace; no full dual-stack rewrite; no NYC | Standing scope |
 | Sibling design | [[ovn-complete-networking]] | Shared OVN/BGP/deploy discipline |
-| Ops today | CKS `docs/ovn-public-ipv6-lb.md` | Inventory API preferred; ConfigKey break-glass post Sprint 3 |
+| Ops today | CKS `docs/ovn-public-ipv6-lb.md` | Inventory / `publicipv6id` (ConfigKey empty; break-glass restore only) |
 
 ---
 
-*End of design. Implementation starts only when Sprint 1 is explicitly scheduled;
-this file is design-only (no code commit required for the design drop).*
+*End of design. Sprints 1–3 are **LIVE** (cutover 2026-07-10). Sprint 4
+optional StaticNAT/PF remains unscheduled. Living progress table: §8.*

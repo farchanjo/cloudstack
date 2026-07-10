@@ -1,14 +1,26 @@
 # OVN Public IPv6 LB — Sprint 3 cutover runbook
 
-> **Purpose:** Migrate live CKS public IPv6 VIPs (`::100` / `::101`) from
-> ConfigKey `ovn.lr.public.ipv6.lb` to inventory + `createLoadBalancerRule`
-> (`publicipv6id`), then clear the ConfigKey.
+> ## ✅ COMPLETED — live cutover **2026-07-10**
+>
+> | Result | Value |
+> |---|---|
+> | ConfigKey `ovn.lr.public.ipv6.lb` | **empty** |
+> | VIP ownership | inventory (`user_public_ipv6_address`) — salazar `::100`, snape `::101` |
+> | Smoke HTTP | **301** both VIPs (Host `x.salazar…` / `x.snape…`) |
+> | OVN NB | **4** `cs-pub6-lb` rows (80+443 × both clusters) |
+>
+> Day-2: inventory / `publicipv6id` only. ConfigKey = break-glass restore from
+> off-box backup (§8). List live ids: `cmk list publicipv6addresses`.
+>
+> ---
+>
+> **Purpose (historical procedure):** Migrate live CKS public IPv6 VIPs
+> (`::100` / `::101`) from ConfigKey `ovn.lr.public.ipv6.lb` to inventory +
+> `createLoadBalancerRule` (`publicipv6id`), then clear the ConfigKey.
 >
 > **Design:** [[ovn-public-ipv6-fip-lb-self-service-api]] §5 Sprint 3 / §9.
 > **Scope:** LAX ("slytherin") only. **Deploy path:** jar-direct (no `.deb`).
 > **Date:** 2026-07-10.
-> **Status:** ✅ **COMPLETE** (2026-07-10) — Sprint 3 cutover done; ConfigKey
-> empty; inventory owns public v6 VIP + LB for salazar/snape.
 
 Historical procedure below. Do **not** re-run import/clear unless rolling back
 or re-onboarding. Cutover was **operator once**; backends remain
@@ -29,6 +41,7 @@ operator-refreshed after CKS recreate (Q7).
 | LB public ports | `80`, `443` | `80`, `443` |
 | Backend ports | hostNetwork `80` / `443` | hostNetwork `80` / `443` |
 | Smoke Host header | `x.salazar.slytherin.eonf.ltd` | `x.snape.slytherin.eonf.ltd` |
+| Inventory `publicipv6id` (post-cutover) | live: `cmk list publicipv6addresses ip6address=2a13:8740:0:7::100` | live: `…::101` |
 
 Worker guest IPv6 addresses **change on every CKS recreate** — always refresh
 from live `kubectl` / `listVirtualMachines` before assigning backends.
