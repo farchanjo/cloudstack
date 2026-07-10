@@ -17,6 +17,8 @@
 package com.cloud.network.ovn.manager;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -31,15 +33,18 @@ import org.junit.Test;
 
 import com.cloud.network.ovn.client.OvnNbClient.OwnedLoadBalancer;
 import com.cloud.network.ovn.config.OvnPublicIpv6Lb;
+import com.cloud.network.ovn.config.OvnPublicIpv6Lb.Entry;
 import com.cloud.network.ovn.config.OvnPublicIpv6Lb.HostPort;
 import com.cloud.network.ovn.manager.OvnReconcilerService.Pub6LbPlan;
 import com.cloud.network.ovn.manager.OvnReconcilerService.ResolvedPub6Lb;
 
 /**
- * Guard tests for the public IPv6 LB reconciler ({@code ovn.lr.public.ipv6.lb}).
- * Idempotency, create, update, and removal-of-owned-only are proven through
- * the pure {@link OvnReconcilerService#planPublicIpv6Lb} planner; the strict
- * no-op on an absent client/controller is proven through
+ * Guard tests for the public IPv6 LB reconciler ({@code ovn.lr.public.ipv6.lb}
+ * dual-read with inventory). Idempotency, create, update, and removal-of-
+ * owned-only are proven through the pure
+ * {@link OvnReconcilerService#planPublicIpv6Lb} planner; dual-read merge via
+ * {@link OvnReconcilerService#mergePublicIpv6LbDesired}; the strict no-op on
+ * an absent client/controller is proven through
  * {@link OvnReconcilerService#ensurePublicIpv6Lb}.
  */
 public class OvnReconcilerPublicIpv6LbTest {
@@ -209,5 +214,106 @@ public class OvnReconcilerPublicIpv6LbTest {
         final List<OvnPublicIpv6Lb.Entry> desired = Collections.singletonList(
                 new OvnPublicIpv6Lb.Entry(SALAZAR, VIP, 80, Arrays.asList(new HostPort(BE1, 80))));
         assertEquals(0, svc.ensurePublicIpv6Lb(null, null, 1L, desired, true));
+    }
+
+    // ---------- dual-read merge (ConfigKey ∪ inventory) ----------
+
+    private static Entry entry(final String net, final String vip, final int port, final String... beHosts) {
+        final List<HostPort> hops = new ArrayList<>();
+        for (final String h : beHosts) {
+            hops.add(new HostPort(h, port));
+        }
+        return new Entry(net, vip, port, hops);
+    }
+
+    @Test
+    public void mergeConfigOnlyPreservesConfigEntries() {
+        final Entry cfg = entry(SALAZAR, VIP, 80, BE1, BE2);
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.singletonList(cfg), Collections.emptyList());
+
+        assertEquals(1, merged.size());
+        assertEquals(cfg, merged.get(0));
+        assertEquals(key(SALAZAR, VIP, 80), merged.get(0).entryKey());
+    }
+
+    @Test
+    public void mergeInventoryOnlyPreservesInventoryEntries() {
+        final Entry inv = entry(SNAPE, VIP2, 443, BE3);
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.emptyList(), Collections.singletonList(inv));
+
+        assertEquals(1, merged.size());
+        assertEquals(inv, merged.get(0));
+        assertEquals(key(SNAPE, VIP2, 443), merged.get(0).entryKey());
+    }
+
+    @Test
+    public void mergeUnionKeepsDistinctKeysFromBothSources() {
+        final Entry cfg = entry(SALAZAR, VIP, 80, BE1);
+        final Entry inv = entry(SNAPE, VIP2, 443, BE2);
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.singletonList(cfg), Collections.singletonList(inv));
+
+        assertEquals(2, merged.size());
+        // Deterministic order by entryKey.
+        assertEquals(key(SALAZAR, VIP, 80), merged.get(0).entryKey());
+        assertEquals(key(SNAPE, VIP2, 443), merged.get(1).entryKey());
+    }
+
+    @Test
+    public void mergeConflictPrefersInventory() {
+        final Entry cfg = entry(SALAZAR, VIP, 80, BE1, BE2);
+        final Entry inv = entry(SALAZAR, VIP, 80, BE3); // same key, different backends
+        assertEquals(cfg.entryKey(), inv.entryKey());
+        assertNotEquals(cfg, inv);
+
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.singletonList(cfg), Collections.singletonList(inv));
+
+        assertEquals(1, merged.size());
+        assertEquals(inv, merged.get(0));
+        assertEquals(Collections.singletonList(new HostPort(BE3, 80)), merged.get(0).getBackends());
+    }
+
+    @Test
+    public void mergeIdenticalSourcesIsIdempotent() {
+        final Entry cfg = entry(SALAZAR, VIP, 80, BE1, BE2);
+        final Entry inv = entry(SALAZAR, VIP, 80, BE1, BE2);
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.singletonList(cfg), Collections.singletonList(inv));
+
+        assertEquals(1, merged.size());
+        assertEquals(inv, merged.get(0));
+    }
+
+    @Test
+    public void mergeNullAndEmptyYieldEmpty() {
+        assertTrue(OvnReconcilerService.mergePublicIpv6LbDesired(null, null).isEmpty());
+        assertTrue(OvnReconcilerService.mergePublicIpv6LbDesired(
+                Collections.emptyList(), null).isEmpty());
+        assertTrue(OvnReconcilerService.mergePublicIpv6LbDesired(
+                null, Collections.emptyList()).isEmpty());
+    }
+
+    @Test
+    public void mergeOrdersDeterministicallyByEntryKey() {
+        // Insert reverse of natural entryKey order; output must still sort.
+        final Entry snape = entry(SNAPE, VIP2, 443, BE2);
+        final Entry salazar = entry(SALAZAR, VIP, 80, BE1);
+        final List<Entry> merged = OvnReconcilerService.mergePublicIpv6LbDesired(
+                Arrays.asList(snape, salazar), Collections.emptyList());
+
+        assertEquals(2, merged.size());
+        assertTrue(merged.get(0).entryKey().compareTo(merged.get(1).entryKey()) < 0);
+        assertEquals(salazar.entryKey(), merged.get(0).entryKey());
+        assertSame(salazar, merged.get(0));
+        assertSame(snape, merged.get(1));
+    }
+
+    @Test
+    public void loadInventoryIsEmptyWhenDaosUninjected() {
+        final OvnReconcilerService svc = new OvnReconcilerService();
+        assertTrue(svc.loadInventoryPublicIpv6Lbs(1L).isEmpty());
     }
 }

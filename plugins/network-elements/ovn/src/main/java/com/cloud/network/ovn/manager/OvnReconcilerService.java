@@ -18,6 +18,7 @@ package com.cloud.network.ovn.manager;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,8 +38,14 @@ import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnOvsPolicySweepAnswer;
 import com.cloud.agent.api.OvnOvsPolicySweepCommand;
 import com.cloud.network.Network;
+import com.cloud.network.UserPublicIpv6AddressVO;
 import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.LoadBalancerDao;
+import com.cloud.network.dao.LoadBalancerVMMapDao;
+import com.cloud.network.dao.LoadBalancerVMMapVO;
+import com.cloud.network.dao.LoadBalancerVO;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.UserPublicIpv6AddressDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
@@ -57,6 +64,7 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnConstants;
 import com.cloud.network.ovn.element.OvnNetworkElement;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
+import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
@@ -125,6 +133,12 @@ public class OvnReconcilerService {
     private VMInstanceDao vmInstanceDao;
     @Inject
     private IPAddressDao ipAddressDao;
+    @Inject
+    private LoadBalancerDao loadBalancerDao;
+    @Inject
+    private LoadBalancerVMMapDao loadBalancerVMMapDao;
+    @Inject
+    private UserPublicIpv6AddressDao userPublicIpv6AddressDao;
     @Inject
     private OvnPublicNetworkManager publicNetworkManager;
     @Inject
@@ -228,11 +242,12 @@ public class OvnReconcilerService {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", ecmpChanged);
         }
-        // Public IPv6 LB resync — programs operator-declared VIPs as OVN
-        // Load_Balancer rows on the VPC LR (+ tier LS) and announces each VIP
-        // as a BGP /128. Self-gated: empty config removes only owned rows.
+        // Public IPv6 LB resync — dual-read: ConfigKey ∪ inventory LB rules
+        // (public_ipv6_address_id). Programs OVN Load_Balancer rows on the VPC
+        // LR (+ tier LS) and announces each VIP as a BGP /128. Self-gated:
+        // empty desired removes only owned rows. Inventory wins on key conflict.
         final int pub6Changed = ensurePublicIpv6Lb(nb, controller, zoneId,
-                OvnPublicIpv6Lb.parse(OvnNetworkConfig.LrPublicIpv6Lb.value()), dryRun);
+                desiredPublicIpv6Lbs(zoneId), dryRun);
         if (pub6Changed > 0) {
             LOGGER.info("OvnReconcilerService: zone={} public IPv6 LB resync {} {} LB row(s)",
                     zoneId, dryRun ? "would change" : "changed", pub6Changed);
@@ -788,10 +803,10 @@ public class OvnReconcilerService {
     }
 
     /**
-     * Ensure public IPv6 Load_Balancer rows for every entry in
-     * {@code ovn.lr.public.ipv6.lb} for this zone. Called from the periodic
-     * reconcile loop ({@link OvnBgpReconcileTask}) so a management restart or
-     * a config change self-heals. Idempotent.
+     * Ensure public IPv6 Load_Balancer rows for this zone from the dual-read
+     * desired set ({@code ovn.lr.public.ipv6.lb} ∪ inventory LB rules). Called
+     * from the periodic reconcile loop ({@link OvnBgpReconcileTask}) so a
+     * management restart or a config / API change self-heals. Idempotent.
      *
      * @param zoneId CloudStack zone id
      * @param dryRun when {@code true}, count only, do not mutate the NB DB
@@ -802,8 +817,7 @@ public class OvnReconcilerService {
         if (controller == null) {
             return 0;
         }
-        final List<OvnPublicIpv6Lb.Entry> desired =
-                OvnPublicIpv6Lb.parse(OvnNetworkConfig.LrPublicIpv6Lb.value());
+        final List<OvnPublicIpv6Lb.Entry> desired = desiredPublicIpv6Lbs(zoneId);
         final int changed = ensurePublicIpv6Lb(pluginManager.nbClient(zoneId), controller, zoneId, desired, dryRun);
         if (changed > 0) {
             LOGGER.info("OvnReconcilerService: zone={} public IPv6 LB resync {} {} LB row(s)",
@@ -813,9 +827,169 @@ public class OvnReconcilerService {
     }
 
     /**
+     * Dual-read desired set for public IPv6 LB: ConfigKey parse ∪ inventory.
+     * Inventory wins on {@link OvnPublicIpv6Lb.Entry#entryKey()} conflict.
+     */
+    List<OvnPublicIpv6Lb.Entry> desiredPublicIpv6Lbs(final long zoneId) {
+        return mergePublicIpv6LbDesired(
+                OvnPublicIpv6Lb.parse(OvnNetworkConfig.LrPublicIpv6Lb.value()),
+                loadInventoryPublicIpv6Lbs(zoneId));
+    }
+
+    /**
+     * Load Active/Add public LoadBalancing rules that bind
+     * {@code public_ipv6_address_id}, for the given zone. VIP from
+     * {@link UserPublicIpv6AddressVO}; network UUID from the rule's network;
+     * VIP port from the rule source port; backends from non-revoked
+     * {@link LoadBalancerVMMapVO} rows with a valid IPv6 {@code instance_ip}.
+     *
+     * @return ordered list of inventory-sourced entries (never {@code null})
+     */
+    List<OvnPublicIpv6Lb.Entry> loadInventoryPublicIpv6Lbs(final long zoneId) {
+        final List<OvnPublicIpv6Lb.Entry> out = new ArrayList<>();
+        if (userPublicIpv6AddressDao == null || loadBalancerDao == null
+                || loadBalancerVMMapDao == null || networkDao == null) {
+            return out;
+        }
+        final List<UserPublicIpv6AddressVO> addrs = userPublicIpv6AddressDao.listByZone(zoneId);
+        if (addrs == null || addrs.isEmpty()) {
+            return out;
+        }
+        // De-dupe by entryKey within inventory (first Active/Add rule wins).
+        final Map<String, OvnPublicIpv6Lb.Entry> byKey = new LinkedHashMap<>();
+        for (final UserPublicIpv6AddressVO addr : addrs) {
+            if (addr == null || StringUtils.isBlank(addr.getAddress())) {
+                continue;
+            }
+            if (!isStrictIpv6Address(addr.getAddress())) {
+                LOGGER.warn("OvnReconcilerService: inventory public IPv6 id={} address '{}' is not IPv6; skipping",
+                        addr.getId(), addr.getAddress());
+                continue;
+            }
+            final List<LoadBalancerVO> rules = loadBalancerDao.listByPublicIpv6AddressId(addr.getId());
+            if (rules == null || rules.isEmpty()) {
+                continue;
+            }
+            for (final LoadBalancerVO rule : rules) {
+                final OvnPublicIpv6Lb.Entry entry = entryFromInventoryRule(rule, addr);
+                if (entry == null) {
+                    continue;
+                }
+                byKey.putIfAbsent(entry.entryKey(), entry);
+            }
+        }
+        out.addAll(byKey.values());
+        return out;
+    }
+
+    /**
+     * Merge ConfigKey entries with inventory entries. Key =
+     * {@link OvnPublicIpv6Lb.Entry#entryKey()}. On conflict inventory wins and a
+     * WARN is logged. Result order is deterministic by {@code entryKey()}.
+     */
+    static List<OvnPublicIpv6Lb.Entry> mergePublicIpv6LbDesired(
+            final List<OvnPublicIpv6Lb.Entry> configEntries,
+            final List<OvnPublicIpv6Lb.Entry> inventoryEntries) {
+        final Map<String, OvnPublicIpv6Lb.Entry> byKey = new LinkedHashMap<>();
+        if (configEntries != null) {
+            for (final OvnPublicIpv6Lb.Entry e : configEntries) {
+                if (e != null) {
+                    byKey.put(e.entryKey(), e);
+                }
+            }
+        }
+        if (inventoryEntries != null) {
+            for (final OvnPublicIpv6Lb.Entry inv : inventoryEntries) {
+                if (inv == null) {
+                    continue;
+                }
+                final OvnPublicIpv6Lb.Entry prev = byKey.put(inv.entryKey(), inv);
+                if (prev != null && !prev.equals(inv)) {
+                    LOGGER.warn("OvnReconcilerService: public IPv6 LB dual-read conflict on key={} — "
+                                    + "preferring inventory over ConfigKey (config={}, inventory={})",
+                            inv.entryKey(), prev, inv);
+                }
+            }
+        }
+        final List<OvnPublicIpv6Lb.Entry> out = new ArrayList<>(byKey.values());
+        out.sort(Comparator.comparing(OvnPublicIpv6Lb.Entry::entryKey));
+        return out;
+    }
+
+    private OvnPublicIpv6Lb.Entry entryFromInventoryRule(final LoadBalancerVO rule,
+                                                         final UserPublicIpv6AddressVO addr) {
+        if (rule == null) {
+            return null;
+        }
+        final FirewallRule.State state = rule.getState();
+        if (state != FirewallRule.State.Active && state != FirewallRule.State.Add) {
+            return null;
+        }
+        final Integer vipPort = rule.getSourcePortStart();
+        if (vipPort == null || vipPort < 1 || vipPort > 65535) {
+            LOGGER.warn("OvnReconcilerService: inventory LB rule id={} has invalid source port {}; skipping",
+                    rule.getId(), vipPort);
+            return null;
+        }
+        final Network network = networkDao.findById(rule.getNetworkId());
+        if (network == null || StringUtils.isBlank(network.getUuid())) {
+            LOGGER.warn("OvnReconcilerService: inventory LB rule id={} network {} missing; skipping",
+                    rule.getId(), rule.getNetworkId());
+            return null;
+        }
+        final int bePort = rule.getDefaultPortStart() > 0 ? rule.getDefaultPortStart() : vipPort;
+        final List<OvnPublicIpv6Lb.HostPort> backends = inventoryBackends(rule.getId(), bePort);
+        if (backends.isEmpty()) {
+            LOGGER.warn("OvnReconcilerService: inventory LB rule id={} VIP {} has no non-revoked IPv6 backends; "
+                            + "skipping (anti-flap: row kept if still configured via other source)",
+                    rule.getId(), addr.getAddress());
+            return null;
+        }
+        return new OvnPublicIpv6Lb.Entry(network.getUuid(), addr.getAddress(), vipPort, backends);
+    }
+
+    private List<OvnPublicIpv6Lb.HostPort> inventoryBackends(final long loadBalancerId, final int bePort) {
+        final List<OvnPublicIpv6Lb.HostPort> hops = new ArrayList<>();
+        final List<LoadBalancerVMMapVO> maps =
+                loadBalancerVMMapDao.listByLoadBalancerId(loadBalancerId, false);
+        if (maps == null || maps.isEmpty()) {
+            return hops;
+        }
+        final Set<String> seen = new HashSet<>();
+        for (final LoadBalancerVMMapVO map : maps) {
+            if (map == null || map.isRevoke()) {
+                continue;
+            }
+            final String ip = StringUtils.trimToEmpty(map.getInstanceIp());
+            if (!isStrictIpv6Address(ip)) {
+                continue;
+            }
+            if (!seen.add(ip + '|' + bePort)) {
+                continue;
+            }
+            hops.add(new OvnPublicIpv6Lb.HostPort(ip, bePort));
+        }
+        return hops;
+    }
+
+    private static boolean isStrictIpv6Address(final String host) {
+        if (StringUtils.isBlank(host)) {
+            return false;
+        }
+        if (NetUtils.isValidIp4(host)) {
+            return false;
+        }
+        return NetUtils.isValidIp6(host);
+    }
+
+    /**
      * Ensure the configured public IPv6 LBs on their owning VPC LRs (+ tier LS).
      * Only rows carrying {@link OvnConstants#EXT_ID_PUBLIC_IPV6_LB} are ever
      * touched. A {@code null} client/controller is a strict no-op.
+     *
+     * <p>{@code desired} must already be the dual-read merge (ConfigKey ∪
+     * inventory). Anti-flap {@code configuredKeys} is derived from that merged
+     * list so both sources keep unresolved rows from being removed.
      *
      * <p>Backend filtering: hops must fall inside the tier's {@code ip6Cidr}.
      * There is no per-network IPv6 NIC finder in CloudStack, so Running-state
@@ -829,6 +1003,7 @@ public class OvnReconcilerService {
             return 0;
         }
         final Map<String, ResolvedPub6Lb> resolved = resolvePublicIpv6Lbs(desired, controller, zoneId);
+        // Merged keys (ConfigKey ∪ inventory) — anti-flap for either source.
         final Set<String> configuredKeys = configuredPublicIpv6LbKeys(desired, zoneId);
         final List<OwnedLoadBalancer> existing = nb.listOwnedLoadBalancers(OvnConstants.EXT_ID_PUBLIC_IPV6_LB);
         final Pub6LbPlan plan = planPublicIpv6Lb(resolved, configuredKeys, existing);
@@ -842,7 +1017,8 @@ public class OvnReconcilerService {
      * Config keys that belong to {@code zoneId} for anti-flap. Entries whose
      * network resolves to another zone are excluded so a global config cannot
      * freeze foreign/orphan rows in this zone's NB. Unresolvable networks stay
-     * in the set (anti-flap) — same as a transient DAO miss.
+     * in the set (anti-flap) — same as a transient DAO miss. Callers pass the
+     * <em>merged</em> desired list so inventory-only keys are included.
      */
     Set<String> configuredPublicIpv6LbKeys(final List<OvnPublicIpv6Lb.Entry> desired, final long zoneId) {
         final Set<String> out = new HashSet<>();
