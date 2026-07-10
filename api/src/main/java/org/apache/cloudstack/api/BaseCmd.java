@@ -63,6 +63,7 @@ import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.Ipv6Service;
 import com.cloud.network.NetworkModel;
 import com.cloud.network.NetworkService;
+import com.cloud.network.PublicIpv6AddressManager;
 import com.cloud.network.NetworkUsageService;
 import com.cloud.network.StorageNetworkService;
 import com.cloud.network.VpcVirtualNetworkApplianceService;
@@ -221,6 +222,8 @@ public abstract class BaseCmd {
     public ResourceIconManager resourceIconManager;
     @Inject
     public Ipv6Service ipv6Service;
+    @Inject
+    public PublicIpv6AddressManager publicIpv6AddressManager;
     @Inject
     public ApiKeyPairService apiKeyPairService;
     @Inject

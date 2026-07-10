@@ -128,6 +128,7 @@ import org.apache.cloudstack.api.response.HypervisorCapabilitiesResponse;
 import org.apache.cloudstack.api.response.HypervisorGuestOsNamesResponse;
 import org.apache.cloudstack.api.response.HypervisorGuestOsResponse;
 import org.apache.cloudstack.api.response.IPAddressResponse;
+import org.apache.cloudstack.api.response.PublicIpv6AddressResponse;
 import org.apache.cloudstack.api.response.ImageStoreResponse;
 import org.apache.cloudstack.api.response.InstanceGroupResponse;
 import org.apache.cloudstack.api.response.InternalLoadBalancerElementResponse;
@@ -323,6 +324,7 @@ import com.cloud.network.GuestVlanRange;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Ipv6Service;
 import com.cloud.network.Network;
+import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.Network.Capability;
 import com.cloud.network.Network.Provider;
 import com.cloud.network.Network.Service;
@@ -1126,6 +1128,41 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
     }
 
     @Override
+    public PublicIpv6AddressResponse createPublicIpv6AddressResponse(UserPublicIpv6Address address) {
+        PublicIpv6AddressResponse response = new PublicIpv6AddressResponse();
+        response.setId(address.getUuid());
+        response.setIp6Address(address.getAddress());
+        if (address.getAllocatedTime() != null) {
+            response.setAllocated(address.getAllocatedTime());
+        }
+        DataCenter zone = ApiDBUtils.findZoneById(address.getDataCenterId());
+        if (zone != null) {
+            response.setZoneId(zone.getUuid());
+            response.setZoneName(zone.getName());
+        }
+        if (address.getAccountId() > 0) {
+            populateOwner(response, address);
+        }
+        if (address.getState() != null) {
+            response.setState(address.getState().toString());
+        }
+        if (address.getNetworkId() != null) {
+            Network ntwk = ApiDBUtils.findNetworkById(address.getNetworkId());
+            if (ntwk != null) {
+                response.setNetworkId(ntwk.getUuid());
+            }
+        }
+        if (address.getVpcId() != null) {
+            Vpc vpc = ApiDBUtils.findVpcById(address.getVpcId());
+            if (vpc != null) {
+                response.setVpcId(vpc.getUuid());
+            }
+        }
+        response.setIsSystem(address.isSystem());
+        response.setObjectName(ApiConstants.PUBLIC_IPV6_ADDRESS);
+        return response;
+    }
+
     public IPAddressResponse createIPAddressResponse(ResponseView view, IpAddress ipAddr) {
         VlanVO vlan = ApiDBUtils.findVlanById(ipAddr.getVlanId());
         boolean forVirtualNetworks = vlan.getVlanType().equals(VlanType.VirtualNetwork);

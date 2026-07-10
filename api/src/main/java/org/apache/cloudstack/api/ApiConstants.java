@@ -327,6 +327,9 @@ public class ApiConstants {
     public static final String IP_ADDRESSES = "ipaddresses";
     public static final String IP6_ADDRESS = "ip6address";
     public static final String IP6_ADDRESSES = "ip6addresses";
+    public static final String PUBLIC_IPV6_ADDRESS = "publicipv6address";
+    public static final String PUBLIC_IPV6_ADDRESSES = "publicipv6addresses";
+    public static final String PUBLIC_IPV6_ADDRESS_ID = "publicipv6id";
     public static final String IP_ADDRESS_ID = "ipaddressid";
     public static final String IS_2FA_ENABLED = "is2faenabled";
     public static final String IS_2FA_VERIFIED = "is2faverified";

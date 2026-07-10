@@ -74,6 +74,7 @@ import org.apache.cloudstack.api.response.HostResponse;
 import org.apache.cloudstack.api.response.HypervisorCapabilitiesResponse;
 import org.apache.cloudstack.api.response.HypervisorGuestOsNamesResponse;
 import org.apache.cloudstack.api.response.IPAddressResponse;
+import org.apache.cloudstack.api.response.PublicIpv6AddressResponse;
 import org.apache.cloudstack.api.response.ImageStoreResponse;
 import org.apache.cloudstack.api.response.InstanceGroupResponse;
 import org.apache.cloudstack.api.response.InternalLoadBalancerElementResponse;
@@ -185,6 +186,7 @@ import com.cloud.hypervisor.HypervisorCapabilities;
 import com.cloud.network.GuestVlan;
 import com.cloud.network.GuestVlanRange;
 import com.cloud.network.IpAddress;
+import com.cloud.network.UserPublicIpv6Address;
 import com.cloud.network.Network;
 import com.cloud.network.Network.Service;
 import com.cloud.network.NetworkPermission;
@@ -300,6 +302,8 @@ public interface ResponseGenerator {
     VlanIpRangeResponse createVlanIpRangeResponse(Class<? extends VlanIpRangeResponse> subClass, Vlan vlan);
 
     IPAddressResponse createIPAddressResponse(ResponseView view, IpAddress ipAddress);
+
+    PublicIpv6AddressResponse createPublicIpv6AddressResponse(UserPublicIpv6Address address);
 
     GuestVlanRangeResponse createDedicatedGuestVlanRangeResponse(GuestVlanRange result);
 

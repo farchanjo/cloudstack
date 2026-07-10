@@ -41,6 +41,7 @@ public enum ApiCommandResourceType {
     StoragePool(com.cloud.storage.StoragePool.class),
     ImageStore(com.cloud.storage.ImageStore.class),
     IpAddress(com.cloud.network.IpAddress.class),
+    PublicIpv6Address(com.cloud.network.UserPublicIpv6Address.class),
     PortableIpAddress(PortableIp.class),
     SecurityGroup(com.cloud.network.security.SecurityGroup.class),
     PhysicalNetwork(com.cloud.network.PhysicalNetwork.class),
