@@ -1560,6 +1560,30 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * Fully replaces {@code Load_Balancer.ip_port_mappings} with the supplied
+     * map (desired state only — never merge). An empty map clears every
+     * mapping so removed backends cannot leave stale LSP probe entries.
+     *
+     * <p>Callers must rebuild the map from the current live destinations on
+     * every apply/update; a merge-style update would retain deleted member
+     * IPs after destroy+recreate chaos and leave health checks targeting
+     * dead LSPs while missing the new member.
+     */
+    public void updateLoadBalancerIpPortMappings(final String lbUuid, final Map<String, String> ipPortMappings) {
+        if (lbUuid == null || lbUuid.isEmpty()) {
+            throw new OvnException("updateLoadBalancerIpPortMappings requires a non-null lbUuid");
+        }
+        if (ipPortMappings == null) {
+            throw new OvnException("updateLoadBalancerIpPortMappings requires a non-null ip_port_mappings map");
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("ip_port_mappings", buildMap(ipPortMappings));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Load_Balancer", OvnOpFactory.whereUuid(lbUuid), row));
+        tx.commit();
+    }
+
+    /**
      * Atomically replaces the backend list for a single VIP. Other VIPs on
      * the same load_balancer are preserved by re-emitting the supplied
      * {@code allVips} map: the caller is expected to compute the desired

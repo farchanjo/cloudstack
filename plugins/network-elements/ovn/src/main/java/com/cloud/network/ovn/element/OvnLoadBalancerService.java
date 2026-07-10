@@ -302,22 +302,44 @@ public class OvnLoadBalancerService extends AdapterBase {
             "interval", "5", "timeout", "3", "success_count", "1", "failure_count", "3");
 
     /**
-     * Configure an OVN L4 health check so dead backends drop out of rotation
-     * instead of blackholing new connections (critical while multi-backend
-     * VIPs — e.g. the CKS API LB — bootstrap with only one live backend).
-     * Best-effort: any failure leaves the LB functional without probes.
-     * Skipped when a health check already exists (idempotent re-apply).
+     * Configure / re-sync OVN L4 health-check state so dead backends drop out
+     * of rotation instead of blackholing new connections (critical while
+     * multi-backend VIPs — e.g. the CKS API LB — bootstrap with only one live
+     * backend). Best-effort: any failure leaves the LB functional without
+     * probes.
+     *
+     * <p>On every apply/update the desired {@code ip_port_mappings} are
+     * <b>fully rebuilt</b> from current live destinations and written as a
+     * replace (never a merge). That drops removed-member entries and picks
+     * up recreated members with new LSP names. When no health-check row
+     * exists yet and at least one mapping is resolvable, the HC row is
+     * created once; subsequent applies only resync the mappings.
      */
     private void configureHealthCheck(final OvnNbClient nb, final Network network,
                                       final LoadBalancingRule rule, final String lbUuid) {
         try {
-            if (rule.getSourceIp() == null || nb.loadBalancerHasHealthCheck(lbUuid)) {
+            if (rule.getSourceIp() == null) {
                 return;
             }
             final Map<String, String> mappings = buildIpPortMappings(network, rule);
-            if (mappings.isEmpty()) {
+            if (mappings == null) {
+                // Transient resolution gap (probe source IP / backend NIC) —
+                // leave OVN state alone rather than wiping live probes.
                 LOGGER.debug("OvnLoadBalancerService: no ip_port_mappings resolvable for rule id={}; "
-                        + "health check skipped", rule.getId());
+                        + "health-check / mapping resync skipped", rule.getId());
+                return;
+            }
+            if (nb.loadBalancerHasHealthCheck(lbUuid)) {
+                // Full replace: current destinations only (drop stale IPs /
+                // LSPs, add recreated members).
+                nb.updateLoadBalancerIpPortMappings(lbUuid, mappings);
+                LOGGER.info("OvnLoadBalancerService: ip_port_mappings resynced on LB {} (rule id={}, {} backend(s))",
+                        lbUuid, rule.getId(), mappings.size());
+                return;
+            }
+            if (mappings.isEmpty()) {
+                LOGGER.debug("OvnLoadBalancerService: no live backends for rule id={}; "
+                        + "health check create skipped", rule.getId());
                 return;
             }
             final String vip = rule.getSourceIp().addr() + ":" + rule.getSourcePortStart();
@@ -332,19 +354,33 @@ public class OvnLoadBalancerService extends AdapterBase {
 
     /**
      * Backend IP -> {@code "<lsp-name>:<probe-source-ip>"} for every live
-     * destination. All-or-nothing: a backend whose NIC cannot be resolved
-     * aborts the mapping (a partial map would leave unprobed backends
-     * permanently "online" per ovn-nb(5) semantics).
+     * destination.
+     *
+     * <p>Semantics:
+     * <ul>
+     *   <li>{@code null} — cannot compute (missing deps, no free probe source
+     *       IP, or a live backend whose NIC cannot be resolved). Caller must
+     *       <b>not</b> wipe OVN {@code ip_port_mappings}.</li>
+     *   <li>empty map — no live destinations (all revoked / none present).
+     *       Caller should full-replace OVN mappings with empty so removed
+     *       members drop.</li>
+     *   <li>non-empty map — complete desired state; full-replace OVN with it
+     *       (never merge).</li>
+     * </ul>
+     *
+     * <p>All-or-nothing for live backends: a single unresolvable NIC aborts
+     * (returns {@code null}) because a partial map would leave unprobed
+     * backends permanently "online" per ovn-nb(5) semantics.
      */
-    private Map<String, String> buildIpPortMappings(final Network network, final LoadBalancingRule rule) {
-        final Map<String, String> out = new LinkedHashMap<>();
-        if (nicDao == null || network == null || rule.getDestinations() == null) {
-            return out;
+    Map<String, String> buildIpPortMappings(final Network network, final LoadBalancingRule rule) {
+        if (nicDao == null || network == null || rule == null || rule.getDestinations() == null) {
+            return null;
         }
         final String sourceIp = healthCheckSourceIp(network);
         if (sourceIp == null) {
-            return out;
+            return null;
         }
+        final Map<String, String> out = new LinkedHashMap<>();
         for (final LbDestination d : rule.getDestinations()) {
             if (d.isRevoked()) {
                 continue;
@@ -352,8 +388,9 @@ public class OvnLoadBalancerService extends AdapterBase {
             final NicVO nic = nicDao.findByIp4AddressAndNetworkId(d.getIpAddress(), network.getId());
             if (nic == null || StringUtils.isBlank(nic.getUuid())) {
                 LOGGER.debug("OvnLoadBalancerService: no NIC for backend {} on network id={}; "
-                        + "skipping health check for rule id={}", d.getIpAddress(), network.getId(), rule.getId());
-                return new LinkedHashMap<>();
+                        + "skipping health check / mapping resync for rule id={}",
+                        d.getIpAddress(), network.getId(), rule.getId());
+                return null;
             }
             out.put(d.getIpAddress(), "lsp-" + nic.getUuid() + ":" + sourceIp);
         }
@@ -395,6 +432,9 @@ public class OvnLoadBalancerService extends AdapterBase {
      *       {@link OvnNbClient#updateLoadBalancerProperties} so that an operator
      *       algorithm change is reflected immediately, even when no backends are
      *       live at the time of the update.</li>
+     *   <li>Always re-sync {@code ip_port_mappings} (full replace from current
+     *       destinations) and create the health-check row if missing — see
+     *       {@link #configureHealthCheck}.</li>
      * </ol>
      *
      * <p><b>Side-effect</b>: rewriting {@code selection_fields} flushes OVN
@@ -414,8 +454,8 @@ public class OvnLoadBalancerService extends AdapterBase {
         LOGGER.info("OvnLoadBalancerService: LB {} properties re-synced (algo={}) for rule id={}",
                 lbUuid, rule.getAlgorithm(), rule.getId());
         // Re-assert the east-west LS attachment (idempotent set insert) and
-        // the health check (skipped when one already exists) so pre-existing
-        // LB rows converge to the new shape on their next apply touch.
+        // full-replace ip_port_mappings / HC so pre-existing LB rows converge
+        // after member remove / destroy+recreate on their next apply touch.
         attachToTierLs(nb, controller, network, lbUuid);
         configureHealthCheck(nb, network, rule, lbUuid);
     }
