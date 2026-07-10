@@ -621,6 +621,15 @@ public class RulesManagerImpl extends ManagerBase implements RulesManager, Rules
         return false;
     }
 
+    /**
+     * Best-effort metadata refresh after static NAT enable/disable so providers that serve
+     * {@code public-ipv4} (notably VirtualRouter) pick up the static-NAT public IP.
+     * <p>
+     * ConfigDrive cannot rewrite the ISO while the instance is Running (its {@code saveUserData}
+     * path throws "Instance should to stopped…"). Calling it from enable/disable StaticNat would
+     * spam ERROR while the API still succeeds. Skip that combination; metadata is rebuilt on next
+     * start. VR and other live-capable providers still receive the update for Running VMs.
+     */
     protected void applyUserDataIfNeeded(long vmId, Network network, Nic guestNic) throws ResourceUnavailableException {
         UserDataServiceProvider element = null;
         try {
@@ -631,20 +640,36 @@ public class RulesManagerImpl extends ManagerBase implements RulesManager, Rules
         }
         if (element == null) {
             logger.error("Can't find network element for " + Service.UserData.getName() + " provider needed for UserData update");
-        } else {
-            UserVmVO vm = _vmDao.findById(vmId);
-            try {
-                VMTemplateVO template = _templateDao.findByIdIncludingRemoved(vm.getTemplateId());
-                NicProfile nicProfile = new NicProfile(guestNic, network, null, null, null,
-                            _networkModel.isSecurityGroupSupportedInNetwork(network),
-                            _networkModel.getNetworkTag(template.getHypervisorType(), network));
-                VirtualMachineProfile vmProfile = new VirtualMachineProfileImpl(vm);
-                if (!element.saveUserData(network, nicProfile, vmProfile)) {
-                    logger.error("Failed to update userdata for vm " + vm + " and nic " + guestNic);
-                }
-            } catch (Exception e) {
-                logger.error("Failed to update userdata for vm " + vm + " and nic " + guestNic + " due to " + e.getMessage(), e);
+            return;
+        }
+
+        UserVmVO vm = _vmDao.findById(vmId);
+        if (vm == null) {
+            return;
+        }
+
+        // ConfigDrive (password/userdata ISO path) requires Stopped — do not invoke for Running VMs.
+        if (VirtualMachine.State.Running.equals(vm.getState())
+                && Network.Provider.ConfigDrive.equals(element.getProvider())) {
+            logger.debug("Skipping userdata metadata refresh for Running VM {} on ConfigDrive provider; "
+                    + "config-drive ISO cannot be updated while Running (refreshed on next start)", vm);
+            return;
+        }
+
+        try {
+            VMTemplateVO template = _templateDao.findByIdIncludingRemoved(vm.getTemplateId());
+            NicProfile nicProfile = new NicProfile(guestNic, network, null, null, null,
+                        _networkModel.isSecurityGroupSupportedInNetwork(network),
+                        _networkModel.getNetworkTag(template.getHypervisorType(), network));
+            VirtualMachineProfile vmProfile = new VirtualMachineProfileImpl(vm);
+            if (!element.saveUserData(network, nicProfile, vmProfile)) {
+                // Static NAT already applied; userdata is best-effort — do not ERROR.
+                logger.warn("Failed to update userdata for vm {} and nic {}", vm, guestNic);
             }
+        } catch (Exception e) {
+            // Soft-fail: enable/disable StaticNat must not surface as ERROR when metadata push fails.
+            logger.warn("Failed to update userdata for vm {} and nic {} due to {}", vm, guestNic, e.getMessage());
+            logger.debug("Userdata update failure detail for vm " + vm + " and nic " + guestNic, e);
         }
     }
 
