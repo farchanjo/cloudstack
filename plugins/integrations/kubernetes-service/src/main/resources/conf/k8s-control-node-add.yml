@@ -47,6 +47,8 @@ bootcmd:
       sysctl -w net.ipv6.conf.default.autoconf=1
       modprobe br_netfilter || true
       sysctl -w net.bridge.bridge-nf-call-ip6tables=1 || true
+      # hostNetwork Istio public gateway (envoy non-root) binds :80/:443
+      sysctl -w net.ipv4.ip_unprivileged_port_start=0 || true
       mkdir -p /etc/sysctl.d
       # 99-cks-dualstack.conf sorted BEFORE 99-sysctl.conf (symlink to
       # /etc/sysctl.conf) and lost on reboot. zz-* always wins after 99-*.
@@ -61,6 +63,7 @@ bootcmd:
         'net.ipv6.conf.all.autoconf = 1' \
         'net.ipv6.conf.default.autoconf = 1' \
         'net.bridge.bridge-nf-call-ip6tables = 1' \
+        'net.ipv4.ip_unprivileged_port_start = 0' \
         > /etc/sysctl.d/zz-cks-dualstack.conf
       # Neutralize every line of the image IPv6-disable block so 99-sysctl.conf
       # cannot re-disable v6 / RA / autoconf on the next boot.
