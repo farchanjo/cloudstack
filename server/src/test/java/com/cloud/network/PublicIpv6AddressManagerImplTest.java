@@ -48,6 +48,7 @@ import org.mockito.junit.MockitoJUnitRunner;
 import com.cloud.exception.InsufficientAddressCapacityException;
 import com.cloud.exception.InvalidParameterValueException;
 import com.cloud.network.UserPublicIpv6Address.State;
+import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.UserPublicIpv6AddressDao;
 import com.cloud.user.Account;
 import com.cloud.user.AccountVO;
@@ -70,6 +71,8 @@ public class PublicIpv6AddressManagerImplTest {
     private ConfigurationDao configDao;
     @Mock
     private AccountDao accountDao;
+    @Mock
+    private LoadBalancerDao loadBalancerDao;
 
     @InjectMocks
     private PublicIpv6AddressManagerImpl manager;
@@ -337,6 +340,7 @@ public class PublicIpv6AddressManagerImplTest {
         allocated.setVpcId(6L);
 
         when(userPublicIpv6AddressDao.lockRow(eq(99L), anyBoolean())).thenReturn(allocated);
+        when(loadBalancerDao.countNotRevokedByPublicIpv6AddressId(99L)).thenReturn(0L);
         when(accountDao.acquireInLockTable(ACCOUNT_ID)).thenReturn(owner);
         when(userPublicIpv6AddressDao.update(eq(0L), any(UserPublicIpv6AddressVO.class))).thenReturn(true);
 
@@ -347,6 +351,26 @@ public class PublicIpv6AddressManagerImplTest {
         assertEquals(null, allocated.getNetworkId());
         assertEquals(null, allocated.getVpcId());
         verify(accountDao).releaseFromLockTable(ACCOUNT_ID);
+    }
+
+    @Test(expected = com.cloud.exception.ResourceUnavailableException.class)
+    public void releaseBlockedWhenActiveLbRules() throws Exception {
+        UserPublicIpv6AddressVO allocated = new UserPublicIpv6AddressVO("2a13:8740:0:7::1000", ZONE_ID);
+        allocated.setState(State.Allocated);
+        allocated.setAccountId(ACCOUNT_ID);
+
+        when(userPublicIpv6AddressDao.lockRow(eq(99L), anyBoolean())).thenReturn(allocated);
+        when(loadBalancerDao.countNotRevokedByPublicIpv6AddressId(99L)).thenReturn(2L);
+
+        manager.release(99L);
+    }
+
+    @Test
+    public void hasActiveLbRulesDelegatesToDao() {
+        when(loadBalancerDao.countNotRevokedByPublicIpv6AddressId(7L)).thenReturn(1L);
+        assertTrue(manager.hasActiveLbRules(7L));
+        when(loadBalancerDao.countNotRevokedByPublicIpv6AddressId(8L)).thenReturn(0L);
+        assertFalse(manager.hasActiveLbRules(8L));
     }
 
     @Test(expected = InsufficientAddressCapacityException.class)

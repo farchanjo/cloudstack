@@ -17,6 +17,7 @@
 
 package com.cloud.network.lb;
 
+import com.cloud.exception.InvalidParameterValueException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.Network;
 import com.cloud.network.NetworkModel;
@@ -27,6 +28,7 @@ import com.cloud.network.dao.LoadBalancerVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.SslCertVO;
+import com.cloud.network.rules.LoadBalancer;
 import com.cloud.network.vpc.VpcManager;
 import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
 import com.cloud.user.Account;
@@ -39,6 +41,8 @@ import com.cloud.utils.db.EntityManager;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.Nic;
+import com.cloud.vm.dao.NicSecondaryIpDao;
+import com.cloud.vm.dao.NicSecondaryIpVO;
 import org.apache.cloudstack.acl.SecurityChecker;
 import org.apache.cloudstack.api.ApiConstants;
 import org.apache.cloudstack.api.ServerApiException;
@@ -64,6 +68,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
@@ -98,6 +103,9 @@ public class LoadBalancingRulesManagerImplTest{
     @Mock
     VpcManager vpcManager;
 
+    @Mock
+    NicSecondaryIpDao _nicSecondaryIpDao;
+
     @Spy
     @InjectMocks
     LoadBalancingRulesManagerImpl lbr = new LoadBalancingRulesManagerImpl();
@@ -112,6 +120,9 @@ public class LoadBalancingRulesManagerImplTest{
     private long lbRuleId = 2L;
     private long certMapRuleId = 3L;
     private long networkId = 4L;
+
+    private static final String GUEST_IPV6 = "fd00:cafe:1::10";
+    private static final String GUEST_IPV6_SEC = "fd00:cafe:1::20";
 
     @Test
     public void generateCidrStringTestNullCidrList() {
@@ -359,5 +370,72 @@ public class LoadBalancingRulesManagerImplTest{
 
         Nic nicInLb = lbr.getVmNicInLoadBalancer(userVm, loadBalancer, loadBalancerNetwork, vmIdNetworkIdMap, owner);
         Assert.assertEquals(nic, nicInLb);
+    }
+
+    @Test
+    public void isPublicIpv6LoadBalancer_trueWhenOnlyPub6Id() {
+        LoadBalancer lb = Mockito.mock(LoadBalancer.class);
+        when(lb.getPublicIpv6AddressId()).thenReturn(99L);
+        when(lb.getSourceIpAddressId()).thenReturn(null);
+        Assert.assertTrue(lbr.isPublicIpv6LoadBalancer(lb));
+    }
+
+    @Test
+    public void isPublicIpv6LoadBalancer_falseWhenNullOrIpv4Bound() {
+        Assert.assertFalse(lbr.isPublicIpv6LoadBalancer(null));
+
+        // Short-circuits on null pub6 id — do not stub source IP (strict Mockito).
+        LoadBalancer ipv4 = Mockito.mock(LoadBalancer.class);
+        when(ipv4.getPublicIpv6AddressId()).thenReturn(null);
+        Assert.assertFalse(lbr.isPublicIpv6LoadBalancer(ipv4));
+
+        // Pub6 set but also bound to IPv4 source IP → not pure pub6 LB.
+        LoadBalancer both = Mockito.mock(LoadBalancer.class);
+        when(both.getPublicIpv6AddressId()).thenReturn(99L);
+        when(both.getSourceIpAddressId()).thenReturn(1L);
+        Assert.assertFalse(lbr.isPublicIpv6LoadBalancer(both));
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void validateBackendIpForLoadBalancer_pub6RejectsIpv4() {
+        Nic nic = Mockito.mock(Nic.class);
+        lbr.validateBackendIpForLoadBalancer("10.0.0.5", GUEST_IPV6, nic, true);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void validateBackendIpForLoadBalancer_pub6RejectsInvalidIp6() {
+        Nic nic = Mockito.mock(Nic.class);
+        lbr.validateBackendIpForLoadBalancer("not-an-ip", GUEST_IPV6, nic, true);
+    }
+
+    @Test
+    public void validateBackendIpForLoadBalancer_pub6AcceptsPrimaryIpv6() {
+        Nic nic = Mockito.mock(Nic.class);
+        lbr.validateBackendIpForLoadBalancer(GUEST_IPV6, GUEST_IPV6, nic, true);
+    }
+
+    @Test
+    public void validateBackendIpForLoadBalancer_pub6AcceptsSecondaryIpv6OnNic() {
+        Nic nic = Mockito.mock(Nic.class);
+        when(nic.getNetworkId()).thenReturn(networkId);
+        NicSecondaryIpVO sec = Mockito.mock(NicSecondaryIpVO.class);
+        when(_nicSecondaryIpDao.findByIp6AddressAndNetworkId(eq(GUEST_IPV6_SEC), eq(networkId))).thenReturn(sec);
+
+        lbr.validateBackendIpForLoadBalancer(GUEST_IPV6_SEC, GUEST_IPV6, nic, true);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void validateBackendIpForLoadBalancer_pub6RejectsForeignIpv6() {
+        Nic nic = Mockito.mock(Nic.class);
+        when(nic.getNetworkId()).thenReturn(networkId);
+        when(_nicSecondaryIpDao.findByIp6AddressAndNetworkId(eq(GUEST_IPV6_SEC), eq(networkId))).thenReturn(null);
+
+        lbr.validateBackendIpForLoadBalancer(GUEST_IPV6_SEC, GUEST_IPV6, nic, true);
+    }
+
+    @Test
+    public void validateBackendIpForLoadBalancer_ipv4PathAllowsPrimary() {
+        Nic nic = Mockito.mock(Nic.class);
+        lbr.validateBackendIpForLoadBalancer("10.0.0.5", "10.0.0.5", nic, false);
     }
 }
