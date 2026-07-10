@@ -334,6 +334,9 @@ public class OvnVifDriver extends VifDriverBase {
         }
 
         final Set<String> vdpaPci = listVdpaMgmtPciAddresses(log);
+        if (log != null && log.isDebugEnabled()) {
+            log.debug("{}: vDPA mgmtdev PCI set size={} ({})", callerLabel, vdpaPci.size(), vdpaPci);
+        }
 
         for (final String iface : candidates) {
             if (!isVfRepresentor(iface)) {
@@ -347,7 +350,8 @@ public class OvnVifDriver extends VifDriverBase {
                 continue;
             }
             final String driver = readPciDriver(vfPci);
-            final boolean hasVdpa = vdpaPci.contains(vfPci);
+            // lower-case: sysfs + parseVdpaDevShowPci normalize; virtfn can vary
+            final boolean hasVdpa = vdpaPci.contains(vfPci.toLowerCase());
             if (!isSafeToFreeStaleRep(driver, hasVdpa)) {
                 result.skippedAllocated++;
                 log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} (ALLOCATED)",
@@ -469,16 +473,91 @@ public class OvnVifDriver extends VifDriverBase {
     }
 
     /**
-     * PCI BDFs currently hosting a vDPA mgmtdev, parsed from
-     * {@code vdpa dev show}. Empty when the binary is absent.
+     * PCI BDFs currently hosting a vDPA mgmtdev.
+     *
+     * <p><b>Must use multi-line sources.</b> {@link Script#runSimpleBashScript}
+     * only returns the <em>first</em> line (OneLineParser). Live CKS hosts often
+     * have 2+ vDPA devices (e.g. salazar + snape); keeping only the first PCI
+     * caused {@link #freeStaleFreeVfRepresentors} to treat the other live
+     * representors as FREE and {@code del-port} them off {@code br-overlay}
+     * (L2 blackhole → etcd/apiserver crashloop).
+     *
+     * <p>Sources (union):
+     * <ol>
+     *   <li>sysfs {@code /sys/bus/vdpa/devices/*} → parent PCI BDF (no PATH)</li>
+     *   <li>{@code vdpa dev show} via {@link Script#runSimpleBashScriptWithFullResult}
+     *       with absolute binary paths</li>
+     * </ol>
      */
     static Set<String> listVdpaMgmtPciAddresses(final Logger log) {
         final Set<String> out = new HashSet<>();
-        final String raw = Script.runSimpleBashScript("vdpa dev show 2>/dev/null", 5_000);
+        out.addAll(listVdpaMgmtPciFromSysfs());
+        out.addAll(listVdpaMgmtPciFromCli(log));
+        return out;
+    }
+
+    /**
+     * Walk {@code /sys/bus/vdpa/devices/*}; each entry is a symlink under a
+     * PCI device directory ({@code .../0000:01:01.0/vdpa-…}). Package-private
+     * for unit tests via injectable path is overkill — pure directory walk.
+     */
+    static Set<String> listVdpaMgmtPciFromSysfs() {
+        final Set<String> out = new HashSet<>();
+        final File bus = new File("/sys/bus/vdpa/devices");
+        final File[] entries = bus.listFiles();
+        if (entries == null) {
+            return out;
+        }
+        for (final File entry : entries) {
+            try {
+                // .../0000:bb:dd.f/vdpa-name  → parent name is the PCI BDF
+                final File real = entry.getCanonicalFile();
+                final File parent = real.getParentFile();
+                if (parent == null) {
+                    continue;
+                }
+                final String bdf = parent.getName();
+                if (bdf.matches("[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-9a-fA-F]")) {
+                    out.add(bdf.toLowerCase());
+                }
+            } catch (IOException ignored) {
+                // skip unreadable entry
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Full multi-line {@code vdpa dev show} parse. Never uses OneLineParser.
+     */
+    static Set<String> listVdpaMgmtPciFromCli(final Logger log) {
+        final Set<String> out = new HashSet<>();
+        for (final String bin : new String[] {"/usr/sbin/vdpa", "/sbin/vdpa", "/usr/local/sbin/vdpa", "vdpa"}) {
+            try {
+                final String raw = Script.runSimpleBashScriptWithFullResult(bin + " dev show 2>/dev/null", 5);
+                out.addAll(parseVdpaDevShowPci(raw));
+                if (!out.isEmpty()) {
+                    return out;
+                }
+            } catch (RuntimeException re) {
+                if (log != null) {
+                    log.debug("listVdpaMgmtPciFromCli: {} failed: {}", bin, re.getMessage());
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Parse multi-line {@code vdpa dev show} into PCI BDFs.
+     * Lines look like: {@code vdpa-XXXX: type network mgmtdev pci/0000:01:00.3 ...}
+     * Package-private for unit tests.
+     */
+    static Set<String> parseVdpaDevShowPci(final String raw) {
+        final Set<String> out = new HashSet<>();
         if (StringUtils.isBlank(raw)) {
             return out;
         }
-        // "vdpa-XXXX: type network mgmtdev pci/0000:01:00.3 ..."
         for (final String line : raw.split("\\R")) {
             final int idx = line.indexOf("mgmtdev pci/");
             if (idx < 0) {
@@ -490,7 +569,7 @@ public class OvnVifDriver extends VifDriverBase {
                 rest = rest.substring(0, sp);
             }
             if (StringUtils.isNotBlank(rest)) {
-                out.add(rest);
+                out.add(rest.toLowerCase());
             }
         }
         return out;

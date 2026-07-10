@@ -84,13 +84,34 @@ public class OvnVifDriverFreeStaleRepTest {
     }
 
     @Test
-    public void listVdpaMgmtPciAddresses_parsesVdpaDevShow() {
+    public void parseVdpaDevShowPci_keepsAllLines_notJustFirst() {
+        // Regression: Script.runSimpleBashScript is OneLineParser — freeStale
+        // used to only see the first vDPA PCI and del-port the rest (live CKS).
+        final String multi = "vdpa-r1: type network mgmtdev pci/0000:01:00.3 max_vqs 33\n"
+                + "vdpa-r2: type network mgmtdev pci/0000:01:04.2 vendor_id 5555\n"
+                + "vdpa-r3: type network mgmtdev pci/0000:01:01.0\n";
+        final Set<String> pci = OvnVifDriver.parseVdpaDevShowPci(multi);
+        assertEquals(3, pci.size());
+        assertTrue(pci.contains("0000:01:00.3"));
+        assertTrue(pci.contains("0000:01:04.2"));
+        assertTrue(pci.contains("0000:01:01.0"));
+    }
+
+    @Test
+    public void parseVdpaDevShowPci_blank_isEmpty() {
+        assertTrue(OvnVifDriver.parseVdpaDevShowPci(null).isEmpty());
+        assertTrue(OvnVifDriver.parseVdpaDevShowPci("").isEmpty());
+        assertTrue(OvnVifDriver.parseVdpaDevShowPci("no mgmtdev here\n").isEmpty());
+    }
+
+    @Test
+    public void listVdpaMgmtPciFromCli_usesFullResult_notOneLine() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev show"), anyInt()))
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
                     .thenReturn("vdpa-r1: type network mgmtdev pci/0000:01:00.3 max_vqs 33\n"
                             + "vdpa-r2: type network mgmtdev pci/0000:01:04.2\n");
 
-            final Set<String> pci = OvnVifDriver.listVdpaMgmtPciAddresses(LOG);
+            final Set<String> pci = OvnVifDriver.listVdpaMgmtPciFromCli(LOG);
             assertEquals(2, pci.size());
             assertTrue(pci.contains("0000:01:00.3"));
             assertTrue(pci.contains("0000:01:04.2"));
@@ -110,7 +131,8 @@ public class OvnVifDriverFreeStaleRepTest {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface"), anyInt()))
                     .thenReturn("vnet101\ndx6p0vf4\n");
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev show"), anyInt()))
+            // empty CLI + empty sysfs (no /sys in unit env) → no vDPA set
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
                     .thenReturn("");
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
 
