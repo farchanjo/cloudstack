@@ -287,7 +287,7 @@ Per standing CloudStack deploy rules (jar-direct, **all 3** control nodes
 | Phase | Status | Notes |
 |---|---|---|
 | Design | ✅ done | this document (2026-07-10) |
-| Sprint 1 — IPAM (`user_public_ipv6_address`) | Proposed / not started | Option B new table |
+| Sprint 1 — IPAM (`user_public_ipv6_address`) | ✅ foundation + API complete (code); live schema/cmk smoke still pending deploy | table `user_public_ipv6_address`; APIs list/associate/disassociatePublicIpv6Address; 13 unit tests; no OVN yet |
 | Sprint 2 — LB API + OVN dual-read | Proposed / not started | `publicipv6id`; reconciler union |
 | Sprint 3 — migrate / cutover | Proposed / not started | empty ConfigKey after inventory |
 | Sprint 4 — StaticNAT / PF (optional) | Proposed / not started | deferred until LB path stable |
