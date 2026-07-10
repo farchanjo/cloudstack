@@ -64,6 +64,7 @@ import org.apache.cloudstack.api.command.admin.account.UpdateAccountCmd;
 import org.apache.cloudstack.api.command.admin.address.AcquirePodIpCmdByAdmin;
 import org.apache.cloudstack.api.command.admin.address.AssociateIPAddrCmdByAdmin;
 import org.apache.cloudstack.api.command.admin.address.AssociatePublicIpv6AddressCmdByAdmin;
+import org.apache.cloudstack.api.command.admin.address.ImportPublicIpv6AddressCmd;
 import org.apache.cloudstack.api.command.admin.address.ListPublicIpAddressesCmdByAdmin;
 import org.apache.cloudstack.api.command.admin.address.ListPublicIpv6AddressesCmdByAdmin;
 import org.apache.cloudstack.api.command.admin.address.ReleasePodIpCmdByAdmin;
@@ -4352,6 +4353,7 @@ public class ManagementServerImpl extends MutualExclusiveIdsManagerBase implemen
         cmdList.add(AssociateIPAddrCmdByAdmin.class);
         cmdList.add(ListPublicIpAddressesCmdByAdmin.class);
         cmdList.add(AssociatePublicIpv6AddressCmdByAdmin.class);
+        cmdList.add(ImportPublicIpv6AddressCmd.class);
         cmdList.add(ListPublicIpv6AddressesCmdByAdmin.class);
         cmdList.add(CreateNetworkCmdByAdmin.class);
         cmdList.add(UpdateNetworkCmdByAdmin.class);
