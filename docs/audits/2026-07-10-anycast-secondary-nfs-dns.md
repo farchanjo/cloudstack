@@ -66,3 +66,29 @@ was deleted from the export.
 - Puppet CONTROL_VERSION at cutover close: 0.1.121
 - k8s-services: regcred SealedSecret resealed (`d961f685`) after registry oauth2 fix
 - Dual legacy underlay VIPs (.45 / .51 / .53) removed from lo / nginx / nft
+
+## Follow-up — Ceph mon + CloudStack primary via DNS (same day)
+
+Client-facing Ceph mon endpoints for RBD / `ceph.conf` moved from bare storage
+IPs to PowerDNS names on `10.185.0.0/24` (storage plane — not cplane/anycast
+identity hostnames).
+
+| DNS name | A |
+|---|---|
+| `ceph-mon-aragog.slytherin.eonf.ltd` | 10.185.0.21 |
+| `ceph-mon-norbert.slytherin.eonf.ltd` | 10.185.0.22 |
+| `ceph-mon-fluffy.slytherin.eonf.ltd` | 10.185.0.23 |
+| `ceph-mon-nagini.slytherin.eonf.ltd` | 10.185.0.24 |
+| `ceph-mon-scabbers.slytherin.eonf.ltd` | 10.185.0.25 |
+| `ceph-mon.slytherin.eonf.ltd` | multipath A (all five) |
+
+| Surface | Value |
+|---|---|
+| CloudStack primary RBD `host_address` | comma-separated `ceph-mon-*` FQDNs above |
+| CloudStack secondary | already `nfs://lumos.slytherin.eonf.ltd/cloudstack-secondary` |
+| `/etc/ceph/ceph.conf` mon_host (all data nodes) | same mon DNS list |
+| RGW client entry | `pensieve.slytherin.eonf.ltd` (VIP anycast `.22`) |
+| RGW listen | still beast on `.22` / `::22` (bind address — not client pointer) |
+
+**Note:** Running libvirt domains may still list mon IPs in disk XML until
+stop/start; IPs remain valid. New attaches use DNS from the storage pool.
