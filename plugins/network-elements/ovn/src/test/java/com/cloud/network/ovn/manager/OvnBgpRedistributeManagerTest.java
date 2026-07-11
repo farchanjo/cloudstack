@@ -334,6 +334,58 @@ public class OvnBgpRedistributeManagerTest {
     }
 
     @Test
+    public void isLbOnlyTrueWhenOnlyLoadBalancingPurpose() {
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.LoadBalancing)))
+                .thenReturn(List.of(mock(FirewallRuleVO.class)));
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.PortForwarding)))
+                .thenReturn(Collections.emptyList());
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.StaticNat)))
+                .thenReturn(Collections.emptyList());
+        assertTrue(manager.isLbOnlyPublicIp(IP_ADDR_ID));
+    }
+
+    @Test
+    public void isLbOnlyFalseWhenSourceNat() {
+        final IPAddressVO ip = mock(IPAddressVO.class);
+        when(ip.isSourceNat()).thenReturn(true);
+        when(ipAddressDao.findById(eq(IP_ADDR_ID))).thenReturn(ip);
+        when(firewallRulesDao.listByIpAndPurposeAndNotRevoked(eq(IP_ADDR_ID), eq(FirewallRule.Purpose.LoadBalancing)))
+                .thenReturn(List.of(mock(FirewallRuleVO.class)));
+        assertFalse(manager.isLbOnlyPublicIp(IP_ADDR_ID));
+    }
+
+    @Test
+    public void announceLbOnlyAnycastsOnBackendHypervisors() {
+        when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        manager = spy(manager);
+        doReturn(true).when(manager).isLbOnlyPublicIp(IP_ADDR_ID);
+        doReturn(List.of(31L, 32L, 33L)).when(manager).resolveLbBackendHostIds(IP_ADDR_ID);
+        when(agentManager.easySend(anyLong(), any(OvnBgpAnnounceCommand.class)))
+                .thenReturn(new OvnBgpAnnounceAnswer(null, true, "ok", 24452L));
+        when(logicalIdMapDao.findByCsId(eq(Kind.BGP_ANNOUNCE), eq(IP_ADDR_ID), eq(CONTROLLER_ID)))
+                .thenReturn(null);
+
+        manager.announce(PUBLIC_IP, IP_ADDR_ID, VPC_ID, ZONE_ID);
+
+        verify(agentManager, times(1)).easySend(eq(31L), any(OvnBgpAnnounceCommand.class));
+        verify(agentManager, times(1)).easySend(eq(32L), any(OvnBgpAnnounceCommand.class));
+        verify(agentManager, times(1)).easySend(eq(33L), any(OvnBgpAnnounceCommand.class));
+        verify(agentManager, never()).easySend(eq(HOST_ID), any(OvnBgpAnnounceCommand.class));
+        final ArgumentCaptor<OvnLogicalIdMapVO> captor = ArgumentCaptor.forClass(OvnLogicalIdMapVO.class);
+        verify(logicalIdMapDao, times(1)).persist(captor.capture());
+        assertEquals("31,32,33", captor.getValue().getOvnUuid());
+    }
+
+    @Test
+    public void encodeAndParseHostIdsRoundTrip() {
+        assertEquals("7,21,99", OvnBgpRedistributeManager.encodeHostIds(List.of(99L, 7L, 21L)));
+        assertEquals(List.of(7L, 21L, 99L),
+                OvnBgpRedistributeManager.parseHostIds("99,7,21").stream().sorted().toList());
+        assertEquals(List.of(5L), OvnBgpRedistributeManager.parseHostIds("5"));
+        assertTrue(OvnBgpRedistributeManager.parseHostIds(null).isEmpty());
+    }
+
+    @Test
     public void findGatewayChassisHostIdReturnsNullWhenChassisNotMapped() {
         when(chassisMapDao.findByChassisUuid(CHASSIS_NAME)).thenReturn(null);
         final Long hostId = manager.findGatewayChassisHostId(ZONE_ID, CONTROLLER_ID);

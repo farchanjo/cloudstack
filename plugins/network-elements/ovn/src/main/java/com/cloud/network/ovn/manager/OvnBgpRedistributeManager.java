@@ -18,11 +18,16 @@ package com.cloud.network.ovn.manager;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 import javax.inject.Inject;
 
@@ -38,6 +43,12 @@ import com.cloud.network.IpAddress;
 import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
+import com.cloud.network.UserPublicIpv6AddressVO;
+import com.cloud.network.dao.LoadBalancerDao;
+import com.cloud.network.dao.LoadBalancerVMMapDao;
+import com.cloud.network.dao.LoadBalancerVMMapVO;
+import com.cloud.network.dao.LoadBalancerVO;
+import com.cloud.network.dao.UserPublicIpv6AddressDao;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.ovn.client.OvnNbClient;
@@ -50,20 +61,33 @@ import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.utils.net.NetUtils;
+import com.cloud.vm.VirtualMachine;
+import com.cloud.vm.VMInstanceVO;
+import com.cloud.vm.dao.VMInstanceDao;
 
 /**
  * Announces / withdraws a {@code /32} host route per allocated public IP via
- * the host-side FRR daemon on the OVN gateway-chassis. Pure opt-in,
+ * the host-side FRR daemon on OVN data-plane chassis. Pure opt-in,
  * controlled by the global ConfigKey {@code ovn.bgp.redistribute.public_ips}
  * or its per-VPC detail override (see {@link OvnPublicNetworkManager#isBgpRedistributeEnabled}).
  *
  * <p>Why this exists: when the public network's parent prefix is announced
  * by every data node via ECMP (the canonical CloudStack DC layout), inbound
  * traffic to a public IP can land on any node — but the conntrack /
- * stateful-NAT state lives only on the OVN gateway-chassis hosting the
- * VPC's distributed-gateway LRP. A {@code /32} announce from the
- * gateway-chassis pulls the /32 prefix toward the right node, fixing
- * inbound DNAT silently dropping on the wrong node.
+ * stateful-NAT state for SourceNAT / StaticNAT / PortForward lives only on
+ * the OVN gateway-chassis hosting the VPC's distributed-gateway LRP. A
+ * {@code /32} announce from the gateway-chassis pulls those IPs toward the
+ * right node.
+ *
+ * <p><b>Option B (LB anycast)</b>: when a public IPv4 is used <em>only</em> by
+ * LoadBalancing (no SNAT / 1:1 NAT / PF), the {@code /32} is announced on
+ * every hypervisor that currently hosts a non-revoked Running LB backend VM.
+ * BGP ECMP then spreads ingress across those data nodes; OVN LB still
+ * round-robins guest backends. K8s control-plane VMs are not special-cased —
+ * they join only if assigned to the LB pool. Baremetal CS management / RR
+ * hosts never announce (they are not KVM hosts of backends and have no
+ * chassis). New workers auto-join on the next invent tick via
+ * {@link #ensurePublicIpv4AnnouncesForZone}.
  *
  * <p>The plugin does NOT replace FRR. It only writes
  * {@code router bgp <asn> ; network <ip>/32} into the host's already-running
@@ -72,9 +96,8 @@ import com.cloud.utils.net.NetUtils;
  *
  * <p>Tracking: each successful announce persists a row of
  * {@link Kind#BGP_ANNOUNCE} in {@code ovn_logical_id_map}. The cs_id is the
- * {@code IPAddressVO.id}; the {@code ovn_uuid} column is reused to carry the
- * agent-side host id (encoded as a string) so the periodic reconciler can
- * detect gateway-chassis migration and re-announce on the new host.
+ * {@code IPAddressVO.id}; the {@code ovn_uuid} column carries one host id or a
+ * comma-separated sorted list of host ids (LB multi-chassis).
  */
 @Component
 public class OvnBgpRedistributeManager {
@@ -85,10 +108,9 @@ public class OvnBgpRedistributeManager {
      *  {@link OvnPublicNetworkManager#ensureHaChassisGroupForZone(long)}. */
     private static final String HAG_NAME_PREFIX = "hag-public-z";
 
-    /** In-memory cache of the last-announced (publicIp, hostId) pair so the
-     *  reconciler can short-circuit unchanged entries between ticks. The
-     *  authoritative state lives in the DAO; this cache only avoids redundant
-     *  agent calls when nothing moved. */
+    /** In-memory cache of the last-announced (publicIp → primary host id) so
+     *  tests and light diagnostics can see the last successful path. The
+     *  authoritative multi-host set lives in the DAO {@code ovn_uuid} CSV. */
     private final Map<String, Long> lastHostByIp = new ConcurrentHashMap<>();
 
     @Inject
@@ -105,10 +127,20 @@ public class OvnBgpRedistributeManager {
     private IPAddressDao ipAddressDao;
     @Inject
     private FirewallRulesDao firewallRulesDao;
+    @Inject
+    private LoadBalancerDao loadBalancerDao;
+    @Inject
+    private LoadBalancerVMMapDao loadBalancerVMMapDao;
+    @Inject
+    private VMInstanceDao vmInstanceDao;
+    @Inject
+    private UserPublicIpv6AddressDao userPublicIpv6AddressDao;
 
     /**
-     * Announce the supplied public IP as a {@code /32} via the gateway-chassis
-     * host's FRR. No-op when the redistributor is not enabled for the VPC.
+     * Announce the supplied public IP as a {@code /32} on the correct chassis
+     * set. SNAT / StaticNAT / PortForward pin to the zone gateway-chassis;
+     * LB-only IPs anycast on every hypervisor that hosts a Running backend
+     * (Option B). No-op when the redistributor is not enabled for the VPC.
      *
      * @param publicIp public IPv4 (no prefix length)
      * @param ipAddrId CloudStack {@code public_ip_address.id} (used as the
@@ -128,9 +160,9 @@ public class OvnBgpRedistributeManager {
             LOGGER.debug("OvnBgpRedistribute.announce: no OVN controller for zone {}", zoneId);
             return;
         }
-        final Long hostId = findGatewayChassisHostId(zoneId, controller.getId());
-        if (hostId == null) {
-            LOGGER.warn("OvnBgpRedistribute.announce: no gateway-chassis for zone={}; skipping {}/32",
+        final List<Long> desiredHosts = resolveAnnounceHostIds(ipAddrId, zoneId, controller.getId());
+        if (desiredHosts.isEmpty()) {
+            LOGGER.warn("OvnBgpRedistribute.announce: no announce hosts for zone={} ip={}/32; skipping",
                     zoneId, publicIp);
             return;
         }
@@ -143,19 +175,40 @@ public class OvnBgpRedistributeManager {
         final String anchorCidr = resolveAnchorCidr(zoneId, vpcId);
         final String vlan = resolveVlan(zoneId, vpcId);
         final String networkGatewayIp = resolveNetworkGateway(zoneId, vpcId);
-        if (sendCommand(hostId, publicIp, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
-                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
-            persistAnnounce(controller.getId(), ipAddrId, hostId, publicIp);
-            lastHostByIp.put(publicIp, hostId);
-            LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host {} (ip_id={}, vpc={})",
-                    publicIp, hostId, ipAddrId, vpcId);
+
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                Kind.BGP_ANNOUNCE, ipAddrId, controller.getId());
+        final Set<Long> previousHosts = new LinkedHashSet<>(parseHostIds(existing == null ? null : existing.getOvnUuid()));
+        final Set<Long> desiredSet = new LinkedHashSet<>(desiredHosts);
+
+        final List<Long> announced = new ArrayList<>();
+        for (final Long hostId : desiredHosts) {
+            if (sendCommand(hostId, publicIp, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
+                    OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+                announced.add(hostId);
+            }
         }
+        // Withdraw hosts that no longer host a backend (or left the gateway pin).
+        for (final Long stale : previousHosts) {
+            if (!desiredSet.contains(stale)) {
+                sendCommand(stale, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            }
+        }
+        if (announced.isEmpty()) {
+            LOGGER.warn("OvnBgpRedistribute.announce: {}/32 failed on all hosts {} (ip_id={}, vpc={})",
+                    publicIp, desiredHosts, ipAddrId, vpcId);
+            return;
+        }
+        persistAnnounceHosts(controller.getId(), ipAddrId, announced, publicIp);
+        lastHostByIp.put(publicIp, announced.get(0));
+        LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host(s) {} (ip_id={}, vpc={}, lbOnly={})",
+                publicIp, announced, ipAddrId, vpcId, isLbOnlyPublicIp(ipAddrId));
     }
 
     /**
-     * Withdraw the supplied public IP from FRR on whatever host last
-     * announced it. Removes the bookkeeping row regardless of agent
-     * success — best-effort cleanup. Safe to call multiple times.
+     * Withdraw the supplied public IP from FRR on every host recorded in the
+     * bookkeeping row. Removes the row regardless of agent success —
+     * best-effort cleanup. Safe to call multiple times.
      *
      * <p><b>Refcount safety</b>: if any remaining SourceNAT / StaticNAT /
      * LoadBalancer / PortForward still uses {@code ipAddrId}, the withdraw is
@@ -181,8 +234,8 @@ public class OvnBgpRedistributeManager {
             lastHostByIp.remove(publicIp);
             return;
         }
-        final Long hostId = parseHostId(mapping.getOvnUuid());
-        if (hostId != null) {
+        final List<Long> hostIds = parseHostIds(mapping.getOvnUuid());
+        for (final Long hostId : hostIds) {
             // Withdraw needs no next-hop and no anchor: the wrapper deletes the
             // /32 route by prefix and writes `no network <ip>/32`. The chassis
             // anchor is shared across FIPs and is NOT torn down per withdraw.
@@ -193,8 +246,8 @@ public class OvnBgpRedistributeManager {
         } finally {
             lastHostByIp.remove(publicIp);
         }
-        LOGGER.info("OvnBgpRedistribute.withdraw: {}/32 withdrawn on host {} (ip_id={}, vpc={})",
-                publicIp, hostId, ipAddrId, vpcId);
+        LOGGER.info("OvnBgpRedistribute.withdraw: {}/32 withdrawn on host(s) {} (ip_id={}, vpc={})",
+                publicIp, hostIds, ipAddrId, vpcId);
     }
 
     /**
@@ -426,18 +479,16 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
-     * Announce a public IPv6 LB VIP as a BGP {@code /128} host route on the
-     * gateway-chassis FRR (IPv6 unicast AF), with a matching kernel route via
-     * the VPC public LRP GUA so inbound N-S enters OVN. Used by
-     * {@code ovn.lr.public.ipv6.lb} — VIPs sit outside CloudStack
-     * {@code user_ip_address}, so bookkeeping uses
-     * {@link Kind#BGP_HOST_ANNOUNCE_V6} with a stable positive hash of the VIP
-     * (kind-isolated from {@link Kind#BGP_ANNOUNCE}; must stay &gt; 0 because
-     * {@code ovn_logical_id_map.cs_id} is {@code bigint unsigned}).
+     * Announce a public IPv6 LB VIP as a BGP {@code /128} host route (IPv6
+     * unicast AF) with a matching kernel route via the VPC public LRP GUA.
+     * Option B: anycast on every hypervisor hosting a Running IPv6 LB backend
+     * for this VIP; falls back to the zone gateway-chassis when backends are
+     * unknown. VIPs sit outside {@code user_ip_address}, so bookkeeping uses
+     * {@link Kind#BGP_HOST_ANNOUNCE_V6} with a stable positive hash of the VIP.
      *
      * @param vip   bare IPv6 VIP (no prefix length)
      * @param vpcId owning VPC id (public LRP GUA / MAC resolution)
-     * @param zoneId zone id (controller / gateway-chassis)
+     * @param zoneId zone id (controller / chassis set)
      */
     public void announceHost6(final String vip, final long vpcId, final long zoneId) {
         if (StringUtils.isBlank(vip) || !vip.contains(":") || !NetUtils.isValidIp6(vip)) {
@@ -449,9 +500,10 @@ public class OvnBgpRedistributeManager {
             LOGGER.debug("OvnBgpRedistribute.announceHost6: no OVN controller for zone {}", zoneId);
             return;
         }
-        final Long hostId = findGatewayChassisHostId(zoneId, controller.getId());
-        if (hostId == null) {
-            LOGGER.warn("OvnBgpRedistribute.announceHost6: no gateway-chassis for zone={}; skipping {}/128",
+        final long csId = host6CsId(canonicalVip);
+        final List<Long> desiredHosts = resolveHost6AnnounceHostIds(canonicalVip, zoneId, controller.getId());
+        if (desiredHosts.isEmpty()) {
+            LOGGER.warn("OvnBgpRedistribute.announceHost6: no announce hosts for zone={} vip={}/128; skipping",
                     zoneId, canonicalVip);
             return;
         }
@@ -460,20 +512,38 @@ public class OvnBgpRedistributeManager {
         final String gatewayMac = publicNetworkManager.getVpcPublicLrpMac(zoneId, vpcId);
         final String v6AnchorCidr = publicNetworkManager.getPublicIpv6AnchorCidr();
         final String v6NetworkGateway = publicNetworkManager.getPublicIpv6Gateway();
-        if (sendSubnetCommand(hostId, cidr, v6GatewayIp, gatewayMac, v6AnchorCidr, null, v6NetworkGateway,
-                OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
-            final long csId = host6CsId(canonicalVip);
-            persistHostAnnounceV6(controller.getId(), csId, hostId, canonicalVip);
-            lastHostByIp.put(cidr, hostId);
-            LOGGER.info("OvnBgpRedistribute.announceHost6: {}/128 announced on host {} (vpc={})",
-                    canonicalVip, hostId, vpcId);
+
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
+                Kind.BGP_HOST_ANNOUNCE_V6, csId, controller.getId());
+        final Set<Long> previousHosts = new LinkedHashSet<>(parseHostIds(existing == null ? null : existing.getOvnUuid()));
+        final Set<Long> desiredSet = new LinkedHashSet<>(desiredHosts);
+
+        final List<Long> announced = new ArrayList<>();
+        for (final Long hostId : desiredHosts) {
+            if (sendSubnetCommand(hostId, cidr, v6GatewayIp, gatewayMac, v6AnchorCidr, null, v6NetworkGateway,
+                    OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
+                announced.add(hostId);
+            }
         }
+        for (final Long stale : previousHosts) {
+            if (!desiredSet.contains(stale)) {
+                sendSubnetCommand(stale, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            }
+        }
+        if (announced.isEmpty()) {
+            LOGGER.warn("OvnBgpRedistribute.announceHost6: {}/128 failed on all hosts {} (vpc={})",
+                    canonicalVip, desiredHosts, vpcId);
+            return;
+        }
+        persistHostAnnounceV6Hosts(controller.getId(), csId, announced, canonicalVip);
+        lastHostByIp.put(cidr, announced.get(0));
+        LOGGER.info("OvnBgpRedistribute.announceHost6: {}/128 announced on host(s) {} (vpc={})",
+                canonicalVip, announced, vpcId);
     }
 
     /**
-     * Withdraw a previously-announced public IPv6 LB VIP {@code /128}.
-     * Best-effort and idempotent. Accepts any textual form of the VIP;
-     * canonicalization inside {@link #host6CsId} keeps the bookkeeping key stable.
+     * Withdraw a previously-announced public IPv6 LB VIP {@code /128} from
+     * every host recorded in bookkeeping. Best-effort and idempotent.
      */
     public void withdrawHost6(final String vip, final long vpcId, final long zoneId) {
         if (StringUtils.isBlank(vip)) {
@@ -492,8 +562,8 @@ public class OvnBgpRedistributeManager {
             lastHostByIp.remove(cidr);
             return;
         }
-        final Long hostId = parseHostId(mapping.getOvnUuid());
-        if (hostId != null) {
+        final List<Long> hostIds = parseHostIds(mapping.getOvnUuid());
+        for (final Long hostId : hostIds) {
             sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
         }
         try {
@@ -501,8 +571,8 @@ public class OvnBgpRedistributeManager {
         } finally {
             lastHostByIp.remove(cidr);
         }
-        LOGGER.info("OvnBgpRedistribute.withdrawHost6: {}/128 withdrawn on host {} (vpc={})",
-                canonicalVip, hostId, vpcId);
+        LOGGER.info("OvnBgpRedistribute.withdrawHost6: {}/128 withdrawn on host(s) {} (vpc={})",
+                canonicalVip, hostIds, vpcId);
     }
 
     /**
@@ -557,18 +627,19 @@ public class OvnBgpRedistributeManager {
         }
     }
 
-    private void persistHostAnnounceV6(final long controllerId, final long csId, final long hostId,
-                                       final String vip) {
+    private void persistHostAnnounceV6Hosts(final long controllerId, final long csId,
+                                            final List<Long> hostIds, final String vip) {
+        final String encoded = encodeHostIds(hostIds);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
                 Kind.BGP_HOST_ANNOUNCE_V6, csId, controllerId);
         if (existing != null) {
-            existing.setOvnUuid(String.valueOf(hostId));
+            existing.setOvnUuid(encoded);
             existing.setOvnName(vip);
             logicalIdMapDao.update(existing.getId(), existing);
             return;
         }
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(
-                Kind.BGP_HOST_ANNOUNCE_V6, csId, controllerId, String.valueOf(hostId), vip));
+                Kind.BGP_HOST_ANNOUNCE_V6, csId, controllerId, encoded, vip));
     }
 
     /**
@@ -626,12 +697,6 @@ public class OvnBgpRedistributeManager {
     }
 
     /**
-     * Reconcile the live gateway-chassis assignment against the persisted
-     * {@link Kind#BGP_ANNOUNCE} rows. When the gateway-chassis migrated,
-     * announce on the new host and withdraw from the old. Designed to be
-     * invoked periodically (see {@link OvnNetworkConfig#BgpReconcileIntervalSeconds}).
-     */
-    /**
      * Global public-IP /32 toggle. Package-visible so unit tests can spy the
      * gate without wiring the static {@code ConfigDepot}.
      */
@@ -639,6 +704,11 @@ public class OvnBgpRedistributeManager {
         return Boolean.TRUE.equals(OvnNetworkConfig.BgpRedistributePublicIps.value());
     }
 
+    /**
+     * Reconcile persisted {@link Kind#BGP_ANNOUNCE} rows against live chassis
+     * membership. LB-only IPs re-run {@link #announce} (Option B multi-host
+     * set). SNAT/StaticNAT/PF rows pin-migrate with the gateway-chassis.
+     */
     public void reconcileZone(final long zoneId) {
         if (!isPublicRedistributeEnabled()) {
             // Global toggle off — even VPC-level overrides only matter if
@@ -657,35 +727,45 @@ public class OvnBgpRedistributeManager {
         }
         final List<OvnLogicalIdMapVO> rows = logicalIdMapDao.listByKind(Kind.BGP_ANNOUNCE, controller.getId());
         for (final OvnLogicalIdMapVO row : rows) {
-            final Long lastHost = parseHostId(row.getOvnUuid());
             final String publicIp = row.getOvnName();
             if (publicIp == null || publicIp.isEmpty()) {
                 continue;
             }
-            if (currentGw.equals(lastHost)) {
+            final long ipAddrId = row.getCsId();
+            // Option B: LB-only membership is derived from backends every tick.
+            if (isLbOnlyPublicIp(ipAddrId)) {
+                final IpAddress ip = ipAddressDao == null ? null : ipAddressDao.findById(ipAddrId);
+                if (ip != null && ip.getVpcId() != null) {
+                    announce(publicIp, ipAddrId, ip.getVpcId(), zoneId);
+                }
                 continue;
             }
-            // Gateway moved. Announce on the new host first (so the route
-            // is in BGP before we tear it down on the old host), then
-            // withdraw on the previous host. Resolve the VPC's public LRP IP
-            // (row cs_id = public_ip_address.id -> vpcId) so the /32 datapath
-            // route is re-installed on the NEW gateway chassis, not just
-            // re-advertised.
-            final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, row.getCsId());
-            final String gatewayMac = resolveGatewayMacForIpAddr(zoneId, row.getCsId());
-            final String anchorCidr = resolveAnchorForIpAddr(zoneId, row.getCsId());
-            final String vlan = resolveVlanForIpAddr(zoneId, row.getCsId());
-            final String networkGatewayIp = resolveNetworkGatewayForIpAddr(zoneId, row.getCsId());
+            final List<Long> lastHosts = parseHostIds(row.getOvnUuid());
+            if (lastHosts.size() == 1 && currentGw.equals(lastHosts.get(0))) {
+                continue;
+            }
+            if (lastHosts.contains(currentGw) && lastHosts.size() == 1) {
+                continue;
+            }
+            // Gateway-pinned VIP: announce on current GW first, then withdraw stale.
+            final String gatewayIp = resolveGatewayIpForIpAddr(zoneId, ipAddrId);
+            final String gatewayMac = resolveGatewayMacForIpAddr(zoneId, ipAddrId);
+            final String anchorCidr = resolveAnchorForIpAddr(zoneId, ipAddrId);
+            final String vlan = resolveVlanForIpAddr(zoneId, ipAddrId);
+            final String networkGatewayIp = resolveNetworkGatewayForIpAddr(zoneId, ipAddrId);
             if (sendCommand(currentGw, publicIp, gatewayIp, gatewayMac, anchorCidr, vlan, networkGatewayIp,
                     OvnBgpAnnounceCommand.OP_ANNOUNCE)) {
-                if (lastHost != null) {
-                    sendCommand(lastHost, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+                for (final Long lastHost : lastHosts) {
+                    if (!currentGw.equals(lastHost)) {
+                        sendCommand(lastHost, publicIp, null, null, null, null, null,
+                                OvnBgpAnnounceCommand.OP_WITHDRAW);
+                    }
                 }
                 row.setOvnUuid(String.valueOf(currentGw));
                 logicalIdMapDao.update(row.getId(), row);
                 lastHostByIp.put(publicIp, currentGw);
-                LOGGER.info("OvnBgpRedistribute.reconcileZone: {}/32 migrated from host {} to host {} (zone={})",
-                        publicIp, lastHost, currentGw, zoneId);
+                LOGGER.info("OvnBgpRedistribute.reconcileZone: {}/32 migrated to gateway host {} from {} (zone={})",
+                        publicIp, currentGw, lastHosts, zoneId);
             }
         }
     }
@@ -901,29 +981,208 @@ public class OvnBgpRedistributeManager {
                 Kind.BGP_SUBNET_ANNOUNCE, networkId, controllerId, String.valueOf(hostId), cidr));
     }
 
-    private void persistAnnounce(final long controllerId, final long ipAddrId, final long hostId,
-                                 final String publicIp) {
+    private void persistAnnounceHosts(final long controllerId, final long ipAddrId,
+                                      final List<Long> hostIds, final String publicIp) {
+        final String encoded = encodeHostIds(hostIds);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(
                 Kind.BGP_ANNOUNCE, ipAddrId, controllerId);
         if (existing != null) {
-            existing.setOvnUuid(String.valueOf(hostId));
+            existing.setOvnUuid(encoded);
             existing.setOvnName(publicIp);
             logicalIdMapDao.update(existing.getId(), existing);
             return;
         }
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(
-                Kind.BGP_ANNOUNCE, ipAddrId, controllerId, String.valueOf(hostId), publicIp));
+                Kind.BGP_ANNOUNCE, ipAddrId, controllerId, encoded, publicIp));
+    }
+
+    /**
+     * Host set for a public IPv4 announce: LB-only → unique Running backend
+     * hypervisors; otherwise the zone gateway-chassis (singleton).
+     */
+    List<Long> resolveAnnounceHostIds(final long ipAddrId, final long zoneId, final long controllerId) {
+        if (isLbOnlyPublicIp(ipAddrId)) {
+            final List<Long> backends = resolveLbBackendHostIds(ipAddrId);
+            if (!backends.isEmpty()) {
+                return backends;
+            }
+            LOGGER.info("OvnBgpRedistribute: LB-only ip_id={} has no Running backends; falling back to gateway",
+                    ipAddrId);
+        }
+        final Long gw = findGatewayChassisHostId(zoneId, controllerId);
+        return gw == null ? Collections.emptyList() : List.of(gw);
+    }
+
+    /**
+     * True when the public IP is used by LoadBalancing and not by SourceNAT,
+     * 1:1 StaticNAT, PortForward, or StaticNat firewall purpose — Option B gate.
+     */
+    boolean isLbOnlyPublicIp(final long ipAddrId) {
+        if (ipAddressDao != null) {
+            final IPAddressVO ip = ipAddressDao.findById(ipAddrId);
+            if (ip != null && (ip.isSourceNat() || ip.isOneToOneNat())) {
+                return false;
+            }
+        }
+        if (!hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.LoadBalancing)) {
+            return false;
+        }
+        if (hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.PortForwarding)) {
+            return false;
+        }
+        return !hasNonRevokedPurpose(ipAddrId, FirewallRule.Purpose.StaticNat);
+    }
+
+    /**
+     * Unique CloudStack host ids of Running (non-Migrating) VMs assigned to
+     * any non-revoked LoadBalancing rule on {@code ipAddrId}. Sorted for stable
+     * bookkeeping. Package-visible for unit tests.
+     */
+    List<Long> resolveLbBackendHostIds(final long ipAddrId) {
+        final Set<Long> hosts = new LinkedHashSet<>();
+        if (loadBalancerDao == null || loadBalancerVMMapDao == null || vmInstanceDao == null) {
+            return Collections.emptyList();
+        }
+        final List<LoadBalancerVO> lbs = loadBalancerDao.listByIpAddress(ipAddrId);
+        if (lbs == null || lbs.isEmpty()) {
+            // Fallback: firewall rule id == load balancer id in classic CS schema.
+            final List<FirewallRuleVO> rules = firewallRulesDao == null ? null
+                    : firewallRulesDao.listByIpAndPurposeAndNotRevoked(ipAddrId, FirewallRule.Purpose.LoadBalancing);
+            if (rules != null) {
+                for (final FirewallRuleVO rule : rules) {
+                    if (rule != null) {
+                        addBackendHostsForLb(rule.getId(), hosts);
+                    }
+                }
+            }
+            return sortedHostList(hosts);
+        }
+        for (final LoadBalancerVO lb : lbs) {
+            if (lb == null) {
+                continue;
+            }
+            final FirewallRule.State st = lb.getState();
+            if (st != null && st != FirewallRule.State.Active && st != FirewallRule.State.Add) {
+                continue;
+            }
+            addBackendHostsForLb(lb.getId(), hosts);
+        }
+        return sortedHostList(hosts);
+    }
+
+    private void addBackendHostsForLb(final long loadBalancerId, final Set<Long> hosts) {
+        final List<LoadBalancerVMMapVO> maps =
+                loadBalancerVMMapDao.listByLoadBalancerId(loadBalancerId, false);
+        if (maps == null) {
+            return;
+        }
+        for (final LoadBalancerVMMapVO map : maps) {
+            if (map == null || map.isRevoke()) {
+                continue;
+            }
+            final VMInstanceVO vm = vmInstanceDao.findById(map.getInstanceId());
+            if (vm == null || vm.getHostId() == null) {
+                continue;
+            }
+            final VirtualMachine.State state = vm.getState();
+            // Skip Migrating: avoid flapping /32 between source and dest mid-move.
+            if (state != VirtualMachine.State.Running) {
+                continue;
+            }
+            hosts.add(vm.getHostId());
+        }
+    }
+
+    /**
+     * Host set for a public IPv6 LB VIP: hypervisors of Running backends bound
+     * via inventory LB rules; gateway fallback when none resolve.
+     */
+    List<Long> resolveHost6AnnounceHostIds(final String canonicalVip, final long zoneId,
+                                           final long controllerId) {
+        final List<Long> backends = resolveHost6BackendHostIds(canonicalVip, zoneId);
+        if (!backends.isEmpty()) {
+            return backends;
+        }
+        LOGGER.info("OvnBgpRedistribute: IPv6 LB VIP {} has no Running backends; falling back to gateway",
+                canonicalVip);
+        final Long gw = findGatewayChassisHostId(zoneId, controllerId);
+        return gw == null ? Collections.emptyList() : List.of(gw);
+    }
+
+    /**
+     * Zone-aware IPv6 backend host resolution for Option B.
+     */
+    List<Long> resolveHost6BackendHostIds(final String canonicalVip, final long zoneId) {
+        final Set<Long> hosts = new LinkedHashSet<>();
+        if (loadBalancerDao == null || loadBalancerVMMapDao == null || vmInstanceDao == null
+                || userPublicIpv6AddressDao == null) {
+            return Collections.emptyList();
+        }
+        final List<UserPublicIpv6AddressVO> addrs =
+                userPublicIpv6AddressDao.listByZone(zoneId);
+        if (addrs == null) {
+            return Collections.emptyList();
+        }
+        for (final UserPublicIpv6AddressVO addr : addrs) {
+            if (addr == null || StringUtils.isBlank(addr.getAddress())) {
+                continue;
+            }
+            if (!canonicalVip.equals(canonicalizeHost6Vip(addr.getAddress()))) {
+                continue;
+            }
+            final List<LoadBalancerVO> rules = loadBalancerDao.listByPublicIpv6AddressId(addr.getId());
+            if (rules == null) {
+                continue;
+            }
+            for (final LoadBalancerVO lb : rules) {
+                if (lb == null) {
+                    continue;
+                }
+                final FirewallRule.State st = lb.getState();
+                if (st != null && st != FirewallRule.State.Active && st != FirewallRule.State.Add) {
+                    continue;
+                }
+                addBackendHostsForLb(lb.getId(), hosts);
+            }
+        }
+        return sortedHostList(hosts);
+    }
+
+    static String encodeHostIds(final List<Long> hostIds) {
+        if (hostIds == null || hostIds.isEmpty()) {
+            return "";
+        }
+        return hostIds.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
+    }
+
+    static List<Long> parseHostIds(final String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return Collections.emptyList();
+        }
+        final List<Long> out = new ArrayList<>();
+        for (final String part : raw.split(",")) {
+            final String t = part.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            try {
+                out.add(Long.valueOf(t));
+            } catch (NumberFormatException nfe) {
+                // skip garbage
+            }
+        }
+        return out;
     }
 
     private static Long parseHostId(final String raw) {
-        if (raw == null || raw.isEmpty()) {
-            return null;
-        }
-        try {
-            return Long.valueOf(raw);
-        } catch (NumberFormatException nfe) {
-            return null;
-        }
+        final List<Long> ids = parseHostIds(raw);
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    private static List<Long> sortedHostList(final Set<Long> hosts) {
+        final List<Long> out = new ArrayList<>(hosts);
+        Collections.sort(out);
+        return out;
     }
 
     /* ---------- accessor surface for tests ---------- */
