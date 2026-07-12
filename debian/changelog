@@ -1,3 +1,21 @@
+cloudstack (4.24.1.30-SNAPSHOT) UNRELEASED; urgency=low
+
+  * Version bump 4.24.1.26 -> 4.24.1.30-SNAPSHOT (schema upgrades through
+    importPublicIpv6Address / public IPv6 inventory).
+  * OVN Option B: BGP anycast LB VIP /32 and /128 on Running backend
+    hypervisors (not RR/control unless in pool); invent reassert.
+  * KVM agent: pub-anchor IPv6 multi-chassis install with nodad preferred_lft 0
+    (no DAD fail; hairpin-safe source selection).
+  * Public IPv6: inventory, LB rules (publicipv6id), assignToLoadBalancerRule
+    vmidipmap IPv6, dual-stack ECMP / PARSEL-V6 fabric announce.
+  * OVN: reassert public IPv4 /32 BGP invent; full-replace LB ip_port_mappings;
+    positive host6CsId for BGP_HOST_ANNOUNCE_V6.
+  * KVM/SR-IOV/vDPA: representor external_ids cleanup and freeStale heal fixes.
+  * Static NAT: skip ConfigDrive userdata refresh for Running VMs.
+  * VPC: multi-NH ECMP createStaticRoute; multi-NH static routes + BGP invent.
+
+ -- Fabricio Archanjo <fabricio@eonf.ltd>  Sun, 12 Jul 2026 18:20:00 -0300
+
 cloudstack (4.24.1.26-SNAPSHOT) UNRELEASED; urgency=low
 
   * OVN: DHCP dns_server zone fallback; firewall egress-to-router-peer allow;
