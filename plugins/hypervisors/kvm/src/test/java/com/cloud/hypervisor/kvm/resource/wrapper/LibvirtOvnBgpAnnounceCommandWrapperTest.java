@@ -416,9 +416,11 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
                             s.equals("ip -6 neigh replace " + V6_LRP_GUA + " lladdr " + V6_LRP_MAC
                                     + " dev pub-anchor nud permanent")));
             Assert.assertTrue("v6 datapath anchor held with ip -6 addr",
-                    issued.stream().anyMatch(s -> s.equals("ip -6 addr replace " + V6_ANCHOR + " dev pub-anchor")));
+                    issued.stream().anyMatch(s -> s.equals(
+                            "ip -6 addr replace " + V6_ANCHOR + " dev pub-anchor nodad preferred_lft 0")));
             Assert.assertTrue("v6 fabric gateway held as /128 on pub-anchor",
-                    issued.stream().anyMatch(s -> s.equals("ip -6 addr replace " + V6_GW + "/128 dev pub-anchor")));
+                    issued.stream().anyMatch(s -> s.equals(
+                            "ip -6 addr replace " + V6_GW + "/128 dev pub-anchor nodad preferred_lft 0")));
 
             final ArgumentCaptor<String> shell = ArgumentCaptor.forClass(String.class);
             scriptMock.verify(() -> Script.runSimpleBashScript(shell.capture()), atLeastOnce());

@@ -299,8 +299,15 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         }
         Script.runSimpleBashScript("ip link set " + ANCHOR_PORT + " up");
         final String addrTool = ipv6 ? "ip -6 addr" : "ip addr";
+        // IPv6 anchors are intentionally identical on every gateway chassis
+        // (shared on-link foot for the public localnet). Without nodad, Linux
+        // DAD marks them dadfailed/tentative when a peer HV already holds the
+        // same GUA — the address never becomes usable. preferred_lft 0 keeps the
+        // GUA off the host's source-address selection (avoids hairpin/OVN
+        // breakage when the shared ::1 is chosen as src). v4 has no DAD.
+        final String v6AddrFlags = ipv6 ? " nodad preferred_lft 0" : "";
         final Pair<String, String> res = Script.executeCommand(
-                String.format("%s replace %s dev %s", addrTool, anchorCidr, ANCHOR_PORT));
+                String.format("%s replace %s dev %s%s", addrTool, anchorCidr, ANCHOR_PORT, v6AddrFlags));
         final String stderr = res == null ? null : res.second();
         if (stderr != null && !stderr.trim().isEmpty()) {
             LOGGER.warn("OvnBgpAnnounce: anchor {} on {} (port {}, af={}) — ip addr replace stderr: {}",
@@ -318,7 +325,7 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
             final String hostMask = ipv6 ? "/128" : "/32";
             final String fwdKey = ipv6 ? "net.ipv6.conf.all.forwarding" : "net.ipv4.ip_forward";
             Script.executeCommand(String.format(
-                    "%s replace %s%s dev %s", addrTool, networkGatewayIp.trim(), hostMask, ANCHOR_PORT));
+                    "%s replace %s%s dev %s%s", addrTool, networkGatewayIp.trim(), hostMask, ANCHOR_PORT, v6AddrFlags));
             Script.runSimpleBashScript("sysctl -w " + fwdKey + "=1");
         }
     }
