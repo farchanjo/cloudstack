@@ -312,16 +312,47 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
         List<KubernetesClusterVmMapVO> vmList = kubernetesClusterVmMapDao.listByClusterId(kubernetesCluster.getId());
         if (vmList == null || vmList.isEmpty() || vmList.size() < originalNodeCount) {
             logTransitStateToFailedIfNeededAndThrow(Level.WARN, String.format("Scaling Kubernetes cluster : %s failed, it is in unstable state as not enough existing VM instances found!", kubernetesCluster.getName()));
-        } else {
-            for (KubernetesClusterVmMapVO vmMapVO : vmList) {
-                VMInstanceVO vmInstance = vmInstanceDao.findById(vmMapVO.getVmId());
-                if (vmInstance != null && vmInstance.getState().equals(VirtualMachine.State.Running) &&
-                        vmInstance.getHypervisorType() != Hypervisor.HypervisorType.XenServer &&
-                        vmInstance.getHypervisorType() != Hypervisor.HypervisorType.VMware &&
-                        vmInstance.getHypervisorType() != Hypervisor.HypervisorType.Simulator) {
-                    logTransitStateToFailedIfNeededAndThrow(Level.WARN, String.format("Scaling Kubernetes cluster : %s failed, scaling Kubernetes cluster with running VMs on hypervisor %s is not supported!", kubernetesCluster.getName(), vmInstance.getHypervisorType()));
-                }
-            }
+        }
+        // KVM (and other non-live-resize hypervisors): offering scale is done via
+        // stop → upgradeVirtualMachine → start in scaleKubernetesClusterOffering.
+        // Do not hard-fail on Running VMs here (historical Xen/VMware-only live path).
+    }
+
+    /**
+     * True when the hypervisor cannot live-resize a fixed compute offering, so we must
+     * stop the instance before upgradeVirtualMachine and start it again afterwards.
+     */
+    private boolean requiresStopStartForOfferingScale(final VMInstanceVO vmInstance) {
+        if (vmInstance == null || !VirtualMachine.State.Running.equals(vmInstance.getState())) {
+            return false;
+        }
+        Hypervisor.HypervisorType type = vmInstance.getHypervisorType();
+        // Live offering change historically supported on these; others (notably KVM) need stop/start.
+        return type != Hypervisor.HypervisorType.XenServer
+                && type != Hypervisor.HypervisorType.VMware
+                && type != Hypervisor.HypervisorType.Simulator;
+    }
+
+    private void stopClusterVmForOfferingScale(final UserVmVO userVM) throws CloudRuntimeException {
+        CallContext vmContext = CallContext.register(CallContext.current(), ApiCommandResourceType.VirtualMachine);
+        vmContext.setEventResourceId(userVM.getId());
+        try {
+            // forced=true: avoid hanging Stopped transitions seen on KVM under load
+            userVmService.stopVirtualMachine(userVM.getId(), true);
+        } catch (Exception ex) {
+            logTransitStateAndThrow(Level.ERROR,
+                    String.format("Scaling Kubernetes cluster : %s failed, unable to stop VM : %s for offering change: %s",
+                            kubernetesCluster.getName(), userVM.getDisplayName(), ex.getMessage()),
+                    kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed, ex);
+        } finally {
+            CallContext.unregister();
+        }
+        UserVmVO stopped = userVmDao.findById(userVM.getId());
+        if (stopped == null || !VirtualMachine.State.Stopped.equals(stopped.getState())) {
+            logTransitStateAndThrow(Level.ERROR,
+                    String.format("Scaling Kubernetes cluster : %s failed, VM : %s did not reach Stopped state before offering upgrade",
+                            kubernetesCluster.getName(), userVM.getDisplayName()),
+                    kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
         }
     }
 
@@ -372,6 +403,18 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
         for (long i = 0; i < tobeScaledVMCount; i++) {
             KubernetesClusterVmMapVO vmMapVO = vmList.get((int) i);
             UserVmVO userVM = userVmDao.findById(vmMapVO.getVmId());
+            if (userVM == null) {
+                logTransitStateAndThrow(Level.ERROR, String.format("Scaling Kubernetes cluster : %s failed, VM map entry %s has no instance",
+                        kubernetesCluster.getName(), vmMapVO.getVmId()), kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
+            }
+            VMInstanceVO vmInstance = vmInstanceDao.findById(userVM.getId());
+            final boolean stopStart = requiresStopStartForOfferingScale(vmInstance);
+            if (stopStart) {
+                logger.info("CKS offering scale on {}: stopping VM {} before upgrade (hypervisor {})",
+                        kubernetesCluster.getName(), userVM, vmInstance != null ? vmInstance.getHypervisorType() : "unknown");
+                stopClusterVmForOfferingScale(userVM);
+                userVM = userVmDao.findById(userVM.getId());
+            }
             boolean result = false;
             try {
                 result = userVmManager.upgradeVirtualMachine(userVM.getId(), serviceOffering.getId(), new HashMap<String, String>());
@@ -380,6 +423,15 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
             }
             if (!result) {
                 logTransitStateAndThrow(Level.WARN, String.format("Scaling Kubernetes cluster : %s failed, unable to scale cluster VM : %s", kubernetesCluster.getName(), userVM.getDisplayName()),kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
+            }
+            if (stopStart) {
+                try {
+                    userVM = userVmDao.findById(userVM.getId());
+                    startKubernetesVM(userVM, kubernetesCluster.getDomainId(), kubernetesCluster.getAccountId(), nodeType);
+                } catch (ManagementServerException e) {
+                    logTransitStateAndThrow(Level.ERROR, String.format("Scaling Kubernetes cluster : %s failed, unable to start VM : %s after offering change: %s",
+                            kubernetesCluster.getName(), userVM.getDisplayName(), e.getMessage()), kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed, e);
+                }
             }
             if (System.currentTimeMillis() > scaleTimeoutTime) {
                 logTransitStateAndThrow(Level.WARN, String.format("Scaling Kubernetes cluster : %s failed, scaling action timed out", kubernetesCluster.getName()),kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
