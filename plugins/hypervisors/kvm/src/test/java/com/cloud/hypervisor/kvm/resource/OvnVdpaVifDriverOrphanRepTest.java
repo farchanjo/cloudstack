@@ -19,6 +19,7 @@
 
 package com.cloud.hypervisor.kvm.resource;
 
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
@@ -83,7 +84,9 @@ public class OvnVdpaVifDriverOrphanRepTest {
         iface.defVdpaNet("/dev/vhost-vdpa-3", "fa:16:3e:00:02:10", 4);
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+            // FullResult: multi-rep attached-mac find must not use OneLineParser.
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("clear Interface")))
                     .thenReturn("");
@@ -111,7 +114,8 @@ public class OvnVdpaVifDriverOrphanRepTest {
         iface.defVdpaNet("/dev/vhost-vdpa-4", "fa:16:3e:00:02:11", 4);
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("");
 
             driver.unplug(iface, true);

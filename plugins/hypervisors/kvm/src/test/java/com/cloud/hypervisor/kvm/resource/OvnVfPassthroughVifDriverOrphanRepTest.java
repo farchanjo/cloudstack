@@ -18,6 +18,7 @@
  */
 package com.cloud.hypervisor.kvm.resource;
 
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.matches;
@@ -239,7 +240,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
         iface.defHostdevNet(null, "fa:16:3e:00:01:02", 0);
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p0vf4");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("clear Interface")))
                     .thenReturn("");
@@ -284,7 +286,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
         iface.defHostdevNet(null, "fa:16:3e:00:01:03", 0);
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface external_ids:attached-mac")))
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("");
 
             driver.unplug(iface, true);

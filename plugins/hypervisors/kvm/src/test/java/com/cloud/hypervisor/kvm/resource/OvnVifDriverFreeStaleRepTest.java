@@ -163,4 +163,50 @@ public class OvnVifDriverFreeStaleRepTest {
                     contains("del-port br-")), never());
         }
     }
+
+    @Test
+    public void parseMacAddressesFromDomainXml_extractsAllMacs() {
+        final String xml = "<domain>\n"
+                + "  <interface type='bridge'>\n"
+                + "    <mac address='AA:BB:CC:DD:EE:01'/>\n"
+                + "  </interface>\n"
+                + "  <interface type='vdpa'>\n"
+                + "    <mac address=\"02:04:02:2e:00:01\"/>\n"
+                + "  </interface>\n"
+                + "</domain>\n";
+        final Set<String> macs = OvnVifDriver.parseMacAddressesFromDomainXml(xml);
+        assertEquals(2, macs.size());
+        assertTrue(macs.contains("aa:bb:cc:dd:ee:01"));
+        assertTrue(macs.contains("02:04:02:2e:00:01"));
+    }
+
+    @Test
+    public void parseMacAddressesFromDomainXml_blank_isEmpty() {
+        assertTrue(OvnVifDriver.parseMacAddressesFromDomainXml(null).isEmpty());
+        assertTrue(OvnVifDriver.parseMacAddressesFromDomainXml("").isEmpty());
+        assertTrue(OvnVifDriver.parseMacAddressesFromDomainXml("<domain/>").isEmpty());
+    }
+
+    /**
+     * clearOrphanRepsByAttachedMac must free every rep line returned by
+     * ovs-vsctl find — regression against OneLineParser dropping multi-rep.
+     */
+    @Test
+    public void clearOrphanRepsByAttachedMac_freesAllFoundReps() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
+                    .thenReturn("dx6p0vf4\ndx6p1vf6\n");
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
+
+            OvnVifDriver.clearOrphanRepsByAttachedMac(LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff");
+
+            scriptMock.verify(() -> Script.runSimpleBashScript(
+                    contains("clear Interface dx6p0vf4 external_ids")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(
+                    contains("clear Interface dx6p1vf6 external_ids")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf4")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p1vf6")), times(1));
+        }
+    }
 }
