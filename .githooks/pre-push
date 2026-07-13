@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# pre-push: only main/master may be pushed. Feature work must be merged first.
+set -euo pipefail
+
+remote="${1:-}"
+url="${2:-}"
+
+trunk=""
+if git show-ref --verify --quiet refs/heads/main; then
+  trunk=main
+elif git show-ref --verify --quiet refs/heads/master; then
+  trunk=master
+else
+  echo "pre-push: neither main nor master exists locally; aborting." >&2
+  exit 1
+fi
+
+# 1) Refuse push of any non-trunk branch (or non-tag non-trunk ref).
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # empty line / nothing to push
+  [[ -z "${local_ref:-}" ]] && continue
+
+  # delete remote ref: remote_sha zeros — still only allow deleting non-trunk? block all branch deletes except not needed
+  if [[ "$remote_ref" == refs/heads/* ]]; then
+    branch="${remote_ref#refs/heads/}"
+    if [[ "$branch" != "main" && "$branch" != "master" ]]; then
+      cat >&2 <<MSG
+pre-push: blocked push of branch '${branch}' to ${remote}.
+
+Only '${trunk}' (or master) may be pushed.
+Merge your work first:
+
+  git checkout ${trunk}
+  git merge --no-ff ${branch}   # or: git merge ${branch}
+  git push ${remote} ${trunk}
+
+MSG
+      exit 1
+    fi
+  elif [[ "$remote_ref" == refs/tags/* ]]; then
+    # tags allowed
+    :
+  elif [[ "$remote_ref" == refs/notes/* ]]; then
+    :
+  else
+    # block weird refs (replace, etc.) unless it's main/master update already handled
+    if [[ "$remote_ref" != refs/heads/main && "$remote_ref" != refs/heads/master ]]; then
+      echo "pre-push: blocked push of ref '${remote_ref}' (only main/master heads or tags)." >&2
+      exit 1
+    fi
+  fi
+done
+
+# 2) Refuse if any local branch is not fully merged into trunk.
+#    (Detached HEAD is ok if only pushing trunk.)
+unmerged=""
+while IFS= read -r b; do
+  [ -z "$b" ] && continue
+  case "$b" in main|master) continue ;; esac
+  if ! git merge-base --is-ancestor "$b" "$trunk" 2>/dev/null; then
+    unmerged="${unmerged}${b}"$'\n'
+  fi
+done <<BRANCHES
+$(git for-each-ref --format='%(refname:short)' refs/heads/)
+BRANCHES
+
+if [ -n "$unmerged" ]; then
+  {
+    echo "pre-push: local branch(es) not merged into '${trunk}':"
+    echo
+    echo "$unmerged" | sed '/^$/d' | sed 's/^/  - /'
+    echo
+    echo "Merge them into ${trunk} before pushing:"
+    echo
+    echo "  git checkout ${trunk}"
+    echo "  git merge <branch>"
+    echo "  git push ${remote} ${trunk}"
+    echo
+    echo "Or delete the branch if it is abandoned:"
+    echo
+    echo "  git branch -d <branch>"
+  } >&2
+  exit 1
+fi
+
+exit 0
