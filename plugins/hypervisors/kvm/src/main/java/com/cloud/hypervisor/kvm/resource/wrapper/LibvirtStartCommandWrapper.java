@@ -120,14 +120,26 @@ public final class LibvirtStartCommandWrapper extends CommandWrapper<StartComman
                 libvirtComputingResource.recreateCheckpointsOnVm(volumes, vmName, conn);
             }
 
-            // pass cmdline info to system vms
-            if (vmSpec.getType() != VirtualMachine.Type.User || (vmSpec.getBootArgs() != null && (vmSpec.getBootArgs().contains(UserVmManager.CKS_NODE) || vmSpec.getBootArgs().contains(UserVmManager.SHAREDFSVM)))) {
-                // try to patch and SSH into the systemvm for up to 5 minutes
+            // pass cmdline info to system vms and CKS/sharedFS guests that require qemu-ga
+            final boolean needsGaPatch = vmSpec.getType() != VirtualMachine.Type.User
+                    || (vmSpec.getBootArgs() != null
+                    && (vmSpec.getBootArgs().contains(UserVmManager.CKS_NODE)
+                    || vmSpec.getBootArgs().contains(UserVmManager.SHAREDFSVM)));
+            if (needsGaPatch) {
+                boolean patched = false;
                 for (int count = 0; count < 10; count++) {
-                    // wait and try passCmdLine for 30 seconds at most for CLOUDSTACK-2823
                     if (libvirtComputingResource.passCmdLine(vmName, vmSpec.getBootArgs())) {
+                        patched = true;
                         break;
                     }
+                }
+                // CKS / sharedFS: ga patch is load-bearing (cloud-init / node identity).
+                // Fail Start and tear down domain+VIFs so VF/vDPA cannot orphan.
+                if (!patched && vmSpec.getType() == VirtualMachine.Type.User) {
+                    String errMsg = "Failed to pass cmdline via qemu-guest-agent for CKS/sharedFS VM " + vmName;
+                    logger.error(errMsg);
+                    libvirtComputingResource.handleVmStartFailure(conn, vmName, vm);
+                    return new StartAnswer(command, errMsg);
                 }
 
                 if (vmSpec.getType() != VirtualMachine.Type.User) {
@@ -154,11 +166,13 @@ public final class LibvirtStartCommandWrapper extends CommandWrapper<StartComman
                         if (!virtRouterResource.isSystemVMSetup(vmName, controlIp)) {
                             String errMsg = "Failed to patch systemVM";
                             logger.error(errMsg);
+                            libvirtComputingResource.handleVmStartFailure(conn, vmName, vm);
                             return new StartAnswer(command, errMsg);
                         }
                     } catch (Exception e) {
                         String errMsg = "Failed to scp files to system VM. Patching of systemVM failed";
                         logger.error(errMsg, e);
+                        libvirtComputingResource.handleVmStartFailure(conn, vmName, vm);
                         return new StartAnswer(command, String.format("%s due to: %s", errMsg, e.getMessage()));
                     }
                 }

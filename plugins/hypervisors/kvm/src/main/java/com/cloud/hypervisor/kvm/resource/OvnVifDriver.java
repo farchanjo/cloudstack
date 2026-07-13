@@ -302,16 +302,28 @@ public class OvnVifDriver extends VifDriverBase {
                 callerLabel, repName);
     }
 
+    /** Matches {@code <mac address='..'/>} / {@code ".." } in virsh dumpxml. */
+    private static final Pattern MAC_IN_DOMAIN_XML = Pattern.compile(
+            "mac\\s+address=['\"]([0-9a-fA-F:]{17})['\"]", Pattern.CASE_INSENSITIVE);
+
     /**
-     * Residual Chaos-B heal: free every switchdev VF representor that still
-     * carries {@code external_ids:iface-id} while the underlying VF is
-     * kernel-FREE (not bound to {@code vfio-pci}, no vDPA mgmtdev).
+     * Residual Chaos-B heal: free switchdev VF representors that still carry
+     * {@code external_ids:iface-id} when no <em>running</em> libvirt domain
+     * owns the representor's {@code attached-mac}.
      *
-     * <p>Unplug already clears external_ids (post-{@code 3d07ad52e1}); this
-     * path reclaims VFs that were released <em>before</em> that fix and still
-     * hold a live OVN binding in OVSDB. ALLOCATED VFs are never touched:
-     * passthrough guests keep {@code vfio-pci}, vDPA guests keep a
-     * {@code vdpa-*} mgmtdev on the same PCI BDF.
+     * <p>Failed CKS/systemvm starts and domain-gone stops often leave the VF
+     * on {@code vfio-pci} or with a leftover {@code vdpa-*} mgmtdev even though
+     * the guest is dead. The old "kernel-FREE only" gate skipped those orphans
+     * forever. Ownership is now decided by live domain MAC inventory:
+     * <ul>
+     *   <li>attached-mac present and <b>not</b> in any running domain → free
+     *       OVS rep + clear VF identity + best-effort {@code vdpa dev del}
+     *       (even if PCI still shows vfio/vDPA leftovers)</li>
+     *   <li>attached-mac present and owned by a live domain → keep
+     *       ({@code skippedAllocated})</li>
+     *   <li>no attached-mac → legacy kernel-FREE gate only
+     *       ({@link #isSafeToFreeStaleRep})</li>
+     * </ul>
      *
      * <p>vnet / TAP interfaces (no {@code phys_port_name=pfNvfM}) are skipped
      * — they are live guest taps and must keep their iface-id.
@@ -333,8 +345,13 @@ public class OvnVifDriver extends VifDriverBase {
             return result;
         }
 
+        // null = inventory incomplete (virsh failed) → refuse free-by-MAC so we
+        // never del-port a live guest's rep because of a partial domain list.
+        final Set<String> liveMacs = collectLiveDomainMacs();
         final Set<String> vdpaPci = listVdpaMgmtPciAddresses(log);
         if (log != null && log.isDebugEnabled()) {
+            log.debug("{}: live domain MACs known={} size={} ({})",
+                    callerLabel, liveMacs != null, liveMacs == null ? -1 : liveMacs.size(), liveMacs);
             log.debug("{}: vDPA mgmtdev PCI set size={} ({})", callerLabel, vdpaPci.size(), vdpaPci);
         }
 
@@ -352,10 +369,48 @@ public class OvnVifDriver extends VifDriverBase {
             final String driver = readPciDriver(vfPci);
             // lower-case: sysfs + parseVdpaDevShowPci normalize; virtfn can vary
             final boolean hasVdpa = vdpaPci.contains(vfPci.toLowerCase());
+            final String attachedMac = readAttachedMac(iface);
+
+            // Primary path: MAC ownership from running domains. Domain-dead
+            // leftovers keep vfio/vDPA on the PCI BDF — still free them.
+            // Only when live inventory is complete (non-null).
+            if (StringUtils.isNotBlank(attachedMac) && liveMacs != null) {
+                if (liveMacs.contains(attachedMac)) {
+                    result.skippedAllocated++;
+                    log.debug("{}: keep rep={} mac={} pci={} (live domain owns MAC)",
+                            callerLabel, iface, attachedMac, vfPci);
+                    continue;
+                }
+                if (dryRun) {
+                    result.freed++;
+                    if (result.freedNames.size() < 64) {
+                        result.freedNames.add(iface);
+                    }
+                    continue;
+                }
+                try {
+                    freeRepresentorOnOvs(log, callerLabel, iface);
+                    clearVfIdentityForRepBestEffort(log, callerLabel, iface);
+                    if (hasVdpa) {
+                        deleteVdpaDevsForPciBestEffort(log, callerLabel, vfPci);
+                    }
+                    result.freed++;
+                    if (result.freedNames.size() < 64) {
+                        result.freedNames.add(iface);
+                    }
+                } catch (RuntimeException re) {
+                    log.warn("{}: failed to free orphan rep={} mac={}: {}",
+                            callerLabel, iface, attachedMac, re.getMessage());
+                }
+                continue;
+            }
+
+            // No attached-mac stamp, or live-domain inventory unknown: only free
+            // when the VF is kernel-FREE (legacy safe path — never free vfio/vDPA).
             if (!isSafeToFreeStaleRep(driver, hasVdpa)) {
                 result.skippedAllocated++;
-                log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} (ALLOCATED)",
-                        callerLabel, iface, vfPci, driver, hasVdpa);
+                log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} mac={} liveKnown={} (ALLOCATED/unknown)",
+                        callerLabel, iface, vfPci, driver, hasVdpa, attachedMac, liveMacs != null);
                 continue;
             }
             if (dryRun) {
@@ -383,9 +438,176 @@ public class OvnVifDriver extends VifDriverBase {
     }
 
     /**
+     * MACs of NICs on currently running libvirt domains
+     * ({@code virsh list --state-running} + {@code dumpxml}). Lower-cased.
+     *
+     * <p>Returns:
+     * <ul>
+     *   <li>empty set — no running domains (safe to free all orphan MACs)</li>
+     *   <li>non-empty set — complete inventory of live guest MACs</li>
+     *   <li>{@code null} — inventory incomplete (virsh failed); caller must
+     *       <b>not</b> free-by-MAC (would risk live guests)</li>
+     * </ul>
+     * Package-private for unit tests of the pure XML parser path.
+     */
+    static Set<String> collectLiveDomainMacs() {
+        final String list;
+        try {
+            // FullResult: OneLineParser would drop every domain after the first.
+            list = Script.runSimpleBashScriptWithFullResult(
+                    "virsh list --name --state-running 2>/dev/null", 10);
+        } catch (RuntimeException re) {
+            return null;
+        }
+        final Set<String> macs = new HashSet<>();
+        if (StringUtils.isBlank(list)) {
+            return macs;
+        }
+        for (final String line : list.split("\\R")) {
+            final String dom = line.trim();
+            if (StringUtils.isBlank(dom)) {
+                continue;
+            }
+            final String xml;
+            try {
+                xml = Script.runSimpleBashScriptWithFullResult(
+                        "virsh dumpxml " + dom + " 2>/dev/null", 15);
+            } catch (RuntimeException re) {
+                // Incomplete inventory — refuse free-by-MAC this pass.
+                return null;
+            }
+            if (xml == null) {
+                return null;
+            }
+            macs.addAll(parseMacAddressesFromDomainXml(xml));
+        }
+        return macs;
+    }
+
+    /**
+     * Extract guest MACs from libvirt domain XML. Package-private pure helper
+     * for unit tests.
+     */
+    static Set<String> parseMacAddressesFromDomainXml(final String xml) {
+        final Set<String> out = new HashSet<>();
+        if (StringUtils.isBlank(xml)) {
+            return out;
+        }
+        final Matcher m = MAC_IN_DOMAIN_XML.matcher(xml);
+        while (m.find()) {
+            out.add(m.group(1).toLowerCase());
+        }
+        return out;
+    }
+
+    /**
+     * Read {@code external_ids:attached-mac} for an OVS Interface, or null when
+     * missing / blank. Lower-cased for set membership against live domain MACs.
+     */
+    static String readAttachedMac(final String iface) {
+        if (StringUtils.isBlank(iface)) {
+            return null;
+        }
+        final String raw = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists get Interface %s external_ids:attached-mac 2>/dev/null",
+                iface));
+        if (StringUtils.isBlank(raw)) {
+            return null;
+        }
+        final String mac = raw.trim().replaceAll("^\"|\"$", "");
+        if (StringUtils.isBlank(mac) || "[]".equals(mac)) {
+            return null;
+        }
+        return mac.toLowerCase();
+    }
+
+    /**
+     * Best-effort {@code vdpa dev del} for every vDPA device whose mgmtdev is
+     * {@code vfPci}.
+     */
+    static void deleteVdpaDevsForPciBestEffort(final Logger log, final String callerLabel,
+                                               final String vfPci) {
+        if (StringUtils.isBlank(vfPci)) {
+            return;
+        }
+        for (final String name : listVdpaNamesForPci(vfPci)) {
+            try {
+                Script.runSimpleBashScript("vdpa dev del " + name + " 2>/dev/null");
+                if (log != null) {
+                    log.info("{}: deleted leftover vdpa {} for pci={}", callerLabel, name, vfPci);
+                }
+            } catch (RuntimeException re) {
+                if (log != null) {
+                    log.warn("{}: vdpa dev del {} for pci={} failed: {}",
+                            callerLabel, name, vfPci, re.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * vDPA device names whose mgmtdev parent PCI is {@code vfPci}. Prefer sysfs
+     * (no PATH / multi-line issues); fall back to multi-line {@code vdpa dev show}.
+     */
+    static Set<String> listVdpaNamesForPci(final String vfPci) {
+        final Set<String> names = new HashSet<>();
+        if (StringUtils.isBlank(vfPci)) {
+            return names;
+        }
+        final String want = vfPci.toLowerCase();
+        final File bus = new File("/sys/bus/vdpa/devices");
+        final File[] entries = bus.listFiles();
+        if (entries != null) {
+            for (final File entry : entries) {
+                try {
+                    final File real = entry.getCanonicalFile();
+                    final File parent = real.getParentFile();
+                    if (parent != null && want.equals(parent.getName().toLowerCase())) {
+                        names.add(entry.getName());
+                    }
+                } catch (IOException ignored) {
+                    // skip unreadable entry
+                }
+            }
+        }
+        if (!names.isEmpty()) {
+            return names;
+        }
+        try {
+            final String raw = Script.runSimpleBashScriptWithFullResult("vdpa dev show 2>/dev/null", 5);
+            if (StringUtils.isBlank(raw)) {
+                return names;
+            }
+            for (final String line : raw.split("\\R")) {
+                final int idx = line.indexOf("mgmtdev pci/");
+                if (idx < 0) {
+                    continue;
+                }
+                String rest = line.substring(idx + "mgmtdev pci/".length()).trim();
+                final int sp = rest.indexOf(' ');
+                if (sp > 0) {
+                    rest = rest.substring(0, sp);
+                }
+                if (!want.equals(rest.toLowerCase())) {
+                    continue;
+                }
+                final int colon = line.indexOf(':');
+                final String name = colon > 0 ? line.substring(0, colon).trim() : null;
+                if (StringUtils.isNotBlank(name)) {
+                    names.add(name);
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // CLI unavailable — empty set is fine (best-effort)
+        }
+        return names;
+    }
+
+    /**
      * Pure decision: a representor with iface-id is safe to free only when the
      * VF is kernel-FREE — not on {@code vfio-pci} and not hosting a vDPA
-     * mgmtdev. Package-private for unit tests.
+     * mgmtdev. Used only when the rep has no {@code attached-mac} stamp.
+     * Package-private for unit tests.
      */
     static boolean isSafeToFreeStaleRep(final String pciDriver, final boolean hasVdpaOnPci) {
         if (hasVdpaOnPci) {
@@ -623,7 +845,18 @@ public class OvnVifDriver extends VifDriverBase {
         final String findCmd = String.format(
             "ovs-vsctl --no-headings --columns=name find Interface external_ids:attached-mac=%s 2>/dev/null",
             mac);
-        final String found = Script.runSimpleBashScript(findCmd);
+        // FullResult: OneLineParser would drop every rep after the first when
+        // multiple Interfaces share the same attached-mac (rare but real).
+        final String found;
+        try {
+            found = Script.runSimpleBashScriptWithFullResult(findCmd, 10);
+        } catch (RuntimeException re) {
+            if (log != null) {
+                log.debug("{}: attached-mac find failed for mac={}: {}",
+                        callerLabel, mac, re.getMessage());
+            }
+            return;
+        }
         if (StringUtils.isBlank(found)) {
             return;
         }

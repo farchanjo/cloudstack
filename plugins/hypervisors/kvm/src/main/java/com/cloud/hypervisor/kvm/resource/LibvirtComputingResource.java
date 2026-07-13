@@ -3945,9 +3945,37 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         return stats;
     }
 
+    /**
+     * Tear down a domain that started far enough to hold live VIFs (incl. OVN
+     * vDPA / VF passthrough) but whose StartCommand must fail. Snapshot live
+     * interface defs <em>before</em> destroy so unplug still has MAC/vhost
+     * metadata; destroy the domain; fan out {@link VifDriver#unplug}; residual
+     * OVS heal for any representor not owned by a running domain.
+     *
+     * <p>Previously this only unplugged from the in-memory {@link LibvirtVMDef}
+     * without destroying the domain — leaving QEMU + plugged vDPA/reps alive
+     * after patch/SCP failures and producing VF/vDPA orphans.
+     */
     public void handleVmStartFailure(final Connect conn, final String vmName, final LibvirtVMDef vm) {
-        if (vm != null && vm.getDevices() != null) {
-            cleanupVMNetworks(conn, vm.getDevices().getInterfaces());
+        List<InterfaceDef> ifaces = null;
+        try {
+            ifaces = getInterfaces(conn, vmName);
+        } catch (Exception e) {
+            LOGGER.debug("handleVmStartFailure: cannot read live ifaces for {}: {}", vmName, e.getMessage());
+        }
+        if (CollectionUtils.isEmpty(ifaces) && vm != null && vm.getDevices() != null) {
+            ifaces = vm.getDevices().getInterfaces();
+        }
+        try {
+            stopVM(conn, vmName, true);
+        } catch (Exception e) {
+            LOGGER.warn("handleVmStartFailure: stopVM {} failed: {}", vmName, e.getMessage());
+        }
+        cleanupVMNetworks(conn, ifaces);
+        try {
+            OvnVifDriver.freeStaleFreeVfRepresentors(LOGGER, "handleVmStartFailure", false);
+        } catch (Exception e) {
+            LOGGER.warn("handleVmStartFailure: residual OVS/VF free failed: {}", e.getMessage());
         }
     }
 

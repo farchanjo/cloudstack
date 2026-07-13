@@ -126,7 +126,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             final String vdpaName = VdpaVifDriver.buildVdpaName(nic);
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             final String vdpaAddCmd = buildVdpaAddCommand(vdpaName, pciAddress, mac, maxVqs, nic);
-            Script.runSimpleBashScript(vdpaAddCmd, 5000);
+            Script.runSimpleBashScript(vdpaAddCmd);
             rollback.push(() -> Script.runSimpleBashScript(
                     String.format("vdpa dev del %s 2>/dev/null", vdpaName)));
 
