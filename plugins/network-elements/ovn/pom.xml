@@ -99,18 +99,6 @@
             <version>${project.version}</version>
         </dependency>
         <!--
-          Optional: CKS worker discovery for auto ECMP / auto LB backends.
-          When the kubernetes-service plugin is not on the classpath, Spring leaves
-          the DAOs null and auto paths stay no-ops.
-        -->
-        <dependency>
-            <groupId>org.apache.cloudstack</groupId>
-            <artifactId>cloud-plugin-integrations-kubernetes-service</artifactId>
-            <version>${project.version}</version>
-            <optional>true</optional>
-        </dependency>
-
-        <!--
           Jackson (managed by the root pom) is the only protocol-level
           dependency. JDK NIO sockets handle transport.
         -->
