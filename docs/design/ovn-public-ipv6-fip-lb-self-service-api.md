@@ -348,7 +348,7 @@ rollback).
 | **Q4** | Should allocate require a VPC association up front, or allocate Free then associate on LB create? | **Allocate Free unassociated**; bind on first LB / associate API |
 | **Q5** | Dual-read conflict: ConfigKey vs inventory same VIP:port, different backends? | **Prefer inventory**; WARN log ConfigKey side |
 | **Q6** | Multi-zone / multi-prefix later? | **Single prefix** from `PublicIpv6Prefix` for LAX; table has `data_center_id` for future |
-| **Q7** | Auto-refresh CKS backends from instance NICs? | **Out of Sprint 1–3**; keep operator refresh (or separate design) |
+| **Q7** | Auto-refresh CKS backends from instance NICs? | **Done** via ConfigKeys `ovn.lr.ecmp.auto.clusters` + `ovn.lb.auto.cks` — see [[ovn-cks-auto-ecmp-lb]] (4.24.1.31 train) |
 | **Q8** | Quotas / resource limits for public IPv6 count per account? | **Yes, simple limit** (ConfigKey or resource count) in Sprint 1 if cheap; else Sprint 2 |
 | **Q9** | After cutover, remove `LrPublicIpv6Lb` ConfigKey entirely or keep as break-glass? | **Keep key one release as break-glass empty default**; remove in a later cleanup |
 

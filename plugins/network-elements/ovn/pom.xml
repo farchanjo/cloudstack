@@ -26,7 +26,7 @@
     <parent>
         <groupId>org.apache.cloudstack</groupId>
         <artifactId>cloudstack-plugins</artifactId>
-        <version>4.24.1.30-SNAPSHOT</version>
+        <version>4.24.1.31-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
@@ -97,6 +97,17 @@
             <groupId>org.apache.cloudstack</groupId>
             <artifactId>cloud-framework-db</artifactId>
             <version>${project.version}</version>
+        </dependency>
+        <!--
+          Optional: CKS worker discovery for auto ECMP / auto LB backends.
+          When the kubernetes-service plugin is not on the classpath, Spring leaves
+          the DAOs null and auto paths stay no-ops.
+        -->
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-plugin-integrations-kubernetes-service</artifactId>
+            <version>${project.version}</version>
+            <optional>true</optional>
         </dependency>
 
         <!--

@@ -147,6 +147,12 @@ public class OvnNetworkConfig implements Configurable {
      *  See {@link com.cloud.network.ovn.config.OvnEcmpRoutes}. */
     public static final String OVN_LR_ECMP_STATIC_ROUTES = "ovn.lr.ecmp.static.routes";
 
+    /** Auto ECMP next-hops from CKS worker VMs. See {@link OvnEcmpAutoClusters}. */
+    public static final String OVN_LR_ECMP_AUTO_CLUSTERS = "ovn.lr.ecmp.auto.clusters";
+
+    /** Auto LB backends from CKS worker guest IPs. See {@link OvnLbAutoCks}. */
+    public static final String OVN_LB_AUTO_CKS = "ovn.lb.auto.cks";
+
     /** Per-network public IPv6 Load_Balancer rows on the VPC Logical_Router
      *  (and tier LS). Map syntax:
      *  {@code <network-uuid>=[vip]:vport->[be]:p|[be]:p;...}. IPv6 VIP/backends
@@ -281,7 +287,24 @@ public class OvnNetworkConfig implements Configurable {
                     + "inside the network's matching-family CIDR (IPv4 cidr / IPv6 ip6cidr); out-of-range "
                     + "next-hops and malformed entries are logged and skipped. Empty disables the feature "
                     + "entirely (no route is ever touched). Used to route k8s LB VIP ranges from the OVN "
-                    + "gateway to CKS workers.",
+                    + "gateway to CKS workers. Merged with " + OVN_LR_ECMP_AUTO_CLUSTERS + " when set "
+                    + "(auto hops first, then static overlay).",
+            true);
+
+    public static final ConfigKey<String> LrEcmpAutoClusters = new ConfigKey<>(CATEGORY, String.class,
+            OVN_LR_ECMP_AUTO_CLUSTERS, "",
+            "Auto-populate ECMP next-hops from CKS worker VMs (kubernetes_cluster_vm_map WORKER only, "
+                    + "Running). Syntax: '<network-uuid>=<cks-cluster-uuid>|<v4-prefix>|<v6-prefix>;...'. "
+                    + "Blank family prefix skips that family. Empty disables. Merged with "
+                    + OVN_LR_ECMP_STATIC_ROUTES + " (auto then static; same-prefix hops merge). "
+                    + "No Kubernetes API — inventory NICs only.",
+            true);
+
+    public static final ConfigKey<String> LbAutoCks = new ConfigKey<>(CATEGORY, String.class,
+            OVN_LB_AUTO_CKS, "",
+            "Auto-refresh CloudStack LB rule backends from CKS worker guest IPs. Syntax: "
+                    + "'<lb-rule-id>=<cks-cluster-uuid>:<dest-port>;...'. Empty disables. Rewrites "
+                    + "load_balancer_vm_map for listed rules then re-applies OVN LB. Does not follow pods.",
             true);
 
     public static final ConfigKey<String> LrPublicIpv6Lb = new ConfigKey<>(CATEGORY, String.class,
@@ -323,6 +346,8 @@ public class OvnNetworkConfig implements Configurable {
                 SnatExemptedDestinations,
                 LspExtraPortSecurityCidrs,
                 LrEcmpStaticRoutes,
+                LrEcmpAutoClusters,
+                LbAutoCks,
                 LrPublicIpv6Lb
         };
     }

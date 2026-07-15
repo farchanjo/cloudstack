@@ -50,11 +50,17 @@ import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
 import com.cloud.network.ovn.client.OvnNbClient.OwnedLoadBalancer;
+import com.cloud.network.ovn.config.OvnEcmpAutoClusters;
 import com.cloud.network.ovn.config.OvnEcmpRoutes;
+import com.cloud.network.ovn.config.OvnLbAutoCks;
 import com.cloud.network.ovn.config.OvnLspAddresses;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.config.OvnPublicIpv6Lb;
 import com.cloud.network.ovn.config.OvnNicConfig;
+import com.cloud.network.ovn.element.OvnLoadBalancerService;
+import com.cloud.network.lb.LoadBalancingRule;
+import com.cloud.network.lb.LoadBalancingRule.LbDestination;
+import com.cloud.utils.net.Ip;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 import com.cloud.network.ovn.dao.OvnChassisMapVO;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -147,6 +153,10 @@ public class OvnReconcilerService {
     private OvnChassisMapDao chassisMapDao;
     @Inject
     private AgentManager agentManager;
+    @Inject
+    private OvnCksWorkerDiscovery cksWorkerDiscovery;
+    @Inject
+    private OvnLoadBalancerService loadBalancerService;
 
     /**
      * Run a reconcile pass against the supplied zone's NB DB.
@@ -235,13 +245,14 @@ public class OvnReconcilerService {
         // no-op when ovn.lr.ecmp.static.routes is empty and no owned route
         // exists; removes only rows tagged cs-ecmp-route when the config drops.
         // Multi-stanza same UUID supports dual-stack (v4 + v6 VIP prefixes).
-        final Map<String, List<OvnEcmpRoutes.Route>> desiredEcmp =
-                OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
+        final Map<String, List<OvnEcmpRoutes.Route>> desiredEcmp = buildDesiredEcmpRoutes();
         final int ecmpChanged = ensureEcmpStaticRoutes(nb, controller, desiredEcmp, dryRun);
         if (ecmpChanged > 0) {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", ecmpChanged);
         }
+        // CKS auto LB backends (inventory + OVN); no-op when ConfigKey empty.
+        ensureLbAutoCksForZone(zoneId, dryRun);
         // Public IPv6 LB resync — dual-read: ConfigKey ∪ inventory LB rules
         // (public_ipv6_address_id). Programs OVN Load_Balancer rows on the VPC
         // LR (+ tier LS) and announces each VIP as a BGP /128. Self-gated:
@@ -497,14 +508,235 @@ public class OvnReconcilerService {
         if (controller == null) {
             return 0;
         }
-        final Map<String, List<OvnEcmpRoutes.Route>> desired =
-                OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value());
+        final Map<String, List<OvnEcmpRoutes.Route>> desired = buildDesiredEcmpRoutes();
         final int changed = ensureEcmpStaticRoutes(pluginManager.nbClient(zoneId), controller, desired, dryRun);
         if (changed > 0) {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", changed);
         }
         return changed;
+    }
+
+    /**
+     * Desired ECMP routes = CKS auto bindings (worker guest IPs) merged with
+     * manual {@link OvnNetworkConfig#LrEcmpStaticRoutes}. Auto hops first;
+     * same-prefix hops merge (order-stable). Package-visible for unit tests.
+     */
+    Map<String, List<OvnEcmpRoutes.Route>> buildDesiredEcmpRoutes() {
+        final Map<String, List<OvnEcmpRoutes.Route>> desired = new LinkedHashMap<>();
+        mergeEcmpRoutes(desired, expandAutoEcmpRoutes(OvnEcmpAutoClusters.parse(
+                OvnNetworkConfig.LrEcmpAutoClusters.value())));
+        mergeEcmpRoutes(desired, OvnEcmpRoutes.parse(OvnNetworkConfig.LrEcmpStaticRoutes.value()));
+        return desired;
+    }
+
+    /**
+     * Expand auto-cluster bindings into per-network routes using live worker
+     * NICs. Empty worker sets still produce routes with empty hop lists so
+     * owned OVN rows for that prefix are removed.
+     */
+    Map<String, List<OvnEcmpRoutes.Route>> expandAutoEcmpRoutes(
+            final List<OvnEcmpAutoClusters.Binding> bindings) {
+        final Map<String, List<OvnEcmpRoutes.Route>> out = new LinkedHashMap<>();
+        if (bindings == null || bindings.isEmpty() || cksWorkerDiscovery == null || networkDao == null) {
+            return out;
+        }
+        for (final OvnEcmpAutoClusters.Binding b : bindings) {
+            if (b == null) {
+                continue;
+            }
+            final Network network = networkDao.findByUuid(b.getNetworkUuid());
+            if (network == null) {
+                LOGGER.warn("OvnReconcilerService: ECMP auto network {} not found; skipping",
+                        b.getNetworkUuid());
+                continue;
+            }
+            final OvnCksWorkerDiscovery.WorkerIps workers =
+                    cksWorkerDiscovery.listWorkerGuestIps(b.getClusterUuid(), network.getId());
+            final List<OvnEcmpRoutes.Route> routes = out.computeIfAbsent(b.getNetworkUuid(),
+                    k -> new ArrayList<>());
+            if (b.getV4Prefix() != null) {
+                mergeOneRoute(routes, new OvnEcmpRoutes.Route(b.getV4Prefix(), workers.getIpv4()));
+            }
+            if (b.getV6Prefix() != null) {
+                mergeOneRoute(routes, new OvnEcmpRoutes.Route(b.getV6Prefix(), workers.getIpv6()));
+            }
+        }
+        return out;
+    }
+
+    /** Merge {@code src} into {@code dest} (same-prefix hop union; append new prefixes). */
+    static void mergeEcmpRoutes(final Map<String, List<OvnEcmpRoutes.Route>> dest,
+                                final Map<String, List<OvnEcmpRoutes.Route>> src) {
+        if (src == null || src.isEmpty()) {
+            return;
+        }
+        for (final Map.Entry<String, List<OvnEcmpRoutes.Route>> e : src.entrySet()) {
+            if (e.getValue() == null) {
+                continue;
+            }
+            final List<OvnEcmpRoutes.Route> list = dest.computeIfAbsent(e.getKey(), k -> new ArrayList<>());
+            for (final OvnEcmpRoutes.Route r : e.getValue()) {
+                if (r != null) {
+                    mergeOneRoute(list, r);
+                }
+            }
+        }
+    }
+
+    static void mergeOneRoute(final List<OvnEcmpRoutes.Route> routes, final OvnEcmpRoutes.Route route) {
+        for (int i = 0; i < routes.size(); i++) {
+            final OvnEcmpRoutes.Route existing = routes.get(i);
+            if (existing.getPrefix().equals(route.getPrefix())) {
+                final LinkedHashMap<String, Boolean> hops = new LinkedHashMap<>();
+                for (final String h : existing.getNextHops()) {
+                    hops.put(h, Boolean.TRUE);
+                }
+                for (final String h : route.getNextHops()) {
+                    hops.put(h, Boolean.TRUE);
+                }
+                routes.set(i, new OvnEcmpRoutes.Route(existing.getPrefix(), new ArrayList<>(hops.keySet())));
+                return;
+            }
+        }
+        routes.add(route);
+    }
+
+    /**
+     * Auto-refresh LB rule backends from CKS workers for bindings in
+     * {@link OvnNetworkConfig#LbAutoCks}. Updates {@code load_balancer_vm_map}
+     * then re-applies OVN via {@link OvnLoadBalancerService}. Returns number of
+     * rules whose membership changed (or would change in dryRun).
+     */
+    public int ensureLbAutoCksForZone(final long zoneId, final boolean dryRun) {
+        final List<OvnLbAutoCks.Binding> bindings =
+                OvnLbAutoCks.parse(OvnNetworkConfig.LbAutoCks.value());
+        if (bindings.isEmpty() || loadBalancerDao == null || loadBalancerVMMapDao == null
+                || cksWorkerDiscovery == null || networkDao == null) {
+            return 0;
+        }
+        int changed = 0;
+        for (final OvnLbAutoCks.Binding b : bindings) {
+            if (syncOneLbAutoCks(b, zoneId, dryRun)) {
+                changed++;
+            }
+        }
+        if (changed > 0) {
+            LOGGER.info("OvnReconcilerService: zone={} LB auto-CKS {} {} rule(s)",
+                    zoneId, dryRun ? "would change" : "changed", changed);
+        }
+        return changed;
+    }
+
+    /**
+     * Package-visible for tests. Returns true when membership differs from
+     * desired worker set (and applies when {@code dryRun=false}).
+     */
+    boolean syncOneLbAutoCks(final OvnLbAutoCks.Binding binding, final long zoneId, final boolean dryRun) {
+        if (binding == null) {
+            return false;
+        }
+        final LoadBalancerVO rule = loadBalancerDao.findById(binding.getRuleId());
+        if (rule == null) {
+            LOGGER.warn("OvnReconcilerService: LB auto rule id={} not found; skipping", binding.getRuleId());
+            return false;
+        }
+        final Network network = networkDao.findById(rule.getNetworkId());
+        if (network == null || network.getDataCenterId() != zoneId) {
+            return false;
+        }
+        if (rule.getState() != FirewallRule.State.Active && rule.getState() != FirewallRule.State.Add) {
+            return false;
+        }
+        final OvnCksWorkerDiscovery.WorkerIps workers =
+                cksWorkerDiscovery.listWorkerGuestIps(binding.getClusterUuid(), network.getId());
+        // Classic LB uses IPv4 instance IPs; empty v4 → clear backends.
+        final List<String> desiredIps = new ArrayList<>(workers.getIpv4());
+        final List<LoadBalancerVMMapVO> current =
+                loadBalancerVMMapDao.listByLoadBalancerId(rule.getId(), false);
+        final Set<String> currentIps = new HashSet<>();
+        final Map<String, LoadBalancerVMMapVO> byIp = new LinkedHashMap<>();
+        if (current != null) {
+            for (final LoadBalancerVMMapVO m : current) {
+                if (m == null || m.isRevoke() || StringUtils.isBlank(m.getInstanceIp())) {
+                    continue;
+                }
+                currentIps.add(m.getInstanceIp());
+                byIp.put(m.getInstanceIp(), m);
+            }
+        }
+        final Set<String> desiredSet = new HashSet<>(desiredIps);
+        if (currentIps.equals(desiredSet)) {
+            return false;
+        }
+        if (dryRun) {
+            return true;
+        }
+        // Remove stale maps
+        for (final Map.Entry<String, LoadBalancerVMMapVO> e : byIp.entrySet()) {
+            if (!desiredSet.contains(e.getKey())) {
+                loadBalancerVMMapDao.remove(e.getValue().getId());
+            }
+        }
+        // Add missing maps (need VM id from NIC)
+        for (final String ip : desiredIps) {
+            if (currentIps.contains(ip)) {
+                continue;
+            }
+            final NicVO nic = nicDao.findByIp4AddressAndNetworkId(ip, network.getId());
+            if (nic == null || nic.getInstanceId() <= 0) {
+                LOGGER.warn("OvnReconcilerService: LB auto cannot resolve VM for worker ip={} net={}",
+                        ip, network.getId());
+                continue;
+            }
+            loadBalancerVMMapDao.persist(new LoadBalancerVMMapVO(rule.getId(), nic.getInstanceId(), ip, false));
+        }
+        // Re-apply OVN LB from rebuilt destinations
+        applyLbRuleToOvn(network, rule, binding.getDestPort());
+        return true;
+    }
+
+    private void applyLbRuleToOvn(final Network network, final LoadBalancerVO rule, final int destPort) {
+        if (loadBalancerService == null || network == null || rule == null) {
+            return;
+        }
+        try {
+            final List<LoadBalancerVMMapVO> maps =
+                    loadBalancerVMMapDao.listByLoadBalancerId(rule.getId(), false);
+            final List<LbDestination> dests = new ArrayList<>();
+            if (maps != null) {
+                for (final LoadBalancerVMMapVO m : maps) {
+                    if (m == null || m.isRevoke() || StringUtils.isBlank(m.getInstanceIp())) {
+                        continue;
+                    }
+                    dests.add(new LbDestination(destPort, destPort, m.getInstanceIp(), false));
+                }
+            }
+            loadBalancerService.applyLBRules(network, List.of(toLoadBalancingRule(rule, dests, resolveLbSourceIp(rule))));
+        } catch (Exception e) {
+            LOGGER.warn("OvnReconcilerService: LB auto OVN re-apply failed for rule id={}: {}",
+                    rule.getId(), e.getMessage());
+        }
+    }
+
+    private Ip resolveLbSourceIp(final LoadBalancerVO rule) {
+        if (rule == null || ipAddressDao == null || rule.getSourceIpAddressId() == null) {
+            return null;
+        }
+        final com.cloud.network.dao.IPAddressVO row = ipAddressDao.findById(rule.getSourceIpAddressId());
+        if (row == null || row.getAddress() == null) {
+            return null;
+        }
+        return row.getAddress();
+    }
+
+    /**
+     * Build a minimal Active {@link LoadBalancingRule} for OVN apply from inventory.
+     */
+    static LoadBalancingRule toLoadBalancingRule(final LoadBalancerVO rule, final List<LbDestination> dests,
+                                                 final Ip sourceIp) {
+        return new LoadBalancingRule(rule, dests, Collections.emptyList(), Collections.emptyList(),
+                sourceIp, null, rule.getLbProtocol());
     }
 
     /**

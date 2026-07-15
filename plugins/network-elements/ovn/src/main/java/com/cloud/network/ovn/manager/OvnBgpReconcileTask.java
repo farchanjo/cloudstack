@@ -108,6 +108,8 @@ public class OvnBgpReconcileTask {
             // it self-heals the k8s LB VIP routes on each VPC LR and is a no-op
             // when ovn.lr.ecmp.static.routes is empty and no owned route exists.
             ensureEcmpStaticRoutes(controllers);
+            // CKS auto LB backends (inventory rewrite + OVN re-apply); no-op when empty.
+            ensureLbAutoCks(controllers);
             // Public IPv6 LB resync — independent of the BGP public-IP toggle:
             // programs ovn.lr.public.ipv6.lb LBs + /128 announces; no-op when
             // the ConfigKey is empty and no owned LB exists.
@@ -159,6 +161,17 @@ public class OvnBgpReconcileTask {
                 reconcilerService.ensureEcmpStaticRoutesForZone(ctrl.getZoneId(), false);
             } catch (RuntimeException re) {
                 LOGGER.warn("OvnBgpReconcileTask: zone={} ECMP static-route resync failed: {}",
+                        ctrl.getZoneId(), re.getMessage());
+            }
+        }
+    }
+
+    private void ensureLbAutoCks(final List<OvnControllerVO> controllers) {
+        for (final OvnControllerVO ctrl : controllers) {
+            try {
+                reconcilerService.ensureLbAutoCksForZone(ctrl.getZoneId(), false);
+            } catch (RuntimeException re) {
+                LOGGER.warn("OvnBgpReconcileTask: zone={} LB auto-CKS resync failed: {}",
                         ctrl.getZoneId(), re.getMessage());
             }
         }
