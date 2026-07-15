@@ -146,6 +146,13 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
         if (existing != null) {
             // Stale-mapping guard — recreate when NB LS was deleted out-of-band.
             if (nb.rowExistsByUuid("Logical_Switch", existing.getOvnUuid())) {
+                // Re-assert snoop-only (no querier) so pre-fix LS do not keep
+                // mcast_querier=true after plugin upgrade.
+                try {
+                    nb.lsSetMcastSnoop(existing.getOvnUuid(), true);
+                } catch (OvnException e) {
+                    LOGGER.warn("OVN LS {} mcast_snoop reassert failed: {}", existing.getOvnUuid(), e.getMessage());
+                }
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnGuestNetworkGuru: NETWORK mapping net={} -> {} stale; recreating",
@@ -155,9 +162,7 @@ public class OvnGuestNetworkGuru extends GuestNetworkGuru {
         final Map<String, String> ext = buildExternalIds(network, Kind.NETWORK);
         final String uuid = nb.createLogicalSwitch(buildLsName(network), ext);
         logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK, network.getId(), controller.getId(), uuid, buildLsName(network)));
-        // Enable IGMP/MLD snooping on every guest LS by default. Cuts the
-        // broadcast tax on multicast-heavy guests (PIM/IGMPv3, mDNS/SSDP).
-        // Cheap toggle; harmless when no multicast traffic exists.
+        // IGMP/MLD snooping only (querier off — see OvnNbClient.lsSetMcastSnoop).
         try {
             nb.lsSetMcastSnoop(uuid, true);
         } catch (OvnException e) {

@@ -359,9 +359,20 @@ public class OvnPublicNetworkManager {
     }
 
     /**
+     * Priority step between HA_Chassis members (100, 80, 60, …). A gap of 1
+     * (legacy) caused thrash between #1 and #2 when the primary was degraded
+     * but still SB-live (pinctrl/OVN load). Wide steps make failover sticky.
+     */
+    static final int HA_CHASSIS_PRIORITY_TOP = 100;
+    static final int HA_CHASSIS_PRIORITY_STEP = 20;
+
+    /**
      * Build (or return existing) HA_Chassis_Group covering all chassis under
      * the supplied controller. Used as the gateway-failover anchor for any
      * north-south LRP a VPC creates against the public LS.
+     * <p>
+     * When the group already exists, priorities are re-synced to the stepped
+     * scale so ops containment and new deploys do not regress to 100/99/98.
      */
     public String ensureHaChassisGroupForZone(final long zoneId) {
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
@@ -370,31 +381,28 @@ public class OvnPublicNetworkManager {
         }
         final OvnNbClient nbExist = pluginManager.nbClient(zoneId);
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.HA_CHASSIS_GROUP, zoneId, controller.getId());
+        final List<OvnChassisMapVO> chassis = chassisMapDao.listByController(controller.getId());
+        if (chassis.isEmpty()) {
+            throw new OvnException("OvnPublicNetworkManager: no OVN chassis registered for controller id="
+                    + controller.getId());
+        }
+        final List<java.util.Map.Entry<String, Integer>> members = buildHaChassisMembers(chassis);
         if (existing != null) {
             if (nbExist.rowExistsByUuid("HA_Chassis_Group", existing.getOvnUuid())) {
+                final int n = nbExist.syncHaChassisGroupPriorities(existing.getOvnUuid(), members);
+                if (n > 0) {
+                    LOGGER.info("OvnPublicNetworkManager: synced {} HA_Chassis priorities on {} (zone={})",
+                            n, existing.getOvnUuid(), zoneId);
+                }
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnPublicNetworkManager: HA_CHASSIS_GROUP mapping {} -> {} stale; recreating",
                     zoneId, existing.getOvnUuid());
             logicalIdMapDao.remove(existing.getId());
         }
-        final List<OvnChassisMapVO> chassis = chassisMapDao.listByController(controller.getId());
-        if (chassis.isEmpty()) {
-            throw new OvnException("OvnPublicNetworkManager: no OVN chassis registered for controller id="
-                    + controller.getId());
-        }
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
-        // Priority decreases by host id order so failover deterministically
-        // picks the lower-id chassis when multiple are healthy. We insert
-        // every HA_Chassis row + the HA_Chassis_Group in a single OVSDB
-        // transaction via createHaChassisGroupAtomic — separate transactions
-        // would let ovsdb-server GC the orphan HA_Chassis rows before the
-        // group references them, raising "referential integrity violation".
-        final List<java.util.Map.Entry<String, Integer>> members = new ArrayList<>(chassis.size());
-        int prio = 100;
-        for (final OvnChassisMapVO row : chassis) {
-            members.add(java.util.Map.entry(row.getChassisUuid(), prio--));
-        }
+        // Priority steps by HA_CHASSIS_PRIORITY_STEP (not 1) so failover is sticky.
+        // Atomic insert: HA_Chassis rows + group in one txn (referential integrity).
         final Map<String, String> ext = new HashMap<>();
         ext.put(OvnConstants.EXT_ID_KIND, Kind.HA_CHASSIS_GROUP.name());
         ext.put(OvnConstants.EXT_ID_ID, String.valueOf(zoneId));
@@ -405,6 +413,17 @@ public class OvnPublicNetworkManager {
         LOGGER.info("OvnPublicNetworkManager: created HA_Chassis_Group {} with {} chassis (zone={})",
                 hagUuid, members.size(), zoneId);
         return hagUuid;
+    }
+
+    /** Ordered (chassisUuid, priority) for zone HA — host-id order, stepped priorities. */
+    static List<java.util.Map.Entry<String, Integer>> buildHaChassisMembers(final List<OvnChassisMapVO> chassis) {
+        final List<java.util.Map.Entry<String, Integer>> members = new ArrayList<>(chassis.size());
+        int prio = HA_CHASSIS_PRIORITY_TOP;
+        for (final OvnChassisMapVO row : chassis) {
+            members.add(java.util.Map.entry(row.getChassisUuid(), prio));
+            prio = Math.max(1, prio - HA_CHASSIS_PRIORITY_STEP);
+        }
+        return members;
     }
 
     /**

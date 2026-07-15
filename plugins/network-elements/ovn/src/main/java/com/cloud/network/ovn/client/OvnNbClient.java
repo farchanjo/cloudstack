@@ -2789,16 +2789,113 @@ public class OvnNbClient implements AutoCloseable {
         delTx.commit();
     }
 
-    /** Toggles IGMP/MLD snooping on a Logical_Switch via the {@code other_config} column. */
+    /**
+     * Toggles IGMP/MLD snooping on a Logical_Switch via {@code other_config}.
+     * <p>
+     * Snooping alone is safe. {@code mcast_querier=true} without a querier IP/MAC
+     * makes every chassis pinctrl spam
+     * {@code IGMP Querier enabled without a valid IPv4 or IPv6 address} and burns
+     * CPU — so we never enable the querier here (snoop-only when {@code enable}).
+     */
     public void lsSetMcastSnoop(final String lsUuid, final boolean enable) {
         final ObjectNode row = JsonNodeFactory.instance.objectNode();
         final Map<String, String> oc = new java.util.HashMap<>();
         oc.put("mcast_snoop", Boolean.toString(enable));
-        oc.put("mcast_querier", Boolean.toString(enable));
+        // Keep querier off unless a future API sets mcast_querier_ip explicitly.
+        oc.put("mcast_querier", "false");
         row.set("other_config", buildMap(oc));
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.update("Logical_Switch", OvnOpFactory.whereUuid(lsUuid), row));
         tx.commit();
+    }
+
+    /** Sets {@code HA_Chassis.priority} on an existing row. */
+    public void haChassisSetPriority(final String haChassisUuid, final int priority) {
+        if (haChassisUuid == null || haChassisUuid.isEmpty()) {
+            return;
+        }
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.put("priority", priority);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("HA_Chassis", OvnOpFactory.whereUuid(haChassisUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Aligns HA_Chassis members of a group to the desired (chassis_name, priority)
+     * list: updates priority on known names; does not remove extra members.
+     *
+     * @return number of rows whose priority was written
+     */
+    public int syncHaChassisGroupPriorities(final String hagUuid,
+                                            final List<Map.Entry<String, Integer>> desired) {
+        if (hagUuid == null || hagUuid.isEmpty() || desired == null || desired.isEmpty()) {
+            return 0;
+        }
+        final Map<String, Integer> want = new java.util.LinkedHashMap<>();
+        for (final Map.Entry<String, Integer> e : desired) {
+            want.put(e.getKey(), e.getValue());
+        }
+        final ArrayNode groupCols = JsonNodeFactory.instance.arrayNode();
+        groupCols.add("_uuid");
+        groupCols.add("ha_chassis");
+        final OvnTransaction txGroup = newTransaction();
+        txGroup.add(OvnOpFactory.select("HA_Chassis_Group", OvnOpFactory.whereUuid(hagUuid), groupCols));
+        final OvnTransaction.Result rGroup;
+        try {
+            rGroup = txGroup.commit();
+        } catch (OvnException e) {
+            return 0;
+        }
+        final ArrayNode gArr = rGroup.raw();
+        if (gArr == null || gArr.size() == 0) {
+            return 0;
+        }
+        final var gRows = gArr.get(0) == null ? null : gArr.get(0).get("rows");
+        if (gRows == null || gRows.size() == 0) {
+            return 0;
+        }
+        final List<String> memberUuids = decodeUuidSetColumn(gRows.get(0).get("ha_chassis"));
+        if (memberUuids.isEmpty()) {
+            return 0;
+        }
+        int updated = 0;
+        final ArrayNode cols = JsonNodeFactory.instance.arrayNode();
+        cols.add("_uuid");
+        cols.add("chassis_name");
+        cols.add("priority");
+        for (final String hacUuid : memberUuids) {
+            final OvnTransaction tx = newTransaction();
+            tx.add(OvnOpFactory.select("HA_Chassis", OvnOpFactory.whereUuid(hacUuid), cols));
+            final OvnTransaction.Result r;
+            try {
+                r = tx.commit();
+            } catch (OvnException e) {
+                continue;
+            }
+            final ArrayNode arr = r.raw();
+            if (arr == null || arr.size() == 0) {
+                continue;
+            }
+            final var rows = arr.get(0) == null ? null : arr.get(0).get("rows");
+            if (rows == null || rows.size() == 0) {
+                continue;
+            }
+            final var row = rows.get(0);
+            final var nameNode = row.get("chassis_name");
+            final String name = nameNode != null && nameNode.isTextual() ? nameNode.asText() : null;
+            if (name == null || !want.containsKey(name)) {
+                continue;
+            }
+            final int target = want.get(name);
+            final var prioNode = row.get("priority");
+            final int cur = prioNode != null && prioNode.isInt() ? prioNode.asInt() : -1;
+            if (cur != target) {
+                haChassisSetPriority(hacUuid, target);
+                updated++;
+            }
+        }
+        return updated;
     }
 
     // ------------------------------------------------------------------
