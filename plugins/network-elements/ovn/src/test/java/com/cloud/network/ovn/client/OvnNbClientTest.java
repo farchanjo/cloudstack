@@ -25,6 +25,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -114,6 +115,68 @@ public class OvnNbClientTest {
         assertEquals("router", params.get(3).get("row").get("type").asText());
         assertEquals("Logical_Switch", params.get(4).get("table").asText());
         verify(pool, times(1)).call(anyString(), any());
+    }
+
+    /**
+     * Regression: enabling mcast snoop must keep querier off. Querier without
+     * IP/MAC makes every chassis pinctrl spam and burns CPU (aragog incident).
+     */
+    @Test
+    public void lsSetMcastSnoopEnablesSnoopWithQuerierFalse() {
+        when(pool.call(anyString(), any())).thenReturn(JsonNodeFactory.instance.arrayNode());
+
+        client.lsSetMcastSnoop("ls-uuid-1", true);
+
+        final ArrayNode params = captureTransactCall();
+        assertEquals("update", params.get(1).get("op").asText());
+        assertEquals("Logical_Switch", params.get(1).get("table").asText());
+        final JsonNode oc = params.get(1).get("row").get("other_config");
+        assertEquals("map", oc.get(0).asText());
+        final Map<String, String> pairs = mapPairs(oc.get(1));
+        assertEquals("true", pairs.get("mcast_snoop"));
+        assertEquals("false", pairs.get("mcast_querier"));
+    }
+
+    @Test
+    public void lsSetMcastSnoopDisableKeepsQuerierFalse() {
+        when(pool.call(anyString(), any())).thenReturn(JsonNodeFactory.instance.arrayNode());
+
+        client.lsSetMcastSnoop("ls-uuid-2", false);
+
+        final ArrayNode params = captureTransactCall();
+        final Map<String, String> pairs = mapPairs(params.get(1).get("row").get("other_config").get(1));
+        assertEquals("false", pairs.get("mcast_snoop"));
+        assertEquals("false", pairs.get("mcast_querier"));
+    }
+
+    @Test
+    public void haChassisSetPriorityEmitsUpdate() {
+        when(pool.call(anyString(), any())).thenReturn(JsonNodeFactory.instance.arrayNode());
+
+        client.haChassisSetPriority("hac-uuid-1", 100);
+
+        final ArrayNode params = captureTransactCall();
+        assertEquals("update", params.get(1).get("op").asText());
+        assertEquals("HA_Chassis", params.get(1).get("table").asText());
+        assertEquals(100, params.get(1).get("row").get("priority").asInt());
+    }
+
+    @Test
+    public void haChassisSetPriorityNoopOnBlankUuid() {
+        client.haChassisSetPriority("", 50);
+        client.haChassisSetPriority(null, 50);
+        verify(pool, times(0)).call(anyString(), any());
+    }
+
+    private static Map<String, String> mapPairs(final JsonNode pairsArr) {
+        final Map<String, String> out = new HashMap<>();
+        if (pairsArr == null || !pairsArr.isArray()) {
+            return out;
+        }
+        for (final JsonNode pair : pairsArr) {
+            out.put(pair.get(0).asText(), pair.get(1).asText());
+        }
+        return out;
     }
 
     private ArrayNode captureTransactCall() {

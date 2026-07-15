@@ -99,6 +99,41 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
     }
 
     @Override
+    public void setPfCarrierAvailability(long hostId, String pfName, boolean carrierUp) {
+        if (pfName == null || pfName.trim().isEmpty()) {
+            return;
+        }
+        final String pf = pfName.trim();
+        int flipped = 0;
+        for (SriovVfPoolVO vf : vfPoolDao.listByHost(hostId)) {
+            if (!pf.equals(vf.getPfName())) {
+                continue;
+            }
+            final String state = vf.getState();
+            // Only FREE ↔ UNAVAILABLE. ALLOCATED/SUSPECT/RESERVED keep their
+            // binding so live VMs and in-flight staging are not unplugged here.
+            if (!carrierUp && State.FREE.name().equals(state)) {
+                SriovVfPoolVO updateVo = vfPoolDao.createForUpdate();
+                updateVo.setState(State.UNAVAILABLE.name());
+                vfPoolDao.update(vf.getId(), updateVo);
+                flipped++;
+            } else if (carrierUp && State.UNAVAILABLE.name().equals(state)) {
+                SriovVfPoolVO updateVo = vfPoolDao.createForUpdate();
+                updateVo.setState(State.FREE.name());
+                vfPoolDao.update(vf.getId(), updateVo);
+                flipped++;
+            }
+        }
+        if (flipped > 0) {
+            LOGGER.info("PF carrier availability host={} pf={} carrierUp={} flipped {} pool row(s)",
+                    hostId, pf, carrierUp, flipped);
+        } else {
+            LOGGER.debug("PF carrier availability host={} pf={} carrierUp={} (no FREE/UNAVAILABLE rows to flip)",
+                    hostId, pf, carrierUp);
+        }
+    }
+
+    @Override
     public SriovVfPoolVO allocate(long hostId, long nicId) throws InsufficientCapacityException {
         SriovVfPoolVO vf = vfPoolDao.allocate(hostId, nicId);
         if (vf == null) {

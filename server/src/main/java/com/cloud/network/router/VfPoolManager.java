@@ -40,6 +40,15 @@ public interface VfPoolManager extends Manager {
     void registerHostVfs(long hostId, String pfName, int totalVfs, java.util.List<String> pciAddresses);
 
     /**
+     * Reflect PF physical carrier into the pool. When {@code carrierUp} is
+     * false, FREE rows for {@code pfName} become UNAVAILABLE so allocate()
+     * will not hand out VFs on a dead uplink (e.g. LACP partner missing).
+     * When carrier returns, UNAVAILABLE rows for that PF return to FREE.
+     * ALLOCATED / SUSPECT rows are left alone (live VMs must keep their binding).
+     */
+    void setPfCarrierAvailability(long hostId, String pfName, boolean carrierUp);
+
+    /**
      * Allocate one FREE VF on the given host and bind it to the NIC.
      *
      * @return the allocated VF row.

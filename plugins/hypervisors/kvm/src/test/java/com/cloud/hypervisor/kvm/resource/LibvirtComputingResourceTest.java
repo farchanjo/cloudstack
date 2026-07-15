@@ -27,10 +27,12 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -6361,7 +6363,10 @@ public class LibvirtComputingResourceTest {
         domainInterfaceStatsMock.rx_bytes = 1000L;
         domainInterfaceStatsMock.tx_bytes = 2000L;
         doReturn(domainInterfaceStatsMock).when(domainMock).interfaceStats(Mockito.any());
-        doReturn(List.of(new InterfaceDef())).when(libvirtComputingResourceSpy).getInterfaces(connMock, VM_NAME);
+        // Bridge target with a non-null libvirt device name (vDPA/hostdev have none).
+        final InterfaceDef bridgeIface = new InterfaceDef();
+        bridgeIface.defBridgeNet("cloudbr0", "vnet0", "02:00:00:00:00:01", InterfaceDef.NicModel.VIRTIO);
+        doReturn(List.of(bridgeIface)).when(libvirtComputingResourceSpy).getInterfaces(connMock, VM_NAME);
 
         domainBlockStatsMock.rd_req = 3000L;
         domainBlockStatsMock.rd_bytes = 4000L;
@@ -6406,6 +6411,96 @@ public class LibvirtComputingResourceTest {
 
         Assert.assertEquals((double) domainInterfaceStatsMock.rx_bytes / 1024, vmStatsEntry.getNetworkReadKBs(), 0);
         Assert.assertEquals((double) domainInterfaceStatsMock.tx_bytes / 1024, vmStatsEntry.getNetworkWriteKBs(), 0);
+    }
+
+    @Test
+    public void supportsDomainInterfaceStatsRejectsVdpaHostdevAndBlank() {
+        final InterfaceDef bridge = new InterfaceDef();
+        bridge.defBridgeNet("cloudbr0", "vnet0", "02:00:00:00:00:01", InterfaceDef.NicModel.VIRTIO);
+        assertTrue(LibvirtComputingResource.supportsDomainInterfaceStats(bridge));
+
+        final InterfaceDef vdpa = new InterfaceDef();
+        vdpa.defVdpaNet("/dev/vhost-vdpa-0", "02:00:00:00:00:02", 16);
+        assertFalse(LibvirtComputingResource.supportsDomainInterfaceStats(vdpa));
+
+        final InterfaceDef hostdev = new InterfaceDef();
+        hostdev.defHostdevNet("0000:01:00.2", "02:00:00:00:00:03", 0);
+        assertFalse(LibvirtComputingResource.supportsDomainInterfaceStats(hostdev));
+
+        assertFalse(LibvirtComputingResource.supportsDomainInterfaceStats(new InterfaceDef()));
+        assertFalse(LibvirtComputingResource.supportsDomainInterfaceStats(null));
+    }
+
+    @Test
+    public void getVmCurrentNetworkStatsSkipsVdpaWithoutCallingLibvirt() throws LibvirtException {
+        final InterfaceDef vdpa = new InterfaceDef();
+        vdpa.defVdpaNet("/dev/vhost-vdpa-0", "02:00:00:00:00:02", 16);
+        doReturn(List.of(vdpa)).when(libvirtComputingResourceSpy).getInterfaces(connMock, VM_NAME);
+        when(domainMock.getConnect()).thenReturn(connMock);
+        when(domainMock.getName()).thenReturn(VM_NAME);
+
+        LibvirtExtendedVmStatsEntry vmStatsEntry = new LibvirtExtendedVmStatsEntry();
+        libvirtComputingResourceSpy.getVmCurrentNetworkStats(domainMock, vmStatsEntry);
+
+        Assert.assertEquals(0, vmStatsEntry.getNetworkReadKBs(), 0);
+        Assert.assertEquals(0, vmStatsEntry.getNetworkWriteKBs(), 0);
+        verify(domainMock, never()).interfaceStats(nullable(String.class));
+    }
+
+    @Test
+    public void getVmCurrentNetworkStatsMixedBridgeAndVdpaOnlyCountsBridge() throws LibvirtException {
+        final InterfaceDef bridge = new InterfaceDef();
+        bridge.defBridgeNet("cloudbr0", "vnet0", "02:00:00:00:00:01", InterfaceDef.NicModel.VIRTIO);
+        final InterfaceDef vdpa = new InterfaceDef();
+        vdpa.defVdpaNet("/dev/vhost-vdpa-0", "02:00:00:00:00:02", 16);
+        doReturn(List.of(bridge, vdpa)).when(libvirtComputingResourceSpy).getInterfaces(connMock, VM_NAME);
+        when(domainMock.getConnect()).thenReturn(connMock);
+        when(domainMock.getName()).thenReturn(VM_NAME);
+
+        domainInterfaceStatsMock.rx_bytes = 2048L;
+        domainInterfaceStatsMock.tx_bytes = 4096L;
+        doReturn(domainInterfaceStatsMock).when(domainMock).interfaceStats("vnet0");
+
+        LibvirtExtendedVmStatsEntry vmStatsEntry = new LibvirtExtendedVmStatsEntry();
+        libvirtComputingResourceSpy.getVmCurrentNetworkStats(domainMock, vmStatsEntry);
+
+        Assert.assertEquals(2.0, vmStatsEntry.getNetworkReadKBs(), 0);
+        Assert.assertEquals(4.0, vmStatsEntry.getNetworkWriteKBs(), 0);
+        verify(domainMock, times(1)).interfaceStats("vnet0");
+        verify(domainMock, never()).interfaceStats(eq("/dev/vhost-vdpa-0"));
+    }
+
+    @Test
+    public void getVmCurrentNetworkStatsIsolatesPerNicLibvirtException() throws LibvirtException {
+        final InterfaceDef bad = new InterfaceDef();
+        bad.defBridgeNet("cloudbr0", "vnet-stale", "02:00:00:00:00:01", InterfaceDef.NicModel.VIRTIO);
+        final InterfaceDef good = new InterfaceDef();
+        good.defBridgeNet("cloudbr0", "vnet1", "02:00:00:00:00:02", InterfaceDef.NicModel.VIRTIO);
+        doReturn(List.of(bad, good)).when(libvirtComputingResourceSpy).getInterfaces(connMock, VM_NAME);
+        when(domainMock.getConnect()).thenReturn(connMock);
+        when(domainMock.getName()).thenReturn(VM_NAME);
+
+        final LibvirtException staleDev = mock(LibvirtException.class);
+        when(staleDev.getMessage()).thenReturn("no such device");
+        when(domainMock.interfaceStats("vnet-stale")).thenThrow(staleDev);
+        domainInterfaceStatsMock.rx_bytes = 1024L;
+        domainInterfaceStatsMock.tx_bytes = 2048L;
+        doReturn(domainInterfaceStatsMock).when(domainMock).interfaceStats("vnet1");
+
+        LibvirtExtendedVmStatsEntry vmStatsEntry = new LibvirtExtendedVmStatsEntry();
+        libvirtComputingResourceSpy.getVmCurrentNetworkStats(domainMock, vmStatsEntry);
+
+        Assert.assertEquals(1.0, vmStatsEntry.getNetworkReadKBs(), 0);
+        Assert.assertEquals(2.0, vmStatsEntry.getNetworkWriteKBs(), 0);
+    }
+
+    @Test
+    public void supportsDomainInterfaceStatsRejectsVhostuserWithoutDevName() {
+        final InterfaceDef vhu = new InterfaceDef();
+        // DPDK vhostuser: net type set but domain target name often absent in parser path.
+        vhu.defDpdkNet("/var/run/openvswitch", "dpdk0", "02:00:00:00:00:09",
+                InterfaceDef.NicModel.VIRTIO, 0, null, "client");
+        assertFalse(LibvirtComputingResource.supportsDomainInterfaceStats(vhu));
     }
 
     @Test

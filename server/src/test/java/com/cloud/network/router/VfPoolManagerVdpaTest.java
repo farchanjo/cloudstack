@@ -21,6 +21,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -30,6 +31,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.util.List;
+
 import com.cloud.network.router.SriovVfPoolVO.State;
 import com.cloud.network.router.SriovVfPoolVO.VdpaKind;
 import com.cloud.network.router.dao.SriovVfPoolDao;
@@ -37,6 +40,7 @@ import com.cloud.network.router.dao.SriovVfPoolDao;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -115,6 +119,67 @@ public class VfPoolManagerVdpaTest {
         verify(vfPoolDao, never()).release(anyLong());
     }
 
+    @Test
+    public void setPfCarrierDownMarksOnlyFreeRowsUnavailable() throws Exception {
+        SriovVfPoolVO freeOnDeadPf = rowWithId(10L, "0000:01:00.4", "dx6p1", "dx6p1vf0", State.FREE);
+        SriovVfPoolVO allocatedOnDeadPf = rowWithId(11L, "0000:01:00.5", "dx6p1", "dx6p1vf1", State.ALLOCATED);
+        SriovVfPoolVO freeOnGoodPf = rowWithId(12L, "0000:01:00.3", "dx6p0", "dx6p0vf1", State.FREE);
+
+        when(vfPoolDao.listByHost(HOST_ID)).thenReturn(List.of(freeOnDeadPf, allocatedOnDeadPf, freeOnGoodPf));
+        when(vfPoolDao.createForUpdate()).thenAnswer(inv -> new SriovVfPoolVO());
+
+        manager.setPfCarrierAvailability(HOST_ID, "dx6p1", false);
+
+        ArgumentCaptor<Long> idCap = ArgumentCaptor.forClass(Long.class);
+        ArgumentCaptor<SriovVfPoolVO> voCap = ArgumentCaptor.forClass(SriovVfPoolVO.class);
+        verify(vfPoolDao, times(1)).update(idCap.capture(), voCap.capture());
+        assertEquals(Long.valueOf(10L), idCap.getValue());
+        assertEquals(State.UNAVAILABLE.name(), voCap.getValue().getState());
+    }
+
+    @Test
+    public void setPfCarrierUpRestoresUnavailableToFree() throws Exception {
+        SriovVfPoolVO unavailable = rowWithId(20L, "0000:01:00.4", "dx6p1", "dx6p1vf0", State.UNAVAILABLE);
+        SriovVfPoolVO allocated = rowWithId(21L, "0000:01:00.5", "dx6p1", "dx6p1vf1", State.ALLOCATED);
+
+        when(vfPoolDao.listByHost(HOST_ID)).thenReturn(List.of(unavailable, allocated));
+        when(vfPoolDao.createForUpdate()).thenAnswer(inv -> new SriovVfPoolVO());
+
+        manager.setPfCarrierAvailability(HOST_ID, "dx6p1", true);
+
+        ArgumentCaptor<Long> idCap = ArgumentCaptor.forClass(Long.class);
+        ArgumentCaptor<SriovVfPoolVO> voCap = ArgumentCaptor.forClass(SriovVfPoolVO.class);
+        verify(vfPoolDao, times(1)).update(idCap.capture(), voCap.capture());
+        assertEquals(Long.valueOf(20L), idCap.getValue());
+        assertEquals(State.FREE.name(), voCap.getValue().getState());
+    }
+
+    @Test
+    public void setPfCarrierIgnoresBlankPfName() {
+        manager.setPfCarrierAvailability(HOST_ID, "", false);
+        manager.setPfCarrierAvailability(HOST_ID, "   ", false);
+        manager.setPfCarrierAvailability(HOST_ID, null, false);
+        verify(vfPoolDao, never()).listByHost(anyLong());
+        verify(vfPoolDao, never()).update(anyLong(), any());
+    }
+
+    @Test
+    public void setPfCarrierDownFlipsAllFreeOnPfLeavesReservedSuspect() throws Exception {
+        SriovVfPoolVO free1 = rowWithId(30L, "0000:01:00.4", "dx6p1", "dx6p1vf0", State.FREE);
+        SriovVfPoolVO free2 = rowWithId(31L, "0000:01:00.5", "dx6p1", "dx6p1vf1", State.FREE);
+        SriovVfPoolVO reserved = rowWithId(32L, "0000:01:00.6", "dx6p1", "dx6p1vf2", State.RESERVED);
+        SriovVfPoolVO suspect = rowWithId(33L, "0000:01:00.7", "dx6p1", "dx6p1vf3", State.SUSPECT);
+
+        when(vfPoolDao.listByHost(HOST_ID)).thenReturn(List.of(free1, free2, reserved, suspect));
+        when(vfPoolDao.createForUpdate()).thenAnswer(inv -> new SriovVfPoolVO());
+
+        manager.setPfCarrierAvailability(HOST_ID, " dx6p1 ", false);
+
+        ArgumentCaptor<Long> idCap = ArgumentCaptor.forClass(Long.class);
+        verify(vfPoolDao, times(2)).update(idCap.capture(), any(SriovVfPoolVO.class));
+        assertEquals(List.of(30L, 31L), idCap.getAllValues());
+    }
+
     /**
      * Build a row in the shape the DAO returns from {@code allocateForVdpa}
      * after it has flipped state and stamped the vdpa fields on the chosen
@@ -126,6 +191,15 @@ public class VfPoolManagerVdpaTest {
         row.setAllocatedToNicId(NIC_ID);
         row.setVdpaKind(VdpaKind.VDPA);
         row.setVdpaName("vdpa-" + NIC_ID);
+        return row;
+    }
+
+    private static SriovVfPoolVO rowWithId(long id, String pci, String pf, String rep, State state) throws Exception {
+        SriovVfPoolVO row = new SriovVfPoolVO(HOST_ID, pci, pf, rep);
+        row.setState(state);
+        final java.lang.reflect.Field idField = SriovVfPoolVO.class.getDeclaredField("id");
+        idField.setAccessible(true);
+        idField.setLong(row, id);
         return row;
     }
 }

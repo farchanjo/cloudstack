@@ -18,6 +18,7 @@ package com.cloud.network.ovn.element;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -25,6 +26,7 @@ import static org.mockito.Mockito.when;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -33,6 +35,7 @@ import com.cloud.dc.Vlan;
 import com.cloud.dc.VlanVO;
 import com.cloud.dc.dao.VlanDao;
 import com.cloud.network.ovn.client.OvnNbClient;
+import com.cloud.network.ovn.dao.OvnChassisMapVO;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
@@ -116,6 +119,56 @@ public class OvnPublicNetworkManagerTest {
         when(vlanDao.listByZoneAndType(ZONE_ID, Vlan.VlanType.VirtualNetwork))
                 .thenReturn(Collections.emptyList());
         assertNull(mgr.getVpcPublicAnchorCidr(ZONE_ID, VPC_ID));
+    }
+
+    /**
+     * Regression for sticky HA failover: priorities must step by
+     * {@link OvnPublicNetworkManager#HA_CHASSIS_PRIORITY_STEP} (not 1), so a
+     * flap does not thrash gateway ownership between chassis of near-equal prio.
+     */
+    @Test
+    public void buildHaChassisMembersUsesSteppedPriorities() {
+        final OvnChassisMapVO a = new OvnChassisMapVO(1L, CONTROLLER_ID, "norbert");
+        final OvnChassisMapVO b = new OvnChassisMapVO(2L, CONTROLLER_ID, "aragog");
+        final OvnChassisMapVO c = new OvnChassisMapVO(3L, CONTROLLER_ID, "fluffy");
+
+        final List<Map.Entry<String, Integer>> members =
+                OvnPublicNetworkManager.buildHaChassisMembers(List.of(a, b, c));
+
+        assertEquals(3, members.size());
+        assertEquals("norbert", members.get(0).getKey());
+        assertEquals(Integer.valueOf(OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_TOP), members.get(0).getValue());
+        assertEquals(Integer.valueOf(OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_TOP
+                - OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_STEP), members.get(1).getValue());
+        assertEquals(Integer.valueOf(OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_TOP
+                - 2 * OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_STEP), members.get(2).getValue());
+        // Sticky gap: adjacent members differ by STEP, not 1.
+        assertEquals(OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_STEP,
+                members.get(0).getValue() - members.get(1).getValue());
+        assertTrue(members.get(2).getValue() >= 1);
+    }
+
+    @Test
+    public void buildHaChassisMembersEmptyInput() {
+        assertTrue(OvnPublicNetworkManager.buildHaChassisMembers(List.of()).isEmpty());
+    }
+
+    @Test
+    public void buildHaChassisMembersDoesNotGoBelowOne() {
+        // Many members would underflow if not clamped with Math.max(1, …).
+        final List<OvnChassisMapVO> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            many.add(new OvnChassisMapVO(i, CONTROLLER_ID, "chassis-" + i));
+        }
+        final List<Map.Entry<String, Integer>> members = OvnPublicNetworkManager.buildHaChassisMembers(many);
+        assertEquals(20, members.size());
+        assertEquals(Integer.valueOf(OvnPublicNetworkManager.HA_CHASSIS_PRIORITY_TOP), members.get(0).getValue());
+        for (final Map.Entry<String, Integer> e : members) {
+            assertTrue("priority must stay >= 1, got " + e.getValue() + " for " + e.getKey(),
+                    e.getValue() >= 1);
+        }
+        // After floor, trailing members share prio 1 (sticky less important than invalid 0).
+        assertEquals(Integer.valueOf(1), members.get(members.size() - 1).getValue());
     }
 
     private static void injectField(final Object target, final String name, final Object value) throws Exception {

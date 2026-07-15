@@ -3660,6 +3660,19 @@ public class ResourceManagerImpl extends ManagerBase implements ResourceManager,
                     }
                 }
             }
+            // Carrier flags (sriov.vfs.<pf>.carrier=true|false): freeze FREE pool
+            // rows on NO-CARRIER PFs so allocate() cannot hand out dead-uplink VFs.
+            if (_vfPoolManager != null) {
+                for (Map.Entry<String, String> entry : details.entrySet()) {
+                    String key = entry.getKey();
+                    if (!key.startsWith("sriov.vfs.") || !key.endsWith(".carrier")) {
+                        continue;
+                    }
+                    String pfName = key.substring("sriov.vfs.".length(), key.length() - ".carrier".length());
+                    boolean carrierUp = Boolean.parseBoolean(entry.getValue());
+                    _vfPoolManager.setPfCarrierAvailability(hostId, pfName, carrierUp);
+                }
+            }
         } catch (Exception e) {
             logger.warn("Failed to register SR-IOV VFs from host_details for host " + hostId, e);
         }

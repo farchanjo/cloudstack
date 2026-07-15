@@ -6229,10 +6229,21 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             List<InterfaceDef> nics = getInterfaces(conn, vmName);
 
             for (InterfaceDef nic : nics) {
-                DomainInterfaceStats nicStats = dm.interfaceStats(nic.getDevName());
-                String macAddress = nic.getMacAddress();
-                VmNetworkStatsEntry stat = new VmNetworkStatsEntry(vmName, macAddress, nicStats.tx_bytes, nicStats.rx_bytes);
-                stats.add(stat);
+                // vDPA / hostdev / blank target have no libvirt domain target name;
+                // virDomainInterfaceStats requires a non-NULL device and logs spam otherwise.
+                if (!supportsDomainInterfaceStats(nic)) {
+                    continue;
+                }
+                try {
+                    DomainInterfaceStats nicStats = dm.interfaceStats(nic.getDevName());
+                    String macAddress = nic.getMacAddress();
+                    VmNetworkStatsEntry stat = new VmNetworkStatsEntry(vmName, macAddress, nicStats.tx_bytes, nicStats.rx_bytes);
+                    stats.add(stat);
+                } catch (LibvirtException e) {
+                    // One stale/missing target must not fail the whole stats answer.
+                    LOGGER.debug("Skipping interfaceStats for VM {} nic dev={} mac={}: {}",
+                            vmName, nic.getDevName(), nic.getMacAddress(), e.getMessage());
+                }
             }
 
             return stats;
@@ -6241,6 +6252,23 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
                 dm.free();
             }
         }
+    }
+
+    /**
+     * libvirt {@code virDomainInterfaceStats} needs a domain target device name
+     * (e.g. {@code vnet0}). vDPA and hostdev/SR-IOV paths never set one, so the
+     * C API returns {@code device in virDomainInterfaceStats must not be NULL}
+     * on every stats poll when those NICs are present.
+     */
+    static boolean supportsDomainInterfaceStats(final InterfaceDef nic) {
+        if (nic == null) {
+            return false;
+        }
+        final InterfaceDef.GuestNetType type = nic.getNetType();
+        if (type == InterfaceDef.GuestNetType.VDPA || type == InterfaceDef.GuestNetType.HOSTDEV) {
+            return false;
+        }
+        return StringUtils.isNotBlank(nic.getDevName());
     }
 
     public List<VmDiskStatsEntry> getVmDiskStat(final Connect conn, final String vmName) throws LibvirtException {
@@ -6402,9 +6430,19 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
         double rx = 0;
         double tx = 0;
         for (final InterfaceDef vif : vifs) {
-            final DomainInterfaceStats ifStats = dm.interfaceStats(vif.getDevName());
-            rx += ifStats.rx_bytes;
-            tx += ifStats.tx_bytes;
+            if (!supportsDomainInterfaceStats(vif)) {
+                LOGGER.trace("Skipping domain interface stats for VM [{}] nic type={} dev={} (unsupported by libvirt interfaceStats)",
+                        vmAsString, vif.getNetType(), vif.getDevName());
+                continue;
+            }
+            try {
+                final DomainInterfaceStats ifStats = dm.interfaceStats(vif.getDevName());
+                rx += ifStats.rx_bytes;
+                tx += ifStats.tx_bytes;
+            } catch (LibvirtException e) {
+                LOGGER.debug("Skipping interfaceStats for VM [{}] dev={}: {}",
+                        vmAsString, vif.getDevName(), e.getMessage());
+            }
         }
         stats.setNetworkReadKBs(rx / 1024);
         stats.setNetworkWriteKBs(tx / 1024);
@@ -7354,6 +7392,12 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
      *   sriov.enabled                = "true" if any VF representor exists
      *   sriov.vfs.&lt;pfname&gt;.count = number of VFs on that PF
      *   sriov.vfs.&lt;pfname&gt;.pci   = comma-separated PCI addresses
+     *   sriov.vfs.&lt;pfname&gt;.carrier = "true"/"false" (physical link on the PF)
+     *
+     * <p>PFs without carrier (NO-CARRIER / LACP partner missing) are still reported
+     * with {@code carrier=false} but their VF PCI lists are omitted so the mgmt
+     * pool does not grow with unusable VFs on a dead uplink. Existing allocated
+     * rows are left alone (no DB mutation from the agent).
      */
     void reportSriovCapabilities(java.util.Map<String, String> details) {
         try {
@@ -7390,12 +7434,35 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             }
             details.put("sriov.enabled", "true");
             for (java.util.Map.Entry<String, java.util.List<String>> e : pfToPci.entrySet()) {
-                details.put("sriov.vfs." + e.getKey() + ".count", String.valueOf(e.getValue().size()));
-                details.put("sriov.vfs." + e.getKey() + ".pci", String.join(",", e.getValue()));
+                final String pfName = e.getKey();
+                final boolean carrier = isPfCarrierUp(pfName);
+                details.put("sriov.vfs." + pfName + ".carrier", String.valueOf(carrier));
+                if (!carrier) {
+                    LOGGER.warn("SR-IOV PF {} has no carrier; not advertising {} VF(s) for new allocation "
+                            + "(physical link/LACP partner required)", pfName, e.getValue().size());
+                    // Still publish count=0 so operators can see the PF was detected.
+                    details.put("sriov.vfs." + pfName + ".count", "0");
+                    continue;
+                }
+                details.put("sriov.vfs." + pfName + ".count", String.valueOf(e.getValue().size()));
+                details.put("sriov.vfs." + pfName + ".pci", String.join(",", e.getValue()));
             }
         } catch (Exception e) {
             LOGGER.warn("Failed to inspect SR-IOV capabilities; HW offload may not be available", e);
         }
+    }
+
+    /**
+     * True when the PF netdev reports kernel carrier (link detected). Missing
+     * sysfs or unreadable carrier is treated as down so we do not advertise
+     * VFs on an uncertain uplink (e.g. dx6p1 LACP NO-CARRIER).
+     */
+    static boolean isPfCarrierUp(final String pfName) {
+        if (StringUtils.isBlank(pfName)) {
+            return false;
+        }
+        final String carrier = readSysfs(new java.io.File("/sys/class/net/" + pfName + "/carrier")).trim();
+        return "1".equals(carrier);
     }
 
     /**
