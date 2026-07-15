@@ -57,6 +57,9 @@
     <!-- Admin API service (Phase I.5). -->
     <bean id="ovnAdminService" class="com.cloud.network.ovn.manager.OvnAdminServiceImpl"/>
 
+    <!-- CKS worker NIC discovery for auto ECMP / auto LB (optional k8s DAOs). -->
+    <bean id="ovnCksWorkerDiscovery" class="com.cloud.network.ovn.manager.OvnCksWorkerDiscovery"/>
+
     <!-- On-demand orphan / stale-mapping reaper (admin runOvnReconciler API). -->
     <bean id="ovnReconcilerService" class="com.cloud.network.ovn.manager.OvnReconcilerService"/>
 
