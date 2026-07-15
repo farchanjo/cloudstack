@@ -22,19 +22,20 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
+import java.util.Map;
+
 import javax.inject.Inject;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.KubernetesServiceHelper.KubernetesClusterNodeType;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
+import com.cloud.utils.component.ComponentContext;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
 import com.cloud.vm.VMInstanceVO;
@@ -46,11 +47,11 @@ import com.cloud.vm.dao.VMInstanceDao;
  * Discovers CKS <b>worker</b> guest IPs on a CloudStack tier network from
  * inventory ({@code kubernetes_cluster_vm_map} + NICs). No Kubernetes API.
  *
- * <p>CKS DAOs are optional: when the kubernetes-service plugin is absent the
- * Spring beans are missing and every list method returns empty (auto ECMP /
- * auto LB stay no-ops).
+ * <p>CKS DAOs live in the kubernetes-service Spring module (sibling of OVN). Field
+ * injection often cannot see them, so they are resolved lazily via
+ * {@link ComponentContext} (root context). When the plugin is absent, lists
+ * stay empty (auto ECMP / auto LB no-ops).
  */
-@Component
 public class OvnCksWorkerDiscovery {
 
     private static final Logger LOGGER = LogManager.getLogger(OvnCksWorkerDiscovery.class);
@@ -60,13 +61,6 @@ public class OvnCksWorkerDiscovery {
     @Inject
     private VMInstanceDao vmInstanceDao;
 
-    /** Optional — null when kubernetes-service plugin is not loaded. */
-    @Autowired(required = false)
-    private KubernetesClusterDao kubernetesClusterDao;
-    /** Optional — null when kubernetes-service plugin is not loaded. */
-    @Autowired(required = false)
-    private KubernetesClusterVmMapDao kubernetesClusterVmMapDao;
-
     /**
      * Running WORKER guest IPs (v4 and/or v6) on {@code networkId} for the CKS
      * cluster identified by UUID.
@@ -75,17 +69,19 @@ public class OvnCksWorkerDiscovery {
         if (StringUtils.isBlank(clusterUuid) || nicDao == null || vmInstanceDao == null) {
             return WorkerIps.empty();
         }
-        if (kubernetesClusterDao == null || kubernetesClusterVmMapDao == null) {
-            LOGGER.debug("OvnCksWorkerDiscovery: kubernetes DAOs unavailable; auto paths disabled");
+        final KubernetesClusterDao clusterDao = lookup(KubernetesClusterDao.class);
+        final KubernetesClusterVmMapDao mapDao = lookup(KubernetesClusterVmMapDao.class);
+        if (clusterDao == null || mapDao == null) {
+            LOGGER.warn("OvnCksWorkerDiscovery: kubernetes DAOs unavailable; auto paths disabled");
             return WorkerIps.empty();
         }
-        final KubernetesClusterVO cluster = kubernetesClusterDao.findByUuid(clusterUuid.trim());
+        final KubernetesClusterVO cluster = clusterDao.findByUuid(clusterUuid.trim());
         if (cluster == null) {
             LOGGER.warn("OvnCksWorkerDiscovery: CKS cluster uuid={} not found", clusterUuid);
             return WorkerIps.empty();
         }
         final List<KubernetesClusterVmMapVO> workers =
-                kubernetesClusterVmMapDao.listByClusterIdAndVmType(cluster.getId(), KubernetesClusterNodeType.WORKER);
+                mapDao.listByClusterIdAndVmType(cluster.getId(), KubernetesClusterNodeType.WORKER);
         if (workers == null || workers.isEmpty()) {
             return WorkerIps.empty();
         }
@@ -121,6 +117,10 @@ public class OvnCksWorkerDiscovery {
                 }
             }
         }
+        if (LOGGER.isInfoEnabled()) {
+            LOGGER.info("OvnCksWorkerDiscovery: cluster={} networkId={} workers v4={} v6={}",
+                    clusterUuid, networkId, v4.size(), v6.size());
+        }
         return new WorkerIps(new ArrayList<>(v4), new ArrayList<>(v6));
     }
 
@@ -129,14 +129,28 @@ public class OvnCksWorkerDiscovery {
      * numeric id (used by tests / call sites that already have the id).
      */
     public WorkerIps listWorkerGuestIpsByClusterId(final long clusterId, final long networkId) {
-        if (kubernetesClusterDao == null) {
+        final KubernetesClusterDao clusterDao = lookup(KubernetesClusterDao.class);
+        if (clusterDao == null) {
             return WorkerIps.empty();
         }
-        final KubernetesClusterVO cluster = kubernetesClusterDao.findById(clusterId);
+        final KubernetesClusterVO cluster = clusterDao.findById(clusterId);
         if (cluster == null || StringUtils.isBlank(cluster.getUuid())) {
             return WorkerIps.empty();
         }
         return listWorkerGuestIps(cluster.getUuid(), networkId);
+    }
+
+    private static <T> T lookup(final Class<T> type) {
+        try {
+            final Map<String, T> map = ComponentContext.getComponentsOfType(type);
+            if (map == null || map.isEmpty()) {
+                return null;
+            }
+            return map.values().iterator().next();
+        } catch (RuntimeException re) {
+            LOGGER.debug("OvnCksWorkerDiscovery: lookup {} failed: {}", type.getSimpleName(), re.getMessage());
+            return null;
+        }
     }
 
     /** Dual-stack guest IPs of Running WORKER nodes on one tier. */
