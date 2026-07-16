@@ -129,6 +129,8 @@ public class OvnPendingDeletionProcessor implements Configurable {
     private OvnPluginManager pluginManager;
     @Inject
     private AlertManager alertManager;
+    @Inject
+    private OvnReconcileLeader reconcileLeader;
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> handle;
@@ -169,6 +171,15 @@ public class OvnPendingDeletionProcessor implements Configurable {
      */
     void tick() {
         try {
+            // Multi-node management cluster: sentinel promotion is a
+            // check-then-act (isPendingByOvnUuid -> persist) with no unique
+            // constraint on (ovn_uuid, kind), and rows carry no claim/lease —
+            // two nodes ticking together duplicate rows and double-process
+            // them. Only the leader runs the pass (fail-closed, next interval
+            // retries); see OvnReconcileLeader.
+            if (!reconcileLeader.isLeader()) {
+                return;
+            }
             processSentinels();
             processRealRows();
         } catch (RuntimeException re) {
@@ -206,7 +217,16 @@ public class OvnPendingDeletionProcessor implements Configurable {
             if (rows == null || rows.isEmpty()) {
                 continue;
             }
-            final OvnNbClient nb = pluginManager.nbClient(controller.getZoneId());
+            final OvnNbClient nb;
+            try {
+                nb = pluginManager.nbClient(controller.getZoneId());
+            } catch (RuntimeException re) {
+                // One zone's missing/unreachable controller must not abort the
+                // remaining controllers' batches for the whole tick.
+                LOGGER.warn("OvnPendingDeletionProcessor: NB client unavailable for zone {} ({}); skipping its batch",
+                        controller.getZoneId(), re.getMessage());
+                continue;
+            }
             for (final OvnPendingDeletionVO row : rows) {
                 processOneRow(row, nb, controller.getId());
             }
