@@ -35,33 +35,36 @@ import com.cloud.utils.component.Manager;
  * */
 public interface VfPoolManager extends Manager {
 
+    // Dynamic: plan/approval/apply gates must take effect on the next singleton sweep
+    // without a management restart. Defaults stay fail-closed. Do not cache these
+    // values outside ConfigKey; always re-read via .value() on each gate evaluation.
     ConfigKey<Boolean> LegacyBroadVfOperationsEnabled = new ConfigKey<>("Advanced", Boolean.class,
             "vf.legacy.broad.operations.enabled", "false",
             "Emergency compatibility gate for legacy broad VF release/recovery. Keep false during rolling rollout.",
-            false);
+            true);
 
     ConfigKey<Boolean> OwnershipRepairPlanEnabled = new ConfigKey<>("Advanced", Boolean.class,
             "vf.ownership.repair.plan.enabled", "false",
-            "Build and log an exact non-mutating VF ownership repair plan. Does not authorize apply.", false);
+            "Build and log an exact non-mutating VF ownership repair plan. Does not authorize apply.", true);
 
     ConfigKey<Boolean> OwnershipRepairApplyEnabled = new ConfigKey<>("Advanced", Boolean.class,
             "vf.ownership.repair.apply.enabled", "false",
-            "Allow application of an exact separately approved VF ownership repair plan.", false);
+            "Allow application of an exact separately approved VF ownership repair plan.", true);
 
     ConfigKey<Integer> OwnershipRepairApprovedCount = new ConfigKey<>("Advanced", Integer.class,
-            "vf.ownership.repair.approved.count", "0", "Exact approved reconciliation candidate count.", false);
+            "vf.ownership.repair.approved.count", "0", "Exact approved reconciliation candidate count.", true);
 
     ConfigKey<String> OwnershipRepairApprovedIds = new ConfigKey<>("Advanced", String.class,
-            "vf.ownership.repair.approved.ids", "", "Sorted comma-separated exact approved candidate ids.", false);
+            "vf.ownership.repair.approved.ids", "", "Sorted comma-separated exact approved candidate ids.", true);
 
     ConfigKey<String> OwnershipRepairApprovedHash = new ConfigKey<>("Advanced", String.class,
-            "vf.ownership.repair.approved.hash", "", "Exact SHA-256 hash of the approved repair plan.", false);
+            "vf.ownership.repair.approved.hash", "", "Exact SHA-256 hash of the approved repair plan.", true);
 
     ConfigKey<String> OwnershipRepairApprovalToken = new ConfigKey<>("Advanced", String.class,
-            "vf.ownership.repair.approval.token", "", "Exact token emitted with the approved repair plan.", false);
+            "vf.ownership.repair.approval.token", "", "Exact token emitted with the approved repair plan.", true);
 
     ConfigKey<String> OwnershipRepairIncidentId = new ConfigKey<>("Advanced", String.class,
-            "vf.ownership.repair.incident.id", "", "Exact one-time internal incident plan ID; never generic authorization.", false);
+            "vf.ownership.repair.incident.id", "", "Exact one-time internal incident plan ID; never generic authorization.", true);
 
     /**
      * Discover VFs reported by the host (called by the StartupRoutingCommand processor)

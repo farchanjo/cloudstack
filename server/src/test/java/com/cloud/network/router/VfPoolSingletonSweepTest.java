@@ -110,6 +110,18 @@ public class VfPoolSingletonSweepTest {
         assertTrue("false".equals(VfPoolManager.LegacyBroadVfOperationsEnabled.defaultValue()));
     }
 
+    @Test
+    public void ownershipOperationalConfigKeysAreDynamic() {
+        assertTrue(VfPoolManager.LegacyBroadVfOperationsEnabled.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairPlanEnabled.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairApplyEnabled.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairApprovedCount.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairApprovedIds.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairApprovedHash.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairApprovalToken.isDynamic());
+        assertTrue(VfPoolManager.OwnershipRepairIncidentId.isDynamic());
+    }
+
     private static final class TestManager extends VfPoolManagerImpl {
         private final GlobalLock lock;
 
