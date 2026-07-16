@@ -1970,6 +1970,14 @@ public class OvnReconcilerService {
             }
             out.recordStaleMapping("BGP_ANNOUNCE", row);
             if (!dryRun) {
+                // Clean FRR first: the row is the LAST record of which host(s)
+                // still hold the /32 — dropping it without a successful
+                // withdraw would orphan the route with no cleanup handle left.
+                if (!bgpRedistributeManager.withdrawStaleAnnounceRow(row)) {
+                    LOGGER.warn("OvnReconcilerService: stale BGP_ANNOUNCE row ip_id={} host(s)={} withdraw "
+                            + "incomplete; row retained for retry", row.getCsId(), row.getOvnUuid());
+                    continue;
+                }
                 logicalIdMapDao.remove(row.getId());
                 LOGGER.info("OvnReconcilerService: dropped stale BGP_ANNOUNCE row ip_id={} host={}",
                         row.getCsId(), row.getOvnUuid());

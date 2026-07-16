@@ -197,18 +197,28 @@ public class OvnBgpRedistributeManager {
                 announced.add(hostId);
             }
         }
-        // Withdraw hosts that no longer host a backend (or left the gateway pin).
-        for (final Long stale : previousHosts) {
-            if (!desiredSet.contains(stale)) {
-                sendCommand(stale, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
-            }
-        }
         if (announced.isEmpty()) {
-            LOGGER.warn("OvnBgpRedistribute.announce: {}/32 failed on all hosts {} (ip_id={}, vpc={})",
-                    publicIp, desiredHosts, ipAddrId, vpcId);
+            // Keep the previous announces AND the previous mapping intact:
+            // withdrawing the stale hosts before at least one new announce
+            // landed would blackhole the VIP entirely (e.g. the new host's
+            // agent is Connecting during a fabric incident). Next reconcile
+            // tick retries the whole set.
+            LOGGER.warn("OvnBgpRedistribute.announce: {}/32 failed on all hosts {} (ip_id={}, vpc={}); "
+                    + "previous announce set retained", publicIp, desiredHosts, ipAddrId, vpcId);
             return;
         }
-        persistAnnounceHosts(controller.getId(), ipAddrId, announced, publicIp);
+        // Withdraw hosts that no longer host a backend (or left the gateway
+        // pin) — only now that the new announce landed somewhere. A stale host
+        // whose withdraw fails (agent down) stays in the persisted set so the
+        // next announce pass retries the withdraw instead of orphaning it.
+        final List<Long> persisted = new ArrayList<>(announced);
+        for (final Long stale : previousHosts) {
+            if (!desiredSet.contains(stale)
+                    && !sendCommand(stale, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+                persisted.add(stale);
+            }
+        }
+        persistAnnounceHosts(controller.getId(), ipAddrId, persisted, publicIp);
         lastHostByIp.put(publicIp, announced.get(0));
         LOGGER.info("OvnBgpRedistribute.announce: {}/32 announced on host(s) {} (ip_id={}, vpc={}, lbOnly={})",
                 publicIp, announced, ipAddrId, vpcId, isLbOnlyPublicIp(ipAddrId));
@@ -244,11 +254,27 @@ public class OvnBgpRedistributeManager {
             return;
         }
         final List<Long> hostIds = parseHostIds(mapping.getOvnUuid());
+        final List<Long> failed = new ArrayList<>();
         for (final Long hostId : hostIds) {
             // Withdraw needs no next-hop and no anchor: the wrapper deletes the
             // /32 route by prefix and writes `no network <ip>/32`. The chassis
             // anchor is shared across FIPs and is NOT torn down per withdraw.
-            sendCommand(hostId, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            if (!sendCommand(hostId, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+                failed.add(hostId);
+            }
+        }
+        if (!failed.isEmpty()) {
+            // Do NOT drop the bookkeeping row while a host still holds the
+            // /32 (agent down/Connecting): there is no invent-missing pass for
+            // withdraws, so the FRR route would be orphaned forever and hijack
+            // the prefix if the IP is later reallocated. Keep only the failed
+            // hosts; reconcileZone retries them once the IP has no users.
+            mapping.setOvnUuid(encodeHostIds(failed));
+            logicalIdMapDao.update(mapping.getId(), mapping);
+            lastHostByIp.remove(publicIp);
+            LOGGER.warn("OvnBgpRedistribute.withdraw: {}/32 withdraw pending on host(s) {} (ip_id={}, vpc={}); "
+                    + "row retained for retry", publicIp, failed, ipAddrId, vpcId);
+            return;
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -422,8 +448,15 @@ public class OvnBgpRedistributeManager {
             return;
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
-        if (hostId != null) {
-            sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+        if (hostId != null
+                && !sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+            // Host still holds the announce (agent down) — keep the row so a
+            // later withdrawSubnet call / operator pass can retry instead of
+            // orphaning the FRR route.
+            lastHostByIp.remove(cidr);
+            LOGGER.warn("OvnBgpRedistribute.withdrawSubnet: {} withdraw pending on host {} (net={}, vpc={}); "
+                    + "row retained for retry", cidr, hostId, networkId, vpcId);
+            return;
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -534,17 +567,21 @@ public class OvnBgpRedistributeManager {
                 announced.add(hostId);
             }
         }
-        for (final Long stale : previousHosts) {
-            if (!desiredSet.contains(stale)) {
-                sendSubnetCommand(stale, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
-            }
-        }
         if (announced.isEmpty()) {
-            LOGGER.warn("OvnBgpRedistribute.announceHost6: {}/128 failed on all hosts {} (vpc={})",
-                    canonicalVip, desiredHosts, vpcId);
+            // Same ordering rule as announce(): never withdraw the previous
+            // set before a new announce landed — that blackholes the VIP.
+            LOGGER.warn("OvnBgpRedistribute.announceHost6: {}/128 failed on all hosts {} (vpc={}); "
+                    + "previous announce set retained", canonicalVip, desiredHosts, vpcId);
             return;
         }
-        persistHostAnnounceV6Hosts(controller.getId(), csId, announced, canonicalVip);
+        final List<Long> persisted = new ArrayList<>(announced);
+        for (final Long stale : previousHosts) {
+            if (!desiredSet.contains(stale)
+                    && !sendSubnetCommand(stale, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+                persisted.add(stale);
+            }
+        }
+        persistHostAnnounceV6Hosts(controller.getId(), csId, persisted, canonicalVip);
         lastHostByIp.put(cidr, announced.get(0));
         LOGGER.info("OvnBgpRedistribute.announceHost6: {}/128 announced on host(s) {} (vpc={})",
                 canonicalVip, announced, vpcId);
@@ -572,8 +609,19 @@ public class OvnBgpRedistributeManager {
             return;
         }
         final List<Long> hostIds = parseHostIds(mapping.getOvnUuid());
+        final List<Long> failed = new ArrayList<>();
         for (final Long hostId : hostIds) {
-            sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+            if (!sendSubnetCommand(hostId, cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+                failed.add(hostId);
+            }
+        }
+        if (!failed.isEmpty()) {
+            mapping.setOvnUuid(encodeHostIds(failed));
+            logicalIdMapDao.update(mapping.getId(), mapping);
+            lastHostByIp.remove(cidr);
+            LOGGER.warn("OvnBgpRedistribute.withdrawHost6: {}/128 withdraw pending on host(s) {} (vpc={}); "
+                    + "row retained for retry", canonicalVip, failed, vpcId);
+            return;
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -670,8 +718,12 @@ public class OvnBgpRedistributeManager {
             return;
         }
         final Long hostId = parseHostId(mapping.getOvnUuid());
-        if (hostId != null) {
-            sendSubnetCommand(hostId, ip6Cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW);
+        if (hostId != null
+                && !sendSubnetCommand(hostId, ip6Cidr, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+            lastHostByIp.remove(ip6Cidr);
+            LOGGER.warn("OvnBgpRedistribute.withdrawSubnet6: {} withdraw pending on host {} (net={}, vpc={}); "
+                    + "row retained for retry", ip6Cidr, hostId, networkId, vpcId);
+            return;
         }
         try {
             logicalIdMapDao.remove(mapping.getId());
@@ -741,6 +793,19 @@ public class OvnBgpRedistributeManager {
                 continue;
             }
             final long ipAddrId = row.getCsId();
+            // A row whose IP no longer has active users is a deferred
+            // withdraw (kept because a host agent was down at release time).
+            // Retry the withdraw instead of re-announcing a released IP; drop
+            // the row only when every recorded host acked.
+            if (!publicIpHasActiveUsers(ipAddrId)) {
+                if (withdrawStaleAnnounceRow(row)) {
+                    logicalIdMapDao.remove(row.getId());
+                    lastHostByIp.remove(publicIp);
+                    LOGGER.info("OvnBgpRedistribute.reconcileZone: {}/32 deferred withdraw completed; "
+                            + "row dropped (ip_id={})", publicIp, ipAddrId);
+                }
+                continue;
+            }
             // Option B: LB-only membership is derived from backends every tick.
             if (isLbOnlyPublicIp(ipAddrId)) {
                 final IpAddress ip = ipAddressDao == null ? null : ipAddressDao.findById(ipAddrId);
@@ -751,9 +816,6 @@ public class OvnBgpRedistributeManager {
             }
             final List<Long> lastHosts = parseHostIds(row.getOvnUuid());
             if (lastHosts.size() == 1 && currentGw.equals(lastHosts.get(0))) {
-                continue;
-            }
-            if (lastHosts.contains(currentGw) && lastHosts.size() == 1) {
                 continue;
             }
             // Gateway-pinned VIP: announce on current GW first, then withdraw stale.
@@ -780,6 +842,28 @@ public class OvnBgpRedistributeManager {
     }
 
     /* ---------- internal helpers ---------- */
+
+    /**
+     * Best-effort FRR cleanup for a stale/deferred {@link Kind#BGP_ANNOUNCE}
+     * row: withdraw the recorded /32 on every host in the row's host list.
+     * Returns {@code true} only when every send was acked — callers must keep
+     * the row (for a later retry) otherwise. Package-visible so
+     * {@code OvnReconcilerService}'s stale-row sweep can clean FRR before
+     * dropping bookkeeping.
+     */
+    boolean withdrawStaleAnnounceRow(final OvnLogicalIdMapVO row) {
+        final String publicIp = row.getOvnName();
+        if (StringUtils.isBlank(publicIp)) {
+            return true;
+        }
+        boolean allAcked = true;
+        for (final Long hostId : parseHostIds(row.getOvnUuid())) {
+            if (!sendCommand(hostId, publicIp, null, null, null, null, null, OvnBgpAnnounceCommand.OP_WITHDRAW)) {
+                allAcked = false;
+            }
+        }
+        return allAcked;
+    }
 
     private boolean isEnabled(final long vpcId) {
         return publicNetworkManager != null && publicNetworkManager.isBgpRedistributeEnabled(vpcId);
