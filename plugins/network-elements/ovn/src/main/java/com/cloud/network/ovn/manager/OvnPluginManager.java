@@ -19,6 +19,7 @@ package com.cloud.network.ovn.manager;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import javax.annotation.PreDestroy;
 import javax.inject.Inject;
 
 import org.apache.logging.log4j.LogManager;
@@ -96,6 +97,22 @@ public class OvnPluginManager {
         final OvnSbClient sb = sbCache.remove(zoneId);
         if (sb != null) {
             sb.close();
+        }
+    }
+
+    /**
+     * Close every cached NB/SB client on bean shutdown. Without this a
+     * graceful management-server stop / Spring context refresh leaked the
+     * cached OVSDB TCP connections ({@link #invalidate} is zone-scoped and
+     * only reachable from the admin API).
+     */
+    @PreDestroy
+    public void shutdown() {
+        for (final Long zoneId : nbCache.keySet()) {
+            invalidate(zoneId);
+        }
+        for (final Long zoneId : sbCache.keySet()) {
+            invalidate(zoneId);
         }
     }
 
