@@ -28,10 +28,14 @@ import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
 
+import org.apache.cloudstack.management.ManagementServerHost;
+import org.apache.cloudstack.utils.identity.ManagementServerNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.stereotype.Component;
 
+import com.cloud.cluster.ManagementServerHostVO;
+import com.cloud.cluster.dao.ManagementServerHostDao;
 import com.cloud.network.ovn.config.OvnNetworkConfig;
 import com.cloud.network.ovn.dao.OvnControllerDao;
 import com.cloud.network.ovn.dao.OvnControllerVO;
@@ -64,9 +68,13 @@ public class OvnBgpReconcileTask {
     private OvnBgpRedistributeManager bgpRedistributeManager;
     @Inject
     private OvnReconcilerService reconcilerService;
+    @Inject
+    private ManagementServerHostDao msHostDao;
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> handle;
+    /** Last observed leadership so transitions are logged exactly once. */
+    private volatile Boolean lastLeaderState;
 
     @PostConstruct
     public void start() {
@@ -96,6 +104,9 @@ public class OvnBgpReconcileTask {
      */
     void tick() {
         try {
+            if (!isReconcileLeader()) {
+                return;
+            }
             final List<OvnControllerVO> controllers = controllerDao.listAll();
             if (controllers == null || controllers.isEmpty()) {
                 return;
@@ -142,6 +153,40 @@ public class OvnBgpReconcileTask {
         } catch (RuntimeException re) {
             LOGGER.warn("OvnBgpReconcileTask: tick failed: {}", re.getMessage());
         }
+    }
+
+    /**
+     * Leader gate: on a multi-node management cluster only ONE node may drive
+     * the reconcile pass — the Up node with the lowest {@code msid}. Without
+     * this every node re-announced every prefix each tick (3x duplicate agent
+     * commands, concurrent NB rewrites, tripled WARN spam while an agent was
+     * degraded — observed during the 2026-07-16 fabric storm).
+     *
+     * <p>Fail-open: if the ms_host view is empty or unreadable the node
+     * reconciles anyway — a duplicated idempotent pass is cheaper than an
+     * orphaned zone with nobody reconciling.
+     */
+    boolean isReconcileLeader() {
+        boolean leader = true;
+        try {
+            final List<ManagementServerHostVO> up = msHostDao.listBy(ManagementServerHost.State.Up);
+            if (up != null && !up.isEmpty()) {
+                long min = Long.MAX_VALUE;
+                for (final ManagementServerHostVO ms : up) {
+                    min = Math.min(min, ms.getMsid());
+                }
+                leader = ManagementServerNode.getManagementServerId() == min;
+            }
+        } catch (RuntimeException re) {
+            LOGGER.warn("OvnBgpReconcileTask: leader check failed ({}); reconciling fail-open", re.getMessage());
+        }
+        final Boolean previous = lastLeaderState;
+        if (previous == null || previous.booleanValue() != leader) {
+            lastLeaderState = leader;
+            LOGGER.info("OvnBgpReconcileTask: this node is {} the OVN reconcile leader",
+                    leader ? "now" : "no longer");
+        }
+        return leader;
     }
 
     private void resyncLspExtraPortSecurity(final List<OvnControllerVO> controllers) {

@@ -98,6 +98,11 @@
             <artifactId>cloud-framework-db</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <dependency>
+            <groupId>org.apache.cloudstack</groupId>
+            <artifactId>cloud-framework-cluster</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <!--
           Jackson (managed by the root pom) is the only protocol-level
           dependency. JDK NIO sockets handle transport.
