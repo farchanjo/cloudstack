@@ -38,7 +38,6 @@ import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.resource.LibvirtKvmAgentHook;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.DiskDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef;
-import com.cloud.hypervisor.kvm.resource.OvnVifDriver;
 import com.cloud.hypervisor.kvm.resource.VifDriver;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
@@ -172,15 +171,9 @@ public final class LibvirtStopCommandWrapper extends CommandWrapper<StopCommand,
                             removeDpdkPort(to.getPort());
                         }
                     }
-                    // Domain already gone (or never defined): no InterfaceDef
-                    // list to fan out unplug. Residual free heals OVS reps that
-                    // still carry iface-id/attached-mac for dead guests (CKS /
-                    // systemvm start-fail orphans, domain-gone stops).
-                    try {
-                        OvnVifDriver.freeStaleFreeVfRepresentors(logger, "LibvirtStopCommandWrapper", false);
-                    } catch (Exception e) {
-                        logger.warn("LibvirtStopCommandWrapper: residual OVS/VF free failed: {}", e.getMessage());
-                    }
+                    // Domain already gone (or never defined): there is no
+                    // explicit InterfaceDef/BDF ownership to clean safely.
+                    // Management reconciliation may issue a targeted cleanup.
                 } else {
                     for (final InterfaceDef iface : ifaces) {
                         String vlanId = libvirtComputingResource.getVlanIdFromBridgeName(iface.getBrName());

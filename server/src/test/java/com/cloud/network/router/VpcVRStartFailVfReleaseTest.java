@@ -74,9 +74,9 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.State.Starting,
                         VirtualMachine.Event.OperationFailed,
                         VirtualMachine.State.Stopped, null);
-        when(vfPoolManager.releaseByVmId(VM_ID)).thenReturn(2);
+        when(vfPoolManager.quarantineByVmId(VM_ID)).thenReturn(2);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, times(1)).releaseByVmId(VM_ID);
+        verify(vfPoolManager, times(1)).quarantineByVmId(VM_ID);
     }
 
     @Test
@@ -88,7 +88,7 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.AgentReportStopped,
                         VirtualMachine.State.Stopped, null);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, times(1)).releaseByVmId(VM_ID);
+        verify(vfPoolManager, times(1)).quarantineByVmId(VM_ID);
     }
 
     @Test
@@ -100,7 +100,7 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.AgentReportShutdowned,
                         VirtualMachine.State.Stopped, null);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, times(1)).releaseByVmId(VM_ID);
+        verify(vfPoolManager, times(1)).quarantineByVmId(VM_ID);
     }
 
     @Test
@@ -112,7 +112,7 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.StopRequested,
                         VirtualMachine.State.Stopping, null);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, never()).releaseByVmId(eq(VM_ID));
+        verify(vfPoolManager, never()).quarantineByVmId(eq(VM_ID));
     }
 
     @Test
@@ -124,7 +124,7 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.OperationSucceeded,
                         VirtualMachine.State.Stopped, null);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, never()).releaseByVmId(eq(VM_ID));
+        verify(vfPoolManager, never()).quarantineByVmId(eq(VM_ID));
     }
 
     @Test
@@ -136,7 +136,7 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.OperationFailed,
                         VirtualMachine.State.Stopped, null);
         releaseHwOffloadVfsOnBootFail.invoke(mgr, transition, vm);
-        verify(vfPoolManager, never()).releaseByVmId(eq(VM_ID));
+        verify(vfPoolManager, never()).quarantineByVmId(eq(VM_ID));
     }
 
     @Test
@@ -150,12 +150,12 @@ public class VpcVRStartFailVfReleaseTest {
                         VirtualMachine.Event.OperationFailed,
                         VirtualMachine.State.Stopped, null);
         releaseHwOffloadVfsOnBootFail.invoke(barebones, transition, vm);
-        verify(vfPoolManager, never()).releaseByVmId(eq(VM_ID));
+        verify(vfPoolManager, never()).quarantineByVmId(eq(VM_ID));
     }
 
     @Test
     public void releaseSwallowsManagerException() throws Exception {
-        when(vfPoolManager.releaseByVmId(VM_ID)).thenThrow(new RuntimeException("DB hiccup"));
+        when(vfPoolManager.quarantineByVmId(VM_ID)).thenThrow(new RuntimeException("DB hiccup"));
         VirtualMachine vm = mockVm(VirtualMachine.Type.DomainRouter);
         StateMachine2.Transition<VirtualMachine.State, VirtualMachine.Event> transition =
                 new StateMachine2.Transition<>(

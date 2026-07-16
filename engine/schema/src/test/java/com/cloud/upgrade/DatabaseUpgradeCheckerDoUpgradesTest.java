@@ -18,6 +18,7 @@ package com.cloud.upgrade;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
 
 import com.cloud.upgrade.dao.VersionDao;
 import com.cloud.upgrade.dao.VersionDaoImpl;
@@ -89,6 +90,11 @@ public class DatabaseUpgradeCheckerDoUpgradesTest {
         protected void handleClusteredUpgradeRequired() {
             clusterHandlerCalled = true;
         }
+
+        @Override
+        protected void executeViewScripts() {
+            // This unit test verifies upgrade routing, not filesystem-backed SQL view execution.
+        }
     }
 
     @Test
@@ -96,7 +102,7 @@ public class DatabaseUpgradeCheckerDoUpgradesTest {
         TestableChecker checker = new TestableChecker("4.8.0");
         checker.implVersionOverride = ""; // blank -> should return early
 
-        GlobalLock lock = GlobalLock.getInternLock("test-noimpl");
+        GlobalLock lock = mock(GlobalLock.class);
         try {
             // acquire lock so doUpgrades can safely call unlock in finally
             lock.lock(1);
@@ -118,7 +124,7 @@ public class DatabaseUpgradeCheckerDoUpgradesTest {
         checker.implVersionOverride = "4.8.1";
         checker.sysVmMetadataOverride = "4.8.1";
 
-        GlobalLock lock = GlobalLock.getInternLock("test-uptodate");
+        GlobalLock lock = mock(GlobalLock.class);
         try {
             lock.lock(1);
             checker.doUpgrades(lock);
@@ -138,7 +144,7 @@ public class DatabaseUpgradeCheckerDoUpgradesTest {
         checker.sysVmMetadataOverride = "4.8.2";
         checker.standaloneOverride = true;
 
-        GlobalLock lock = GlobalLock.getInternLock("test-upgrade-standalone");
+        GlobalLock lock = mock(GlobalLock.class);
         try {
             lock.lock(1);
             checker.doUpgrades(lock);
@@ -158,7 +164,7 @@ public class DatabaseUpgradeCheckerDoUpgradesTest {
         checker.sysVmMetadataOverride = "4.8.2";
         checker.standaloneOverride = false;
 
-        GlobalLock lock = GlobalLock.getInternLock("test-upgrade-clustered");
+        GlobalLock lock = mock(GlobalLock.class);
         try {
             lock.lock(1);
             checker.doUpgrades(lock);

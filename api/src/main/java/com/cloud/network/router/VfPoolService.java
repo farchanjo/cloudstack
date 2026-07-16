@@ -17,7 +17,7 @@
 package com.cloud.network.router;
 
 /**
- * Public façade over {@code VfPoolManager} for the API module. Phase H.1.
+ * Public façade over the legacy VF host admin commands.
  *
  * <p>The {@code server} module's {@code VfPoolManager} carries the full DAO +
  * lifecycle surface that internal callers need; admin API commands only need
@@ -29,29 +29,14 @@ package com.cloud.network.router;
 public interface VfPoolService {
 
     /**
-     * Force every {@code ALLOCATED} or {@code SUSPECT} VF row on the host
-     * back to {@code FREE}. Returns the number of rows released. Idempotent.
+     * Default-off legacy entry. When explicitly enabled it only quarantines
+     * rows as {@code SUSPECT}; it never performs broad DB-only FREE updates.
      */
     int forceReleaseByHostId(long hostId);
 
     /**
-     * Recover the VF pool state for the host by re-binding every
-     * {@code FREE} pool entry to the live NIC that still references it via
-     * {@code nics.vf_pool_id}. Walks {@code nics} → {@code vm_instance}
-     * filtering on {@code v.removed IS NULL AND v.state IN
-     * ('Running','Starting','Stopping','Migrating')}, flips the matching
-     * pool row to {@code ALLOCATED}, stamps {@code allocated_to_nic_id}
-     * and refreshes {@code last_seen}. Idempotent.
-     *
-     * <p>Used after {@link #forceReleaseByHostId(long)} or any other event
-     * that wiped pool ownership while VMs were still alive on the
-     * hypervisor — e.g. after a mgmt-side reset, a schema upgrade rebuild,
-     * or operator triage. Restores the pool ↔ NIC linkage without
-     * touching the live qemu / libvirt domain XML, which keeps the
-     * existing vfio-pci binding intact.
-     *
-     * <p>Returns the number of rows promoted from {@code FREE} to
-     * {@code ALLOCATED}.
+     * Deactivated broad recovery entry. Returns zero; ownership repair must
+     * use the leader/GlobalLock/exact-plan approval path.
      */
     int recoverByHostId(long hostId);
 }

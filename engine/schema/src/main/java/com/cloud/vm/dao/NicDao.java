@@ -62,6 +62,9 @@ public interface NicDao extends GenericDao<NicVO, Long> {
 
     NicVO findByNetworkIdAndMacAddress(long networkId, String mac);
 
+    /** Active NICs matching an exact MAC; callers must treat multiple rows as ambiguous. */
+    List<NicVO> listByMacAddress(String macAddress);
+
     NicVO findDefaultNicForVM(long instanceId);
 
     NicVO findFirstNicForVM(long instanceId);

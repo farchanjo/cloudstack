@@ -33,9 +33,15 @@ import static org.mockito.Mockito.when;
 
 import java.util.List;
 
+import com.cloud.agent.AgentManager;
+import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
+import com.cloud.agent.api.HostVfPurgeOrphansAnswer.TargetResult;
+import com.cloud.agent.api.HostVfPurgeOrphansCommand;
 import com.cloud.network.router.SriovVfPoolVO.State;
 import com.cloud.network.router.SriovVfPoolVO.VdpaKind;
 import com.cloud.network.router.dao.SriovVfPoolDao;
+import com.cloud.vm.NicVO;
+import com.cloud.vm.dao.NicDao;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -62,6 +68,10 @@ public class VfPoolManagerVdpaTest {
 
     @Mock
     private SriovVfPoolDao vfPoolDao;
+    @Mock
+    private NicDao nicDao;
+    @Mock
+    private AgentManager agentManager;
 
     @InjectMocks
     private VfPoolManagerImpl manager;
@@ -96,26 +106,31 @@ public class VfPoolManagerVdpaTest {
     }
 
     @Test
-    public void releaseVdpaDelegatesToDao() {
-        when(vfPoolDao.releaseVdpa(7L)).thenReturn(true);
+    public void releaseVdpaUsesExactAgentEvidenceBeforeRelease() throws Exception {
+        final SriovVfPoolVO row = rowWithId(7L, "0000:01:00.5", "dx6p1", "dx6p1vf1", State.ALLOCATED);
+        row.setAllocatedToNicId(NIC_ID);
+        final NicVO nic = org.mockito.Mockito.mock(NicVO.class);
+        when(nic.getMacAddress()).thenReturn(MAC);
+        when(vfPoolDao.findById(7L)).thenReturn(row);
+        when(nicDao.findByIdIncludingRemoved(NIC_ID)).thenReturn(nic);
+        when(agentManager.send(eq(HOST_ID), any(HostVfPurgeOrphansCommand.class)))
+                .thenReturn(successAnswer("0000:01:00.5"));
+        when(vfPoolDao.releaseExact(7L, NIC_ID)).thenReturn(true);
+
         assertTrue(manager.releaseVdpa(7L));
-        verify(vfPoolDao, times(1)).releaseVdpa(7L);
+        verify(vfPoolDao).releaseExact(7L, NIC_ID);
     }
 
     @Test
     public void releaseVdpaReturnsFalseOnUnknownRow() {
-        when(vfPoolDao.releaseVdpa(404L)).thenReturn(false);
         assertFalse(manager.releaseVdpa(404L));
-        verify(vfPoolDao, times(1)).releaseVdpa(404L);
+        verify(vfPoolDao, never()).releaseExact(anyLong(), anyLong());
     }
 
     @Test
-    public void releaseVdpaDoesNotInvokePassthroughRelease() {
-        // Defensive: the manager must not silently re-route a vDPA release
-        // through release() — that would leave vdpa_name / vdpa_device set
-        // on the row.
-        when(vfPoolDao.releaseVdpa(7L)).thenReturn(true);
-        manager.releaseVdpa(7L);
+    public void releaseVdpaNeverInvokesDbOnlyFreePrimitive() {
+        manager.releaseVdpa(404L);
+        verify(vfPoolDao, never()).releaseVdpa(anyLong());
         verify(vfPoolDao, never()).release(anyLong());
     }
 
@@ -192,6 +207,22 @@ public class VfPoolManagerVdpaTest {
         row.setVdpaKind(VdpaKind.VDPA);
         row.setVdpaName("vdpa-" + NIC_ID);
         return row;
+    }
+
+    private static HostVfPurgeOrphansAnswer successAnswer(final String bdf) {
+        final HostVfPurgeOrphansCommand command = new HostVfPurgeOrphansCommand();
+        final HostVfPurgeOrphansAnswer answer = new HostVfPurgeOrphansAnswer(command, true, "ok");
+        final TargetResult result = new TargetResult(bdf, true, false, false, false, false, "absent");
+        result.setObservationComplete(true);
+        result.setMacObservation("UNASSIGNED_ZERO");
+        result.setExpectedMac(MAC);
+        result.setOwnerOperationId("release-7");
+        result.setOwnerPurpose("LIFECYCLE_RELEASE");
+        result.setOwnerToken(HostVfPurgeOrphansCommand.createOwnerToken(
+                bdf, MAC, "release-7", "LIFECYCLE_RELEASE"));
+        result.setLifecycleAuthorizationUsed(true);
+        answer.setTargetResults(List.of(result));
+        return answer;
     }
 
     private static SriovVfPoolVO rowWithId(long id, String pci, String pf, String rep, State state) throws Exception {

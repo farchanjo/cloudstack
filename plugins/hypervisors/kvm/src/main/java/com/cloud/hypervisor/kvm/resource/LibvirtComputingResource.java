@@ -1601,13 +1601,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
 
         setupMemoryBalloonStatsPeriod(conn);
 
-        // Residual FREE VF OVS heal (Chaos B) MUST run before Bug 25 re-stamp.
-        // Bug 25 walks every Interface with iface-id=lsp-* and re-stamps
-        // ovn-installed=true — that would re-activate FREE representors that
-        // still hold a stale iface-id from pre-fix unplug. Free them first
-        // (agent-local FREE heuristic: not vfio, no vdpa), then re-stamp the
-        // remaining ALLOCATED ports. Both walks run on one worker so configure
-        // is not delayed by ovs-vsctl.
+        // Re-stamp OVN state asynchronously. Destructive VF cleanup is never
+        // inferred locally at startup; it requires an explicit management-side
+        // PCI target through HostVfPurgeOrphansCommand.
         try {
             new Thread(this::reconcileFreeVfOvsThenOvnInstalled,
                     "ovn-free-vf-and-installed-startup-reconcile").start();
@@ -1620,17 +1616,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     /**
-     * Startup sequence: free residual FREE VF representors that still carry
-     * {@code external_ids:iface-id}, then re-stamp {@code ovn-installed} on
-     * remaining OVN ports (Bug 25). Order is load-bearing — see configure().
+     * Compatibility wrapper retained for tests and thread naming. Startup now
+     * performs only the non-destructive OVN installed-state re-stamp.
      */
     void reconcileFreeVfOvsThenOvnInstalled() {
-        try {
-            OvnVifDriver.freeStaleFreeVfRepresentors(LOGGER,
-                    "startup-free-stale-free-vf", false);
-        } catch (final Exception freeErr) {
-            LOGGER.warn("startup freeStaleFreeVfRepresentors failed: {}", freeErr.getMessage());
-        }
         reconcileOvnInstalledOnStartup();
     }
 
@@ -3949,8 +3938,7 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
      * Tear down a domain that started far enough to hold live VIFs (incl. OVN
      * vDPA / VF passthrough) but whose StartCommand must fail. Snapshot live
      * interface defs <em>before</em> destroy so unplug still has MAC/vhost
-     * metadata; destroy the domain; fan out {@link VifDriver#unplug}; residual
-     * OVS heal for any representor not owned by a running domain.
+     * metadata; destroy the domain; and fan out {@link VifDriver#unplug}.
      *
      * <p>Previously this only unplugged from the in-memory {@link LibvirtVMDef}
      * without destroying the domain — leaving QEMU + plugged vDPA/reps alive
@@ -3972,11 +3960,6 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             LOGGER.warn("handleVmStartFailure: stopVM {} failed: {}", vmName, e.getMessage());
         }
         cleanupVMNetworks(conn, ifaces);
-        try {
-            OvnVifDriver.freeStaleFreeVfRepresentors(LOGGER, "handleVmStartFailure", false);
-        } catch (Exception e) {
-            LOGGER.warn("handleVmStartFailure: residual OVS/VF free failed: {}", e.getMessage());
-        }
     }
 
     protected String getUuid(String uuid) {

@@ -20,13 +20,11 @@ import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
@@ -49,10 +47,8 @@ import com.cloud.network.router.SriovVfPoolVO.VdpaKind;
 import com.cloud.network.router.dao.SriovVfPoolDao;
 
 /**
- * Behaviour tests for {@link VfPoolReconcilerImpl}. Exercises the four
- * reconcile primitives (touch last_seen, adopt vDPA, inject orphan, flip
- * suspect) against a mocked {@link SriovVfPoolDao}, asserting the manager's
- * counters match the agent advertise.
+ * Behaviour tests for the deactivated legacy inventory consumer. It may
+ * refresh last_seen, but cannot mutate ownership, inject rows, or alert.
  */
 @RunWith(MockitoJUnitRunner.class)
 public class VfPoolReconcilerImplTest {
@@ -76,12 +72,7 @@ public class VfPoolReconcilerImplTest {
     public void setUp() {
         HostVO host = Mockito.mock(HostVO.class);
         when(host.getId()).thenReturn(HOST_ID);
-        when(host.getDataCenterId()).thenReturn(1L);
-        when(host.getPodId()).thenReturn(1L);
-        when(host.getName()).thenReturn("aragog");
         when(hostDao.findByGuid(HOST_UUID)).thenReturn(host);
-        when(vfPoolDao.listByHost(anyLong())).thenReturn(Collections.emptyList());
-        when(vfPoolDao.findStaleAllocated(Mockito.anyInt())).thenReturn(Collections.emptyList());
     }
 
     @Test
@@ -123,7 +114,7 @@ public class VfPoolReconcilerImplTest {
     }
 
     @Test
-    public void reconcileFlipsAllocatedToSuspectAndAlerts() {
+    public void legacyInventoryDoesNotFlipOwnershipOrAlert() {
         SriovVfPoolVO stale = new SriovVfPoolVO(HOST_ID, "0000:01:00.4", "dx6p0", "dx6p0vf2");
         // Inject the row id so VfPoolReconcilerImpl.update() finds it.
         try {
@@ -134,23 +125,20 @@ public class VfPoolReconcilerImplTest {
             throw new AssertionError(e);
         }
         stale.setState(State.ALLOCATED);
-        when(vfPoolDao.findStaleAllocated(Mockito.anyInt())).thenReturn(
-                new ArrayList<>(Arrays.asList(stale)));
-
         UpdateHostVfInventoryCommand cmd = new UpdateHostVfInventoryCommand(
                 HOST_UUID,
                 Collections.emptyList(),
                 Collections.emptyList(),
                 Collections.emptyList());
         VfPoolReconcilerImpl.ReconcileResult r = reconciler.reconcile(cmd);
-        assertEquals(1, r.getSuspectFlipped());
-        verify(alertMgr, atLeastOnce()).sendAlert(
+        assertEquals(0, r.getSuspectFlipped());
+        verify(alertMgr, never()).sendAlert(
                 eq(AlertManager.AlertType.ALERT_TYPE_HOST),
                 anyLong(), Mockito.anyLong(), anyString(), anyString());
     }
 
     @Test
-    public void reconcileAdoptsPassthroughRowAsVdpa() {
+    public void legacyInventoryDoesNotAdoptPassthroughRowAsVdpa() {
         SriovVfPoolVO row = new SriovVfPoolVO(HOST_ID, "0000:01:00.5", "dx6p0", "dx6p0vf3");
         try {
             java.lang.reflect.Field idField = SriovVfPoolVO.class.getDeclaredField("id");
@@ -162,8 +150,6 @@ public class VfPoolReconcilerImplTest {
         row.setVdpaKind(VdpaKind.PASSTHROUGH);
         row.setState(State.ALLOCATED);
         row.setLastSeen(new Date());
-        when(vfPoolDao.findByHostAndPci(HOST_ID, "0000:01:00.5")).thenReturn(row);
-
         UpdateHostVfInventoryCommand cmd = new UpdateHostVfInventoryCommand(
                 HOST_UUID,
                 Collections.emptyList(),
@@ -172,15 +158,12 @@ public class VfPoolReconcilerImplTest {
                         new UpdateHostVfInventoryCommand.VdpaSf(
                                 "vdpa-7", "0000:01:00.5", "aa:bb:cc:00:00:05", 33, "/dev/vhost-vdpa0")));
         VfPoolReconcilerImpl.ReconcileResult r = reconciler.reconcile(cmd);
-        assertEquals(1, r.getVdpaConverted());
-        verify(vfPoolDao, atLeastOnce()).update(eq(11L), Mockito.any(SriovVfPoolVO.class));
+        assertEquals(0, r.getVdpaConverted());
+        verify(vfPoolDao, never()).update(eq(11L), Mockito.any(SriovVfPoolVO.class));
     }
 
     @Test
-    public void reconcileInjectsOrphanWhenSfIsUnknownToDb() {
-        // No matching row by name OR by BDF.
-        when(vfPoolDao.findByHostAndPci(HOST_ID, "0000:01:00.6")).thenReturn(null);
-
+    public void legacyInventoryDoesNotInjectOrphanRows() {
         UpdateHostVfInventoryCommand cmd = new UpdateHostVfInventoryCommand(
                 HOST_UUID,
                 Collections.emptyList(),
@@ -189,8 +172,8 @@ public class VfPoolReconcilerImplTest {
                         new UpdateHostVfInventoryCommand.VdpaSf(
                                 "vdpa-orphan", "0000:01:00.6", "aa:bb:cc:00:00:06", 33, "/dev/vhost-vdpa1")));
         VfPoolReconcilerImpl.ReconcileResult r = reconciler.reconcile(cmd);
-        assertEquals(1, r.getOrphanInserted());
-        verify(vfPoolDao, times(1)).persist(Mockito.any(SriovVfPoolVO.class));
+        assertEquals(0, r.getOrphanInserted());
+        verify(vfPoolDao, never()).persist(Mockito.any(SriovVfPoolVO.class));
     }
 
     @Test
@@ -198,8 +181,6 @@ public class VfPoolReconcilerImplTest {
         SriovVfPoolVO row = new SriovVfPoolVO(HOST_ID, "0000:01:00.7", "dx6p0", "dx6p0vf4");
         row.setVdpaKind(VdpaKind.VDPA);
         row.setState(State.ALLOCATED);
-        when(vfPoolDao.findByHostAndPci(HOST_ID, "0000:01:00.7")).thenReturn(row);
-
         UpdateHostVfInventoryCommand cmd = new UpdateHostVfInventoryCommand(
                 HOST_UUID,
                 Collections.emptyList(),
@@ -218,9 +199,6 @@ public class VfPoolReconcilerImplTest {
         existing.setVdpaName("vdpa-known");
         existing.setVdpaKind(VdpaKind.VDPA);
         existing.setState(State.ALLOCATED);
-        when(vfPoolDao.listByHost(HOST_ID)).thenReturn(
-                new ArrayList<>(Arrays.asList(existing)));
-
         UpdateHostVfInventoryCommand cmd = new UpdateHostVfInventoryCommand(
                 HOST_UUID,
                 Collections.emptyList(),
@@ -240,16 +218,6 @@ public class VfPoolReconcilerImplTest {
         assertEquals(0, r.getSuspectFlipped());
         assertEquals(0, r.getOrphanInserted());
         assertEquals(0, r.getVdpaConverted());
-    }
-
-    @Test
-    public void suspectTimeoutDefaultsToFifteenMinutes() {
-        // Subclass with no override: must yield the default 900-second value.
-        VfPoolReconcilerImpl r = new VfPoolReconcilerImpl();
-        assertEquals(900, r.suspectTimeoutSeconds());
-        // The constant is defined in the impl; reaffirm it here so a careless
-        // change does not silently lower the safety net.
-        assertEquals(VfPoolReconcilerImpl.DEFAULT_SUSPECT_TIMEOUT_SECONDS, r.suspectTimeoutSeconds());
     }
 
     @Test

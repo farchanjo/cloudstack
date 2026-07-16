@@ -17,14 +17,179 @@
 package com.cloud.agent.api;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
- * Answer to {@link HostVfPurgeOrphansCommand}. Reports per-host counts so
- * the management caller can log aggregate cleanup numbers next to the DB
- * release counts already produced by {@code forceReleaseByHostId}.
+ * Answer to {@link HostVfPurgeOrphansCommand}. A management caller may use a
+ * per-target result as release evidence only when {@link TargetResult#isSuccess()}
+ * is true and the returned BDF/MAC/authorization matches its exact plan.
  */
 public class HostVfPurgeOrphansAnswer extends Answer {
+
+    /** Result for one explicitly authorized PCI BDF. */
+    public static class TargetResult {
+        private String pciBdf;
+        private boolean success;
+        private boolean devicePresent;
+        private boolean representorRemoved;
+        private boolean vdpaRemoved;
+        private boolean vfioRebound;
+        private String currentMac;
+        /** MAC observation state: READ_ERROR, UNASSIGNED_ZERO, or NONZERO. */
+        private String macObservation;
+        private String expectedMac;
+        private String ownerOperationId;
+        private String ownerPurpose;
+        private String ownerToken;
+        private String bindingState;
+        private String driver;
+        private String vdpaName;
+        private boolean domainReferenced;
+        private String domainState;
+        private boolean lifecycleAuthorizationUsed;
+        private boolean observationComplete;
+        private String details;
+
+        public TargetResult() {
+        }
+
+        public TargetResult(final String pciBdf, final boolean success, final boolean devicePresent,
+                            final boolean representorRemoved, final boolean vdpaRemoved,
+                            final boolean vfioRebound, final String details) {
+            this.pciBdf = pciBdf;
+            this.success = success;
+            this.devicePresent = devicePresent;
+            this.representorRemoved = representorRemoved;
+            this.vdpaRemoved = vdpaRemoved;
+            this.vfioRebound = vfioRebound;
+            this.details = details;
+        }
+
+        public String getPciBdf() {
+            return pciBdf;
+        }
+
+        public boolean isSuccess() {
+            return success;
+        }
+
+        public boolean isDevicePresent() {
+            return devicePresent;
+        }
+
+        public boolean isRepresentorRemoved() {
+            return representorRemoved;
+        }
+
+        public void setRepresentorRemoved(final boolean representorRemoved) {
+            this.representorRemoved = representorRemoved;
+        }
+
+        public boolean isVdpaRemoved() {
+            return vdpaRemoved;
+        }
+
+        public void setVdpaRemoved(final boolean vdpaRemoved) {
+            this.vdpaRemoved = vdpaRemoved;
+        }
+
+        public boolean isVfioRebound() {
+            return vfioRebound;
+        }
+
+        public void setVfioRebound(final boolean vfioRebound) {
+            this.vfioRebound = vfioRebound;
+        }
+
+        public String getDetails() {
+            return details;
+        }
+
+        public String getCurrentMac() {
+            return currentMac;
+        }
+
+        public void setCurrentMac(final String currentMac) {
+            this.currentMac = currentMac;
+        }
+
+        public String getMacObservation() {
+            return macObservation;
+        }
+
+        public void setMacObservation(final String macObservation) {
+            this.macObservation = macObservation;
+        }
+
+        public String getExpectedMac() { return expectedMac; }
+        public void setExpectedMac(final String expectedMac) { this.expectedMac = expectedMac; }
+        public String getOwnerOperationId() { return ownerOperationId; }
+        public void setOwnerOperationId(final String ownerOperationId) { this.ownerOperationId = ownerOperationId; }
+        public String getOwnerPurpose() { return ownerPurpose; }
+        public void setOwnerPurpose(final String ownerPurpose) { this.ownerPurpose = ownerPurpose; }
+        public String getOwnerToken() { return ownerToken; }
+        public void setOwnerToken(final String ownerToken) { this.ownerToken = ownerToken; }
+
+        public String getBindingState() {
+            return bindingState;
+        }
+
+        public void setBindingState(final String bindingState) {
+            this.bindingState = bindingState;
+        }
+
+        public String getDriver() {
+            return driver;
+        }
+
+        public void setDriver(final String driver) {
+            this.driver = driver;
+        }
+
+        public String getVdpaName() {
+            return vdpaName;
+        }
+
+        public void setVdpaName(final String vdpaName) {
+            this.vdpaName = vdpaName;
+        }
+
+        public boolean isDomainReferenced() {
+            return domainReferenced;
+        }
+
+        public void setDomainReferenced(final boolean domainReferenced) {
+            this.domainReferenced = domainReferenced;
+        }
+
+        public String getDomainState() {
+            return domainState;
+        }
+
+        public void setDomainState(final String domainState) {
+            this.domainState = domainState;
+        }
+
+        public boolean isLifecycleAuthorizationUsed() {
+            return lifecycleAuthorizationUsed;
+        }
+
+        public void setLifecycleAuthorizationUsed(final boolean lifecycleAuthorizationUsed) {
+            this.lifecycleAuthorizationUsed = lifecycleAuthorizationUsed;
+        }
+
+        public boolean isObservationComplete() {
+            return observationComplete;
+        }
+
+        public void setObservationComplete(final boolean observationComplete) {
+            this.observationComplete = observationComplete;
+        }
+    }
+
+    /** Per-BDF cleanup results; empty means no destructive target was supplied. */
+    private List<TargetResult> targetResults = new ArrayList<>();
 
     /** Total vdpa-net devices found via {@code vdpa dev show}. */
     private int vdpaFound;
@@ -166,5 +331,13 @@ public class HostVfPurgeOrphansAnswer extends Answer {
     public void setOvsRepsFreedNames(final List<String> ovsRepsFreedNames) {
         this.ovsRepsFreedNames = ovsRepsFreedNames == null
                 ? new ArrayList<>() : new ArrayList<>(ovsRepsFreedNames);
+    }
+
+    public List<TargetResult> getTargetResults() {
+        return targetResults == null ? Collections.emptyList() : targetResults;
+    }
+
+    public void setTargetResults(final List<TargetResult> targetResults) {
+        this.targetResults = targetResults == null ? new ArrayList<>() : new ArrayList<>(targetResults);
     }
 }

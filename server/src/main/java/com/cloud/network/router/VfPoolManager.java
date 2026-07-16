@@ -16,6 +16,8 @@
 // under the License.
 package com.cloud.network.router;
 
+import org.apache.cloudstack.framework.config.ConfigKey;
+
 import com.cloud.exception.InsufficientCapacityException;
 import com.cloud.utils.component.Manager;
 
@@ -32,6 +34,34 @@ import com.cloud.utils.component.Manager;
  * or fall back to SW VR (depending on offering settings).
  * */
 public interface VfPoolManager extends Manager {
+
+    ConfigKey<Boolean> LegacyBroadVfOperationsEnabled = new ConfigKey<>("Advanced", Boolean.class,
+            "vf.legacy.broad.operations.enabled", "false",
+            "Emergency compatibility gate for legacy broad VF release/recovery. Keep false during rolling rollout.",
+            false);
+
+    ConfigKey<Boolean> OwnershipRepairPlanEnabled = new ConfigKey<>("Advanced", Boolean.class,
+            "vf.ownership.repair.plan.enabled", "false",
+            "Build and log an exact non-mutating VF ownership repair plan. Does not authorize apply.", false);
+
+    ConfigKey<Boolean> OwnershipRepairApplyEnabled = new ConfigKey<>("Advanced", Boolean.class,
+            "vf.ownership.repair.apply.enabled", "false",
+            "Allow application of an exact separately approved VF ownership repair plan.", false);
+
+    ConfigKey<Integer> OwnershipRepairApprovedCount = new ConfigKey<>("Advanced", Integer.class,
+            "vf.ownership.repair.approved.count", "0", "Exact approved reconciliation candidate count.", false);
+
+    ConfigKey<String> OwnershipRepairApprovedIds = new ConfigKey<>("Advanced", String.class,
+            "vf.ownership.repair.approved.ids", "", "Sorted comma-separated exact approved candidate ids.", false);
+
+    ConfigKey<String> OwnershipRepairApprovedHash = new ConfigKey<>("Advanced", String.class,
+            "vf.ownership.repair.approved.hash", "", "Exact SHA-256 hash of the approved repair plan.", false);
+
+    ConfigKey<String> OwnershipRepairApprovalToken = new ConfigKey<>("Advanced", String.class,
+            "vf.ownership.repair.approval.token", "", "Exact token emitted with the approved repair plan.", false);
+
+    ConfigKey<String> OwnershipRepairIncidentId = new ConfigKey<>("Advanced", String.class,
+            "vf.ownership.repair.incident.id", "", "Exact one-time internal incident plan ID; never generic authorization.", false);
 
     /**
      * Discover VFs reported by the host (called by the StartupRoutingCommand processor)
@@ -56,30 +86,40 @@ public interface VfPoolManager extends Manager {
      */
     SriovVfPoolVO allocate(long hostId, long nicId) throws InsufficientCapacityException;
 
-    /** Release a VF back to FREE. Idempotent. */
+    /** Quarantine, clean by exact BDF, and release only after positive agent evidence. */
     boolean release(long vfPoolId);
 
-    /** Release any VF currently bound to the NIC. Used when the NIC is being removed. */
+    /** Apply the same exact-evidence release protocol to rows bound to one NIC. */
     boolean releaseByNicId(long nicId);
 
-    /**
-     * Release every VF whose {@code allocated_to_nic_id} belongs to any NIC of the given VM.
-     *
-     * <p>Complements {@link #releaseByNicId(long)} for the VR-expunge path where the
-     * caller only has the VM id and wants to guarantee no VF remains bound — even
-     * if individual NIC rows are in a transient state or the listener missed some.
-     *
-     * @return number of VFs released (0 if none were bound).
-     */
-    int releaseByVmId(long vmId);
+    /** Atomically commit all destination VF reservations for one authoritative VM work item. */
+    void commitOwnershipForVm(long vmId, Long expectedSourceHostId, long destinationHostId, String workId);
 
     /**
-     * Garbage-collect stuck ALLOCATED VFs whose {@code allocated_to_nic_id} points at
+     * Roll back exact destination reservations. When cleanup is uncertain the
+     * rows become SUSPECT instead of being guessed FREE.
+     */
+    void rollbackReservationsForVm(long vmId, long destinationHostId, boolean cleanupAuthorized, String workId);
+
+    /** Roll back a failed start attempt, including its first canonical allocation. */
+    void rollbackStartAttemptForVm(long vmId, long destinationHostId, boolean cleanupAuthorized, String workId);
+
+    /**
+     * Mark every active/reserved VF row of the VM SUSPECT. This is safe for
+     * failed-start and expunge paths that no longer have enough exact host
+     * evidence to release hardware.
+     *
+     * @return number of rows quarantined.
+     */
+    int quarantineByVmId(long vmId);
+
+    /**
+     * Quarantine stuck ALLOCATED VFs whose {@code allocated_to_nic_id} points at
      * a NIC that has been removed (or whose VM has been removed). Safety net for
      * cases where the postStateTransition listener missed its window (race, crash,
      * mgmt restart between DestroyRequested and ExpungeOperation).
      *
-     * @return number of VFs swept back to FREE.
+     * @return number of VFs marked SUSPECT.
      */
     int sweepOrphans();
 
@@ -116,18 +156,15 @@ public interface VfPoolManager extends Manager {
     int markSuspectByHostId(long hostId);
 
     /**
-     * Force every ALLOCATED or SUSPECT row on the host back to FREE. Driven
-     * by the {@code forceReleaseHostVfs} admin command. Returns the number of
-     * rows released.
+     * Legacy admin entry point. It is default-off and, even when explicitly
+     * enabled for compatibility, only quarantines rows. Ownership repair must
+     * pass the leader/GlobalLock/exact-plan gate.
      */
     int forceReleaseByHostId(long hostId);
 
     /**
-     * Re-bind FREE pool rows on the host to the live NIC that still
-     * references them via {@code nics.vf_pool_id}. Idempotent; reverses
-     * an over-zealous {@link #forceReleaseByHostId(long)} without
-     * bouncing live VMs / VRs. Driven by the {@code recoverHostVfs}
-     * admin command. Returns the number of rows recovered.
+     * Deactivated legacy recovery entry point. Returns zero; operators must
+     * use an exact approved repair plan instead of a broad DB-only promotion.
      */
     int recoverByHostId(long hostId);
 }

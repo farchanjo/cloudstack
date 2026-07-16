@@ -20,6 +20,7 @@ import java.util.List;
 
 import com.cloud.network.router.SriovVfPoolVO;
 import com.cloud.network.router.SriovVfPoolVO.State;
+import com.cloud.network.router.SriovVfPoolVO.VdpaKind;
 import com.cloud.utils.db.GenericDao;
 
 public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
@@ -42,15 +43,61 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     SriovVfPoolVO allocate(long hostId, long nicId);
 
     /**
-     * Release a VF back to the FREE pool: clear nic binding, blank
-     * {@code vdpa_name}/{@code vdpa_device}, force {@code vdpa_kind=PASSTHROUGH},
-     * bump {@code updated}. Idempotent.
+     * Allocate on a new host without stealing canonical ownership. When the
+     * NIC already has a valid canonical row on another host, the destination
+     * row is RESERVED and {@code nics.vf_pool_id} remains unchanged.
+     */
+    SriovVfPoolVO allocateOrReserve(long hostId, long nicId, VdpaKind kind, String vdpaName);
+
+    /** All pool rows that currently reference one NIC, across hosts. */
+    List<SriovVfPoolVO> listByNicId(long nicId);
+
+    /**
+     * Atomically commit every VF NIC of one VM. Lock order is VM, sorted NICs,
+     * then sorted pool rows. The exact work id and destination are revalidated
+     * before any row is changed; stale operation generations are refused.
+     *
+     * @return prior rows atomically marked SUSPECT for later exact cleanup.
+     */
+    List<SriovVfPoolVO> commitVmReservations(long vmId, Long expectedSourceHostId,
+                                             long destinationHostId, String workId);
+
+    /**
+     * Atomically quarantine destination rows for an explicit VM operation.
+     * RESERVED rows, and optionally first-start ALLOCATED rows, become SUSPECT
+     * before any remote cleanup is attempted. Repeated calls are idempotent.
+     */
+    List<SriovVfPoolVO> quarantineVmDestinationRows(long vmId, long destinationHostId,
+                                                    boolean includeAllocated, String workId);
+
+    /** Mark one exact row SUSPECT while it remains bound to the expected NIC. */
+    boolean markSuspect(long vfPoolId, long expectedNicId);
+
+    /** Release one exact row and conditionally clear only its own reverse pointer. */
+    boolean releaseExact(long vfPoolId, long expectedNicId);
+
+    /**
+     * Atomically revalidate the complete approved reconciliation plan under
+     * sorted VM/NIC/pool locks, reject RESERVED/conflicting work, promote exact
+     * current-host rows, and quarantine every stale target before host cleanup.
+     */
+    boolean prepareReconciliationPlan(List<VfReconciliationCandidate> candidates);
+
+    /**
+     * Recheck the same plan predicates after host cleanup and return only the
+     * exact pre-quarantined stale row to FREE.
+     */
+    boolean completeReconciliation(long vmId, long nicId, long currentHostId,
+                                   long currentPoolId, long stalePoolId);
+
+    /**
+     * Legacy DAO quarantine entry. It never returns a row to FREE; use
+     * {@link #releaseExact(long, long)} after exact agent evidence.
      */
     boolean release(long vfPoolId);
 
     /**
-     * Release VF by NIC id (used when NIC is being removed). Same free-state
-     * wipe as {@link #release(long)} (including vdpa_* blanking).
+     * Legacy DAO quarantine by NIC id. It never returns rows to FREE.
      */
     boolean releaseByNicId(long nicId);
 
@@ -63,13 +110,11 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
      *
      * @return number of rows updated.
      */
-    int releaseByVmId(long vmId);
+    int quarantineByVmId(long vmId);
 
     /**
-     * Sweep ALLOCATED VFs whose {@code allocated_to_nic_id} points at a NIC
-     * that has {@code nics.removed IS NOT NULL} or whose VM has been removed.
-     * Returns the number of rows swept back to FREE (with vdpa_* wiped).
-     * Used by the periodic orphan GC.
+     * Mark ALLOCATED VFs SUSPECT when their NIC or VM has been removed. Exact
+     * agent cleanup must be confirmed before a row becomes FREE.
      */
     int sweepOrphans();
 
@@ -98,10 +143,7 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     SriovVfPoolVO findFreeVdpaCapableVf(long hostId);
 
     /**
-     * Release a vDPA-bound VF: clear vdpa_name / vdpa_device, flip
-     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind} back to
-     * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind#PASSTHROUGH},
-     * and {@link #release} the row. Idempotent.
+     * Legacy named vDPA quarantine entry; exact cleanup is still required.
      */
     boolean releaseVdpa(long vfPoolId);
 
@@ -122,31 +164,12 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     int markSuspectByHostId(long hostId);
 
     /**
-     * Force every {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED}
-     * or {@link com.cloud.network.router.SriovVfPoolVO.State#SUSPECT} row on the
-     * host back to {@link com.cloud.network.router.SriovVfPoolVO.State#FREE},
-     * clearing nic binding and vDPA fields. Used by the
-     * {@code forceReleaseHostVfs} admin API. Returns the number of rows
-     * released.
+     * Legacy host quarantine. No row is returned to FREE.
      */
     int forceReleaseByHostId(long hostId);
 
     /**
-     * Re-bind every {@link com.cloud.network.router.SriovVfPoolVO.State#FREE}
-     * pool entry on the host to the live NIC that still references it via
-     * {@code nics.vf_pool_id}. Walks {@code nics} ⇒ {@code vm_instance}
-     * filtering on live VMs ({@code v.removed IS NULL AND v.state IN
-     * ('Running','Starting','Stopping','Migrating')}), flips the matching
-     * pool row to {@link com.cloud.network.router.SriovVfPoolVO.State#ALLOCATED},
-     * stamps {@code allocated_to_nic_id} from {@code nics.id}, and refreshes
-     * {@code last_seen=NOW()}. Idempotent (no-op for already-allocated
-     * rows).
-     *
-     * <p>Companion to {@link #forceReleaseByHostId(long)} — used by the
-     * {@code recoverHostVfs} admin API to undo an over-zealous force-
-     * release without bouncing live VMs / VRs.
-     *
-     * @return number of rows promoted from {@code FREE} to {@code ALLOCATED}.
+     * Deactivated broad recovery primitive; returns zero.
      */
     int recoverByHostId(long hostId);
 

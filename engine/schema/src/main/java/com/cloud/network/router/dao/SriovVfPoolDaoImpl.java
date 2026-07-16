@@ -20,8 +20,13 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -47,33 +52,15 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
     private static final Logger LOGGER = LogManager.getLogger(SriovVfPoolDaoImpl.class);
 
     /**
-     * Release by VM id via JOIN into {@code nics} (covering removed NICs too)
-     * and blanking the binding. A single cross-table UPDATE is the atomic
-     * primitive for the VR-expunge race where {@code releaseByNicId} may miss
-     * NICs whose {@code removed} column is already set.
-     */
-    private static final String SQL_RELEASE_BY_VM_ID =
-            "UPDATE sriov_vf_pool p " +
-            "JOIN nics n ON n.id = p.allocated_to_nic_id " +
-            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, " +
-            "    p.vdpa_kind = 'PASSTHROUGH', p.vdpa_name = NULL, p.vdpa_device = NULL, " +
-            "    p.updated = NOW() " +
-            "WHERE n.instance_id = ? AND p.state = 'ALLOCATED'";
-
-    /**
-     * Orphan sweep — any ALLOCATED VF whose NIC is gone (nics.removed IS NOT NULL)
-     * or whose VM is gone (vm_instance.removed IS NOT NULL) gets freed. Safety net
-     * for the race where the listener missed the VR state transition window.
-     * Also blanks vdpa_* so a subsequent hostdev PASSTHROUGH allocate cannot
-     * inherit a stale VDPA kind/name from a prior vDPA occupant.
+     * Orphan sweep — any ALLOCATED VF whose NIC or VM is gone becomes SUSPECT.
+     * Destructive cleanup and FREE transition require a later exact-BDF agent
+     * confirmation; absence in the application database is not sufficient.
      */
     private static final String SQL_SWEEP_ORPHANS =
             "UPDATE sriov_vf_pool p " +
             "LEFT JOIN nics n ON n.id = p.allocated_to_nic_id " +
             "LEFT JOIN vm_instance v ON v.id = n.instance_id " +
-            "SET p.state = 'FREE', p.allocated_to_nic_id = NULL, " +
-            "    p.vdpa_kind = 'PASSTHROUGH', p.vdpa_name = NULL, p.vdpa_device = NULL, " +
-            "    p.updated = NOW() " +
+            "SET p.state = 'SUSPECT', p.updated = NOW() " +
             "WHERE p.state = 'ALLOCATED' " +
             "  AND ( p.allocated_to_nic_id IS NULL " +
             "     OR n.id IS NULL " +
@@ -90,42 +77,6 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
             "   SET state = 'SUSPECT', updated = NOW() " +
             " WHERE host_id = ? AND state = 'ALLOCATED'";
 
-    /**
-     * Force every ALLOCATED or SUSPECT row on the host back to FREE — clears
-     * nic binding and vdpa fields. Driven by the {@code forceReleaseHostVfs}
-     * admin command. Idempotent.
-     */
-    private static final String SQL_FORCE_RELEASE_BY_HOST_ID =
-            "UPDATE sriov_vf_pool " +
-            "   SET state = 'FREE', allocated_to_nic_id = NULL, " +
-            "       vdpa_kind = 'PASSTHROUGH', vdpa_name = NULL, vdpa_device = NULL, " +
-            "       updated = NOW() " +
-            " WHERE host_id = ? AND state IN ('ALLOCATED', 'SUSPECT')";
-
-    /**
-     * Recovery JOIN — re-bind every FREE pool entry to the live NIC that
-     * still references it via {@code nics.vf_pool_id}. Filters on live VMs
-     * (DomainRouter / User in Running / Starting / Stopping / Migrating).
-     * Pool row keeps its {@code vdpa_kind} / {@code vdpa_name} / {@code
-     * vdpa_device} columns intact (caller is responsible for vDPA-specific
-     * state restoration).
-     *
-     * <p>Companion to {@link #SQL_FORCE_RELEASE_BY_HOST_ID} — used by the
-     * {@code recoverHostVfs} admin API to undo an over-zealous force-
-     * release without bouncing live VMs / VRs.
-     */
-    private static final String SQL_RECOVER_BY_HOST_ID =
-            "UPDATE sriov_vf_pool p " +
-            "  JOIN nics n ON n.vf_pool_id = p.id AND n.removed IS NULL " +
-            "  JOIN vm_instance v ON v.id = n.instance_id " +
-            "    SET p.state = 'ALLOCATED', " +
-            "        p.allocated_to_nic_id = n.id, " +
-            "        p.last_seen = NOW(), " +
-            "        p.updated = NOW() " +
-            "  WHERE p.host_id = ? " +
-            "    AND p.state = 'FREE' " +
-            "    AND v.removed IS NULL " +
-            "    AND v.state IN ('Running','Starting','Stopping','Migrating')";
 
     /**
      * Stale ALLOCATED rows: last_seen older than NOW() - threshold seconds, OR
@@ -142,10 +93,8 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
      * that the allocator just bound. Fired inside the same transaction as
      * the {@code sriov_vf_pool} row update so the two columns stay in sync.
      *
-     * <p>Without this dual-write the {@link #SQL_RECOVER_BY_HOST_ID} JOIN
-     * matches zero rows in production (NIC always has {@code vf_pool_id IS
-     * NULL}), making {@code recoverHostVfs} a no-op against pools created
-     * before the JOIN was added.
+     * <p>The pointer is also the compare-and-clear guard used by exact release
+     * and the canonical anchor validated by atomic commit/reconciliation.
      */
     private static final String SQL_BIND_NIC_VF_POOL_ID =
             "UPDATE nics SET vf_pool_id = ? WHERE id = ?";
@@ -155,14 +104,39 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
      * pointer when a VF is released. Fired inside the same release
      * transaction so a NIC that was bound through {@code allocate()} /
      * {@code allocateForVdpa()} ends up with {@code vf_pool_id IS NULL}
-     * once the VF goes back to FREE.
+     * once exact cleanup evidence allows the VF to go back to FREE.
      */
-    private static final String SQL_UNBIND_NIC_VF_POOL_ID_BY_NIC =
-            "UPDATE nics SET vf_pool_id = NULL WHERE id = ?";
+    private static final String SQL_UNBIND_NIC_VF_POOL_ID_EXACT =
+            "UPDATE nics SET vf_pool_id = NULL WHERE id = ? AND vf_pool_id = ?";
 
-    // NOTE: forceReleaseByHostId() intentionally leaves nics.vf_pool_id
-    // intact — that reverse pointer is the anchor recoverHostVfs() walks
-    // back to re-bind the pool row to its still-live NIC.
+    private static final String SQL_LOCK_NIC_VF_POOL_ID =
+            "SELECT vf_pool_id FROM nics WHERE id = ? FOR UPDATE";
+
+    private static final String SQL_LOCK_POOL_ROWS_FOR_NIC =
+            "SELECT id FROM sriov_vf_pool WHERE allocated_to_nic_id = ? ORDER BY id FOR UPDATE";
+
+    private static final String SQL_FIND_VM_ID_FOR_NIC =
+            "SELECT instance_id FROM nics WHERE id = ?";
+
+    private static final String SQL_LOCK_VM =
+            "SELECT state, host_id FROM vm_instance WHERE id = ? FOR UPDATE";
+
+    private static final String SQL_LOCK_VM_NICS =
+            "SELECT id, vf_pool_id FROM nics WHERE instance_id = ? ORDER BY id FOR UPDATE";
+
+    private static final String SQL_LOCK_WORK =
+            "SELECT instance_id, resource_id, type, step FROM op_it_work WHERE id = ? FOR UPDATE";
+
+    private static final String SQL_LOCK_LATEST_VM_WORK =
+            "SELECT id FROM op_it_work WHERE instance_id = ? " +
+            "ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1 FOR UPDATE";
+
+    private static final String SQL_COUNT_CONFLICTING_WORK =
+            "SELECT COUNT(*) FROM op_it_work WHERE instance_id = ? " +
+            "AND type IN ('Starting','Stopping','Migrating') AND step <> 'Done'";
+
+    // Broad quarantine intentionally leaves nics.vf_pool_id intact. Only
+    // exact release may conditionally clear the pointer to its own row.
 
     private final SearchBuilder<SriovVfPoolVO> hostStateSearch;
     private final SearchBuilder<SriovVfPoolVO> hostPciSearch;
@@ -237,34 +211,35 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
 
     @Override
     public SriovVfPoolVO allocate(final long hostId, final long nicId) {
+        return allocateOrReserve(hostId, nicId, VdpaKind.PASSTHROUGH, null);
+    }
+
+    @Override
+    public SriovVfPoolVO allocateOrReserve(final long hostId, final long nicId,
+                                           final VdpaKind kind, final String vdpaName) {
         return Transaction.execute(new TransactionCallback<SriovVfPoolVO>() {
             @Override
             public SriovVfPoolVO doInTransaction(TransactionStatus status) {
-                // Idempotency: if this (hostId, nicId) already has an ALLOCATED entry,
-                // reuse it instead of taking another FREE VF. Multiple StartCommand
-                // re-fires (HA, mgmt-cluster races) will each call allocate(), and
-                // without this check we'd burn a fresh VF every time, exhausting the
-                // host pool after a few retries.
-                SearchCriteria<SriovVfPoolVO> existSc = hostNicIdSearch.create();
-                existSc.setParameters("hostId", hostId);
-                existSc.setParameters("allocatedToNicId", nicId);
-                List<SriovVfPoolVO> existing = listBy(existSc);
-                if (existing != null && !existing.isEmpty()) {
-                    return existing.get(0);
+                lockVmForNic(nicId);
+                final Long canonicalId = lockNicAndReadVfPoolId(nicId);
+                final List<SriovVfPoolVO> existing = lockRowsForNic(nicId);
+                for (final SriovVfPoolVO row : existing) {
+                    if (row.getHostId() == hostId) {
+                        if (State.ALLOCATED.name().equals(row.getState())
+                                || State.RESERVED.name().equals(row.getState())) {
+                            return row;
+                        }
+                        throw new CloudRuntimeException(String.format(
+                                "VF pool row %d for nic=%d host=%d is %s; refusing to reuse uncertain ownership",
+                                row.getId(), nicId, hostId, row.getState()));
+                    }
                 }
 
-                // Bug 12 fix: use lockOneRandomRow with exclusive=true (SELECT … FOR
-                // UPDATE) so only one concurrent caller obtains the row lock at a time.
-                // The previous lockRows(sc, null, false) used LOCK IN SHARE MODE, which
-                // allowed N parallel callers to see the same FREE row simultaneously;
-                // all N then issued separate UPDATE statements and all N appeared to
-                // succeed, but only 1 VF was truly consumed — the others overwrote each
-                // other's allocation, leaving N-1 VMs silently without a VF.
-                //
-                // With FOR UPDATE, the second concurrent caller blocks on the lock until
-                // the first transaction commits. After commit the FREE row is ALLOCATED,
-                // so the second caller's re-executed SELECT skips it and moves to the
-                // next FREE entry (or returns null on genuine exhaustion).
+                final SriovVfPoolVO canonical = canonicalId == null ? null : findById(canonicalId);
+                final boolean reserve = canonical != null
+                        && canonical.getHostId() != hostId
+                        && Long.valueOf(nicId).equals(canonical.getAllocatedToNicId())
+                        && !State.FREE.name().equals(canonical.getState());
                 SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
                 sc.setParameters("hostId", hostId);
                 sc.setParameters("state", State.FREE.name());
@@ -272,26 +247,13 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 if (vf == null) {
                     return null;
                 }
-                // createForUpdate() returns a CGLib proxy for partial update.
-                // Pass String for enum-backed columns (state, vdpa_kind) — the
-                // enum overload would store the enum object and trigger
-                // Java-serialization BLOB output that MySQL utf8mb4 rejects.
-                //
-                // Hostdev PASSTHROUGH allocate must stamp vdpa_kind=PASSTHROUGH
-                // and blank vdpa_name/vdpa_device so a row previously used as
-                // VDPA (and incompletely freed) cannot keep kind=VDPA and
-                // confuse HypervisorGuruBase.isVdpaBoundVf / toNicTO.
                 SriovVfPoolVO updateVo = createForUpdate();
-                applyPassthroughAllocated(updateVo, nicId);
+                applyOwnershipState(updateVo, nicId, reserve ? State.RESERVED : State.ALLOCATED, kind, vdpaName);
                 update(vf.getId(), updateVo);
-                vf.setState(State.ALLOCATED.name());
-                vf.setAllocatedToNicId(nicId);
-                vf.setVdpaKind(VdpaKind.PASSTHROUGH);
-                vf.setVdpaName(null);
-                vf.setVdpaDevice(null);
-                // Dual-write nics.vf_pool_id so the recoverHostVfs JOIN can
-                // re-bind the row after a force-release. See SQL_BIND_NIC_VF_POOL_ID.
-                bindNicVfPoolId(nicId, vf.getId());
+                applyOwnershipState(vf, nicId, reserve ? State.RESERVED : State.ALLOCATED, kind, vdpaName);
+                if (!reserve) {
+                    bindNicVfPoolId(nicId, vf.getId());
+                }
                 return vf;
             }
         });
@@ -302,22 +264,216 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         return Transaction.execute(new TransactionCallback<Boolean>() {
             @Override
             public Boolean doInTransaction(TransactionStatus status) {
-                SriovVfPoolVO vf = lockRow(vfPoolId, false);
-                if (vf == null) {
+                final SriovVfPoolVO observed = findById(vfPoolId);
+                if (observed == null || observed.getAllocatedToNicId() == null) {
                     return false;
                 }
-                Long boundNic = vf.getAllocatedToNicId();
-                SriovVfPoolVO updateVo = createForUpdate();
-                applyFreeState(updateVo);
-                update(vf.getId(), updateVo);
-                // Mirror the unbind on the NIC side so a future
-                // recoverHostVfs JOIN does not resurrect a stale link.
-                if (boundNic != null) {
-                    unbindNicVfPoolIdByNic(boundNic);
+                final Long expectedNic = observed.getAllocatedToNicId();
+                lockVmForNic(expectedNic);
+                lockNicAndReadVfPoolId(expectedNic);
+                final SriovVfPoolVO vf = lockRow(vfPoolId, true);
+                if (vf == null || !expectedNic.equals(vf.getAllocatedToNicId())) {
+                    return false;
                 }
+                markSuspectLocked(vf);
                 return true;
             }
         });
+    }
+
+    @Override
+    public List<SriovVfPoolVO> listByNicId(final long nicId) {
+        SearchCriteria<SriovVfPoolVO> sc = nicIdSearch.create();
+        sc.setParameters("allocatedToNicId", nicId);
+        return listBy(sc);
+    }
+
+    @Override
+    public List<SriovVfPoolVO> commitVmReservations(final long vmId, final Long expectedSourceHostId,
+                                                     final long destinationHostId, final String workId) {
+        return executeWithDeadlockRetry(() -> Transaction.execute(
+                (TransactionCallback<List<SriovVfPoolVO>>) status -> {
+            final VmState vm = lockVm(vmId);
+            requireAuthoritativeDestination(vmId, vm, destinationHostId);
+            validateWork(vmId, destinationHostId, workId);
+            final Map<Long, Long> canonicalByNic = lockVmNics(vmId);
+            final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(canonicalByNic);
+            final List<CommitChange> changes = validateVmCommit(vmId, expectedSourceHostId,
+                    destinationHostId, canonicalByNic, rowsByNic);
+            final List<SriovVfPoolVO> prior = new ArrayList<>();
+            for (final CommitChange change : changes) {
+                final SriovVfPoolVO promote = createForUpdate();
+                promote.setState(State.ALLOCATED.name());
+                update(change.destination.getId(), promote);
+                bindNicVfPoolId(change.nicId, change.destination.getId());
+                for (final SriovVfPoolVO row : change.prior) {
+                    markSuspectLocked(row);
+                    prior.add(row);
+                }
+            }
+            return prior;
+                }));
+    }
+
+    @Override
+    public List<SriovVfPoolVO> quarantineVmDestinationRows(final long vmId, final long destinationHostId,
+                                                           final boolean includeAllocated, final String workId) {
+        return executeWithDeadlockRetry(() -> Transaction.execute(
+                (TransactionCallback<List<SriovVfPoolVO>>) status -> {
+            lockVm(vmId);
+            validateWorkIfPresent(vmId, destinationHostId, workId);
+            final Map<Long, Long> canonicalByNic = lockVmNics(vmId);
+            final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(canonicalByNic);
+            final List<SriovVfPoolVO> quarantined = new ArrayList<>();
+            for (final List<SriovVfPoolVO> rows : rowsByNic.values()) {
+                for (final SriovVfPoolVO row : rows) {
+                    final boolean eligible = State.RESERVED.name().equals(row.getState())
+                            || includeAllocated && State.ALLOCATED.name().equals(row.getState())
+                            || State.SUSPECT.name().equals(row.getState());
+                    if (row.getHostId() != destinationHostId || !eligible) {
+                        continue;
+                    }
+                    if (!State.SUSPECT.name().equals(row.getState())) {
+                        markSuspectLocked(row);
+                    }
+                    quarantined.add(row);
+                }
+            }
+            return quarantined;
+                }));
+    }
+
+    @Override
+    public boolean markSuspect(final long vfPoolId, final long expectedNicId) {
+        return Transaction.execute(new TransactionCallback<Boolean>() {
+            @Override
+            public Boolean doInTransaction(TransactionStatus status) {
+                lockVmForNic(expectedNicId);
+                lockNicAndReadVfPoolId(expectedNicId);
+                final SriovVfPoolVO row = lockRow(vfPoolId, true);
+                if (row == null || !Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())) {
+                    return false;
+                }
+                markSuspectLocked(row);
+                return true;
+            }
+        });
+    }
+
+    @Override
+    public boolean releaseExact(final long vfPoolId, final long expectedNicId) {
+        return Transaction.execute(new TransactionCallback<Boolean>() {
+            @Override
+            public Boolean doInTransaction(TransactionStatus status) {
+                lockVmForNic(expectedNicId);
+                lockNicAndReadVfPoolId(expectedNicId);
+                final SriovVfPoolVO row = lockRow(vfPoolId, true);
+                if (row == null || !Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())) {
+                    return false;
+                }
+                SriovVfPoolVO updateVo = createForUpdate();
+                applyFreeState(updateVo);
+                update(row.getId(), updateVo);
+                unbindNicVfPoolIdExact(expectedNicId, row.getId());
+                return true;
+            }
+        });
+    }
+
+    @Override
+    public boolean prepareReconciliationPlan(final List<VfReconciliationCandidate> requestedCandidates) {
+        return executeWithDeadlockRetry(() -> Transaction.execute(
+                (TransactionCallback<Boolean>) status -> {
+            if (requestedCandidates == null || requestedCandidates.isEmpty()) {
+                return false;
+            }
+            final List<VfReconciliationCandidate> candidates = new ArrayList<>(requestedCandidates);
+            candidates.sort((left, right) -> {
+                final int vmOrder = Long.compare(left.getVmId(), right.getVmId());
+                return vmOrder != 0 ? vmOrder : Long.compare(left.getStalePoolId(), right.getStalePoolId());
+            });
+            if (hasDuplicateReconciliationRows(candidates)) {
+                return false;
+            }
+            final Map<Long, Long> nics = new LinkedHashMap<>();
+            final Map<Long, VmState> vmStates = new HashMap<>();
+            long lastVmId = Long.MIN_VALUE;
+            for (final VfReconciliationCandidate candidate : candidates) {
+                if (candidate.getVmId() != lastVmId) {
+                    final VmState vm = lockVm(candidate.getVmId());
+                    vmStates.put(candidate.getVmId(), vm);
+                    requireNoConflictingWork(candidate.getVmId());
+                    lastVmId = candidate.getVmId();
+                }
+                requireAuthoritativeDestination(candidate.getVmId(), vmStates.get(candidate.getVmId()),
+                        candidate.getCurrentHostId());
+            }
+            lastVmId = Long.MIN_VALUE;
+            for (final VfReconciliationCandidate candidate : candidates) {
+                if (candidate.getVmId() != lastVmId) {
+                    nics.putAll(lockVmNics(candidate.getVmId()));
+                    lastVmId = candidate.getVmId();
+                }
+            }
+            final Map<Long, List<Long>> additional = new HashMap<>();
+            for (final VfReconciliationCandidate candidate : candidates) {
+                additional.computeIfAbsent(candidate.getNicId(), ignored -> new ArrayList<>())
+                        .addAll(java.util.Arrays.asList(candidate.getCurrentPoolId(), candidate.getStalePoolId()));
+            }
+            final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(nics, additional);
+            for (final VfReconciliationCandidate candidate : candidates) {
+                if (!validReconciliationCandidate(candidate, nics, rowsByNic)) {
+                    return false;
+                }
+            }
+            for (final VfReconciliationCandidate candidate : candidates) {
+                final List<SriovVfPoolVO> rows = rowsByNic.get(candidate.getNicId());
+                final SriovVfPoolVO current = findRowById(rows, candidate.getCurrentPoolId());
+                final SriovVfPoolVO stale = findRowById(rows, candidate.getStalePoolId());
+                if (candidate.isPromoteCurrent()) {
+                    final SriovVfPoolVO promote = createForUpdate();
+                    applyOwnershipState(promote, candidate.getNicId(), State.ALLOCATED,
+                            current.getVdpaKindEnum(), current.getVdpaName());
+                    update(candidate.getCurrentPoolId(), promote);
+                    bindNicVfPoolId(candidate.getNicId(), candidate.getCurrentPoolId());
+                }
+                if (!State.SUSPECT.name().equals(stale.getState())) {
+                    markSuspectLocked(stale);
+                }
+            }
+            return true;
+                }));
+    }
+
+    @Override
+    public boolean completeReconciliation(final long vmId, final long nicId, final long currentHostId,
+                                          final long currentPoolId, final long stalePoolId) {
+        return executeWithDeadlockRetry(() -> Transaction.execute(
+                (TransactionCallback<Boolean>) status -> {
+            final VmState vm = lockVm(vmId);
+            requireAuthoritativeDestination(vmId, vm, currentHostId);
+            requireNoConflictingWork(vmId);
+            final Map<Long, Long> nics = lockVmNics(vmId);
+            if (!Long.valueOf(currentPoolId).equals(nics.get(nicId))) {
+                return false;
+            }
+            final Map<Long, List<Long>> additional = new HashMap<>();
+            additional.put(nicId, java.util.Arrays.asList(currentPoolId, stalePoolId));
+            final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(nics, additional);
+            final List<SriovVfPoolVO> rows = rowsByNic.get(nicId);
+            final SriovVfPoolVO current = findRowById(rows, currentPoolId);
+            final SriovVfPoolVO stale = findRowById(rows, stalePoolId);
+            if (!validReconciliationRows(nicId, currentHostId, current, stale, rows)
+                    || !State.ALLOCATED.name().equals(current.getState())
+                    || !State.SUSPECT.name().equals(stale.getState())) {
+                return false;
+            }
+            final SriovVfPoolVO free = createForUpdate();
+            applyFreeState(free);
+            update(stalePoolId, free);
+            unbindNicVfPoolIdExact(nicId, stalePoolId);
+            return true;
+                }));
     }
 
     @Override
@@ -325,33 +481,36 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         return Transaction.execute(new TransactionCallback<Boolean>() {
             @Override
             public Boolean doInTransaction(TransactionStatus status) {
-                // Bulk UPDATE WHERE allocated_to_nic_id=? — one SQL stmt that
-                // releases every row matching the nic id (across hosts). The
-                // previous lockRows + per-row update loop only updated the
-                // first row reliably because the reused createForUpdate() VO
-                // had its dirty flags cleared after the first update() call,
-                // making subsequent update(id, vo) calls no-op.
-                SearchCriteria<SriovVfPoolVO> sc = nicIdSearch.create();
-                sc.setParameters("allocatedToNicId", nicId);
-                SriovVfPoolVO updateVo = createForUpdate();
-                applyFreeState(updateVo);
-                int affected = update(updateVo, sc);
-                // Same-tx reverse-pointer clear so the NIC stops referring
-                // to the freed pool row.
-                if (affected > 0) {
-                    unbindNicVfPoolIdByNic(nicId);
+                lockVmForNic(nicId);
+                lockNicAndReadVfPoolId(nicId);
+                final List<SriovVfPoolVO> rows = lockRowsForNic(nicId);
+                for (final SriovVfPoolVO row : rows) {
+                    markSuspectLocked(row);
                 }
-                return affected > 0;
+                return !rows.isEmpty();
             }
         });
     }
 
     @Override
-    public int releaseByVmId(final long vmId) {
+    public int quarantineByVmId(final long vmId) {
         return Transaction.execute(new TransactionCallback<Integer>() {
             @Override
             public Integer doInTransaction(TransactionStatus status) {
-                return executeUpdateWithCount(SQL_RELEASE_BY_VM_ID, vmId);
+                lockVm(vmId);
+                final Map<Long, Long> nics = lockVmNics(vmId);
+                final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(nics);
+                int affected = 0;
+                for (final List<SriovVfPoolVO> rows : rowsByNic.values()) {
+                    for (final SriovVfPoolVO row : rows) {
+                        if (State.ALLOCATED.name().equals(row.getState())
+                                || State.RESERVED.name().equals(row.getState())) {
+                            markSuspectLocked(row);
+                            affected++;
+                        }
+                    }
+                }
+                return affected;
             }
         });
     }
@@ -381,86 +540,12 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
 
     @Override
     public SriovVfPoolVO allocateForVdpa(final long hostId, final long nicId, final String mac, final int maxVqs) {
-        return Transaction.execute(new TransactionCallback<SriovVfPoolVO>() {
-            @Override
-            public SriovVfPoolVO doInTransaction(TransactionStatus status) {
-                // Idempotency: an existing ALLOCATED row for (hostId, nicId)
-                // whose vdpa_kind is already VDPA is reused as-is. Avoids
-                // burning a fresh VF on StartCommand re-fires (HA, mgmt
-                // cluster races) — same shape as plain allocate().
-                SearchCriteria<SriovVfPoolVO> existSc = hostNicIdSearch.create();
-                existSc.setParameters("hostId", hostId);
-                existSc.setParameters("allocatedToNicId", nicId);
-                List<SriovVfPoolVO> existing = listBy(existSc);
-                if (existing != null && !existing.isEmpty()) {
-                    SriovVfPoolVO row = existing.get(0);
-                    if (VdpaKind.VDPA.name().equals(row.getVdpaKind())) {
-                        // Idempotent reuse — make sure reverse pointer is
-                        // present even if a previous run pre-dated the
-                        // dual-write logic.
-                        bindNicVfPoolId(nicId, row.getId());
-                        return row;
-                    }
-                    // Row exists but was previously bound as PASSTHROUGH —
-                    // flip it in place rather than allocating a second VF.
-                    // Pass String to the createForUpdate proxy: the proxy
-                    // intercepts setters and stores the raw argument; if we
-                    // pass the enum, GenericDaoBase later serializes it as
-                    // a Java object stream and MySQL utf8mb4 rejects the
-                    // \xAC\xED... bytes.
-                    SriovVfPoolVO promote = createForUpdate();
-                    promote.setVdpaKind(VdpaKind.VDPA.name());
-                    promote.setVdpaName(buildVdpaName(nicId));
-                    update(row.getId(), promote);
-                    row.setVdpaKind(VdpaKind.VDPA);
-                    row.setVdpaName(buildVdpaName(nicId));
-                    bindNicVfPoolId(nicId, row.getId());
-                    return row;
-                }
-
-                // Bug 12 fix (symmetric with allocate()): use lockOneRandomRow with
-                // exclusive=true (SELECT … FOR UPDATE). The previous lockRows(sc, null,
-                // false) used LOCK IN SHARE MODE, allowing N concurrent vDPA starters
-                // on the same host to all read the same FREE row. Only 1 VF was
-                // consumed; N-1 callers silently received the same PCI BDF and then
-                // fell through to the OvnVifDriver bridge path when the kernel rejected
-                // the duplicate mlx5_vdpa attach.
-                //
-                // FOR UPDATE serialises concurrent callers: the second caller blocks
-                // until the first transaction commits, then sees the now-ALLOCATED row
-                // and advances to the next FREE entry via lockOneRandomRow's ORDER BY
-                // RAND() / LIMIT 1 semantics.
-                SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
-                sc.setParameters("hostId", hostId);
-                sc.setParameters("state", State.FREE.name());
-                SriovVfPoolVO vf = lockOneRandomRow(sc, true);
-                if (vf == null) {
-                    return null;
-                }
-                // createForUpdate() returns a CGLib proxy that captures
-                // setter args verbatim into a diff map. Pass String for
-                // enum-backed columns (state, vdpa_kind) — the enum overload
-                // would store the enum object and trigger Java-serialization
-                // BLOB output that MySQL utf8mb4 rejects.
-                SriovVfPoolVO updateVo = createForUpdate();
-                updateVo.setState(State.ALLOCATED.name());
-                updateVo.setAllocatedToNicId(nicId);
-                updateVo.setVdpaKind(VdpaKind.VDPA.name());
-                updateVo.setVdpaName(buildVdpaName(nicId));
-                update(vf.getId(), updateVo);
-                vf.setState(State.ALLOCATED.name());
-                vf.setAllocatedToNicId(nicId);
-                vf.setVdpaKind(VdpaKind.VDPA);
-                vf.setVdpaName(buildVdpaName(nicId));
-                // Dual-write reverse pointer in the same tx. Required for
-                // recoverHostVfs JOIN; see SQL_BIND_NIC_VF_POOL_ID javadoc.
-                bindNicVfPoolId(nicId, vf.getId());
-                LOGGER.info(String.format(
-                    "allocateForVdpa: host=%d nic=%d vf=%s pci=%s mac=%s maxVqs=%d vdpaName=%s",
-                    hostId, nicId, vf.getUuid(), vf.getPciAddress(), mac, maxVqs, vf.getVdpaName()));
-                return vf;
-            }
-        });
+        final SriovVfPoolVO vf = allocateOrReserve(hostId, nicId, VdpaKind.VDPA, buildVdpaName(nicId));
+        if (vf != null) {
+            LOGGER.info("allocateForVdpa: host={} nic={} vf={} pci={} mac={} maxVqs={} vdpaName={} state={}",
+                    hostId, nicId, vf.getUuid(), vf.getPciAddress(), mac, maxVqs, vf.getVdpaName(), vf.getState());
+        }
+        return vf;
     }
 
     @Override
@@ -503,6 +588,15 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         updateVo.setVdpaDevice(null);
     }
 
+    static void applyOwnershipState(final SriovVfPoolVO updateVo, final long nicId, final State state,
+                                    final VdpaKind kind, final String vdpaName) {
+        updateVo.setState(state.name());
+        updateVo.setAllocatedToNicId(nicId);
+        updateVo.setVdpaKind(kind.name());
+        updateVo.setVdpaName(kind == VdpaKind.VDPA ? vdpaName : null);
+        updateVo.setVdpaDevice(null);
+    }
+
     /**
      * Build the canonical vDPA mgmt-device name for a NIC id. The ConnectX
      * family limits the name length, so we keep it short ({@code vdpa-<nicId>})
@@ -542,22 +636,13 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
 
     @Override
     public int forceReleaseByHostId(final long hostId) {
-        return Transaction.execute(new TransactionCallback<Integer>() {
-            @Override
-            public Integer doInTransaction(TransactionStatus status) {
-                return executeUpdateWithCount(SQL_FORCE_RELEASE_BY_HOST_ID, hostId);
-            }
-        });
+        return markSuspectByHostId(hostId);
     }
 
     @Override
     public int recoverByHostId(final long hostId) {
-        return Transaction.execute(new TransactionCallback<Integer>() {
-            @Override
-            public Integer doInTransaction(TransactionStatus status) {
-                return executeUpdateWithCount(SQL_RECOVER_BY_HOST_ID, hostId);
-            }
-        });
+        LOGGER.warn("Broad VF recovery is deactivated for host {}", hostId);
+        return 0;
     }
 
     @Override
@@ -614,18 +699,440 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         executeUpdateWithCount(SQL_BIND_NIC_VF_POOL_ID, poolId, nicId);
     }
 
+    private List<SriovVfPoolVO> lockRowsForNic(final long nicId) {
+        return lockRowsForNic(nicId, null);
+    }
+
+    private List<SriovVfPoolVO> lockRowsForNic(final long nicId, final Long additionalRowId) {
+        final List<SriovVfPoolVO> rows = currentLockedRowsForNic(nicId);
+        if (additionalRowId != null && findRowById(rows, additionalRowId) == null) {
+            final SriovVfPoolVO additional = findById(additionalRowId);
+            if (additional != null) {
+                rows.add(additional);
+            }
+        }
+        rows.sort((left, right) -> Long.compare(left.getId(), right.getId()));
+        final List<SriovVfPoolVO> locked = new ArrayList<>();
+        for (final SriovVfPoolVO row : rows) {
+            final SriovVfPoolVO lockedRow = lockRow(row.getId(), true);
+            if (lockedRow != null) {
+                locked.add(lockedRow);
+            }
+        }
+        return locked;
+    }
+
+    private List<SriovVfPoolVO> currentLockedRowsForNic(final long nicId) {
+        final List<SriovVfPoolVO> rows = new ArrayList<>();
+        final List<Long> ids = new ArrayList<>();
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement statement = txn.prepareAutoCloseStatement(SQL_LOCK_POOL_ROWS_FOR_NIC);
+            statement.setLong(1, nicId);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    ids.add(result.getLong(1));
+                }
+            }
+            for (final Long id : ids) {
+                final SriovVfPoolVO row = lockRow(id, true);
+                if (row != null) {
+                    rows.add(row);
+                }
+            }
+            return rows;
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to lock VF rows for NIC " + nicId, e);
+        }
+    }
+
+    private SriovVfPoolVO findOwnedRow(final List<SriovVfPoolVO> rows, final long hostId) {
+        for (final SriovVfPoolVO row : rows) {
+            if (row.getHostId() == hostId) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    private SriovVfPoolVO findRowById(final List<SriovVfPoolVO> rows, final Long id) {
+        if (id == null) {
+            return null;
+        }
+        for (final SriovVfPoolVO row : rows) {
+            if (row.getId() == id) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    private void markSuspectLocked(final SriovVfPoolVO row) {
+        SriovVfPoolVO suspect = createForUpdate();
+        suspect.setState(State.SUSPECT.name());
+        update(row.getId(), suspect);
+        row.setState(State.SUSPECT);
+    }
+
+    private Long lockNicAndReadVfPoolId(final long nicId) {
+        TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_LOCK_NIC_VF_POOL_ID);
+            pstmt.setLong(1, nicId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (!rs.next()) {
+                    throw new CloudRuntimeException("NIC " + nicId + " does not exist");
+                }
+                final long value = rs.getLong(1);
+                return rs.wasNull() ? null : value;
+            }
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to lock NIC " + nicId, e);
+        }
+    }
+
+    private long lockVmForNic(final long nicId) {
+        final long vmId = findVmIdForNic(nicId);
+        lockVm(vmId);
+        return vmId;
+    }
+
+    private long findVmIdForNic(final long nicId) {
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_FIND_VM_ID_FOR_NIC);
+            pstmt.setLong(1, nicId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (!rs.next()) {
+                    throw new CloudRuntimeException("NIC " + nicId + " does not exist");
+                }
+                return rs.getLong(1);
+            }
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to resolve VM for NIC " + nicId, e);
+        }
+    }
+
+    private VmState lockVm(final long vmId) {
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_LOCK_VM);
+            pstmt.setLong(1, vmId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (!rs.next()) {
+                    throw new CloudRuntimeException("VM " + vmId + " does not exist");
+                }
+                final long hostValue = rs.getLong("host_id");
+                return new VmState(rs.getString("state"), rs.wasNull() ? null : hostValue);
+            }
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to lock VM " + vmId, e);
+        }
+    }
+
+    private Map<Long, Long> lockVmNics(final long vmId) {
+        final Map<Long, Long> canonicalByNic = new LinkedHashMap<>();
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_LOCK_VM_NICS);
+            pstmt.setLong(1, vmId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    final long value = rs.getLong("vf_pool_id");
+                    canonicalByNic.put(rs.getLong("id"), rs.wasNull() ? null : value);
+                }
+            }
+            return canonicalByNic;
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to lock NICs for VM " + vmId, e);
+        }
+    }
+
+    private Map<Long, List<SriovVfPoolVO>> lockPoolRowsForNics(final Map<Long, Long> canonicalByNic) {
+        return lockPoolRowsForNics(canonicalByNic, Collections.emptyMap());
+    }
+
+    private Map<Long, List<SriovVfPoolVO>> lockPoolRowsForNics(
+            final Map<Long, Long> canonicalByNic, final Map<Long, List<Long>> additionalByNic) {
+        final Map<Long, List<SriovVfPoolVO>> observedByNic = new LinkedHashMap<>();
+        final Map<Long, SriovVfPoolVO> uniqueRows = new java.util.TreeMap<>();
+        for (final Map.Entry<Long, Long> entry : canonicalByNic.entrySet()) {
+            final List<SriovVfPoolVO> rows = new ArrayList<>(listByNicId(entry.getKey()));
+            final Long canonicalId = entry.getValue();
+            if (canonicalId != null && findRowById(rows, canonicalId) == null) {
+                final SriovVfPoolVO canonical = findById(canonicalId);
+                if (canonical != null) {
+                    rows.add(canonical);
+                }
+            }
+            for (final Long additionalId : additionalByNic.getOrDefault(entry.getKey(), Collections.emptyList())) {
+                if (additionalId != null && findRowById(rows, additionalId) == null) {
+                    final SriovVfPoolVO additional = findById(additionalId);
+                    if (additional != null) {
+                        rows.add(additional);
+                    }
+                }
+            }
+            observedByNic.put(entry.getKey(), rows);
+            for (final SriovVfPoolVO row : rows) {
+                uniqueRows.put(row.getId(), row);
+            }
+        }
+        final Map<Long, SriovVfPoolVO> lockedRows = new HashMap<>();
+        for (final Long rowId : uniqueRows.keySet()) {
+            final SriovVfPoolVO locked = lockRow(rowId, true);
+            if (locked != null) {
+                lockedRows.put(rowId, locked);
+            }
+        }
+        final Map<Long, List<SriovVfPoolVO>> lockedByNic = new LinkedHashMap<>();
+        for (final Map.Entry<Long, List<SriovVfPoolVO>> entry : observedByNic.entrySet()) {
+            final List<SriovVfPoolVO> rows = new ArrayList<>();
+            for (final SriovVfPoolVO row : entry.getValue()) {
+                if (lockedRows.containsKey(row.getId())) {
+                    rows.add(lockedRows.get(row.getId()));
+                }
+            }
+            lockedByNic.put(entry.getKey(), rows);
+        }
+        return lockedByNic;
+    }
+
+    List<CommitChange> validateVmCommit(final long vmId, final Long expectedSourceHostId,
+                                        final long destinationHostId,
+                                        final Map<Long, Long> canonicalByNic,
+                                        final Map<Long, List<SriovVfPoolVO>> rowsByNic) {
+        final List<CommitChange> changes = new ArrayList<>();
+        for (final Map.Entry<Long, List<SriovVfPoolVO>> entry : rowsByNic.entrySet()) {
+            final long nicId = entry.getKey();
+            final List<SriovVfPoolVO> rows = entry.getValue();
+            if (rows.isEmpty()) {
+                continue;
+            }
+            final SriovVfPoolVO destination = findOwnedRow(rows, destinationHostId);
+            if (destination == null || !(State.RESERVED.name().equals(destination.getState())
+                    || State.ALLOCATED.name().equals(destination.getState()))) {
+                throw new CloudRuntimeException(String.format(
+                        "Atomic VF commit refused for vm=%d nic=%d: destination host=%d row missing or not owned",
+                        vmId, nicId, destinationHostId));
+            }
+            for (final SriovVfPoolVO row : rows) {
+                if (State.RESERVED.name().equals(row.getState()) && row.getId() != destination.getId()) {
+                    throw new CloudRuntimeException("Atomic VF commit refused: unrelated RESERVED row " + row.getId());
+                }
+            }
+            final SriovVfPoolVO canonical = findRowById(rows, canonicalByNic.get(nicId));
+            if (expectedSourceHostId != null && (canonical == null
+                    || canonical.getHostId() != expectedSourceHostId && canonical.getId() != destination.getId())) {
+                throw new CloudRuntimeException(String.format(
+                        "Atomic VF commit refused for vm=%d nic=%d: expected source=%d canonical=%s",
+                        vmId, nicId, expectedSourceHostId, canonical));
+            }
+            final List<SriovVfPoolVO> prior = new ArrayList<>();
+            for (final SriovVfPoolVO row : rows) {
+                if (row.getId() != destination.getId() && !State.FREE.name().equals(row.getState())) {
+                    prior.add(row);
+                }
+            }
+            changes.add(new CommitChange(nicId, destination, prior));
+        }
+        return changes;
+    }
+
+    private void requireAuthoritativeDestination(final long vmId, final VmState vm,
+                                                 final long destinationHostId) {
+        if (!"Running".equals(vm.state) || vm.hostId == null || vm.hostId != destinationHostId) {
+            throw new CloudRuntimeException(String.format(
+                    "Atomic VF commit refused for vm=%d: state=%s host=%s destination=%d",
+                    vmId, vm.state, vm.hostId, destinationHostId));
+        }
+    }
+
+    private void validateWorkIfPresent(final long vmId, final long destinationHostId,
+                                       final String workId) {
+        if (workId != null && !workId.trim().isEmpty()) {
+            validateWork(vmId, destinationHostId, workId);
+        }
+    }
+
+    private void validateWork(final long vmId, final long destinationHostId, final String workId) {
+        if (workId == null || workId.trim().isEmpty()) {
+            throw new CloudRuntimeException("Atomic VF ownership change requires an operation work id");
+        }
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_LOCK_WORK);
+            pstmt.setString(1, workId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (!rs.next() || rs.getLong("instance_id") != vmId) {
+                    throw new CloudRuntimeException("Stale or foreign VF ownership work id " + workId);
+                }
+                final String type = rs.getString("type");
+                final String step = rs.getString("step");
+                final long resourceId = rs.getLong("resource_id");
+                final boolean validStep = "Prepare".equals(step) || "Started".equals(step) || "Done".equals(step)
+                        || "Starting".equals(step) || "Migrating".equals(step)
+                        || "Release".equals(step);
+                final boolean validType = "Starting".equals(type) || "Migrating".equals(type);
+                final boolean validDestination = !"Migrating".equals(type) || resourceId == destinationHostId;
+                if (!validStep || !validType || !validDestination) {
+                    throw new CloudRuntimeException(String.format(
+                            "Stale VF ownership work id=%s type=%s step=%s resource=%d destination=%d",
+                            workId, type, step, resourceId, destinationHostId));
+                }
+            }
+            final PreparedStatement latest = txn.prepareAutoCloseStatement(SQL_LOCK_LATEST_VM_WORK);
+            latest.setLong(1, vmId);
+            try (ResultSet rs = latest.executeQuery()) {
+                if (!rs.next() || !workId.equals(rs.getString("id"))) {
+                    throw new CloudRuntimeException("Stale VF ownership operation generation " + workId);
+                }
+            }
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to validate VF ownership work " + workId, e);
+        }
+    }
+
+    private void requireNoConflictingWork(final long vmId) {
+        final TransactionLegacy txn = TransactionLegacy.currentTxn();
+        try {
+            final PreparedStatement pstmt = txn.prepareAutoCloseStatement(SQL_COUNT_CONFLICTING_WORK);
+            pstmt.setLong(1, vmId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (!rs.next() || rs.getLong(1) != 0) {
+                    throw new CloudRuntimeException("VF reconciliation refused: VM " + vmId
+                            + " has conflicting ownership work");
+                }
+            }
+        } catch (SQLException e) {
+            throw new CloudRuntimeException("Failed to check work for VM " + vmId, e);
+        }
+    }
+
+    private boolean validReconciliationRows(final long nicId, final long currentHostId,
+                                            final SriovVfPoolVO current, final SriovVfPoolVO stale,
+                                            final List<SriovVfPoolVO> rows) {
+        if (current == null || stale == null || current.getId() == stale.getId()
+                || current.getHostId() != currentHostId
+                || !Long.valueOf(nicId).equals(stale.getAllocatedToNicId())) {
+            return false;
+        }
+        for (final SriovVfPoolVO row : rows) {
+            if (State.RESERVED.name().equals(row.getState())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean validReconciliationCandidate(final VfReconciliationCandidate candidate,
+                                                 final Map<Long, Long> canonicalByNic,
+                                                 final Map<Long, List<SriovVfPoolVO>> rowsByNic) {
+        final List<SriovVfPoolVO> rows = rowsByNic.get(candidate.getNicId());
+        if (rows == null) {
+            return false;
+        }
+        final SriovVfPoolVO current = findRowById(rows, candidate.getCurrentPoolId());
+        final SriovVfPoolVO stale = findRowById(rows, candidate.getStalePoolId());
+        if (!validReconciliationRows(candidate.getNicId(), candidate.getCurrentHostId(), current, stale, rows)) {
+            return false;
+        }
+        final Long canonical = canonicalByNic.get(candidate.getNicId());
+        if (candidate.isPromoteCurrent()) {
+            final boolean pending = canonical != null && canonical == candidate.getStalePoolId()
+                    && State.ALLOCATED.name().equals(stale.getState())
+                    && State.FREE.name().equals(current.getState())
+                    && current.getAllocatedToNicId() == null;
+            final boolean quarantined = canonical != null && canonical == candidate.getCurrentPoolId()
+                    && State.ALLOCATED.name().equals(current.getState())
+                    && Long.valueOf(candidate.getNicId()).equals(current.getAllocatedToNicId())
+                    && State.SUSPECT.name().equals(stale.getState());
+            return pending || quarantined;
+        }
+        return canonical != null && canonical == candidate.getCurrentPoolId()
+                && State.ALLOCATED.name().equals(current.getState());
+    }
+
+    private boolean hasDuplicateReconciliationRows(final List<VfReconciliationCandidate> candidates) {
+        final java.util.Set<Long> staleRows = new java.util.HashSet<>();
+        for (final VfReconciliationCandidate candidate : candidates) {
+            if (!staleRows.add(candidate.getStalePoolId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    <T> T executeWithDeadlockRetry(final Supplier<T> action) {
+        CloudRuntimeException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                return action.get();
+            } catch (CloudRuntimeException e) {
+                if (!isDeadlock(e) || attempt == 2) {
+                    throw e;
+                }
+                last = e;
+                try {
+                    Thread.sleep(25L * (attempt + 1));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new CloudRuntimeException("Interrupted while retrying VF ownership deadlock", interrupted);
+                }
+            }
+        }
+        throw last;
+    }
+
+    private boolean isDeadlock(final Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof SQLException) {
+                final SQLException sql = (SQLException) current;
+                if (sql.getErrorCode() == 1213 || "40001".equals(sql.getSQLState())) {
+                    return true;
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static final class VmState {
+        private final String state;
+        private final Long hostId;
+
+        private VmState(final String state, final Long hostId) {
+            this.state = state;
+            this.hostId = hostId;
+        }
+    }
+
+    static final class CommitChange {
+        private final long nicId;
+        private final SriovVfPoolVO destination;
+        private final List<SriovVfPoolVO> prior;
+
+        private CommitChange(final long nicId, final SriovVfPoolVO destination,
+                             final List<SriovVfPoolVO> prior) {
+            this.nicId = nicId;
+            this.destination = destination;
+            this.prior = prior;
+        }
+    }
+
     /**
      * Inverse of {@link #bindNicVfPoolId} — clears the reverse pointer on
      * a single NIC. Used by every release path so a NIC that went through
      * dual-write allocation does not stay tagged with a stale {@code
      * vf_pool_id} after the VF was returned to the pool.
      */
-    private void unbindNicVfPoolIdByNic(long nicId) {
-        executeUpdateWithCount(SQL_UNBIND_NIC_VF_POOL_ID_BY_NIC, nicId);
+    private void unbindNicVfPoolIdExact(long nicId, long vfPoolId) {
+        executeUpdateWithCount(SQL_UNBIND_NIC_VF_POOL_ID_EXACT, nicId, vfPoolId);
     }
 
     /**
-     * Cross-table UPDATE helper for {@link #releaseByVmId(long)} / {@link #sweepOrphans()}.
+     * Cross-table UPDATE helper for {@link #quarantineByVmId(long)} / {@link #sweepOrphans()}.
      * Uses {@link TransactionLegacy#prepareAutoCloseStatement(String)} on the enclosing
      * transaction's connection; the returned PreparedStatement closes itself when the
      * transaction commits / rolls back — we must NOT close the TransactionLegacy itself

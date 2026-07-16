@@ -158,30 +158,13 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         }
         String pciAddress = iface.getPciAddress();
         final String mac = iface.getMacAddress();
-        // libvirt strips the host-side info on destroy paths; resolve VF by
-        // MAC scan via the static lookup the legacy driver already implements.
-        if (StringUtils.isBlank(pciAddress) && StringUtils.isNotBlank(mac)) {
-            pciAddress = new VfPassthroughVifDriver().pfCache().isEmpty() ? null : null;
-            // Fall back through reflection of VfPassthroughVifDriver.lookupVfPciByMac
-            // to reuse the cached PF scan without copy-pasting the algorithm.
-            try {
-                final java.lang.reflect.Method m = VfPassthroughVifDriver.class
-                        .getDeclaredMethod("lookupVfPciByMac", String.class);
-                m.setAccessible(true);
-                pciAddress = (String) m.invoke(new VfPassthroughVifDriver(), mac);
-            } catch (ReflectiveOperationException e) {
-                logger.debug("OvnVfPassthroughVifDriver.unplug: VF MAC reverse lookup failed: {}", e.getMessage());
-            }
-        }
         if (StringUtils.isNotBlank(pciAddress)) {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.unplug", repName);
             } else {
-                logger.warn("OvnVfPassthroughVifDriver.unplug: rep not found for pci={} mac={}; "
-                        + "falling back to attached-mac rep lookup", pciAddress, mac);
-                OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVfPassthroughVifDriver.unplug",
-                        integrationBridge, mac);
+                logger.warn("OvnVfPassthroughVifDriver.unplug: exact representor not found for pci={} mac={}; skipping OVS cleanup",
+                        pciAddress, mac);
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
@@ -190,9 +173,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
         } else {
-            logger.warn("OvnVfPassthroughVifDriver.unplug: could not resolve VF PCI for mac={}; "
-                    + "falling back to attached-mac rep lookup", mac);
-            OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVfPassthroughVifDriver.unplug", integrationBridge, mac);
+            logger.warn("OvnVfPassthroughVifDriver.unplug: no explicit VF PCI for mac={}; fail-closed skip", mac);
         }
     }
 

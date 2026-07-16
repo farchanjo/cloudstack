@@ -1,0 +1,8 @@
+{
+  "keepVdpaNames": ["vdpa-legacy"],
+  "keepPciBdfs": ["0000:01:00.2"],
+  "dryRun": false,
+  "purgeVdpa": true,
+  "rebindPassthroughVfs": true,
+  "purgeStaleOvsReps": true
+}

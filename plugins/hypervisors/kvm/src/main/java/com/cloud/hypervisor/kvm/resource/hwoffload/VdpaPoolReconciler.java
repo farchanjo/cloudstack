@@ -54,10 +54,9 @@ import com.google.gson.JsonParser;
  *   <li>Cross-reference each SF against the {@link IntentReconciler}'s live
  *       VR set <em>and</em> the host's libvirt domain XML (via the
  *       {@link DomainOwnerProbe} hook so tests can stub it).
- *   <li>If the SF has no live owner: add it to {@code pendingDeletion} with a
- *       wall-clock deadline of {@code graceMillis} (default 5 minutes); on the
- *       next tick, if the SF is still unowned past the deadline, run
- *       {@code vdpa dev del}.
+ *   <li>If the SF has no live owner: add it to {@code pendingDeletion} for
+ *       observability only. Destructive deletion requires an explicit PCI
+ *       target from management and is never inferred from local-domain absence.
  *   <li>If a domain references an SF that is missing on the host: log an
  *       error (data-plane drift; admin alert path).
  * </ol>
@@ -136,16 +135,15 @@ public class VdpaPoolReconciler {
             if (firstSeen == null) {
                 pendingDeletion.put(sf.name, now);
                 markedPending++;
-                LOGGER.warn("VdpaPoolReconciler: SF {} (mgmtdev={} mac={}) has no live owner — pending deletion in {} ms",
+                LOGGER.warn("VdpaPoolReconciler: SF {} (mgmtdev={} mac={}) has no live owner — preserving and rechecking in {} ms",
                         sf.name, sf.mgmtdevPci, sf.mac, graceMillis);
                 continue;
             }
             if (now - firstSeen >= graceMillis) {
-                Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", sf.name), 5000);
-                pendingDeletion.remove(sf.name);
-                deleted++;
-                appendLogEntry(now, "deleted", sf, "grace-expired");
-                LOGGER.warn("VdpaPoolReconciler: deleted orphan SF {} after {} ms grace", sf.name, graceMillis);
+                driftAlerts++;
+                appendLogEntry(now, "suspect", sf, "grace-expired-targeted-cleanup-required");
+                LOGGER.error("VdpaPoolReconciler: SF {} remains unowned after {} ms; preserving it until explicit targeted cleanup",
+                        sf.name, graceMillis);
             }
         }
 

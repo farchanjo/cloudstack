@@ -244,6 +244,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         // (1) vdpa dev del — match by /dev path first, fall back to vdpa-name
         //     scan via VdpaVifDriver helpers.
         String vdpaName = VdpaVifDriver.lookupVdpaNameByVhostDev(vhostDev);
+        final String pciAddress = VdpaVifDriver.lookupVdpaPciByName(vdpaName);
         if (StringUtils.isNotBlank(vdpaName)) {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("OvnVdpaVifDriver.unplug: deleted vdpa dev {}", vdpaName);
@@ -254,16 +255,12 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         // (2) Free the representor for OVN reuse: clear external_ids (iface-id /
         //     attached-mac / iface-status) and del-port in a bridge-agnostic way
         //     so a wrong integration-bridge name cannot leave a live OVN binding
-        //     after destroy/expunge (Chaos B). Prefer PCI reverse lookup; if that
-        //     misses (libvirt zeroed the VF MAC) or the rep is unresolved, fall
-        //     back to OVSDB attached-mac.
-        boolean repFreed = false;
-        final String pciAddress = lookupVfPciByMac(mac);
+        //     after destroy/expunge (Chaos B). Cleanup is fail-closed unless
+        //     the vhost device resolves to one exact vDPA management BDF.
         if (StringUtils.isNotBlank(pciAddress)) {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.unplug", repName);
-                repFreed = true;
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
@@ -271,11 +268,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 Script.runSimpleBashScript(String.format(
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
-        }
-        if (!repFreed) {
-            logger.warn("OvnVdpaVifDriver.unplug: VF MAC reverse lookup failed or rep missing for mac={}; "
-                    + "falling back to attached-mac rep lookup", mac);
-            OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVdpaVifDriver.unplug", integrationBridge, mac);
+        } else {
+            logger.warn("OvnVdpaVifDriver.unplug: no exact VF PCI for vhost={} mac={}; fail-closed skip of representor/VF identity",
+                    vhostDev, mac);
         }
     }
 
@@ -365,26 +360,6 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 + " (deferred-active: post-start hook will cycle to active after vDPA queue negotiation)",
                 repName, lspName);
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
-    }
-
-    /**
-     * Resolve VF PCI BDF by guest MAC. Reflectively reuses the cached PF
-     * scan in {@link VfPassthroughVifDriver}; reflection cost is paid once
-     * per unplug, dwarfed by the surrounding sysfs scans.
-     */
-    private String lookupVfPciByMac(final String mac) {
-        if (StringUtils.isBlank(mac)) {
-            return null;
-        }
-        try {
-            final java.lang.reflect.Method m = VfPassthroughVifDriver.class
-                    .getDeclaredMethod("lookupVfPciByMac", String.class);
-            m.setAccessible(true);
-            return (String) m.invoke(new VfPassthroughVifDriver(), mac);
-        } catch (ReflectiveOperationException e) {
-            logger.debug("OvnVdpaVifDriver.lookupVfPciByMac reflective dispatch failed: {}", e.getMessage());
-            return null;
-        }
     }
 
     /**

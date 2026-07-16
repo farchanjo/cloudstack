@@ -5705,9 +5705,10 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
     @Override
     public void finalizeExpunge(VirtualMachine vm) {
         try {
-            int released = vfPoolManager.releaseByVmId(vm.getId());
+            int released = vfPoolManager.quarantineByVmId(vm.getId());
             if (released > 0) {
-                logger.info("Released {} SR-IOV VF(s) from pool for expunged VM id={}", released, vm.getId());
+                logger.info("Quarantined {} SR-IOV VF row(s) for expunged VM id={} pending exact cleanup",
+                        released, vm.getId());
             }
         } catch (Exception e) {
             logger.warn("VF pool release failed during expunge for VM id={}: {}", vm.getId(), e.getMessage());

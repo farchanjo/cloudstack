@@ -421,26 +421,33 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * we always return the actual PF (phys_port_name = p&lt;N&gt;) and never a representor
      * (phys_port_name = pf&lt;N&gt;vf&lt;M&gt;).
      */
-    static String lookupPfFromVf(String vfPciAddress) {
+    public static String lookupPfFromVf(String vfPciAddress) {
+        return lookupPfFromVf(vfPciAddress,
+                java.nio.file.Paths.get("/sys/bus/pci/devices"),
+                java.nio.file.Paths.get("/sys/class/net"));
+    }
+
+    public static String lookupPfFromVf(String vfPciAddress, java.nio.file.Path pciDevices,
+                                        java.nio.file.Path netClass) {
         if (StringUtils.isBlank(vfPciAddress)) {
             return null;
         }
-        File pfNetDir = new File(String.format("/sys/bus/pci/devices/%s/physfn/net", vfPciAddress));
-        if (!pfNetDir.isDirectory()) {
+        final java.nio.file.Path pfNetDir = pciDevices.resolve(vfPciAddress).resolve("physfn/net");
+        if (!java.nio.file.Files.isDirectory(pfNetDir)) {
             return null;
         }
-        String[] entries = pfNetDir.list();
+        final String[] entries = pfNetDir.toFile().list();
         if (entries == null || entries.length == 0) {
             return null;
         }
         for (String name : entries) {
-            String port = readPhysPortName(name);
+            String port = readPhysPortName(name, netClass);
             if (port != null && port.matches("p\\d+")) {
                 return name;
             }
         }
         for (String name : entries) {
-            String port = readPhysPortName(name);
+            String port = readPhysPortName(name, netClass);
             if (port == null || !port.startsWith("pf")) {
                 return name;
             }
@@ -449,12 +456,16 @@ public class VfPassthroughVifDriver extends VifDriverBase {
     }
 
     static String readPhysPortName(String iface) {
-        File f = new File(String.format("/sys/class/net/%s/phys_port_name", iface));
-        if (!f.exists()) {
+        return readPhysPortName(iface, java.nio.file.Paths.get("/sys/class/net"));
+    }
+
+    static String readPhysPortName(String iface, java.nio.file.Path netClass) {
+        final java.nio.file.Path physPort = netClass.resolve(iface).resolve("phys_port_name");
+        if (!java.nio.file.Files.exists(physPort)) {
             return null;
         }
         try {
-            return new String(java.nio.file.Files.readAllBytes(f.toPath())).trim();
+            return new String(java.nio.file.Files.readAllBytes(physPort)).trim();
         } catch (Exception e) {
             return null;
         }
@@ -464,17 +475,20 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * Resolve the VF index (0..N-1) under its parent PF, by inspecting
      * {@code /sys/bus/pci/devices/<pf>/virtfnN/} symlinks.
      */
-    static Integer lookupVfIdFromPci(String vfPciAddress) {
+    public static Integer lookupVfIdFromPci(String vfPciAddress) {
+        return lookupVfIdFromPci(vfPciAddress, java.nio.file.Paths.get("/sys/bus/pci/devices"));
+    }
+
+    public static Integer lookupVfIdFromPci(String vfPciAddress, java.nio.file.Path pciDevices) {
         if (StringUtils.isBlank(vfPciAddress)) {
             return null;
         }
-        File physfnLink = new File(String.format("/sys/bus/pci/devices/%s/physfn", vfPciAddress));
-        if (!physfnLink.exists()) {
+        final java.nio.file.Path physfnLink = pciDevices.resolve(vfPciAddress).resolve("physfn");
+        if (!java.nio.file.Files.exists(physfnLink)) {
             return null;
         }
         try {
-            String pfPath = physfnLink.getCanonicalPath();
-            File pfDir = new File(pfPath);
+            final File pfDir = physfnLink.toRealPath().toFile();
             String[] entries = pfDir.list();
             if (entries == null) {
                 return null;
@@ -501,14 +515,25 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * The PF index (N) is read from the PF's own phys_port_name (p&lt;N&gt;) rather than
      * parsed from the PF netdev name, so renames (eg. enp1s0f0np0) do not break lookup.
      */
-    static String lookupRepresentor(String vfPciAddress) {
-        Integer vfId = lookupVfIdFromPci(vfPciAddress);
-        String pfName = lookupPfFromVf(vfPciAddress);
+    public static String lookupRepresentor(String vfPciAddress) {
+        return lookupRepresentor(vfPciAddress,
+                java.nio.file.Paths.get("/sys/bus/pci/devices"),
+                java.nio.file.Paths.get("/sys/class/net"));
+    }
+
+    public static String lookupRepresentor(String vfPciAddress, java.nio.file.Path pciDevices,
+                                           java.nio.file.Path netClass) {
+        Integer vfId = lookupVfIdFromPci(vfPciAddress, pciDevices);
+        String pfName = lookupPfFromVf(vfPciAddress, pciDevices, netClass);
         if (vfId == null || pfName == null) {
             return null;
         }
+        final String parentPfPci = resolveParentPfPci(vfPciAddress, pciDevices);
+        if (parentPfPci == null) {
+            return null;
+        }
         Integer pfIdx = null;
-        String pfPhysPort = readPhysPortName(pfName);
+        String pfPhysPort = readPhysPortName(pfName, netClass);
         if (pfPhysPort != null && pfPhysPort.matches("p\\d+")) {
             try {
                 pfIdx = Integer.parseInt(pfPhysPort.substring(1));
@@ -517,20 +542,69 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             }
         }
         if (pfIdx == null) {
-            pfIdx = (pfName.endsWith("p1") || pfName.contains("1")) ? 1 : 0;
+            return null;
         }
         String expectedPhysPort = String.format("pf%dvf%d", pfIdx, vfId);
-        File netDir = new File("/sys/class/net");
-        String[] ifaces = netDir.list();
+        final String parentSwitchId = readNetAttribute(pfName, "phys_switch_id", netClass);
+        String[] ifaces = netClass.toFile().list();
         if (ifaces == null) {
             return null;
         }
+        java.util.Arrays.sort(ifaces);
+        final List<String> exactDeviceMatches = new ArrayList<>();
+        final List<String> switchPortMatches = new ArrayList<>();
         for (String iface : ifaces) {
-            if (expectedPhysPort.equals(readPhysPortName(iface))) {
-                return iface;
+            if (!expectedPhysPort.equals(readPhysPortName(iface, netClass))) {
+                continue;
+            }
+            final String candidatePci = resolveNetDevicePci(iface, netClass);
+            if (parentPfPci.equalsIgnoreCase(candidatePci)) {
+                exactDeviceMatches.add(iface);
+                continue;
+            }
+            final String candidateSwitchId = readNetAttribute(iface, "phys_switch_id", netClass);
+            if (StringUtils.isNotBlank(parentSwitchId)
+                    && parentSwitchId.equalsIgnoreCase(candidateSwitchId)
+                    && pfPhysPort.equals("p" + pfIdx)) {
+                switchPortMatches.add(iface);
             }
         }
-        return null;
+        if (exactDeviceMatches.size() == 1) {
+            return exactDeviceMatches.get(0);
+        }
+        return exactDeviceMatches.isEmpty() && switchPortMatches.size() == 1
+                ? switchPortMatches.get(0) : null;
+    }
+
+    private static String resolveParentPfPci(final String vfPciAddress,
+                                             final java.nio.file.Path pciDevices) {
+        try {
+            return pciDevices.resolve(vfPciAddress).resolve("physfn")
+                    .toRealPath().getFileName().toString();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    private static String resolveNetDevicePci(final String iface,
+                                              final java.nio.file.Path netClass) {
+        try {
+            return netClass.resolve(iface).resolve("device")
+                    .toRealPath().getFileName().toString();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    private static String readNetAttribute(final String iface, final String attribute,
+                                           final java.nio.file.Path netClass) {
+        final java.nio.file.Path path = netClass.resolve(iface).resolve(attribute);
+        try {
+            return java.nio.file.Files.exists(path)
+                    ? new String(java.nio.file.Files.readAllBytes(path)).trim() : null;
+        } catch (java.io.IOException e) {
+            return null;
+        }
     }
 
     private static final java.util.regex.Pattern PF_VF_PHYS_PORT =

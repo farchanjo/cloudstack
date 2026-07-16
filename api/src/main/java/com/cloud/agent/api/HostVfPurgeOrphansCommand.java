@@ -16,46 +16,30 @@
 // under the License.
 package com.cloud.agent.api;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
+import org.apache.commons.codec.digest.DigestUtils;
+
 /**
- * Purge orphan host-level NIC bindings on a target KVM agent. Sent by
- * {@code VfPoolManagerImpl.forceReleaseByHostId} after the DB pool rows
- * have been flipped to {@code FREE}, so kernel state is brought back
- * into agreement with the management database.
+ * Inspect or clean explicitly targeted host-level VF bindings on a KVM agent.
  *
- * <p>Three cleanup paths run inside one round-trip:
+ * <p><b>Fail closed:</b> {@link #targetPciBdfs} is the destructive scope.
+ * When it is absent or empty, a compatible agent performs no cleanup even
+ * when a legacy management server sends broad flags or empty keep sets. This
+ * protects the agent during mixed-version operation, but does not make an old
+ * management server's DB-side release behavior safe. Management safety gates
+ * must be deployed and left disabled before agent rollout.
  *
- * <ul>
- *   <li><b>vDPA</b> — every {@code vdpa dev show} entry whose name is NOT
- *       in {@link #keepVdpaNames} gets removed via {@code vdpa dev del}.
- *       Without this, a failed VR / VM start that ran {@code vdpa dev add}
- *       but never reached the unwind path leaves an orphan vdpa-net dev
- *       on a VF; mlx5_vdpa allows only one vdpa-net per VF, so the next
- *       allocator pick on the same PCI BDF fails with
- *       {@code kernel answers: No space left on device}.</li>
- *   <li><b>VF passthrough</b> — every PCI VF currently bound to
- *       {@code vfio-pci} whose BDF is NOT in {@link #keepPciBdfs} gets
- *       unbound and re-bound to {@code mlx5_core}. Without this, a VF
- *       stranded in {@code vfio-pci} after an abnormal VM termination
- *       cannot host a fresh hostdev passthrough on the next deploy.</li>
- *   <li><b>OVS FREE representors</b> — every switchdev VF representor that
- *       still carries {@code external_ids:iface-id} while the VF is
- *       kernel-FREE (not on {@code vfio-pci}, no vDPA) gets
- *       {@code external_ids} cleared and the port deleted. Heals residual
- *       Chaos-B leaks left by pre-fix unplug paths. ALLOCATED VFs are
- *       never touched (agent-local FREE heuristic).</li>
- * </ul>
- *
- * <p>Both keep-sets default to empty: empty ⇒ wipe everything on the
- * vDPA/vfio paths. The OVS path always uses the FREE heuristic so live
- * ALLOCATED bindings stay intact even with empty keep-sets. The caller
- * (force-release path) typically passes empty sets because the DB rows
- * have already been flipped to {@code FREE}; in operator-controlled
- * paths a non-empty keep-set protects active bindings on the first two
- * paths. Periodic orphan sweep sets {@link #purgeVdpa}/{@link #rebindPassthroughVfs}
- * false and only runs the OVS residual heal.
+ * <p>A present target is mutated only when the observed nonzero MAC exactly
+ * matches the expected MAC, or when management supplies a cryptographically
+ * bound lifecycle authorization containing the BDF, expected MAC, operation
+ * id, and purpose. Active domain references always block cleanup. An inactive
+ * migration-stage domain additionally requires a {@code STAGE_ROLLBACK}
+ * lifecycle purpose.
  *
  * <p>{@code dryRun} reports without mutating.
  *
@@ -72,20 +56,35 @@ public class HostVfPurgeOrphansCommand extends Command {
     /** PCI BDFs (e.g. {@code 0000:01:04.3}) that must NOT be rebound. */
     private Set<String> keepPciBdfs = new HashSet<>();
 
+    /** Exact PCI BDFs that the agent is authorized to inspect and clean. */
+    private Set<String> targetPciBdfs = new HashSet<>();
+
+    /** Optional expected guest MAC per target BDF; mismatches fail closed. */
+    private Map<String, String> expectedMacsByPciBdf = new HashMap<>();
+
+    /** Operation id used to bind explicit lifecycle authorization per BDF. */
+    private Map<String, String> ownerOperationIdsByPciBdf = new HashMap<>();
+
+    /** Authorization purpose per BDF, for example RECONCILE or STAGE_ROLLBACK. */
+    private Map<String, String> ownerPurposesByPciBdf = new HashMap<>();
+
+    /** SHA-256 authorization bound to BDF, MAC, operation id, and purpose. */
+    private Map<String, String> ownerTokensByPciBdf = new HashMap<>();
+
     /** When {@code true}, only report what would be cleaned. */
     private boolean dryRun;
 
     /** When {@code true}, run the vDPA purge step. */
-    private boolean purgeVdpa = true;
+    private boolean purgeVdpa;
 
     /** When {@code true}, run the VF passthrough rebind step. */
-    private boolean rebindPassthroughVfs = true;
+    private boolean rebindPassthroughVfs;
 
     /**
      * When {@code true}, free OVS external_ids/del-port on FREE VF
      * representors that still carry iface-id (residual Chaos B).
      */
-    private boolean purgeStaleOvsReps = true;
+    private boolean purgeStaleOvsReps;
 
     /** No-arg constructor for serialization frameworks. */
     public HostVfPurgeOrphansCommand() {
@@ -118,6 +117,94 @@ public class HostVfPurgeOrphansCommand extends Command {
 
     public void setKeepPciBdfs(final Set<String> keepPciBdfs) {
         this.keepPciBdfs = keepPciBdfs == null ? new HashSet<>() : new HashSet<>(keepPciBdfs);
+    }
+
+    public Set<String> getTargetPciBdfs() {
+        return targetPciBdfs == null ? Collections.emptySet() : targetPciBdfs;
+    }
+
+    public void setTargetPciBdfs(final Set<String> targetPciBdfs) {
+        this.targetPciBdfs = targetPciBdfs == null ? new HashSet<>() : new HashSet<>(targetPciBdfs);
+    }
+
+    public Map<String, String> getExpectedMacsByPciBdf() {
+        return expectedMacsByPciBdf == null ? Collections.emptyMap() : expectedMacsByPciBdf;
+    }
+
+    public void setExpectedMacsByPciBdf(final Map<String, String> expectedMacsByPciBdf) {
+        this.expectedMacsByPciBdf = expectedMacsByPciBdf == null
+                ? new HashMap<>() : new HashMap<>(expectedMacsByPciBdf);
+    }
+
+    public Map<String, String> getOwnerOperationIdsByPciBdf() {
+        return ownerOperationIdsByPciBdf == null ? Collections.emptyMap() : ownerOperationIdsByPciBdf;
+    }
+
+    public void setOwnerOperationIdsByPciBdf(final Map<String, String> values) {
+        ownerOperationIdsByPciBdf = values == null ? new HashMap<>() : new HashMap<>(values);
+    }
+
+    public Map<String, String> getOwnerPurposesByPciBdf() {
+        return ownerPurposesByPciBdf == null ? Collections.emptyMap() : ownerPurposesByPciBdf;
+    }
+
+    public void setOwnerPurposesByPciBdf(final Map<String, String> values) {
+        ownerPurposesByPciBdf = values == null ? new HashMap<>() : new HashMap<>(values);
+    }
+
+    public Map<String, String> getOwnerTokensByPciBdf() {
+        return ownerTokensByPciBdf == null ? Collections.emptyMap() : ownerTokensByPciBdf;
+    }
+
+    public void setOwnerTokensByPciBdf(final Map<String, String> values) {
+        ownerTokensByPciBdf = values == null ? new HashMap<>() : new HashMap<>(values);
+    }
+
+    public static String createOwnerToken(final String bdf, final String expectedMac,
+                                          final String operationId, final String purpose) {
+        return DigestUtils.sha256Hex(String.join("|", "VF_OWNER_V1", normalize(bdf),
+                normalize(expectedMac), normalize(operationId), normalize(purpose)));
+    }
+
+    public boolean hasValidOwnerToken(final String bdf, final String expectedMac) {
+        if (expectedMac == null || expectedMac.trim().isEmpty()
+                || "00:00:00:00:00:00".equalsIgnoreCase(expectedMac)) {
+            return false;
+        }
+        final String operationId = valueForBdf(getOwnerOperationIdsByPciBdf(), bdf);
+        final String purpose = valueForBdf(getOwnerPurposesByPciBdf(), bdf);
+        final String token = valueForBdf(getOwnerTokensByPciBdf(), bdf);
+        return operationId != null && !operationId.trim().isEmpty()
+                && purpose != null && !purpose.trim().isEmpty()
+                && token != null && token.equalsIgnoreCase(createOwnerToken(bdf, expectedMac, operationId, purpose));
+    }
+
+    public String getOwnerPurpose(final String bdf) {
+        return valueForBdf(getOwnerPurposesByPciBdf(), bdf);
+    }
+
+    public String getOwnerOperationId(final String bdf) {
+        return valueForBdf(getOwnerOperationIdsByPciBdf(), bdf);
+    }
+
+    public String getOwnerToken(final String bdf) {
+        return valueForBdf(getOwnerTokensByPciBdf(), bdf);
+    }
+
+    private static String valueForBdf(final Map<String, String> values, final String bdf) {
+        if (values == null || bdf == null) {
+            return null;
+        }
+        for (final Map.Entry<String, String> entry : values.entrySet()) {
+            if (bdf.equalsIgnoreCase(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static String normalize(final String value) {
+        return value == null ? "" : value.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     public boolean isDryRun() {

@@ -37,16 +37,9 @@ import com.cloud.agent.api.Command;
  *       BDF, MAC, max_vqs, /dev/vhost-vdpa-N path).
  * </ul>
  *
- * <p>The mgmt-side {@code VfPoolReconcilerImpl} consumes the payload to:
- * <ol>
- *   <li>refresh {@code last_seen} on every VF the agent confirms;
- *   <li>flip {@code ALLOCATED} rows to {@code SUSPECT} when no agent has
- *       refreshed them past the suspect timeout;
- *   <li>convert {@code PASSTHROUGH} rows to {@code VDPA} when the agent
- *       reports a vDPA SF on top of the matching VF;
- *   <li>insert synthetic {@code ORPHAN_MANUAL} rows for SFs the agent
- *       reports but the DB has no row for.
- * </ol>
+ * <p>The legacy mgmt-side consumer only refreshes {@code last_seen}. It is not
+ * an ownership-repair entry point. Ownership changes require the common
+ * leader/GlobalLock/exact-plan approval gate and fresh targeted inventory.
  *
  * <p>Sent at agent startup and on a periodic timer driven by
  * {@code vdpa.sf.reconcile.interval.seconds} on the agent. Idempotent on the

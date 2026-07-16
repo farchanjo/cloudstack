@@ -756,7 +756,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             if (!shouldOffload && !shouldVdpa) {
                 return;
             }
-            Long hostId = vmProfile.getVirtualMachine().getHostId();
+            Long hostId = vfAllocationHostId(vmProfile);
             if (hostId == null) {
                 return;
             }
@@ -788,10 +788,14 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                     vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
         } catch (com.cloud.exception.InsufficientCapacityException e) {
             logger.warn("No free VF for HW offload on host {}; NIC {} will use bridge/TAP fallback",
-                    vmProfile.getVirtualMachine().getHostId(), nicProfile.getId());
+                    vmProfile.getHostId(), nicProfile.getId());
         } catch (Exception e) {
             logger.warn("Failed to allocate VF for HW offload", e);
         }
+    }
+
+    static Long vfAllocationHostId(final VirtualMachineProfile vmProfile) {
+        return vmProfile == null ? null : vmProfile.getHostId();
     }
 
     /**

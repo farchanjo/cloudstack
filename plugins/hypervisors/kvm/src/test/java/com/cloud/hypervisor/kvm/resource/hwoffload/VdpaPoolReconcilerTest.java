@@ -20,7 +20,6 @@
 package com.cloud.hypervisor.kvm.resource.hwoffload;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -31,7 +30,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Before;
 import org.junit.Rule;
@@ -43,7 +41,7 @@ import org.mockito.Mockito;
  * Unit tests for {@link VdpaPoolReconciler}. The class is built around side
  * effects (vdpa CLI, libvirt domain XML, sysfs), all of which are routed
  * through overridable hooks. Tests stub those hooks and assert the resulting
- * grace-timer + delete-on-expiry state machine.
+ * grace-timer + fail-closed suspect reporting state machine.
  */
 public class VdpaPoolReconcilerTest {
 
@@ -68,7 +66,6 @@ public class VdpaPoolReconcilerTest {
     }
 
     private VdpaPoolReconciler newReconciler(String vdpaShowJson, long graceMillis) {
-        AtomicReference<String> deletedSf = new AtomicReference<>();
         return new VdpaPoolReconciler(intentReconciler, domainProbe, graceMillis, logDir) {
             @Override
             protected String runVdpaDevShow() {
@@ -125,7 +122,7 @@ public class VdpaPoolReconcilerTest {
     }
 
     @Test
-    public void sweepMarksOrphanPendingOnFirstTickAndDeletesAfterGrace() throws InterruptedException {
+    public void sweepMarksOrphanPendingAndPreservesItAfterGrace() throws InterruptedException {
         String json = "{\"dev\":{\"vdpa-orphan\":{\"mgmtdev\":\"pci/0000:01:00.5\",\"max_vqs\":33}}}";
         VdpaPoolReconciler r = newReconciler(json, 50L);
 
@@ -135,13 +132,10 @@ public class VdpaPoolReconcilerTest {
         assertTrue(r.pendingDeletionSnapshot().containsKey("vdpa-orphan"));
 
         Thread.sleep(120L);
-        // Second sweep past the grace window: delete fires.
-        // Note: we can't observe the underlying `vdpa dev del` shell-out under
-        // unit-test conditions, but the bookkeeping flips and the SF is
-        // dropped from pendingDeletion.
         VdpaPoolReconciler.SweepResult second = r.sweep();
-        assertEquals(1, second.getDeleted());
-        assertFalse(r.pendingDeletionSnapshot().containsKey("vdpa-orphan"));
+        assertEquals(0, second.getDeleted());
+        assertEquals(1, second.getDriftAlerts());
+        assertTrue(r.pendingDeletionSnapshot().containsKey("vdpa-orphan"));
     }
 
     @Test

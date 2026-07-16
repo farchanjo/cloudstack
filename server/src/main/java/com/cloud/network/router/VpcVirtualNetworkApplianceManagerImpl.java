@@ -1177,9 +1177,9 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             return;
         }
         try {
-            int swept = _vfPoolManager.releaseByVmId(vo.getId());
+            int swept = _vfPoolManager.quarantineByVmId(vo.getId());
             if (swept > 0) {
-                logger.warn("Phase H.1: VR {} boot failed (event={}) — released {} VF(s) (releaseByVmId)",
+                logger.warn("VR {} boot failed (event={}); quarantined {} VF row(s) pending exact cleanup",
                         vo.getInstanceName(), event, swept);
             }
         } catch (Exception e) {
@@ -1237,9 +1237,9 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             // and its VF stays ALLOCATED. releaseByVmId joins sriov_vf_pool against
             // nics.instance_id without the removed filter, catching the leak.
             try {
-                int swept = _vfPoolManager.releaseByVmId(vo.getId());
+                int swept = _vfPoolManager.quarantineByVmId(vo.getId());
                 if (swept > 0) {
-                    logger.info("Released {} HW offload VF(s) on VR {} expunge via VM-id sweep", swept, vo.getInstanceName());
+                    logger.info("Quarantined {} HW offload VF row(s) on VR {} expunge", swept, vo.getInstanceName());
                 }
             } catch (Exception vmSweepEx) {
                 logger.warn("Failed VM-id VF sweep for VR {}: {}", vo.getInstanceName(), vmSweepEx.getMessage());
@@ -1252,7 +1252,7 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             try {
                 int orphans = _vfPoolManager.sweepOrphans();
                 if (orphans > 0) {
-                    logger.info("Swept {} orphan VF(s) back to FREE during VR {} expunge", orphans, vo.getInstanceName());
+                    logger.info("Marked {} orphan VF row(s) SUSPECT during VR {} expunge", orphans, vo.getInstanceName());
                 }
             } catch (Exception orphanEx) {
                 logger.warn("Orphan sweep failed during VR {} expunge: {}", vo.getInstanceName(), orphanEx.getMessage());

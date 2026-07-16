@@ -294,12 +294,29 @@ public class OvnVifDriver extends VifDriverBase {
             return;
         }
         Script.runSimpleBashScript(String.format(
-            "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
-        // No bridge arg: remove from whatever bridge currently owns the port.
+                "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
         Script.runSimpleBashScript(String.format(
-            "ovs-vsctl --if-exists del-port %s", repName));
+                "ovs-vsctl --if-exists del-port %s", repName));
+        log.info("{}: freed OVS representor {} (cleared external_ids + del-port)", callerLabel, repName);
+    }
+
+    /** Checked variant used when management requires positive cleanup evidence. */
+    public static boolean freeRepresentorOnOvsChecked(final Logger log, final String callerLabel, final String repName) {
+        if (StringUtils.isBlank(repName)) {
+            return true;
+        }
+        final Script script = new Script("/bin/bash", 5_000, log);
+        script.add("-c");
+        script.add(String.format("ovs-vsctl --if-exists clear Interface %s external_ids"
+                + " && ovs-vsctl --if-exists del-port %s", repName, repName));
+        final String error = script.execute();
+        if (error != null) {
+            log.warn("{}: failed to free OVS representor {}: {}", callerLabel, repName, error);
+            return false;
+        }
         log.info("{}: freed OVS representor {} (cleared external_ids + del-port)",
                 callerLabel, repName);
+        return true;
     }
 
     /** Matches {@code <mac address='..'/>} / {@code ".." } in virsh dumpxml. */
@@ -333,8 +350,8 @@ public class OvnVifDriver extends VifDriverBase {
      * @param dryRun when true, report only — no ovs-vsctl mutations
      * @return summary counts + freed names (capped)
      */
-    public static FreeStaleOvsResult freeStaleFreeVfRepresentors(final Logger log, final String callerLabel,
-                                                                  final boolean dryRun) {
+    static FreeStaleOvsResult freeStaleFreeVfRepresentors(final Logger log, final String callerLabel,
+                                                           final boolean dryRun) {
         final FreeStaleOvsResult result = new FreeStaleOvsResult();
         final String listCmd = "ovs-vsctl --no-headings --bare --columns=name find Interface "
                 + "external_ids:iface-id!=[] 2>/dev/null";
@@ -890,12 +907,12 @@ public class OvnVifDriver extends VifDriverBase {
                     callerLabel, repName, physPort);
             return;
         }
-        final int pfIdx = Integer.parseInt(matcher.group(1));
-        final int vfId = Integer.parseInt(matcher.group(2));
-        final String pfName = VfPassthroughVifDriver.findPfByPhysPortIndex(pfIdx);
-        if (pfName == null) {
-            log.debug("{}: no PF netdev found for phys_port_name index p{}; skipping PF-side clear for rep={}",
-                    callerLabel, pfIdx, repName);
+        final String vfPci = resolveVfPciFromRepresentor(repName);
+        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
+        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
+        if (pfName == null || vfId == null) {
+            log.debug("{}: no exact parent PF/VF found for rep={} pci={}; skipping PF-side clear",
+                    callerLabel, repName, vfPci);
             return;
         }
         Script.runSimpleBashScript(String.format(

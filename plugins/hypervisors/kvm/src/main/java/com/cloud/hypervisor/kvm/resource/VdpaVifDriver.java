@@ -20,6 +20,7 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
@@ -386,6 +387,24 @@ public class VdpaVifDriver extends VifDriverBase {
                     return dev;
                 }
             }
+        }
+        return null;
+    }
+
+    /** Resolve one vDPA device name to its exact management PCI BDF via sysfs. */
+    static String lookupVdpaPciByName(String vdpaName) {
+        if (StringUtils.isBlank(vdpaName)) {
+            return null;
+        }
+        try {
+            final File real = new File("/sys/bus/vdpa/devices/" + vdpaName).getCanonicalFile();
+            final File parent = real.getParentFile();
+            if (parent != null && parent.getName().matches(
+                    "[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-9a-fA-F]")) {
+                return parent.getName().toLowerCase(java.util.Locale.ROOT);
+            }
+        } catch (IOException ignored) {
+            // Fail closed: caller skips destructive cleanup without an exact BDF.
         }
         return null;
     }

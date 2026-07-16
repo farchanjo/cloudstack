@@ -111,7 +111,7 @@ public class RecoverHostVfsCmd extends BaseCmd {
         response.setObjectName("vfpool");
         response.setSuccess(recovered >= 0);
         response.setDisplayText(String.format(
-                "Recovered %d VF row(s) on host %s (id=%d) from FREE → ALLOCATED via live-NIC join.",
+                "Legacy broad recovery is deactivated; recovered %d VF row(s) on host %s (id=%d).",
                 recovered, host.getName(), host.getId()));
         setResponseObject(response);
     }

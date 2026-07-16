@@ -99,7 +99,8 @@ public class ForceReleaseHostVfsCmd extends BaseCmd {
         response.setObjectName("vfpool");
         response.setSuccess(released >= 0);
         response.setDisplayText(String.format(
-                "Force-released %d VF row(s) on host %s (id=%d).", released, host.getName(), host.getId()));
+                "Quarantined %d VF row(s) on host %s (id=%d); no row was broadly freed.",
+                released, host.getName(), host.getId()));
         setResponseObject(response);
     }
 

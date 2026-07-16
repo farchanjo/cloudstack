@@ -144,6 +144,16 @@ public class NicDaoImpl extends GenericDaoBase<NicVO, Long> implements NicDao {
     }
 
     @Override
+    public List<NicVO> listByMacAddress(final String macAddress) {
+        if (macAddress == null) {
+            return new ArrayList<>();
+        }
+        SearchCriteria<NicVO> sc = AllFieldsSearch.create();
+        sc.setParameters("macAddress", macAddress);
+        return listBy(sc);
+    }
+
+    @Override
     public List<NicVO> listByVmIdOrderByDeviceId(long instanceId) {
         SearchCriteria<NicVO> sc = AllFieldsSearch.create();
         sc.setParameters("instance", instanceId);

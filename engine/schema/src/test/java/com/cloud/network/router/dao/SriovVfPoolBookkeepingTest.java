@@ -84,6 +84,31 @@ public class SriovVfPoolBookkeepingTest {
                 row.getUpdated());
     }
 
+    @Test
+    public void reservedVdpaOwnershipKeepsNicBindingWithoutClaimingAllocatedState() {
+        SriovVfPoolVO row = staleVdpaRow();
+
+        SriovVfPoolDaoImpl.applyOwnershipState(row, NIC_ID, State.RESERVED, VdpaKind.VDPA, "vdpa-99");
+
+        assertEquals(State.RESERVED.name(), row.getState());
+        assertEquals(Long.valueOf(NIC_ID), row.getAllocatedToNicId());
+        assertEquals(VdpaKind.VDPA.name(), row.getVdpaKind());
+        assertEquals("vdpa-99", row.getVdpaName());
+        assertNull(row.getVdpaDevice());
+    }
+
+    @Test
+    public void allocatedPassthroughOwnershipClearsPriorVdpaIdentity() {
+        SriovVfPoolVO row = staleVdpaRow();
+
+        SriovVfPoolDaoImpl.applyOwnershipState(row, NIC_ID, State.ALLOCATED, VdpaKind.PASSTHROUGH, null);
+
+        assertEquals(State.ALLOCATED.name(), row.getState());
+        assertEquals(VdpaKind.PASSTHROUGH.name(), row.getVdpaKind());
+        assertNull(row.getVdpaName());
+        assertNull(row.getVdpaDevice());
+    }
+
     /** Row shaped like a leak after vDPA allocate + incomplete free. */
     private static SriovVfPoolVO staleVdpaRow() {
         SriovVfPoolVO row = new SriovVfPoolVO(1L, "0000:01:00.3", "dx6p0", "dx6p0r1");

@@ -232,6 +232,7 @@ import com.cloud.network.dao.NetworkDetailVO;
 import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.router.VirtualRouter;
+import com.cloud.network.router.VfPoolManager;
 import com.cloud.network.security.SecurityGroupManager;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
@@ -322,6 +323,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     private DataStoreManager dataStoreMgr;
     @Inject
     private NetworkOrchestrationService _networkMgr;
+    @Inject
+    private VfPoolManager vfPoolManager;
     @Inject
     private NetworkModel _networkModel;
     @Inject
@@ -1490,6 +1493,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 updateOverCommitRatioForVmProfile(vmProfile, clusterId);
 
                 StartAnswer startAnswer = null;
+                boolean vfDomainStopConfirmed = false;
 
                 try {
                     if (!changeState(vm, Event.OperationRetry, destHostId, work, Step.Prepare)) {
@@ -1594,6 +1598,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                             }
 
                             startedVm = vm;
+                            commitVfOwnershipBestEffort(vm.getId(), null, destHostId, "start", work.getId());
                             logger.debug("Start completed for VM {}", vm);
                             final Host vmHost = _hostDao.findById(destHostId);
                             if (vmHost != null && (VirtualMachine.Type.ConsoleProxy.equals(vm.getType()) ||
@@ -1641,6 +1646,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                                 _haMgr.scheduleStop(vm, destHostId, WorkType.ForceStop);
                                 throw new ExecutionException("Unable to stop this VM, " + vm.getUuid() + " so we are unable to retry the start operation");
                             }
+                            vfDomainStopConfirmed = true;
                             throw new ExecutionException("Unable to start  VM:" + vm.getUuid() + " due to error in finalizeStart, not retrying");
                         }
                     }
@@ -1696,6 +1702,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                             cleanup(vmGuru, vmProfile, work, Event.OperationFailed, true);
                         }
                     }
+                    if (startedVm == null) {
+                        // Hardware cleanup is deliberately last. A successful StartAnswer
+                        // followed by finalize failure may still have live QEMU; the agent
+                        // independently inventories domains and rejects any referenced BDF.
+                        rollbackVfStartAttemptBestEffort(vm.getId(), destHostId,
+                                authorizeFailedStartHardwareCleanup(startAnswer, vfDomainStopConfirmed, canRetry),
+                                work.getId());
+                    }
                 }
             }
         } finally {
@@ -1728,6 +1742,69 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             }
             String message = String.format(messageTmpl, vm.getHostName(), vm.getUuid(), details);
             throw new CloudRuntimeException(message, lastKnownError);
+        }
+    }
+
+    void commitVfOwnershipBestEffort(final long vmId, final Long sourceHostId,
+                                     final long destinationHostId, final String operation,
+                                     final String workId) {
+        if (vfPoolManager == null) {
+            return;
+        }
+        try {
+            vfPoolManager.commitOwnershipForVm(vmId, sourceHostId, destinationHostId, workId);
+        } catch (RuntimeException e) {
+            logger.error("VF ownership commit failed closed for operation={} vm={} source={} destination={}: {}",
+                    operation, vmId, sourceHostId, destinationHostId, e.getMessage(), e);
+        }
+    }
+
+    void finalizeVfOwnershipAfterMigration(final long vmId, final long sourceHostId,
+                                           final long destinationHostId,
+                                           final boolean commandConclusive,
+                                           final boolean destinationAuthoritativelyVerified,
+                                           final String operation, final String workId) {
+        if (commandConclusive && destinationAuthoritativelyVerified) {
+            commitVfOwnershipBestEffort(vmId, sourceHostId, destinationHostId, operation, workId);
+            return;
+        }
+        rollbackVfReservationsBestEffort(vmId, destinationHostId, false,
+                operation + "-inconclusive", workId);
+    }
+
+    static boolean authorizeFailedStartHardwareCleanup(final StartAnswer startAnswer,
+                                                       final boolean domainStopConfirmed,
+                                                       final boolean canRetry) {
+        if (!canRetry) {
+            return false;
+        }
+        return startAnswer == null || !startAnswer.getResult() || domainStopConfirmed;
+    }
+
+    void rollbackVfReservationsBestEffort(final long vmId, final long destinationHostId,
+                                           final boolean cleanupAuthorized, final String operation,
+                                           final String workId) {
+        if (vfPoolManager == null) {
+            return;
+        }
+        try {
+            vfPoolManager.rollbackReservationsForVm(vmId, destinationHostId, cleanupAuthorized, workId);
+        } catch (RuntimeException e) {
+            logger.error("VF reservation rollback failed closed for operation={} vm={} destination={}: {}",
+                    operation, vmId, destinationHostId, e.getMessage(), e);
+        }
+    }
+
+    void rollbackVfStartAttemptBestEffort(final long vmId, final long destinationHostId,
+                                           final boolean cleanupAuthorized, final String workId) {
+        if (vfPoolManager == null) {
+            return;
+        }
+        try {
+            vfPoolManager.rollbackStartAttemptForVm(vmId, destinationHostId, cleanupAuthorized, workId);
+        } catch (RuntimeException e) {
+            logger.error("VF start-attempt rollback failed closed for vm={} destination={}: {}",
+                    vmId, destinationHostId, e.getMessage(), e);
         }
     }
 
@@ -3165,6 +3242,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         work = _workDao.persist(work);
 
         Answer pfma = null;
+        boolean prepareCleanupAuthorized = true;
         try {
             pfma = _agentMgr.send(dstHostId, pfmc);
             if (pfma == null || !pfma.getResult()) {
@@ -3176,10 +3254,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             }
             logger.debug("Successfully prepared destination host {} for migration of VM {} ", dstHostId, vm.getInstanceName());
         } catch (final OperationTimedoutException e1) {
+            prepareCleanupAuthorized = false;
             throw new AgentUnavailableException("Operation timed out", dstHostId);
         } finally {
             if (pfma == null) {
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, prepareCleanupAuthorized,
+                        "migration-prepare", work.getId());
                 volumeMgr.release(vm.getId(), dstHostId);
                 work.setStep(Step.Done);
                 _workDao.update(work.getId(), work);
@@ -3191,6 +3272,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         try {
             if (vm.getHostId() == null || vm.getHostId() != srcHostId || !changeState(vm, Event.MigrationRequested, dstHostId, work, Step.Migrating)) {
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
+                        "migration-state-change", work.getId());
                 if (vm != null) {
                     volumeMgr.release(vm.getId(), dstHostId);
                 }
@@ -3201,6 +3284,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             }
         } catch (final NoTransitionException e1) {
             _networkMgr.rollbackNicForMigration(vmSrc, profile);
+            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
+                    "migration-state-transition", work.getId());
             volumeMgr.release(vm.getId(), dstHostId);
             String msg = String.format("Migration cancelled for VM %s due to state transition failure: %s",
                     vm.getInstanceName(), e1.getMessage());
@@ -3208,6 +3293,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             throw new ConcurrentOperationException("Migration cancelled because " + e1.getMessage());
         } catch (final CloudRuntimeException e2) {
             _networkMgr.rollbackNicForMigration(vmSrc, profile);
+            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
+                    "migration-runtime-failure", work.getId());
             volumeMgr.release(vm.getId(), dstHostId);
             String msg = String.format("Migration cancelled for VM %s due to runtime exception: %s",
                     vm.getInstanceName(), e2.getMessage());
@@ -3223,6 +3310,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
 
         boolean migrated = false;
+        boolean migrationCleanupAuthorized = true;
+        boolean migrationCommandTimedOut = false;
+        boolean destinationAuthoritativelyVerified = false;
         Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
         try {
             final MigrateCommand mc = buildMigrateCommand(vm, to, dest, pfma, dpdkInterfaceMapping);
@@ -3238,6 +3328,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 }
                 logger.info("Migration command successful for VM {}", vm.getInstanceName());
             } catch (final OperationTimedoutException e) {
+                migrationCommandTimedOut = true;
+                migrationCleanupAuthorized = false;
                 boolean success = false;
                 if (HypervisorType.KVM.equals(vm.getHypervisorType())) {
                     try {
@@ -3282,7 +3374,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("Unable to complete migration for " + vm);
                 }
+                destinationAuthoritativelyVerified = true;
             } catch (final OperationTimedoutException e) {
+                destinationAuthoritativelyVerified = false;
                 logger.warn("Error while checking the vm {} on host {}", vm, dest.getHost(), e);
             }
             migrated = true;
@@ -3290,6 +3384,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!migrated) {
                 logger.info("Migration was unsuccessful. Cleaning up: {}", vm);
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, migrationCleanupAuthorized,
+                        "migration", work.getId());
                 volumeMgr.release(vm.getId(), dstHostId);
                 // deallocate GPU devices for the VM on the destination host
                 gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), dstHostId);
@@ -3311,6 +3407,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             } else {
                 logger.info("Migration completed successfully for VM %s" + vm);
                 _networkMgr.commitNicForMigration(vmSrc, profile);
+                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
+                        !migrationCommandTimedOut, destinationAuthoritativelyVerified, "migration", work.getId());
                 volumeMgr.release(vm.getId(), srcHostId);
                 // deallocate GPU devices for the VM on the src host after migration is complete
                 gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), srcHostId);
@@ -3732,6 +3830,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         moveVmToMigratingState(vm, destHostId, work);
 
         boolean migrated = false;
+        boolean storageCleanupAuthorized = true;
+        boolean storageDestinationVerified = false;
         try {
             Nic defaultNic = _networkModel.getDefaultNic(vm.getId());
 
@@ -3781,7 +3881,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("VM not found on destination host. Unable to complete migration for " + vm);
                 }
+                storageDestinationVerified = true;
             } catch (final OperationTimedoutException e) {
+                storageCleanupAuthorized = false;
+                storageDestinationVerified = false;
                 logger.error("Error while checking the vm {} is on host {}", vm, destHost, e);
             }
             migrated = true;
@@ -3799,13 +3902,18 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     vm.setPodIdToDeployIn(srcHost.getPodId());
                     stateTransitTo(vm, Event.OperationFailed, srcHostId);
                 } catch (final AgentUnavailableException e) {
+                    storageCleanupAuthorized = false;
                     logger.warn("Looks like the destination Host is unavailable for cleanup.", e);
                 } catch (final NoTransitionException e) {
                     logger.error("Error while transitioning vm from migrating to running state.", e);
                 }
+                rollbackVfReservationsBestEffort(vm.getId(), destHostId, storageCleanupAuthorized,
+                        "storage-migration", work.getId());
                 _networkMgr.setHypervisorHostname(profile, destination, false);
             } else {
                 _networkMgr.commitNicForMigration(vmSrc, profile);
+                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, destHostId,
+                        true, storageDestinationVerified, "storage-migration", work.getId());
                 volumeMgr.release(vm.getId(), srcHostId);
                 _networkMgr.setHypervisorHostname(profile, destination, true);
                 endSnapshotChainForVolumes(volumeToPoolMap, vm.getHypervisorType());
@@ -4981,7 +5089,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             alertType = AlertManager.AlertType.ALERT_TYPE_CONSOLE_PROXY_MIGRATE;
         }
 
+        final VirtualMachineProfile vmSrc = new VirtualMachineProfileImpl(vm);
+        vmSrc.setHost(fromHost);
+        for (final NicProfile nic : _networkMgr.getNicProfiles(vm)) {
+            vmSrc.addNic(nic);
+        }
         final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm);
+        profile.setHost(dest.getHost());
         _networkMgr.prepareNicForMigration(profile, dest);
 
         volumeMgr.prepareForMigration(profile, dest);
@@ -4996,6 +5110,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         work = _workDao.persist(work);
 
         Answer pfma = null;
+        boolean prepareCleanupAuthorized = true;
         try {
             pfma = _agentMgr.send(dstHostId, pfmc);
             if (pfma == null || !pfma.getResult()) {
@@ -5004,9 +5119,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 throw new AgentUnavailableException(String.format("Unable to prepare for migration to destination host [%s] due to [%s].", dest.getHost(), details), dstHostId);
             }
         } catch (final OperationTimedoutException e1) {
+            prepareCleanupAuthorized = false;
             throw new AgentUnavailableException("Operation timed out", dstHostId);
         } finally {
             if (pfma == null) {
+                _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, prepareCleanupAuthorized,
+                        "scale-migration-prepare", work.getId());
                 work.setStep(Step.Done);
                 _workDao.update(work.getId(), work);
             }
@@ -5015,17 +5134,25 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         vm.setLastHostId(srcHostId);
         try {
             if (vm.getHostId() == null || vm.getHostId() != srcHostId || !changeState(vm, Event.MigrationRequested, dstHostId, work, Step.Migrating)) {
+                _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
+                        "scale-migration-state-change", work.getId());
                 String message = String.format("Migration of %s cancelled because state has changed.", vm.toString());
                 logger.warn(message);
                 throw new ConcurrentOperationException(message);
             }
         } catch (final NoTransitionException e1) {
+            _networkMgr.rollbackNicForMigration(vmSrc, profile);
+            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
+                    "scale-migration-state-transition", work.getId());
             String message = String.format("Migration of %s cancelled due to [%s].", vm.toString(), e1.getMessage());
             logger.error(message, e1);
             throw new ConcurrentOperationException(message);
         }
 
         boolean migrated = false;
+        boolean scaleCleanupAuthorized = true;
+        boolean scaleDestinationVerified = false;
         try {
             final MigrateCommand mc = buildMigrateCommand(vm, to, dest, pfma, null);
 
@@ -5037,6 +5164,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     throw new CloudRuntimeException(msg);
                 }
             } catch (final OperationTimedoutException e) {
+                scaleCleanupAuthorized = false;
                 if (e.isActive()) {
                     logger.warn("Active migration command so scheduling a restart for {}", vm, e);
                     _haMgr.scheduleRestart(vm, true);
@@ -5066,7 +5194,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("Unable to complete migration for " + vm);
                 }
+                scaleDestinationVerified = true;
             } catch (final OperationTimedoutException e) {
+                scaleCleanupAuthorized = false;
+                scaleDestinationVerified = false;
                 logger.debug("Error while checking the {} on {}", vm, dstHost, e);
             }
 
@@ -5074,6 +5205,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         } finally {
             if (!migrated) {
                 logger.info("Migration was unsuccessful.  Cleaning up: {}", vm);
+                _networkMgr.rollbackNicForMigration(vmSrc, profile);
 
                 String alertSubject = String.format("Unable to migrate %s from %s in Zone [%s] and Pod [%s].",
                         vm.getInstanceName(), fromHost, dest.getDataCenter().getName(), dest.getPod().getName());
@@ -5082,8 +5214,11 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 try {
                     _agentMgr.send(dstHostId, new Commands(cleanup(vm.getInstanceName())), null);
                 } catch (final AgentUnavailableException ae) {
+                    scaleCleanupAuthorized = false;
                     logger.info("Looks like the destination Host is unavailable for cleanup");
                 }
+                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, scaleCleanupAuthorized,
+                        "scale-migration", work.getId());
                 _networkMgr.setHypervisorHostname(profile, dest, false);
                 try {
                     stateTransitTo(vm, Event.OperationFailed, srcHostId);
@@ -5091,6 +5226,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     logger.warn(e.getMessage(), e);
                 }
             } else {
+                _networkMgr.commitNicForMigration(vmSrc, profile);
+                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
+                        true, scaleDestinationVerified, "scale-migration", work.getId());
                 _networkMgr.setHypervisorHostname(profile, dest, true);
 
                 updateVmPod(vm, dstHostId);
