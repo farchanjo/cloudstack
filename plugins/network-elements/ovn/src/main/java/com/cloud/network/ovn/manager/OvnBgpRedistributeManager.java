@@ -39,6 +39,9 @@ import org.springframework.stereotype.Component;
 import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.host.HostVO;
+import com.cloud.host.Status;
+import com.cloud.host.dao.HostDao;
 import com.cloud.network.IpAddress;
 import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
@@ -135,6 +138,12 @@ public class OvnBgpRedistributeManager {
     private VMInstanceDao vmInstanceDao;
     @Inject
     private UserPublicIpv6AddressDao userPublicIpv6AddressDao;
+    @Inject
+    private HostDao hostDao;
+
+    /** Damping for the agent-not-Up skip WARN: one line per host per window. */
+    private static final long AGENT_SKIP_LOG_INTERVAL_MS = 300_000L;
+    private final Map<Long, Long> lastAgentSkipLogByHost = new ConcurrentHashMap<>();
 
     /**
      * Announce the supplied public IP as a {@code /32} on the correct chassis
@@ -856,9 +865,34 @@ public class OvnBgpRedistributeManager {
         return resolveNetworkGateway(zoneId, ip.getVpcId());
     }
 
+    /**
+     * Skip agent sends while the host agent is not {@code Up} (e.g. stuck in
+     * {@code Connecting} after a fabric incident): {@code easySend} would only
+     * time out per prefix and spam a WARN per attempt, while the reconcile
+     * loop retries everything on the next tick anyway. The skip WARN is
+     * damped to one line per host per {@link #AGENT_SKIP_LOG_INTERVAL_MS}.
+     */
+    private boolean agentUp(final long hostId) {
+        final HostVO host = hostDao.findById(hostId);
+        if (host != null && host.getStatus() == Status.Up) {
+            return true;
+        }
+        final long now = System.currentTimeMillis();
+        final Long last = lastAgentSkipLogByHost.get(hostId);
+        if (last == null || now - last >= AGENT_SKIP_LOG_INTERVAL_MS) {
+            lastAgentSkipLogByHost.put(hostId, now);
+            LOGGER.warn("OvnBgpRedistribute: host={} agent not Up (status={}); deferring BGP ops to next reconcile",
+                    hostId, host == null ? "unknown" : host.getStatus());
+        }
+        return false;
+    }
+
     private boolean sendCommand(final long hostId, final String publicIp, final String gatewayIp,
                                 final String gatewayMac, final String anchorCidr, final String vlan,
                                 final String networkGatewayIp, final String operation) {
+        if (!agentUp(hostId)) {
+            return false;
+        }
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
                 publicIp,
                 operation,
@@ -934,6 +968,9 @@ public class OvnBgpRedistributeManager {
             prefixLen = Integer.parseInt(cidr.substring(slash + 1).trim());
         } catch (NumberFormatException nfe) {
             LOGGER.warn("OvnBgpRedistribute: bad CIDR {} (host={}); skipping {}", cidr, hostId, operation);
+            return false;
+        }
+        if (!agentUp(hostId)) {
             return false;
         }
         final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
