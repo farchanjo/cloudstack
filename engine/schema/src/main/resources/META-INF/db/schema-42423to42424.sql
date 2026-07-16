@@ -93,7 +93,7 @@ CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
     'cloud.ovn_logical_id_map', 'network_id',
     'BIGINT UNSIGNED NOT NULL DEFAULT 0'
 );
-CALL `cloud`.`IDEMPOTENT_DROP_INDEX`('cloud.ovn_logical_id_map', 'uc_ovn_lim_cs');
+CALL `cloud`.`IDEMPOTENT_DROP_INDEX`('uc_ovn_lim_cs', 'cloud.ovn_logical_id_map');
 CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`(
     'uc_ovn_lim_cs', 'cloud.ovn_logical_id_map',
     '(`cs_kind`, `cs_id`, `controller_id`, `network_id`)'
