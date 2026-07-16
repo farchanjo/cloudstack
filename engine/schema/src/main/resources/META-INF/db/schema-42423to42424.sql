@@ -78,13 +78,26 @@ CREATE TABLE IF NOT EXISTS `cloud`.`ovn_logical_id_map` (
     `controller_id` BIGINT UNSIGNED NOT NULL,
     `ovn_uuid` VARCHAR(64) NOT NULL,
     `ovn_name` VARCHAR(255) DEFAULT NULL,
+    `network_id` BIGINT UNSIGNED NOT NULL DEFAULT 0,
     `created` DATETIME NOT NULL,
     PRIMARY KEY (`id`),
-    UNIQUE KEY `uc_ovn_lim_cs` (`cs_kind`, `cs_id`, `controller_id`),
+    UNIQUE KEY `uc_ovn_lim_cs` (`cs_kind`, `cs_id`, `controller_id`, `network_id`),
     KEY `i_ovn_lim_uuid` (`ovn_uuid`),
     CONSTRAINT `fk_ovn_lim_controller_id` FOREIGN KEY (`controller_id`)
         REFERENCES `ovn_controller` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Upgrade is handled by the guarded metadata migration below; no unconditional
+-- DROP INDEX is used here so reruns and fresh installs remain safe.
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`(
+    'cloud.ovn_logical_id_map', 'network_id',
+    'BIGINT UNSIGNED NOT NULL DEFAULT 0'
+);
+CALL `cloud`.`IDEMPOTENT_DROP_INDEX`('cloud.ovn_logical_id_map', 'uc_ovn_lim_cs');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`(
+    'uc_ovn_lim_cs', 'cloud.ovn_logical_id_map',
+    '(`cs_kind`, `cs_id`, `controller_id`, `network_id`)'
+);
 
 -- 4) Provider catalog: register `Ovn` as a network service provider on every
 -- existing physical network. `Disabled` so the plugin is opt-in. The

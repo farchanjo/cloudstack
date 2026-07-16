@@ -174,6 +174,9 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
     @Column(name = "controller_id", nullable = false)
     private long controllerId;
 
+    @Column(name = "network_id", nullable = false)
+    private long networkId;
+
     @Column(name = "ovn_uuid", nullable = false, length = 64)
     private String ovnUuid;
 
@@ -188,9 +191,15 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
     }
 
     public OvnLogicalIdMapVO(final Kind kind, final long csId, final long controllerId, final String ovnUuid, final String ovnName) {
+        this(kind, csId, controllerId, 0L, ovnUuid, ovnName);
+    }
+
+    public OvnLogicalIdMapVO(final Kind kind, final long csId, final long controllerId, final long networkId,
+                             final String ovnUuid, final String ovnName) {
         this.csKind = kind.name();
         this.csId = csId;
         this.controllerId = controllerId;
+        this.networkId = networkId;
         this.ovnUuid = ovnUuid;
         this.ovnName = ovnName;
     }
@@ -226,6 +235,14 @@ public class OvnLogicalIdMapVO implements InternalIdentity {
 
     public void setControllerId(final long controllerId) {
         this.controllerId = controllerId;
+    }
+
+    public long getNetworkId() {
+        return networkId;
+    }
+
+    public void setNetworkId(final long networkId) {
+        this.networkId = networkId;
     }
 
     public String getOvnUuid() {

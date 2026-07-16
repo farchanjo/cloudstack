@@ -178,7 +178,7 @@ public class OvnFirewallService extends AdapterBase {
         boolean overall = true;
         for (final NetworkACLItem rule : rules) {
             try {
-                applyOne(nb, controller, tierLsUuid, rule);
+                applyOne(nb, controller, tierLsUuid, network, rule);
             } catch (final OvnException oe) {
                 LOGGER.error("OvnFirewallService: failed to apply ACL rule id={}: {}", rule.getId(), oe.getMessage());
                 overall = false;
@@ -220,9 +220,15 @@ public class OvnFirewallService extends AdapterBase {
         if (tierLsUuid == null) {
             return;
         }
-        pluginManager.nbClient(tier.getDataCenterId()).clearAllAclsFromLogicalSwitch(tierLsUuid);
+        final OvnNbClient nb = pluginManager.nbClient(tier.getDataCenterId());
+        final List<String> tierAcls = nb.listAclsOnLogicalSwitch(tierLsUuid);
+        nb.clearAllAclsFromLogicalSwitch(tierLsUuid);
+        final String prefix = "csacl-net-" + tier.getId() + "-";
         for (final OvnLogicalIdMapVO row : logicalIdMapDao.listByKind(Kind.NETWORK_ACL, controller.getId())) {
-            logicalIdMapDao.remove(row.getId());
+            if ((row.getOvnName() != null && row.getOvnName().startsWith(prefix))
+                    || tierAcls.contains(row.getOvnUuid())) {
+                logicalIdMapDao.remove(row.getId());
+            }
         }
     }
 
@@ -263,17 +269,26 @@ public class OvnFirewallService extends AdapterBase {
     }
 
     private void applyOne(final OvnNbClient nb, final OvnControllerVO controller, final String tierLsUuid,
-                          final NetworkACLItem rule) {
+                          final Network network,
+                           final NetworkACLItem rule) {
         final NetworkACLItem.State state = rule.getState();
         if (state == NetworkACLItem.State.Revoke) {
-            revokeOne(nb, controller, tierLsUuid, rule);
+            revokeOne(nb, controller, tierLsUuid, network, rule);
             return;
         }
         if (state != NetworkACLItem.State.Add && state != NetworkACLItem.State.Active) {
             LOGGER.debug("OvnFirewallService: skipping rule id={} in state {}", rule.getId(), state);
             return;
         }
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId());
+        final String name = aclName(network.getId(), rule.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId(), network.getId());
+        final OvnLogicalIdMapVO legacy = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId(), 0L);
+        if (existing == null && legacy != null && ("csacl-" + rule.getId()).equals(legacy.getOvnName())
+                && nb.listAclsOnLogicalSwitch(tierLsUuid).contains(legacy.getOvnUuid())) {
+            legacy.setOvnName(name);
+            logicalIdMapDao.update(legacy.getId(), legacy);
+            return;
+        }
         if (existing != null) {
             // Stale-mapping guard — recreate when ACL row was deleted out-of-band.
             if (nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
@@ -289,11 +304,11 @@ public class OvnFirewallService extends AdapterBase {
         final String action = actionFor(rule);
         final String match = buildMatch(rule);
         final int priority = priorityFor(rule);
-        final String name = "csacl-" + rule.getId();
         final Map<String, String> ext = buildExternalIds(rule);
+        ext.put("network_id", String.valueOf(network.getId()));
         final String aclUuid = nb.addAclToLogicalSwitch(tierLsUuid, direction, priority, match, action,
                 ext, false, null, name);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK_ACL, rule.getId(), controller.getId(), aclUuid, name));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.NETWORK_ACL, rule.getId(), controller.getId(), network.getId(), aclUuid, name));
         LOGGER.info("OvnFirewallService: ACL {} added (rule id={}, dir={}, action={}, match=\"{}\")",
                 aclUuid, rule.getId(), direction, action, match);
         // Bind tierLsUuid is recorded implicitly: the ACL is reachable only via the LS it is attached to.
@@ -301,8 +316,14 @@ public class OvnFirewallService extends AdapterBase {
     }
 
     private void revokeOne(final OvnNbClient nb, final OvnControllerVO controller,
-                           final String tierLsUuid, final NetworkACLItem rule) {
-        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId());
+                           final String tierLsUuid, final Network network, final NetworkACLItem rule) {
+        OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId(), network.getId());
+        if (mapping == null) {
+            mapping = logicalIdMapDao.findByCsId(Kind.NETWORK_ACL, rule.getId(), controller.getId(), 0L);
+            if (mapping != null && !nb.listAclsOnLogicalSwitch(tierLsUuid).contains(mapping.getOvnUuid())) {
+                mapping = null;
+            }
+        }
         if (mapping == null) {
             LOGGER.debug("OvnFirewallService: no OVN ACL mapping for rule id={}; revoke is a no-op",
                     rule.getId());
@@ -326,6 +347,10 @@ public class OvnFirewallService extends AdapterBase {
             LOGGER.warn("OvnFirewallService: sync ACL delete failed for rule id={} uuid={}: {}",
                     rule.getId(), aclUuid, oe.getMessage());
         }
+    }
+
+    private static String aclName(final long networkId, final long ruleId) {
+        return "csacl-net-" + networkId + "-rule-" + ruleId;
     }
 
     /**
@@ -437,7 +462,7 @@ public class OvnFirewallService extends AdapterBase {
                 out.append("udp");
                 break;
             case "icmp":
-                out.append("icmp4");
+                out.append("(icmp4 || icmp6)");
                 break;
             case "all":
             case "any":
@@ -455,22 +480,34 @@ public class OvnFirewallService extends AdapterBase {
         if (cidrs == null || cidrs.isEmpty()) {
             return;
         }
-        final String column = ingress ? "ip4.src" : "ip4.dst";
-        final StringBuilder grp = new StringBuilder();
+        final String v4Column = ingress ? "ip4.src" : "ip4.dst";
+        final String v6Column = ingress ? "ip6.src" : "ip6.dst";
+        final StringBuilder v4 = new StringBuilder();
+        final StringBuilder v6 = new StringBuilder();
         for (final String cidr : cidrs) {
             if (cidr == null || cidr.isEmpty()) {
                 continue;
             }
+            final StringBuilder grp = cidr.indexOf(':') >= 0 ? v6 : v4;
+            final String column = cidr.indexOf(':') >= 0 ? v6Column : v4Column;
             if (grp.length() > 0) {
                 grp.append(" || ");
             }
             grp.append(column).append(" == ").append(cidr);
         }
-        if (grp.length() == 0) {
+        if (v4.length() == 0 && v6.length() == 0) {
             return;
         }
         joinAnd(out);
-        out.append("(").append(grp).append(")");
+        out.append("(");
+        if (v4.length() > 0) {
+            out.append(v4);
+        }
+        if (v6.length() > 0) {
+            if (v4.length() > 0) out.append(" || ");
+            out.append(v6);
+        }
+        out.append(")");
     }
 
     private static void appendPortPredicate(final StringBuilder out, final String proto,
@@ -501,11 +538,11 @@ public class OvnFirewallService extends AdapterBase {
         }
         if (icmpType != null && icmpType >= 0) {
             joinAnd(out);
-            out.append("icmp4.type == ").append(icmpType);
+            out.append("(icmp4.type == ").append(icmpType).append(" || icmp6.type == ").append(icmpType).append(")");
         }
         if (icmpCode != null && icmpCode >= 0) {
             joinAnd(out);
-            out.append("icmp4.code == ").append(icmpCode);
+            out.append("(icmp4.code == ").append(icmpCode).append(" || icmp6.code == ").append(icmpCode).append(")");
         }
     }
 
@@ -571,7 +608,7 @@ public class OvnFirewallService extends AdapterBase {
         boolean overall = true;
         for (final FirewallRule rule : rules) {
             try {
-                applyOneFw(nb, controller, tierLsUuid, rule);
+                applyOneFw(nb, controller, network, tierLsUuid, rule);
             } catch (final OvnException oe) {
                 LOGGER.error("OvnFirewallService: failed to apply firewall rule id={}: {}",
                         rule.getId(), oe.getMessage());
@@ -581,18 +618,19 @@ public class OvnFirewallService extends AdapterBase {
         return overall;
     }
 
-    private void applyOneFw(final OvnNbClient nb, final OvnControllerVO controller, final String tierLsUuid,
+    private void applyOneFw(final OvnNbClient nb, final OvnControllerVO controller, final Network network,
+                            final String tierLsUuid,
                             final FirewallRule rule) {
         final FirewallRule.State state = rule.getState();
         if (state == FirewallRule.State.Revoke) {
-            revokeOneFw(nb, controller, tierLsUuid, rule);
+            revokeOneFw(nb, controller, network, tierLsUuid, rule);
             return;
         }
         if (state != FirewallRule.State.Add && state != FirewallRule.State.Active) {
             LOGGER.debug("OvnFirewallService: skipping firewall rule id={} in state {}", rule.getId(), state);
             return;
         }
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, rule.getId(), controller.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, rule.getId(), controller.getId(), network.getId());
         if (existing != null) {
             // Stale-mapping guard — recreate when the ACL row was deleted out-of-band.
             if (nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
@@ -614,14 +652,20 @@ public class OvnFirewallService extends AdapterBase {
         final Map<String, String> ext = buildFwExternalIds(rule);
         final String aclUuid = nb.addAclToLogicalSwitch(tierLsUuid, direction, priority, match, action,
                 ext, false, null, name);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, rule.getId(), controller.getId(), aclUuid, name));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, rule.getId(), controller.getId(), network.getId(), aclUuid, name));
         LOGGER.info("OvnFirewallService: firewall ACL {} added (rule id={}, dir={}, action={}, match=\"{}\")",
                 aclUuid, rule.getId(), direction, action, match);
     }
 
-    private void revokeOneFw(final OvnNbClient nb, final OvnControllerVO controller,
+    private void revokeOneFw(final OvnNbClient nb, final OvnControllerVO controller, final Network network,
                              final String tierLsUuid, final FirewallRule rule) {
-        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.FIREWALL, rule.getId(), controller.getId());
+        OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.FIREWALL, rule.getId(), controller.getId(), network.getId());
+        if (mapping == null) {
+            mapping = logicalIdMapDao.findByCsId(Kind.FIREWALL, rule.getId(), controller.getId(), 0L);
+            if (mapping != null && !nb.listAclsOnLogicalSwitch(tierLsUuid).contains(mapping.getOvnUuid())) {
+                mapping = null;
+            }
+        }
         if (mapping == null) {
             LOGGER.debug("OvnFirewallService: no OVN ACL mapping for firewall rule id={}; revoke is a no-op",
                     rule.getId());
@@ -670,7 +714,7 @@ public class OvnFirewallService extends AdapterBase {
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         installDefaultDenyBaseline(nb, controller, network, tierLsUuid);
         final long csId = defaultEgressCsId(network.getId());
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId(), network.getId());
         if (add && defaultAllow) {
             if (existing != null && nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
                 LOGGER.debug("OvnFirewallService: default-egress allow override already present for network id={}",
@@ -683,9 +727,9 @@ public class OvnFirewallService extends AdapterBase {
             final String name = "csfw-egress-default-allow-" + network.getId();
             final Map<String, String> ext = buildSyntheticExternalIds(network.getId(), name);
             final String aclUuid = nb.addAclToLogicalSwitch(tierLsUuid, OvnNbClient.ACL_DIRECTION_FROM_LPORT,
-                    FW_DEFAULT_EGRESS_ALLOW_PRIORITY, "ip4", OvnNbClient.ACL_ACTION_ALLOW_RELATED,
+                    FW_DEFAULT_EGRESS_ALLOW_PRIORITY, "ip4 || ip6", OvnNbClient.ACL_ACTION_ALLOW_RELATED,
                     ext, false, null, name);
-            logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), aclUuid, name));
+            logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), network.getId(), aclUuid, name));
             LOGGER.info("OvnFirewallService: default-egress ALLOW override {} installed (network id={})",
                     aclUuid, network.getId());
             return true;
@@ -755,7 +799,7 @@ public class OvnFirewallService extends AdapterBase {
                                   final String tierLsUuid, final String direction, final int slot,
                                   final String match, final String label) {
         final long csId = infraCsId(network.getId(), slot);
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId(), network.getId());
         if (existing != null) {
             if (nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
                 return;
@@ -766,7 +810,7 @@ public class OvnFirewallService extends AdapterBase {
         final Map<String, String> ext = buildSyntheticExternalIds(network.getId(), name);
         final String aclUuid = nb.addAclToLogicalSwitch(tierLsUuid, direction, FW_BASELINE_INFRA_ALLOW_PRIORITY,
                 match, OvnNbClient.ACL_ACTION_ALLOW_RELATED, ext, false, null, name);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), aclUuid, name));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), network.getId(), aclUuid, name));
         LOGGER.info("OvnFirewallService: infra-allow {} ({}) installed (network id={}, dir={})",
                 aclUuid, label, network.getId(), direction);
     }
@@ -774,7 +818,7 @@ public class OvnFirewallService extends AdapterBase {
     private void ensureBaselineDrop(final OvnNbClient nb, final OvnControllerVO controller, final Network network,
                                     final String tierLsUuid, final String direction, final boolean fromLport) {
         final long csId = baselineCsId(network.getId(), fromLport);
-        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId());
+        final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.FIREWALL, csId, controller.getId(), network.getId());
         if (existing != null) {
             if (nb.rowExistsByUuid("ACL", existing.getOvnUuid())) {
                 return;
@@ -790,7 +834,7 @@ public class OvnFirewallService extends AdapterBase {
         // allows below. A blanket match="1" would black-hole ARP -> no gateway.
         final String aclUuid = nb.addAclToLogicalSwitch(tierLsUuid, direction, FW_BASELINE_DENY_PRIORITY,
                 "ip4 || ip6", OvnNbClient.ACL_ACTION_DROP, ext, false, null, name);
-        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), aclUuid, name));
+        logicalIdMapDao.persist(new OvnLogicalIdMapVO(Kind.FIREWALL, csId, controller.getId(), network.getId(), aclUuid, name));
         LOGGER.info("OvnFirewallService: baseline DROP {} installed (network id={}, dir={})",
                 aclUuid, network.getId(), direction);
     }

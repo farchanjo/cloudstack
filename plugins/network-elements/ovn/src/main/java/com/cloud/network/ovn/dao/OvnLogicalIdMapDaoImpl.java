@@ -32,6 +32,7 @@ public class OvnLogicalIdMapDaoImpl extends GenericDaoBase<OvnLogicalIdMapVO, Lo
     private final SearchBuilder<OvnLogicalIdMapVO> csSearch;
     private final SearchBuilder<OvnLogicalIdMapVO> uuidSearch;
     private final SearchBuilder<OvnLogicalIdMapVO> kindSearch;
+    private final SearchBuilder<OvnLogicalIdMapVO> csNetworkSearch;
 
     public OvnLogicalIdMapDaoImpl() {
         csSearch = createSearchBuilder();
@@ -48,6 +49,13 @@ public class OvnLogicalIdMapDaoImpl extends GenericDaoBase<OvnLogicalIdMapVO, Lo
         kindSearch.and("csKind", kindSearch.entity().getCsKind(), Op.EQ);
         kindSearch.and("controllerId", kindSearch.entity().getControllerId(), Op.EQ);
         kindSearch.done();
+
+        csNetworkSearch = createSearchBuilder();
+        csNetworkSearch.and("csKind", csNetworkSearch.entity().getCsKind(), Op.EQ);
+        csNetworkSearch.and("csId", csNetworkSearch.entity().getCsId(), Op.EQ);
+        csNetworkSearch.and("controllerId", csNetworkSearch.entity().getControllerId(), Op.EQ);
+        csNetworkSearch.and("networkId", csNetworkSearch.entity().getNetworkId(), Op.EQ);
+        csNetworkSearch.done();
     }
 
     @Override
@@ -63,6 +71,17 @@ public class OvnLogicalIdMapDaoImpl extends GenericDaoBase<OvnLogicalIdMapVO, Lo
     public OvnLogicalIdMapVO findByOvnUuid(final String ovnUuid) {
         final SearchCriteria<OvnLogicalIdMapVO> sc = uuidSearch.create();
         sc.setParameters("ovnUuid", ovnUuid);
+        return findOneBy(sc);
+    }
+
+    @Override
+    public OvnLogicalIdMapVO findByCsId(final Kind kind, final long csId, final long controllerId,
+                                        final long networkId) {
+        final SearchCriteria<OvnLogicalIdMapVO> sc = csNetworkSearch.create();
+        sc.setParameters("csKind", kind.name());
+        sc.setParameters("csId", csId);
+        sc.setParameters("controllerId", controllerId);
+        sc.setParameters("networkId", networkId);
         return findOneBy(sc);
     }
 

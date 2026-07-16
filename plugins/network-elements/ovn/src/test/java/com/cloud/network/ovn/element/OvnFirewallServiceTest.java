@@ -91,6 +91,7 @@ public class OvnFirewallServiceTest {
         service = new OvnFirewallService();
         injectField(service, "pluginManager", pluginManager);
         injectField(service, "logicalIdMapDao", logicalIdMapDao);
+        injectField(service, "pendingDeletionDao", mock(com.cloud.network.ovn.dao.OvnPendingDeletionDao.class));
     }
 
     @Test
@@ -111,7 +112,7 @@ public class OvnFirewallServiceTest {
         verify(nbClient, times(1)).addAclToLogicalSwitch(eq(TIER_LS_UUID), direction.capture(), priority.capture(),
                 match.capture(), action.capture(), anyMap(), anyBoolean(), any(), anyString());
 
-        assertEquals(OvnNbClient.ACL_DIRECTION_FROM_LPORT, direction.getValue());
+        assertEquals(OvnNbClient.ACL_DIRECTION_TO_LPORT, direction.getValue());
         assertEquals(OvnNbClient.ACL_ACTION_ALLOW_RELATED, action.getValue());
         final String built = match.getValue();
         assertTrue("match must include tcp predicate: " + built, built.contains("tcp"));
@@ -140,7 +141,7 @@ public class OvnFirewallServiceTest {
         verify(nbClient).addAclToLogicalSwitch(anyString(), direction.capture(), anyInt(),
                 match.capture(), action.capture(), anyMap(), anyBoolean(), any(), anyString());
 
-        assertEquals(OvnNbClient.ACL_DIRECTION_TO_LPORT, direction.getValue());
+        assertEquals(OvnNbClient.ACL_DIRECTION_FROM_LPORT, direction.getValue());
         assertEquals(OvnNbClient.ACL_ACTION_DROP, action.getValue());
         final String built = match.getValue();
         assertTrue("egress must use ip4.dst: " + built, built.contains("ip4.dst == 0.0.0.0/0"));
@@ -158,6 +159,16 @@ public class OvnFirewallServiceTest {
         assertTrue("must include icmp4.type: " + built, built.contains("icmp4.type == 8"));
         assertTrue("must include icmp4.code: " + built, built.contains("icmp4.code == 0"));
         assertTrue("must include CIDR predicate: " + built, built.contains("ip4.src == 10.10.0.0/16"));
+    }
+
+    @Test
+    public void dualStackRuleUsesIp6CidrAndIcmp6Predicates() {
+        final NetworkACLItem rule = aclRule(304L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "icmp", null, null, List.of("2a13:8740::/64"), 128, 0, 2, NetworkACLItem.State.Add);
+        final String built = OvnFirewallService.buildMatch(rule);
+        assertTrue(built.contains("ip6.src == 2a13:8740::/64"));
+        assertTrue(built.contains("icmp6.type == 128"));
+        assertTrue(built.contains("icmp6.code == 0"));
     }
 
     @Test
@@ -183,7 +194,8 @@ public class OvnFirewallServiceTest {
         // Pretend rule 101 already mapped — addAclToLogicalSwitch must NOT fire.
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
         when(existing.getOvnUuid()).thenReturn("acl-uuid-existing");
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(101L), eq(CONTROLLER_ID))).thenReturn(existing);
+        when(nbClient.rowExistsByUuid(eq("ACL"), eq("acl-uuid-existing"))).thenReturn(true);
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(101L), eq(CONTROLLER_ID), eq(NETWORK_ID))).thenReturn(existing);
 
         final NetworkACLItem rule = aclRule(101L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
                 "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Add);
@@ -195,12 +207,82 @@ public class OvnFirewallServiceTest {
     }
 
     @Test
+    public void legacyRuleMappingIsRenamedWhenAttachedToThisTier() throws Exception {
+        final OvnLogicalIdMapVO legacy = mock(OvnLogicalIdMapVO.class);
+        when(legacy.getId()).thenReturn(808L);
+        when(legacy.getOvnUuid()).thenReturn("acl-legacy");
+        when(legacy.getOvnName()).thenReturn("csacl-101");
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(101L), eq(CONTROLLER_ID), eq(0L))).thenReturn(legacy);
+        when(nbClient.listAclsOnLogicalSwitch(TIER_LS_UUID)).thenReturn(List.of("acl-legacy"));
+        final NetworkACLItem rule = aclRule(101L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Add);
+        assertTrue(service.applyNetworkACLs(network, List.of(rule)));
+        verify(logicalIdMapDao).update(eq(808L), eq(legacy));
+        verify(legacy).setOvnName("csacl-net-100-rule-101");
+        verify(nbClient, never()).addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(),
+                anyString(), anyMap(), anyBoolean(), any(), anyString());
+    }
+
+    @Test
+    public void sameRuleIdOnTwoTiersUsesTwoNetworkMappings() throws Exception {
+        final Network second = mock(Network.class);
+        when(second.getId()).thenReturn(200L);
+        when(second.getDataCenterId()).thenReturn(ZONE_ID);
+        final OvnLogicalIdMapVO secondLs = mock(OvnLogicalIdMapVO.class);
+        when(secondLs.getOvnUuid()).thenReturn("ls-uuid-bbb");
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK), eq(200L), eq(CONTROLLER_ID))).thenReturn(secondLs);
+        when(nbClient.addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(), anyString(), anyMap(), anyBoolean(), any(), anyString()))
+                .thenReturn("acl-a", "acl-b");
+        final NetworkACLItem rule = aclRule(101L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Add);
+        assertTrue(service.applyNetworkACLs(network, List.of(rule)));
+        assertTrue(service.applyNetworkACLs(second, List.of(rule)));
+        final ArgumentCaptor<OvnLogicalIdMapVO> mappings = ArgumentCaptor.forClass(OvnLogicalIdMapVO.class);
+        verify(logicalIdMapDao, times(2)).persist(mappings.capture());
+        assertEquals(100L, mappings.getAllValues().get(0).getNetworkId());
+        assertEquals(200L, mappings.getAllValues().get(1).getNetworkId());
+    }
+
+    @Test
+    public void revokeLegacyMappingOnlyWhenUuidBelongsToTier() throws Exception {
+        final OvnLogicalIdMapVO legacy = mock(OvnLogicalIdMapVO.class);
+        when(legacy.getId()).thenReturn(1001L);
+        when(legacy.getOvnUuid()).thenReturn("legacy-acl");
+        when(legacy.getOvnName()).thenReturn("csacl-909");
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(909L), eq(CONTROLLER_ID), eq(0L))).thenReturn(legacy);
+        when(nbClient.listAclsOnLogicalSwitch(TIER_LS_UUID)).thenReturn(List.of("other-acl"));
+        final NetworkACLItem rule = aclRule(909L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Revoke);
+        assertTrue(service.applyNetworkACLs(network, List.of(rule)));
+        verify(nbClient, never()).removeAclFromLogicalSwitch(anyString(), eq("legacy-acl"));
+        verify(logicalIdMapDao, never()).remove(eq(1001L));
+    }
+
+    @Test
+    public void clearTierPreservesMappingsFromOtherTier() throws Exception {
+        final Network second = mock(Network.class);
+        when(second.getId()).thenReturn(200L);
+        when(second.getDataCenterId()).thenReturn(ZONE_ID);
+        final OvnLogicalIdMapVO other = mock(OvnLogicalIdMapVO.class);
+        when(other.getOvnUuid()).thenReturn("acl-tier-b");
+        when(other.getOvnName()).thenReturn("csacl-net-200-rule-101");
+        when(logicalIdMapDao.listByKind(Kind.NETWORK_ACL, CONTROLLER_ID)).thenReturn(List.of(other));
+        when(nbClient.listAclsOnLogicalSwitch(TIER_LS_UUID)).thenReturn(List.of("acl-tier-a"));
+        final NetworkACLItem rule = aclRule(101L, NetworkACLItem.TrafficType.Ingress, NetworkACLItem.Action.Allow,
+                "tcp", 80, 80, List.of("10.0.0.0/8"), null, null, 1, NetworkACLItem.State.Add);
+        when(nbClient.addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(), anyString(), anyMap(), anyBoolean(), any(), anyString()))
+                .thenReturn("new-acl");
+        assertTrue(service.reorderAclRules(null, List.of(network), List.of(rule)));
+        verify(logicalIdMapDao, never()).remove(eq(other.getId()));
+    }
+
+    @Test
     public void revokeRemovesMappingAndCallsDetach() throws Exception {
         // mapping for rule 707 exists.
         final OvnLogicalIdMapVO mapping = mock(OvnLogicalIdMapVO.class);
         when(mapping.getId()).thenReturn(909L);
         when(mapping.getOvnUuid()).thenReturn("acl-uuid-707");
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(707L), eq(CONTROLLER_ID))).thenReturn(mapping);
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(707L), eq(CONTROLLER_ID), eq(NETWORK_ID))).thenReturn(mapping);
 
         // listByKind returns one tier LS under this controller.
         final OvnLogicalIdMapVO tierLs = mock(OvnLogicalIdMapVO.class);
@@ -252,7 +334,7 @@ public class OvnFirewallServiceTest {
     @Test
     public void applyNetworkACLs_returnsFalse_whenRuleApplyThrowsOvnException() throws Exception {
         // The OVN NB client throws on the actual rule apply — must propagate as false.
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(303L), eq(CONTROLLER_ID))).thenReturn(null);
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(303L), eq(CONTROLLER_ID), eq(NETWORK_ID))).thenReturn(null);
         doThrow(new OvnException("OVSDB transact failed"))
                 .when(nbClient).addAclToLogicalSwitch(anyString(), anyString(), anyInt(), anyString(),
                         anyString(), anyMap(), anyBoolean(), any(), anyString());

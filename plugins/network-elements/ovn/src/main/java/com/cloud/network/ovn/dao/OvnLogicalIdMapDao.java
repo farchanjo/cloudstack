@@ -33,6 +33,8 @@ public interface OvnLogicalIdMapDao extends GenericDao<OvnLogicalIdMapVO, Long> 
      */
     OvnLogicalIdMapVO findByCsId(Kind kind, long csId, long controllerId);
 
+    OvnLogicalIdMapVO findByCsId(Kind kind, long csId, long controllerId, long networkId);
+
     /**
      * Reverse lookup: given an OVN UUID, find the CloudStack mapping. Useful
      * for the import flow ({@code ImportOvnVpcCmd}).
