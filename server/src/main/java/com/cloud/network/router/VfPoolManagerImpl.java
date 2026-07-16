@@ -397,29 +397,36 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         }
     }
 
+    /**
+     * Resolve exact stale/current rows by immutable candidate pool IDs.
+     * Do not use {@code listByNicId} as existence authority: WRONG_HOST_CANONICAL
+     * PENDING promotions are FREE with {@code allocated_to_nic_id=NULL} and are
+     * omitted from nic-scoped listings (production rows 749/1022/2468).
+     */
     private VfOwnershipRepairPlan.CandidateState incidentCandidateState(
             final VfOwnershipRepairPlan plan, final VfOwnershipRepairPlan.Candidate candidate) {
-        final List<SriovVfPoolVO> rows = vfPoolDao.listByNicId(candidate.getNicId());
-        SriovVfPoolVO current = null;
-        SriovVfPoolVO stale = null;
-        for (final SriovVfPoolVO row : rows) {
-            if (row.getId() == candidate.getCurrentPoolId()) {
-                current = row;
-            } else if (row.getId() == candidate.getStalePoolId()) {
-                stale = row;
-            }
-            if (State.RESERVED.name().equals(row.getState())) {
-                return VfOwnershipRepairPlan.CandidateState.INVALID;
-            }
-        }
-        if (current == null || stale == null || current.getHostId() != candidate.getCurrentHostId()
-                || stale.getHostId() != candidate.getStaleHostId()
-                || !safeEqualsIgnoreCase(current.getPciAddress(), candidate.getCurrentBdf())
-                || !safeEqualsIgnoreCase(stale.getPciAddress(), candidate.getStaleBdf())) {
+        final SriovVfPoolVO current = vfPoolDao.findById(candidate.getCurrentPoolId());
+        final SriovVfPoolVO stale = vfPoolDao.findById(candidate.getStalePoolId());
+        if (!exactCandidateRow(current, candidate.getCurrentPoolId(), candidate.getCurrentHostId(),
+                candidate.getCurrentBdf())
+                || !exactCandidateRow(stale, candidate.getStalePoolId(), candidate.getStaleHostId(),
+                candidate.getStaleBdf())) {
             return VfOwnershipRepairPlan.CandidateState.INVALID;
         }
+        // FREE current + null owner is accepted only via plan.state() for
+        // WRONG_HOST_CANONICAL PENDING; other kinds/states fail closed there.
         return plan.state(candidate, current.getState(), current.getAllocatedToNicId(),
                 stale.getState(), stale.getAllocatedToNicId());
+    }
+
+    /** Fail closed unless the locked row matches the immutable candidate identity. */
+    private boolean exactCandidateRow(final SriovVfPoolVO row, final long expectedId,
+                                      final long expectedHostId, final String expectedBdf) {
+        return row != null
+                && row.getId() == expectedId
+                && row.getHostId() == expectedHostId
+                && !State.RESERVED.name().equals(row.getState())
+                && safeEqualsIgnoreCase(row.getPciAddress(), expectedBdf);
     }
 
     private boolean incidentProgressValid(final VfOwnershipRepairPlan plan) {

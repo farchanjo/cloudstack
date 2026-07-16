@@ -20,6 +20,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -120,6 +121,112 @@ public class VfPoolIncidentResumeGateTest {
         verify(harness.dao).prepareReconciliationPlan(any());
     }
 
+    /**
+     * Production initial incident: ALLOCATED=27 FREE=237 with three WRONG_HOST_CANONICAL
+     * promotion rows FREE + allocated_to_nic_id=NULL (749/1022/2468). listByNicId omits
+     * them; exact findById must still pass the apply gate through prepare.
+     */
+    @Test
+    public void productionInitialTwentySevenTwoThirtySevenPassesApplyGateWithFreePromotions()
+            throws Exception {
+        final IncidentFixture fixture = IncidentFixture.initialPending();
+        final GateHarness harness = new GateHarness(fixture);
+
+        assertTrue(fixture.plan.isExactIncidentScope());
+        assertEquals(27, fixture.count(State.ALLOCATED));
+        assertEquals(237, fixture.count(State.FREE));
+        for (final long freePromotionId : IncidentFixture.WRONG_HOST_CURRENT_IDS) {
+            final SriovVfPoolVO promotion = fixture.rowById(freePromotionId);
+            assertEquals(State.FREE.name(), promotion.getState());
+            assertEquals(null, promotion.getAllocatedToNicId());
+            // FREE + null owner is invisible to listByNicId (production root cause).
+            assertTrue(fixture.listByNicIdProduction(8829L).stream()
+                    .noneMatch(row -> row.getId() == freePromotionId));
+            assertTrue(fixture.listByNicIdProduction(8847L).stream()
+                    .noneMatch(row -> row.getId() == freePromotionId));
+            assertTrue(fixture.listByNicIdProduction(8925L).stream()
+                    .noneMatch(row -> row.getId() == freePromotionId));
+        }
+        for (final VfOwnershipRepairPlan.Candidate candidate : fixture.plan.getCandidates()) {
+            if (candidate.getKind() != VfOwnershipRepairPlan.Kind.WRONG_HOST_CANONICAL) {
+                continue;
+            }
+            final List<SriovVfPoolVO> byNic = fixture.listByNicIdProduction(candidate.getNicId());
+            assertTrue("listByNicId must omit FREE current " + candidate.getCurrentPoolId(),
+                    byNic.stream().noneMatch(row -> row.getId() == candidate.getCurrentPoolId()));
+            assertEquals(candidate.getCurrentPoolId(),
+                    fixture.rowById(candidate.getCurrentPoolId()).getId());
+        }
+
+        harness.newManager().runOwnershipRepairGate();
+
+        assertEquals(19, fixture.count(State.ALLOCATED));
+        assertEquals(245, fixture.count(State.FREE));
+        verify(harness.dao, times(1)).prepareReconciliationPlan(any());
+        verify(harness.dao, atLeast(22)).findById(anyLong());
+        verify(harness.agents, times(11)).send(anyLong(), any(HostVfPurgeOrphansCommand.class));
+    }
+
+    @Test
+    public void freePromotionRowsResolvedByFindByIdNotListByNicIdForAllThreeWrongHostCandidates()
+            throws Exception {
+        final IncidentFixture fixture = IncidentFixture.initialPending();
+        final GateHarness harness = new GateHarness(fixture);
+        final List<VfOwnershipRepairPlan.Candidate> wrongHost = fixture.plan.getCandidates().stream()
+                .filter(c -> c.getKind() == VfOwnershipRepairPlan.Kind.WRONG_HOST_CANONICAL)
+                .toList();
+        assertEquals(3, wrongHost.size());
+
+        for (final VfOwnershipRepairPlan.Candidate candidate : wrongHost) {
+            assertTrue(fixture.listByNicIdProduction(candidate.getNicId()).stream()
+                    .noneMatch(row -> row.getId() == candidate.getCurrentPoolId()));
+            final SriovVfPoolVO exact = harness.dao.findById(candidate.getCurrentPoolId());
+            assertEquals(State.FREE.name(), exact.getState());
+            assertEquals(null, exact.getAllocatedToNicId());
+            assertEquals(candidate.getCurrentHostId(), exact.getHostId());
+            assertEquals(candidate.getCurrentBdf().toLowerCase(),
+                    exact.getPciAddress().toLowerCase());
+        }
+
+        harness.newManager().runOwnershipRepairGate();
+        verify(harness.dao).prepareReconciliationPlan(any());
+    }
+
+    @Test
+    public void applyGateRejectsWrongPoolIdHostBdfNicOwnershipOrState() throws Exception {
+        // Fixed approved plan + drifted exact rows exercises incidentCandidateState fail-closed
+        // (not merely plan-hash mismatch from rebuild).
+        assertBlockedWithFixedPlan(fixture -> fixture.setHostId(1022L, 999L));
+        assertBlockedWithFixedPlan(fixture -> fixture.setPciAddress(749L, "0000:ff:00.0"));
+        assertBlockedWithFixedPlan(fixture -> {
+            final SriovVfPoolVO stale = fixture.rowById(1625L);
+            stale.setState(State.ALLOCATED);
+            stale.setAllocatedToNicId(99999L);
+        });
+        assertBlockedWithFixedPlan(fixture -> {
+            // PENDING wrong-host requires FREE+null; ALLOCATED+nic is invalid mid-state.
+            final SriovVfPoolVO current = fixture.rowById(2468L);
+            current.setState(State.ALLOCATED);
+            current.setAllocatedToNicId(8925L);
+        });
+        assertBlockedWithFixedPlan(fixture -> fixture.rowById(1016L).setState(State.RESERVED));
+        assertBlockedWithFixedPlan(fixture -> fixture.removeRow(818L));
+    }
+
+    private static void assertBlockedWithFixedPlan(final FixtureMutator mutator) throws Exception {
+        final IncidentFixture fixture = IncidentFixture.initialPending();
+        mutator.mutate(fixture);
+        final GateHarness harness = new GateHarness(fixture);
+        harness.newFixedPlanManager().runOwnershipRepairGate();
+        verify(harness.dao, never()).prepareReconciliationPlan(any());
+        verify(harness.agents, never()).send(anyLong(), any(HostVfPurgeOrphansCommand.class));
+    }
+
+    @FunctionalInterface
+    private interface FixtureMutator {
+        void mutate(IncidentFixture fixture) throws Exception;
+    }
+
     private static final class GateHarness {
         private final IncidentFixture fixture;
         private final SriovVfPoolDao dao = mock(SriovVfPoolDao.class);
@@ -131,8 +238,11 @@ public class VfPoolIncidentResumeGateTest {
         private GateHarness(final IncidentFixture fixture) throws Exception {
             this.fixture = fixture;
             when(dao.listAll()).thenAnswer(invocation -> fixture.allRows);
+            // Production semantics: only rows with allocated_to_nic_id = nicId.
             when(dao.listByNicId(anyLong())).thenAnswer(invocation ->
-                    fixture.rowsByNic.getOrDefault(invocation.getArgument(0), List.of()));
+                    fixture.listByNicIdProduction(invocation.getArgument(0)));
+            when(dao.findById(anyLong())).thenAnswer(invocation ->
+                    fixture.rowById(invocation.getArgument(0)));
             when(dao.prepareReconciliationPlan(any())).thenAnswer(invocation -> {
                 fixture.quarantine(invocation.getArgument(0));
                 return true;
@@ -147,7 +257,15 @@ public class VfPoolIncidentResumeGateTest {
         }
 
         private ApprovedManager newManager() {
-            final ApprovedManager manager = new ApprovedManager(fixture.plan);
+            return wire(new ApprovedManager(fixture.plan));
+        }
+
+        /** Keeps the immutable approved plan while exact DAO rows may drift. */
+        private ApprovedManager newFixedPlanManager() {
+            return wire(new FixedPlanManager(fixture.plan));
+        }
+
+        private ApprovedManager wire(final ApprovedManager manager) {
             ReflectionTestUtils.setField(manager, "vfPoolDao", dao);
             ReflectionTestUtils.setField(manager, "agentMgr", agents);
             ReflectionTestUtils.setField(manager, "nicDao", nics);
@@ -175,7 +293,7 @@ public class VfPoolIncidentResumeGateTest {
         return answer;
     }
 
-    private static final class ApprovedManager extends VfPoolManagerImpl {
+    private static class ApprovedManager extends VfPoolManagerImpl {
         private final VfOwnershipRepairPlan plan;
 
         private ApprovedManager(final VfOwnershipRepairPlan plan) {
@@ -191,13 +309,29 @@ public class VfPoolIncidentResumeGateTest {
         @Override protected boolean isIncidentScopeApproved(final VfOwnershipRepairPlan ignored) { return true; }
     }
 
+    /** Returns the pre-built approved plan so row drift is validated by exact findById. */
+    private static final class FixedPlanManager extends ApprovedManager {
+        private final VfOwnershipRepairPlan fixed;
+
+        private FixedPlanManager(final VfOwnershipRepairPlan plan) {
+            super(plan);
+            this.fixed = plan;
+        }
+
+        @Override
+        VfOwnershipRepairPlan buildOwnershipRepairPlan() {
+            return fixed;
+        }
+    }
+
     private static final class IncidentFixture {
         private static final long[][] SPECS = {{857, 833, 8820}, {1427, 833, 8820}, {2435, 833, 8820},
                 {764, 827, 8913}, {896, 827, 8913}, {995, 827, 8913}, {1469, 827, 8913},
                 {2537, 827, 8913}, {1625, 1022, 8829}, {818, 749, 8847}, {1016, 2468, 8925}};
+        /** Production WRONG_HOST_CANONICAL current promotion pool IDs (FREE + null owner). */
+        private static final long[] WRONG_HOST_CURRENT_IDS = {1022L, 749L, 2468L};
         private final VfOwnershipRepairPlan plan;
         private final List<SriovVfPoolVO> allRows = new ArrayList<>();
-        private final Map<Long, List<SriovVfPoolVO>> rowsByNic = new HashMap<>();
         private final Map<Long, SriovVfPoolVO> rowsById = new LinkedHashMap<>();
         private final Map<Long, NicVO> nics = new HashMap<>();
         private final Map<Long, VMInstanceVO> vms = new HashMap<>();
@@ -221,27 +355,36 @@ public class VfPoolIncidentResumeGateTest {
                         throw new IllegalStateException(e);
                     }
                 });
-                addForNic(nicId, current);
+                registerRow(current);
                 final State staleState = state == VfOwnershipRepairPlan.CandidateState.PENDING
                         ? State.ALLOCATED : state == VfOwnershipRepairPlan.CandidateState.QUARANTINED
                         ? State.SUSPECT : State.FREE;
                 final SriovVfPoolVO stale = row(staleId, 269L, pci(staleId), staleState,
                         staleState == State.FREE ? null : nicId);
-                addForNic(nicId, stale);
+                registerRow(stale);
                 final VfOwnershipRepairPlan.Kind kind = wrongHost
                         ? VfOwnershipRepairPlan.Kind.WRONG_HOST_CANONICAL
                         : VfOwnershipRepairPlan.Kind.NONCANONICAL_STALE;
                 candidates.add(new VfOwnershipRepairPlan.Candidate(kind, 1500L + nicId, nicId,
                         currentId, staleId, 16L, 269L, current.getPciAddress(), stale.getPciAddress(), mac(nicId)));
                 final long vmId = 1500L + nicId;
-                nics.computeIfAbsent(nicId, ignored -> mockNic(mac(nicId), vmId));
-                vms.computeIfAbsent(vmId, ignored -> mockVm(vmId));
+                nics.computeIfAbsent(nicId, ignored -> {
+                    try {
+                        return realNic(nicId, mac(nicId), vmId, currentId);
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                });
+                vms.computeIfAbsent(vmId, ignored -> realVm(vmId));
             }
             addFillers();
             plan = new VfOwnershipRepairPlan(candidates, 27, 237);
             assertTrue(plan.isExactIncidentScope());
         }
 
+        private static IncidentFixture initialPending() throws Exception {
+            return new IncidentFixture(states(VfOwnershipRepairPlan.CandidateState.PENDING));
+        }
         private static IncidentFixture quarantined() throws Exception {
             return new IncidentFixture(states(VfOwnershipRepairPlan.CandidateState.QUARANTINED));
         }
@@ -276,24 +419,54 @@ public class VfPoolIncidentResumeGateTest {
             return states;
         }
 
-        private void addForNic(final long nicId, final SriovVfPoolVO row) {
+        private void registerRow(final SriovVfPoolVO row) {
             if (!rowsById.containsKey(row.getId())) {
                 rowsById.put(row.getId(), row);
                 allRows.add(row);
-            }
-            final List<SriovVfPoolVO> rows = rowsByNic.computeIfAbsent(nicId, ignored -> new ArrayList<>());
-            if (!rows.contains(row)) {
-                rows.add(row);
             }
         }
 
         private void addFillers() throws Exception {
             for (int index = 0; index < 14; index++) {
-                allRows.add(row(5000L + index, 300L, pci(5000L + index), State.ALLOCATED, 9000L + index));
+                registerRow(row(5000L + index, 300L, pci(5000L + index), State.ALLOCATED, 9000L + index));
             }
             for (int index = 0; index < 234; index++) {
-                allRows.add(row(10000L + index, 300L, pci(10000L + index), State.FREE, null));
+                registerRow(row(10000L + index, 300L, pci(10000L + index), State.FREE, null));
             }
+        }
+
+        /** Production listByNicId: only rows whose allocated_to_nic_id equals nicId. */
+        private List<SriovVfPoolVO> listByNicIdProduction(final long nicId) {
+            final List<SriovVfPoolVO> owned = new ArrayList<>();
+            for (final SriovVfPoolVO row : allRows) {
+                if (Long.valueOf(nicId).equals(row.getAllocatedToNicId())) {
+                    owned.add(row);
+                }
+            }
+            return owned;
+        }
+
+        private SriovVfPoolVO rowById(final long id) {
+            return rowsById.get(id);
+        }
+
+        private void removeRow(final long id) {
+            final SriovVfPoolVO removed = rowsById.remove(id);
+            if (removed != null) {
+                allRows.remove(removed);
+            }
+        }
+
+        private void setHostId(final long id, final long hostId) throws Exception {
+            final Field field = SriovVfPoolVO.class.getDeclaredField("hostId");
+            field.setAccessible(true);
+            field.setLong(rowById(id), hostId);
+        }
+
+        private void setPciAddress(final long id, final String bdf) throws Exception {
+            final Field field = SriovVfPoolVO.class.getDeclaredField("pciAddress");
+            field.setAccessible(true);
+            field.set(rowById(id), bdf);
         }
 
         private boolean complete(final long staleId) {
@@ -340,18 +513,31 @@ public class VfPoolIncidentResumeGateTest {
             return row;
         }
 
-        private static NicVO mockNic(final String mac, final long vmId) {
-            final NicVO nic = mock(NicVO.class);
-            when(nic.getMacAddress()).thenReturn(mac);
-            when(nic.getInstanceId()).thenReturn(vmId);
+        /** Real VO — avoid Mockito/Byte Buddy instrumentation of JPA entities on JDK 25. */
+        private static NicVO realNic(final long nicId, final String mac, final long vmId,
+                                      final long vfPoolId) throws Exception {
+            final NicVO nic = new NicVO("test", vmId, 1L, VirtualMachine.Type.User);
+            final Field idField = NicVO.class.getDeclaredField("id");
+            idField.setAccessible(true);
+            idField.setLong(nic, nicId);
+            nic.setMacAddress(mac);
+            nic.setVfPoolId(vfPoolId);
             return nic;
         }
 
-        private static VMInstanceVO mockVm(final long vmId) {
-            final VMInstanceVO vm = mock(VMInstanceVO.class);
-            when(vm.getId()).thenReturn(vmId);
-            when(vm.getHostId()).thenReturn(16L);
-            when(vm.getState()).thenReturn(VirtualMachine.State.Running);
+        /** Real VO — avoid Mockito/Byte Buddy instrumentation of JPA entities on JDK 25. */
+        private static VMInstanceVO realVm(final long vmId) {
+            final VMInstanceVO vm = new VMInstanceVO();
+            // id is set via protected field on construction path; use reflection for empty ctor.
+            try {
+                final Field idField = VMInstanceVO.class.getDeclaredField("id");
+                idField.setAccessible(true);
+                idField.setLong(vm, vmId);
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+            vm.setHostId(16L);
+            vm.setState(VirtualMachine.State.Running);
             return vm;
         }
 
