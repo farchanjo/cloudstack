@@ -185,6 +185,7 @@ public class OvnDhcpService {
         if (existing != null) {
             // Stale-mapping guard — recreate when NB row was deleted out-of-band.
             if (nb.rowExistsByUuid("DHCP_Options", existing.getOvnUuid())) {
+                nb.updateDhcpOptions(existing.getOvnUuid(), buildDhcpv4Options(network));
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnDhcpService: DHCP_OPTIONS mapping net={} -> {} stale; recreating",
@@ -203,6 +204,7 @@ public class OvnDhcpService {
         final OvnLogicalIdMapVO existing = logicalIdMapDao.findByCsId(Kind.DHCP_OPTIONS_V6, network.getId(), controller.getId());
         if (existing != null) {
             if (nb.rowExistsByUuid("DHCP_Options", existing.getOvnUuid())) {
+                nb.updateDhcpOptions(existing.getOvnUuid(), buildDhcpv6Options(network));
                 return existing.getOvnUuid();
             }
             LOGGER.warn("OvnDhcpService: DHCP_OPTIONS_V6 mapping net={} -> {} stale; recreating",
@@ -224,8 +226,10 @@ public class OvnDhcpService {
      */
     private Map<String, String> buildDhcpv4Options(final Network network) {
         final Map<String, String> opts = new HashMap<>();
-        final String gateway = StringUtils.defaultString(network.getGateway());
-        opts.put("server_id", gateway);
+        final String gateway = StringUtils.trimToNull(network.getGateway());
+        if (gateway != null) {
+            opts.put("server_id", gateway);
+        }
         opts.put("server_mac", deriveServerMac(gateway));
         opts.put("lease_time", String.valueOf(DEFAULT_LEASE_SECS));
         if (StringUtils.isNotBlank(gateway)) {
@@ -262,12 +266,12 @@ public class OvnDhcpService {
     }
 
     /**
-     * Build the OVN DHCPv6 options map. {@code server_id} is a stable
-     * link-local for the LR's south-side LRP; OVN uses it as the responder.
+     * Build the OVN DHCPv6 options map. {@code server_id} is the stable MAC
+     * identity required by OVN's DHCPv6 responder.
      */
     private Map<String, String> buildDhcpv6Options(final Network network) {
         final Map<String, String> opts = new HashMap<>();
-        opts.put("server_id", deriveLinkLocalFromGateway(network.getIp6Gateway()));
+        opts.put("server_id", deriveServerMacV6(network.getIp6Gateway()));
         // Same zone-DNS fallback as v4 (see buildDhcpv4Options).
         String dns1 = network.getIp6Dns1();
         String dns2 = network.getIp6Dns2();
@@ -312,11 +316,20 @@ public class OvnDhcpService {
         }
     }
 
-    private static String deriveLinkLocalFromGateway(final String gw6) {
+    private static String deriveServerMacV6(final String gw6) {
         if (StringUtils.isBlank(gw6)) {
-            return "fe80::1";
+            return "02:00:00:00:00:02";
         }
-        return gw6.trim();
+        final String hex = gw6.replace(":", "").replace("%", "");
+        if (hex.length() < 6) {
+            return "02:00:00:00:00:02";
+        }
+        try {
+            final String tail = hex.substring(hex.length() - 6);
+            return "02:00:" + tail.substring(0, 2) + ":" + tail.substring(2, 4) + ":" + tail.substring(4, 6) + ":02";
+        } catch (RuntimeException e) {
+            return "02:00:00:00:00:02";
+        }
     }
 
     /** Stable external_ids for forensic + import flows. */

@@ -86,8 +86,13 @@ public final class OvnOpFactory {
      * {@code Logical_Router.load_balancer}).
      */
     public static ObjectNode mutateDeleteSet(final String table, final ArrayNode where, final String column,
-                                             final ArrayNode setValue) {
+                                              final ArrayNode setValue) {
         return buildMutateSetOp(table, where, column, setValue, "delete");
+    }
+
+    public static ObjectNode mutateMap(final String table, final ArrayNode where, final String column,
+                                        final String mutator, final ArrayNode mapValue) {
+        return buildMutateSetOp(table, where, column, mapValue, mutator);
     }
 
     private static ObjectNode buildMutateSetOp(final String table, final ArrayNode where, final String column,

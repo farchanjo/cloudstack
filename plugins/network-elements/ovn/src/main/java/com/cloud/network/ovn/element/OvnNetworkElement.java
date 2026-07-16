@@ -446,8 +446,7 @@ public class OvnNetworkElement extends AdapterBase
             try {
                 final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
                 final String lspUuid = nb.addLogicalSwitchPort(lsUuid, lspName, addresses, null, null);
-                // port_security mirrors addresses → spoof guard.
-                nb.lspSetPortSecurity(lspUuid, addresses);
+                // addresses + port_security are inserted in the same NB transaction.
                 // Feature: requested-chassis — pin LSP to specific OVN chassis.
                 // Feature: arp_proxy — suppress ARP flooding on the logical segment.
                 // Feature: ha-chassis-priority — combined with requested-chassis when set.

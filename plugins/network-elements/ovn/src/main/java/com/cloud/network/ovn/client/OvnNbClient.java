@@ -468,6 +468,7 @@ public class OvnNbClient implements AutoCloseable {
         row.put("name", name);
         if (addresses != null && !addresses.isEmpty()) {
             row.set("addresses", stringSet(addresses));
+            row.set("port_security", stringSet(addresses));
         }
         if (type != null && !type.isEmpty()) {
             row.put("type", type);
@@ -1950,6 +1951,43 @@ public class OvnNbClient implements AutoCloseable {
         row.set("records", buildMap(records == null ? Map.of() : records));
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.update("DNS", OvnOpFactory.whereUuid(dnsUuid), row));
+        tx.commit();
+    }
+
+    /** Read the authoritative records column immediately before a DNS update. */
+    public Map<String, String> readDnsRecords(final String dnsUuid) {
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("records");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("DNS", OvnOpFactory.whereUuid(dnsUuid), columns));
+        final ArrayNode raw = tx.commit().raw();
+        if (raw == null || raw.size() == 0 || raw.get(0).get("rows") == null
+                || raw.get(0).get("rows").size() == 0) {
+            return new LinkedHashMap<>();
+        }
+        return new LinkedHashMap<>(OvnNbReader.decodeMap(raw.get(0).get("rows").get(0).get("records")));
+    }
+
+    /** Atomically inserts/replaces one DNS map entry without a JVM snapshot. */
+    public void mutateDnsRecord(final String dnsUuid, final String hostname, final String address) {
+        final ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+        pair.add(hostname);
+        pair.add(address);
+        final ArrayNode pairs = JsonNodeFactory.instance.arrayNode().add(pair);
+        final ArrayNode map = JsonNodeFactory.instance.arrayNode().add("map").add(pairs);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateMap("DNS", OvnOpFactory.whereUuid(dnsUuid), "records", "insert", map));
+        tx.commit();
+    }
+
+    /** Atomically deletes DNS map keys; concurrent writers are not lost. */
+    public void removeDnsRecordKeys(final String dnsUuid, final List<String> hostnames) {
+        if (hostnames == null || hostnames.isEmpty()) return;
+        final ArrayNode keys = JsonNodeFactory.instance.arrayNode();
+        hostnames.forEach(keys::add);
+        final ArrayNode keySet = JsonNodeFactory.instance.arrayNode().add("set").add(keys);
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.mutateMap("DNS", OvnOpFactory.whereUuid(dnsUuid), "records", "delete", keySet));
         tx.commit();
     }
 

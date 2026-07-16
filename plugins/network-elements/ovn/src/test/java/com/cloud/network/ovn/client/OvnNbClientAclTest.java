@@ -140,6 +140,25 @@ public class OvnNbClientAclTest {
         assertEquals("to-lport", OvnNbClient.ACL_DIRECTION_TO_LPORT);
     }
 
+    @Test
+    public void dnsEntryUsesAtomicMapMutation() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+        client.mutateDnsRecord("dns-1", "node-a", "10.0.0.8");
+        final ArrayNode params = captureTransactCall();
+        assertEquals("mutate", params.get(1).get("op").asText());
+        assertEquals("DNS", params.get(1).get("table").asText());
+        assertEquals("records", params.get(1).get("mutations").get(0).get(0).asText());
+        assertEquals("insert", params.get(1).get("mutations").get(0).get(1).asText());
+    }
+
+    @Test
+    public void dnsRemovalUsesAtomicKeyMutation() {
+        when(pool.call(anyString(), any())).thenReturn(emptyReply());
+        client.removeDnsRecordKeys("dns-1", java.util.List.of("node-a", "node-b"));
+        final ArrayNode params = captureTransactCall();
+        assertEquals("delete", params.get(1).get("mutations").get(0).get(1).asText());
+    }
+
     private ArrayNode captureTransactCall() {
         final ArgumentCaptor<JsonNode> captor = ArgumentCaptor.forClass(JsonNode.class);
         verify(pool).call(anyString(), captor.capture());

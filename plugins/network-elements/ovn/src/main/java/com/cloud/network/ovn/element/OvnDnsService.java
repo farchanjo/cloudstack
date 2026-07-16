@@ -18,7 +18,6 @@ package com.cloud.network.ovn.element;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
 
@@ -44,11 +43,9 @@ import com.cloud.vm.VirtualMachineProfile;
  * recorded names directly from the integration bridge.
  *
  * <p>The {@code records} map is a single OVSDB column whose lifecycle is
- * authoritative — partial updates use OVSDB's {@code update} verb, but
- * because that verb wholesale-replaces the column, this service keeps a
- * per-network in-memory snapshot and re-emits the full map on every
- * {@code addDnsEntry} / {@code removeDnsEntry}. The snapshot is rebuilt
- * lazily from {@link OvnNbClient} on cold start by reading the live row.
+ * authoritative. Since {@code update} wholesale-replaces the column, every
+ * mutation reads the live row first and performs a read-modify-write; no
+ * management-server JVM owns an authoritative snapshot.
  *
  * <p>Helper bean (single-Provider invariant); invoked from
  * {@link OvnNetworkElement}.
@@ -68,7 +65,6 @@ public class OvnDnsService {
      * authoritative copy lives in OVN; the snapshot is a write-through cache
      * to avoid a round-trip read before every update.
      */
-    private final Map<Long, Map<String, String>> snapshots = new ConcurrentHashMap<>();
 
     /**
      * Add (or replace) a {@code <hostname, ip>} record for the VM nic. Keys
@@ -89,9 +85,7 @@ public class OvnDnsService {
         final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
         try {
             final String dnsUuid = ensureDnsRow(nb, controller, network);
-            final Map<String, String> records = snapshots.computeIfAbsent(network.getId(), k -> new HashMap<>());
-            records.put(hostname.toLowerCase(), nic.getIPv4Address());
-            nb.updateDnsRecords(dnsUuid, records);
+            nb.mutateDnsRecord(dnsUuid, hostname.toLowerCase(), nic.getIPv4Address());
             LOGGER.info("OvnDnsService: registered {} -> {} on DNS {} (network id={})",
                     hostname, nic.getIPv4Address(), dnsUuid, network.getId());
             return true;
@@ -114,15 +108,20 @@ public class OvnDnsService {
         if (mapping == null) {
             return true;
         }
-        final String hostname = pickHostname(vm, nic);
-        if (StringUtils.isBlank(hostname)) {
-            return true;
-        }
-        try {
-            final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
-            final Map<String, String> records = snapshots.computeIfAbsent(network.getId(), k -> new HashMap<>());
-            records.remove(hostname.toLowerCase());
-            nb.updateDnsRecords(mapping.getOvnUuid(), records);
+            try {
+                final OvnNbClient nb = pluginManager.nbClient(network.getDataCenterId());
+            final Map<String, String> records = nb.readDnsRecords(mapping.getOvnUuid());
+            final java.util.List<String> keys = new java.util.ArrayList<>();
+            final String hostname = pickHostname(vm, nic);
+            if (StringUtils.isNotBlank(hostname)) {
+                keys.add(hostname.toLowerCase());
+            }
+            if (StringUtils.isNotBlank(nic.getIPv4Address())) {
+                records.forEach((key, value) -> {
+                    if (nic.getIPv4Address().equals(value)) keys.add(key);
+                });
+            }
+            nb.removeDnsRecordKeys(mapping.getOvnUuid(), keys);
             return true;
         } catch (OvnException e) {
             LOGGER.warn("OvnDnsService.removeDnsEntry failed for nic id={}: {}", nic.getId(), e.getMessage());
@@ -180,7 +179,6 @@ public class OvnDnsService {
                 // best-effort
             }
         }
-        snapshots.remove(network.getId());
     }
 
     private String ensureDnsRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network) {
