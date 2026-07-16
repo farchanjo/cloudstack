@@ -93,6 +93,11 @@
          ovn.bgp.redistribute.public_ips). -->
     <bean id="ovnBgpRedistributeManager"
           class="com.cloud.network.ovn.manager.OvnBgpRedistributeManager"/>
+    <!-- Shared fail-closed leader election for the plugin's periodic loops
+         (multi-node management cluster: only one node drives reconcile /
+         pending-deletion passes). -->
+    <bean id="ovnReconcileLeader"
+          class="com.cloud.network.ovn.manager.OvnReconcileLeader"/>
     <bean id="ovnBgpReconcileTask"
           class="com.cloud.network.ovn.manager.OvnBgpReconcileTask"/>
 
