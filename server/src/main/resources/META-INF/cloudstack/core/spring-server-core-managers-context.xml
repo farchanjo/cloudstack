@@ -241,6 +241,9 @@
     <bean id="vpcVirtualNetworkApplianceManagerImpl"
         class="com.cloud.network.router.VpcVirtualNetworkApplianceManagerImpl" />
 
+    <bean id="vfPoolReconcileLeader"
+        class="com.cloud.network.router.VfPoolReconcileLeader" />
+
     <bean id="vfPoolManagerImpl"
         class="com.cloud.network.router.VfPoolManagerImpl" />
 
