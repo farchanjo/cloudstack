@@ -44,6 +44,8 @@ import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.LoadBalancerVMMapDao;
 import com.cloud.network.dao.LoadBalancerVMMapVO;
 import com.cloud.network.dao.LoadBalancerVO;
+import com.cloud.network.dao.FirewallRulesDao;
+import com.cloud.network.vpc.NetworkACLItemDao;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.UserPublicIpv6AddressDao;
 import com.cloud.network.ovn.client.OvnException;
@@ -141,6 +143,10 @@ public class OvnReconcilerService {
     private IPAddressDao ipAddressDao;
     @Inject
     private LoadBalancerDao loadBalancerDao;
+    @Inject
+    private FirewallRulesDao firewallRulesDao;
+    @Inject
+    private NetworkACLItemDao networkACLItemDao;
     @Inject
     private LoadBalancerVMMapDao loadBalancerVMMapDao;
     @Inject
@@ -460,6 +466,10 @@ public class OvnReconcilerService {
      */
     private boolean applyExtraPortSecurity(final OvnNbClient nb, final OvnLogicalIdMapVO mapping,
                                            final Map<String, List<String>> extrasByNetworkUuid, final boolean dryRun) {
+        if (mapping.getCsKind().equals(Kind.ORPHAN_NIC.name())) {
+            // Imported ports use synthetic IDs; never interpret them as NIC PKs.
+            return false;
+        }
         final NicVO nic = nicDao.findById(mapping.getCsId());
         if (nic == null) {
             return false;
@@ -2212,9 +2222,11 @@ public class OvnReconcilerService {
             case SOURCE_NAT:
                 return networkDao.findById(csId) != null;
             case NIC:
-            case ORPHAN_NIC:
             case QOS:
                 return nicDao.findById(csId) != null;
+            case ORPHAN_NIC:
+                // ORPHAN_NIC cs_id is a synthetic importer key, not a NIC PK.
+                return true;
             case STATIC_NAT:
                 return ipAddressDao.findById(csId) != null;
             case BGP_ANNOUNCE:
@@ -2224,16 +2236,17 @@ public class OvnReconcilerService {
                 // an NB table never matches and the row is reaped only via
                 // CS-entity deletion through this path.
                 return ipAddressDao.findById(csId) != null;
-            case PORT_FORWARDING:
             case LOAD_BALANCER:
+                return loadBalancerDao.findById(csId) != null;
+            case PORT_FORWARDING:
+                return loadBalancerDao.findById(csId) != null;
             case NETWORK_ACL:
+                return networkACLItemDao.findById(csId) != null;
+            case FIREWALL:
+                // Baseline/infra rows use reserved synthetic positive IDs.
+                return csId > 1_000_000_000_000_000_000L || firewallRulesDao.findById(csId) != null;
             case STATIC_ROUTE:
-                // Per-rule kinds keyed by FirewallRule / NetworkACL / LB id.
-                // No cheap "exists" probe across all rule DAOs without
-                // pulling more deps; fall back to NB-presence-only for
-                // these. Their cleanup is well-driven by revoke flows
-                // anyway.
-                return true;
+                return vpcDao.findById(csId) != null;
             case PUBLIC_LS:
             case HA_CHASSIS_GROUP:
                 // Per-zone, never expires while controller registered.
@@ -2284,6 +2297,12 @@ public class OvnReconcilerService {
                     }
                     break;
                 case "Load_Balancer":
+                    for (final OvnLogicalIdMapVO ls : logicalIdMapDao.listByKind(Kind.NETWORK, controller.getId())) {
+                        nb.detachLoadBalancerFromLogicalSwitch(ls.getOvnUuid(), uuid);
+                    }
+                    for (final OvnLogicalIdMapVO lr : logicalIdMapDao.listByKind(Kind.VPC, controller.getId())) {
+                        nb.detachLoadBalancerFromLogicalRouter(lr.getOvnUuid(), uuid);
+                    }
                     nb.deleteLoadBalancer(uuid);
                     break;
                 case "Logical_Switch_Port":

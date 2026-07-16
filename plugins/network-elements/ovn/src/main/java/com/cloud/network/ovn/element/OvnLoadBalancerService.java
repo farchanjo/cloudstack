@@ -426,8 +426,9 @@ public class OvnLoadBalancerService extends AdapterBase {
      *
      * <p>Two operations are issued atomically against the same OVSDB row:
      * <ol>
-     *   <li>If {@code vips} is non-empty, rewrite the {@code vips} column via
-     *       {@link OvnNbClient#updateLoadBalancerBackends}.</li>
+     *   <li>Rewrite the {@code vips} column via
+     *       {@link OvnNbClient#updateLoadBalancerBackends}, including an empty
+     *       map so stale backends are removed.</li>
      *   <li>Always rewrite {@code selection_fields} and {@code external_ids} via
      *       {@link OvnNbClient#updateLoadBalancerProperties} so that an operator
      *       algorithm change is reflected immediately, even when no backends are
@@ -443,13 +444,9 @@ public class OvnLoadBalancerService extends AdapterBase {
      */
     private void updateExistingLbRow(final OvnNbClient nb, final OvnControllerVO controller, final Network network,
                                      final String lbUuid, final LoadBalancingRule rule, final Map<String, String> vips) {
-        if (!vips.isEmpty()) {
-            nb.updateLoadBalancerBackends(lbUuid, vips);
-            LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={}", lbUuid, rule.getId());
-        } else {
-            LOGGER.info("OvnLoadBalancerService: LB {} has no live backends; skipping vips write for rule id={}",
-                    lbUuid, rule.getId());
-        }
+        nb.updateLoadBalancerBackends(lbUuid, vips);
+        LOGGER.info("OvnLoadBalancerService: LB {} backends updated for rule id={} ({} VIPs)",
+                lbUuid, rule.getId(), vips.size());
         nb.updateLoadBalancerProperties(lbUuid, selectionFieldsFor(rule), buildExternalIds(rule));
         LOGGER.info("OvnLoadBalancerService: LB {} properties re-synced (algo={}) for rule id={}",
                 lbUuid, rule.getAlgorithm(), rule.getId());
@@ -588,22 +585,34 @@ public class OvnLoadBalancerService extends AdapterBase {
             return out;
         }
         final String addr = rule.getSourceIp().addr();
-        final String vipKey = formatVipKey(addr, rule.getSourcePortStart());
         final List<? extends LbDestination> dests = rule.getDestinations();
         if (dests == null || dests.isEmpty()) {
             return out;
         }
-        final List<String> backends = new ArrayList<>();
-        for (final LbDestination d : dests) {
-            if (d.isRevoked()) {
-                continue;
+        final int sourceStart = rule.getSourcePortStart();
+        final int sourceEnd = rule.getSourcePortEnd();
+        if (sourceStart < 1 || sourceEnd < sourceStart) {
+            throw new IllegalArgumentException("Invalid load-balancer source port range: "
+                    + sourceStart + "-" + sourceEnd);
+        }
+        final int width = sourceEnd - sourceStart;
+        for (int sourcePort = rule.getSourcePortStart(); sourcePort <= sourceEnd; sourcePort++) {
+            final List<String> backends = new ArrayList<>();
+            for (final LbDestination d : dests) {
+                if (d.isRevoked()) continue;
+                final int destinationStart = d.getDestinationPortStart();
+                final int destinationEnd = d.getDestinationPortEnd();
+                if (destinationStart < 1 || destinationEnd < destinationStart
+                        || destinationEnd - destinationStart != width) {
+                    throw new IllegalArgumentException("LB destination range " + destinationStart + "-"
+                            + destinationEnd + " is incompatible with source range " + sourceStart + "-" + sourceEnd);
+                }
+                backends.add(formatVipKey(d.getIpAddress(), destinationStart + (sourcePort - sourceStart)));
             }
-            backends.add(formatVipKey(d.getIpAddress(), d.getDestinationPortStart()));
+            if (!backends.isEmpty()) {
+                out.put(formatVipKey(addr, sourcePort), String.join(",", backends));
+            }
         }
-        if (backends.isEmpty()) {
-            return out;
-        }
-        out.put(vipKey, String.join(",", backends));
         return out;
     }
 

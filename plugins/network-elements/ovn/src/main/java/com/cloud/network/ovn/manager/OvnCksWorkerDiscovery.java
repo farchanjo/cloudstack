@@ -32,6 +32,7 @@ import org.apache.logging.log4j.Logger;
 import com.cloud.utils.db.DB;
 import com.cloud.utils.db.TransactionLegacy;
 import com.cloud.utils.net.NetUtils;
+import com.cloud.network.ovn.client.OvnException;
 
 /**
  * Discovers CKS <b>worker</b> guest IPs on a CloudStack tier network from
@@ -40,6 +41,11 @@ import com.cloud.utils.net.NetUtils;
  * (sibling contexts cannot inject those DAOs into OVN).
  */
 public class OvnCksWorkerDiscovery {
+
+    @FunctionalInterface
+    interface WorkerQuery {
+        WorkerIps query(String clusterUuid, long networkId) throws SQLException;
+    }
 
     private static final Logger LOGGER = LogManager.getLogger(OvnCksWorkerDiscovery.class);
 
@@ -56,6 +62,16 @@ public class OvnCksWorkerDiscovery {
                     + "WHERE c.uuid = ? AND IFNULL(k.control_node,0) = 0 AND IFNULL(k.etcd_node,0) = 0 "
                     + "AND v.state = 'Running' AND v.removed IS NULL";
 
+    private final WorkerQuery workerQuery;
+
+    public OvnCksWorkerDiscovery() {
+        workerQuery = this::queryDatabase;
+    }
+
+    OvnCksWorkerDiscovery(final WorkerQuery workerQuery) {
+        this.workerQuery = workerQuery;
+    }
+
     /**
      * Running WORKER guest IPs (v4 and/or v6) on {@code networkId} for the CKS
      * cluster identified by UUID.
@@ -63,8 +79,18 @@ public class OvnCksWorkerDiscovery {
     @DB
     public WorkerIps listWorkerGuestIps(final String clusterUuid, final long networkId) {
         if (StringUtils.isBlank(clusterUuid) || networkId < 1) {
-            return WorkerIps.empty();
+            throw new OvnException("CKS worker discovery failed for cluster=" + clusterUuid
+                    + " networkId=" + networkId);
         }
+        try {
+            return workerQuery.query(clusterUuid, networkId);
+        } catch (final SQLException e) {
+            throw new OvnException("CKS worker discovery SQL failed for cluster=" + clusterUuid
+                    + " networkId=" + networkId, e);
+        }
+    }
+
+    private WorkerIps queryDatabase(final String clusterUuid, final long networkId) throws SQLException {
         final Set<String> v4 = new LinkedHashSet<>();
         final Set<String> v6 = new LinkedHashSet<>();
         final TransactionLegacy txn = TransactionLegacy.currentTxn();
@@ -87,10 +113,6 @@ public class OvnCksWorkerDiscovery {
                     }
                 }
             }
-        } catch (final SQLException e) {
-            LOGGER.warn("OvnCksWorkerDiscovery: SQL failed for cluster={} networkId={}: {}",
-                    clusterUuid, networkId, e.getMessage());
-            return WorkerIps.empty();
         }
         LOGGER.info("OvnCksWorkerDiscovery: cluster={} networkId={} workers v4={} v6={}",
                 clusterUuid, networkId, v4.size(), v6.size());

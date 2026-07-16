@@ -185,6 +185,25 @@ public class OvnLoadBalancerServiceTest {
     }
 
     @Test
+    public void portRangesExpandWithoutTruncatingVipOrBackendPorts() {
+        final LoadBalancingRule rule = lbRule(499L, "192.168.100.30", 8000, 8002,
+                List.of(new LbDestination(9000, 9002, "10.0.0.7", false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
+        final Map<String, String> vips = OvnLoadBalancerService.buildVipsMap(rule);
+        assertEquals("10.0.0.7:9000", vips.get("192.168.100.30:8000"));
+        assertEquals("10.0.0.7:9001", vips.get("192.168.100.30:8001"));
+        assertEquals("10.0.0.7:9002", vips.get("192.168.100.30:8002"));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void incompatibleDestinationRangeIsRejected() {
+        final LoadBalancingRule rule = lbRule(498L, "192.168.100.31", 8000, 8002,
+                List.of(new LbDestination(9000, 9001, "10.0.0.8", false)),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Add, List.of());
+        OvnLoadBalancerService.buildVipsMap(rule);
+    }
+
+    @Test
     public void backendUpdateOnExistingMappingCallsUpdateBackends() throws Exception {
         // Mapping already exists.
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
@@ -303,6 +322,20 @@ public class OvnLoadBalancerServiceTest {
         assertEquals(1, mappings.size());
         assertNull(mappings.get("10.0.0.5"));
         assertEquals("lsp-nic-keep:10.0.0.254", mappings.get("10.0.0.6"));
+    }
+
+    @Test
+    public void existingLbWithZeroDestinationsWritesEmptyVips() throws Exception {
+        final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
+        when(existing.getOvnUuid()).thenReturn("lb-empty");
+        when(logicalIdMapDao.findByCsId(eq(Kind.LOAD_BALANCER), eq(431L), eq(CONTROLLER_ID))).thenReturn(existing);
+        when(nbClient.rowExistsByUuid("Load_Balancer", "lb-empty")).thenReturn(true);
+        final LoadBalancingRule rule = lbRule(431L, "192.168.100.41", 80, 80, List.of(),
+                "tcp", "tcp", "roundrobin", FirewallRule.State.Active, List.of());
+        assertTrue(service.applyLBRules(network, List.of(rule)));
+        final ArgumentCaptor<Map<String, String>> emptyVips = mapCaptor();
+        verify(nbClient).updateLoadBalancerBackends(eq("lb-empty"), emptyVips.capture());
+        assertTrue(emptyVips.getValue().isEmpty());
     }
 
     @Test

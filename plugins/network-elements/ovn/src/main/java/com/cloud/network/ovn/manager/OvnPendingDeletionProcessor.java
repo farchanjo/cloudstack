@@ -403,6 +403,18 @@ public class OvnPendingDeletionProcessor implements Configurable {
                 nb.deleteAclByUuid(uuid);
                 break;
             case LOAD_BALANCER:
+                // A retry must repeat the detach precondition from the
+                // synchronous revoke path. Set-delete is idempotent, so scan
+                // every known parent rather than guessing which attachment
+                // survived the failed transaction.
+                for (final OvnLogicalIdMapVO ls : logicalIdMapDao.listByKind(
+                        OvnLogicalIdMapVO.Kind.NETWORK, row.getControllerId())) {
+                    nb.detachLoadBalancerFromLogicalSwitch(ls.getOvnUuid(), uuid);
+                }
+                for (final OvnLogicalIdMapVO lr : logicalIdMapDao.listByKind(
+                        OvnLogicalIdMapVO.Kind.VPC, row.getControllerId())) {
+                    nb.detachLoadBalancerFromLogicalRouter(lr.getOvnUuid(), uuid);
+                }
                 nb.deleteLoadBalancer(uuid);
                 break;
             case HA_CHASSIS_GROUP:
