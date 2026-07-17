@@ -1263,6 +1263,10 @@ public class OvnBgpRedistributeManager {
                 if (st != null && st != FirewallRule.State.Active && st != FirewallRule.State.Add) {
                     continue;
                 }
+                // DSR_SOFTWARE backends do not drive CT_LB /128 host announce hosts.
+                if (lb.getLbKind() != null && lb.getLbKind().isDsr()) {
+                    continue;
+                }
                 addBackendHostsForLb(lb.getId(), hosts);
             }
         }

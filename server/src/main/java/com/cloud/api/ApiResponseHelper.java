@@ -1373,6 +1373,9 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
         lbResponse.setPublicPort(Integer.toString(loadBalancer.getSourcePortStart()));
         lbResponse.setPrivatePort(Integer.toString(loadBalancer.getDefaultPortStart()));
         lbResponse.setAlgorithm(loadBalancer.getAlgorithm());
+        if (loadBalancer.getLbKind() != null) {
+            lbResponse.setLbKind(loadBalancer.getLbKind().getApiName());
+        }
         lbResponse.setLbProtocol(loadBalancer.getLbProtocol());
         lbResponse.setForDisplay(loadBalancer.isDisplay());
         FirewallRule.State state = loadBalancer.getState();

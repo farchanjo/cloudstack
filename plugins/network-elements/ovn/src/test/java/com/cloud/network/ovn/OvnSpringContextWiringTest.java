@@ -100,6 +100,22 @@ public class OvnSpringContextWiringTest {
     }
 
     @Test
+    public void dsrSoftwareLbServiceBeanIsRegistered() throws Exception {
+        final DefaultListableBeanFactory factory = loadFactory();
+        final String beanName = "dsrSoftwareLbService";
+        assertTrue("plugin must register dsrSoftwareLbService so OvnNetworkElement "
+                + "can inject the DSR programmer", factory.containsBeanDefinition(beanName));
+        final String className = factory.getBeanDefinition(beanName).getBeanClassName();
+        assertEquals("com.cloud.network.ovn.element.DsrSoftwareLbService", className);
+        final Class<?> beanType = Class.forName(className);
+        assertNotNull(beanType);
+        // Collaborators: CT_LB service must also be present so element can dispatch by kind.
+        assertTrue(factory.containsBeanDefinition("ovnLoadBalancerService"));
+        assertEquals("com.cloud.network.ovn.element.OvnLoadBalancerService",
+                factory.getBeanDefinition("ovnLoadBalancerService").getBeanClassName());
+    }
+
+    @Test
     public void contextResourceFileIsOnClasspath() {
         final ClassPathResource resource = new ClassPathResource(CONTEXT_RESOURCE);
         assertTrue("plugin spring context resource must be packaged into the plugin jar",

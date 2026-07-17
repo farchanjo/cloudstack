@@ -710,6 +710,11 @@ public class OvnReconcilerService {
         if (loadBalancerService == null || network == null || rule == null) {
             return;
         }
+        // Never re-create OVN Load_Balancer for DSR_SOFTWARE via auto-CKS / reconcile.
+        if (!isCtLbInventoryRule(rule)) {
+            LOGGER.info("OvnReconcilerService: skip OVN LB re-apply for DSR_SOFTWARE rule id={}", rule.getId());
+            return;
+        }
         try {
             final List<LoadBalancerVMMapVO> maps =
                     loadBalancerVMMapDao.listByLoadBalancerId(rule.getId(), false);
@@ -1113,6 +1118,15 @@ public class OvnReconcilerService {
                 continue;
             }
             for (final LoadBalancerVO rule : rules) {
+                // DSR_SOFTWARE must never enter the public IPv6 OVN Load_Balancer
+                // desired set (null/missing lb_kind = legacy CT_LB).
+                if (!isCtLbInventoryRule(rule)) {
+                    LOGGER.debug("OvnReconcilerService: skipping inventory LB rule id={} kind={} "
+                                    + "from public IPv6 OVN LB desired set",
+                            rule == null ? null : rule.getId(),
+                            rule == null || rule.getLbKind() == null ? "null" : rule.getLbKind());
+                    continue;
+                }
                 final OvnPublicIpv6Lb.Entry entry = entryFromInventoryRule(rule, addr);
                 if (entry == null) {
                     continue;
@@ -1122,6 +1136,19 @@ public class OvnReconcilerService {
         }
         out.addAll(byKey.values());
         return out;
+    }
+
+    /**
+     * Inventory rules that program OVN {@code Load_Balancer} / {@code ct_lb}.
+     * Null or missing {@code lb_kind} is treated as legacy {@code CT_LB}.
+     * Visible for unit tests.
+     */
+    static boolean isCtLbInventoryRule(final LoadBalancerVO rule) {
+        if (rule == null) {
+            return false;
+        }
+        // LoadBalancerContainer.LbKind.getLbKind() defaults null → CT_LB on VO.
+        return rule.getLbKind() == null || rule.getLbKind().isCtLb();
     }
 
     /**
@@ -1161,6 +1188,9 @@ public class OvnReconcilerService {
     private OvnPublicIpv6Lb.Entry entryFromInventoryRule(final LoadBalancerVO rule,
                                                          final UserPublicIpv6AddressVO addr) {
         if (rule == null) {
+            return null;
+        }
+        if (!isCtLbInventoryRule(rule)) {
             return null;
         }
         final FirewallRule.State state = rule.getState();

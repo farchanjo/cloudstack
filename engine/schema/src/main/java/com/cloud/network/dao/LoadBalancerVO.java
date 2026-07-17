@@ -26,6 +26,7 @@ import javax.persistence.Table;
 
 import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.rules.LoadBalancer;
+import com.cloud.network.rules.LoadBalancerContainer.LbKind;
 import com.cloud.utils.net.NetUtils;
 import org.apache.cloudstack.utils.reflectiontostringbuilderutils.ReflectionToStringBuilderUtils;
 
@@ -66,6 +67,14 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
     @Column(name = "cidr_list")
     String cidrList;
 
+    /**
+     * Datapath kind: {@link Scheme} is orthogonal (Public/Internal).
+     * Default {@link LbKind#CT_LB} preserves legacy OVN ct_lb behaviour.
+     */
+    @Enumerated(value = EnumType.STRING)
+    @Column(name = "lb_kind")
+    private LbKind lbKind = LbKind.CT_LB;
+
     public LoadBalancerVO() {
     }
 
@@ -85,6 +94,7 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
         this.scheme = Scheme.Public;
         this.lbProtocol = lbProtocol;
         this.cidrList = cidrList;
+        this.lbKind = LbKind.CT_LB;
     }
 
     /**
@@ -106,6 +116,7 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
         this.scheme = Scheme.Public;
         this.lbProtocol = lbProtocol;
         this.cidrList = cidrList;
+        this.lbKind = LbKind.CT_LB;
         setPublicIpv6AddressId(publicIpv6AddressId);
     }
 
@@ -158,6 +169,15 @@ public class LoadBalancerVO extends FirewallRuleVO implements LoadBalancer {
     @Override
     public Scheme getScheme() {
         return scheme;
+    }
+
+    @Override
+    public LbKind getLbKind() {
+        return lbKind == null ? LbKind.CT_LB : lbKind;
+    }
+
+    public void setLbKind(LbKind lbKind) {
+        this.lbKind = lbKind == null ? LbKind.CT_LB : lbKind;
     }
 
     @Override

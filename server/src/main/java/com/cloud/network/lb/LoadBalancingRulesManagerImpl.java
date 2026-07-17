@@ -112,6 +112,8 @@ import com.cloud.network.dao.LBStickinessPolicyDao;
 import com.cloud.network.dao.LBStickinessPolicyVO;
 import com.cloud.network.dao.LoadBalancerCertMapDao;
 import com.cloud.network.dao.LoadBalancerCertMapVO;
+import com.cloud.network.dao.DsrLbDesiredStateDao;
+import com.cloud.network.dao.DsrLbDesiredStateVO;
 import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.LoadBalancerVMMapDao;
 import com.cloud.network.dao.LoadBalancerVMMapVO;
@@ -138,6 +140,7 @@ import com.cloud.network.rules.HealthCheckPolicy;
 import com.cloud.network.rules.LbStickinessMethod;
 import com.cloud.network.rules.LbStickinessMethod.LbStickinessMethodParam;
 import com.cloud.network.rules.LoadBalancer;
+import com.cloud.network.rules.LoadBalancerContainer.LbKind;
 import com.cloud.network.rules.LoadBalancerContainer.Scheme;
 import com.cloud.network.rules.RulesManager;
 import com.cloud.network.rules.StickinessPolicy;
@@ -277,6 +280,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     EntityManager _entityMgr;
     @Inject
     LoadBalancerCertMapDao _lbCertMapDao;
+    @Inject
+    DsrSoftwareLbValidator dsrSoftwareLbValidator;
+    @Inject
+    DsrLbDesiredStateDao dsrLbDesiredStateDao;
 
     @Inject
     NicSecondaryIpDao _nicSecondaryIpDao;
@@ -627,6 +634,9 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         if (loadBalancer.getState() == FirewallRule.State.Revoke) {
             throw new InvalidParameterValueException(String.format("Failed: LB rule: %s is in deleting state: ", loadBalancer));
         }
+        if (dsrSoftwareLbValidator != null) {
+            dsrSoftwareLbValidator.validateStickiness(loadBalancer, cmd.getStickinessMethodName());
+        }
 
         /* Generic validations */
         if (!genericValidator(cmd)) {
@@ -736,8 +746,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             logger.debug("Unable to validate network rules for purpose: " + purpose.toString());
             return false;
         }
-        // Public IPv6 VIP rules are not validated by IPv4 LB providers
-        if (lbRule.getLb() != null && isPublicIpv6LoadBalancer(lbRule.getLb())) {
+        // G3: public IPv6 short-circuit is CT_LB-only. DSR_SOFTWARE must run
+        // provider validation for both families.
+        if (lbRule.getLb() != null && isPublicIpv6LoadBalancer(lbRule.getLb())
+                && (lbRule.getLb().getLbKind() == null || lbRule.getLb().getLbKind().isCtLb())) {
             return true;
         }
         for (LoadBalancingServiceProvider ne : _lbProviders) {
@@ -746,6 +758,57 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
                 return false;
         }
         return true;
+    }
+
+    /**
+     * Parse API/DB wire name; blank defaults to {@link LbKind#CT_LB}.
+     */
+    protected LbKind parseLbKind(String raw) {
+        try {
+            return LbKind.fromString(raw);
+        } catch (IllegalArgumentException e) {
+            throw new InvalidParameterValueException(e.getMessage());
+        }
+    }
+
+    /**
+     * Persist DSR desired-state row on create (atomic with rule insert).
+     * No OVN LB/NAT objects are written here.
+     */
+    protected void persistDsrDesiredStateIfNeeded(LoadBalancerVO rule, String vipV4, String vipV6) {
+        if (rule == null || !rule.getLbKind().isDsr() || dsrLbDesiredStateDao == null) {
+            return;
+        }
+        DsrLbDesiredStateVO existing = dsrLbDesiredStateDao.findByLoadBalancerId(rule.getId());
+        if (existing != null) {
+            return;
+        }
+        String externalIds = buildDsrExternalIdsJson(rule);
+        int port = rule.getSourcePortStart() == null ? 0 : rule.getSourcePortStart();
+        String protocol = rule.getLbProtocol() == null ? rule.getProtocol() : rule.getLbProtocol();
+        DsrLbDesiredStateVO desired = new DsrLbDesiredStateVO(rule.getId(), vipV4, vipV6, port, protocol, externalIds);
+        dsrLbDesiredStateDao.persist(desired);
+        logger.info("Persisted DSR desired state for LB rule id={} vip4={} vip6={} port={}",
+                rule.getId(), vipV4, vipV6, port);
+    }
+
+    /**
+     * external_ids contract for health-gated BGP / Kubernetes ownership.
+     * Shape mirrors OVN external_ids keys without creating NB objects.
+     */
+    protected String buildDsrExternalIdsJson(LoadBalancerVO rule) {
+        StringBuilder sb = new StringBuilder(128);
+        sb.append('{');
+        sb.append("\"cs_lb_kind\":\"DSR_SOFTWARE\"");
+        sb.append(",\"cs_id\":\"").append(rule.getId()).append('"');
+        if (rule.getUuid() != null) {
+            sb.append(",\"cs_uuid\":\"").append(rule.getUuid()).append('"');
+        }
+        if (rule.getAlgorithm() != null) {
+            sb.append(",\"cs_algo\":\"").append(rule.getAlgorithm()).append('"');
+        }
+        sb.append('}');
+        return sb.toString();
     }
 
     @Override
@@ -1795,7 +1858,7 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     public LoadBalancer createPublicLoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
         Long ipAddrId, String protocol, String algorithm, long networkId, long lbOwnerId, boolean openFirewall, String lbProtocol, Boolean forDisplay) throws NetworkRuleConflictException,
         InsufficientAddressCapacityException {
-            return createPublicLoadBalancerRule(xId, name, description, srcPortStart, srcPortEnd, defPortStart, defPortEnd, ipAddrId, protocol, algorithm, networkId, lbOwnerId, openFirewall, lbProtocol, forDisplay, null);
+            return createPublicLoadBalancerRule(xId, name, description, srcPortStart, srcPortEnd, defPortStart, defPortEnd, ipAddrId, protocol, algorithm, networkId, lbOwnerId, openFirewall, lbProtocol, forDisplay, null, null);
         }
 
     @Override
@@ -1803,6 +1866,15 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     public LoadBalancer createPublicLoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
             Long ipAddrId, String protocol, String algorithm, long networkId, long lbOwnerId, boolean openFirewall, String lbProtocol, Boolean forDisplay, List<String> cidrList) throws NetworkRuleConflictException,
             InsufficientAddressCapacityException {
+        return createPublicLoadBalancerRule(xId, name, description, srcPortStart, srcPortEnd, defPortStart, defPortEnd, ipAddrId, protocol, algorithm, networkId,
+                lbOwnerId, openFirewall, lbProtocol, forDisplay, cidrList, null);
+    }
+
+    @Override
+    @ActionEvent(eventType = EventTypes.EVENT_LOAD_BALANCER_CREATE, eventDescription = "creating load balancer")
+    public LoadBalancer createPublicLoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
+            Long ipAddrId, String protocol, String algorithm, long networkId, long lbOwnerId, boolean openFirewall, String lbProtocol, Boolean forDisplay,
+            List<String> cidrList, String lbKind) throws NetworkRuleConflictException, InsufficientAddressCapacityException {
         Account lbOwner = _accountMgr.getAccount(lbOwnerId);
 
         if (srcPortStart != srcPortEnd) {
@@ -1873,7 +1945,7 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             }
 
             result = createPublicLoadBalancer(xId, name, description, srcPortStart, defPortStart, ipVO.getId(), protocol, algorithm, openFirewall, CallContext.current(),
-                    lbProtocol, forDisplay, cidrString, networkId);
+                    lbProtocol, forDisplay, cidrString, networkId, lbKind);
         } catch (Exception ex) {
             logger.warn("Failed to create load balancer due to ", ex);
             if (ex instanceof NetworkRuleConflictException) {
@@ -1909,6 +1981,16 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     public LoadBalancer createPublicIpv6LoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
             long publicIpv6AddressId, String protocol, String algorithm, long networkId, long lbOwnerId, String lbProtocol, Boolean forDisplay, List<String> cidrList)
             throws NetworkRuleConflictException {
+        return createPublicIpv6LoadBalancerRule(xId, name, description, srcPortStart, srcPortEnd, defPortStart, defPortEnd, publicIpv6AddressId, protocol, algorithm,
+                networkId, lbOwnerId, lbProtocol, forDisplay, cidrList, null);
+    }
+
+    @Override
+    @DB
+    @ActionEvent(eventType = EventTypes.EVENT_LOAD_BALANCER_CREATE, eventDescription = "creating public IPv6 load balancer")
+    public LoadBalancer createPublicIpv6LoadBalancerRule(String xId, String name, String description, int srcPortStart, int srcPortEnd, int defPortStart, int defPortEnd,
+            long publicIpv6AddressId, String protocol, String algorithm, long networkId, long lbOwnerId, String lbProtocol, Boolean forDisplay, List<String> cidrList,
+            String lbKind) throws NetworkRuleConflictException {
         if (srcPortStart != srcPortEnd) {
             throw new InvalidParameterValueException("Port ranges are not supported by the load balancer");
         }
@@ -1945,6 +2027,11 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
 
         checkPublicIpv6PortConflict(publicIpv6AddressId, srcPortStart, null);
 
+        final LbKind kind = parseLbKind(lbKind);
+        if (dsrSoftwareLbValidator != null) {
+            dsrSoftwareLbValidator.validateCreate(kind, network, null, publicIpv6AddressId, srcPortStart, algorithm, null);
+        }
+
         String cidrString = generateCidrString(cidrList);
         long accountId = pub6.getAccountId() > 0 ? pub6.getAccountId() : lbOwnerId;
         long domainId = pub6.getDomainId() > 0 ? pub6.getDomainId() : caller.getCallingAccount().getDomainId();
@@ -1952,19 +2039,31 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         LoadBalancerVO newRule = Transaction.execute((TransactionCallbackWithException<LoadBalancerVO, NetworkRuleConflictException>) status -> {
             LoadBalancerVO rule = new LoadBalancerVO(xId, name, description, null, publicIpv6AddressId, srcPortStart, defPortStart,
                     algorithm, networkId, accountId, domainId, lbProtocol, cidrString);
+            rule.setLbKind(kind);
             if (forDisplay != null) {
                 rule.setDisplay(forDisplay);
             }
 
-            // Skip IPv4 provider validateLbRule (source IP is IPv4-only); pub6 applies via OVN reconciler
+            // Provider validate for both CT_LB and DSR (G3: do not skip IPv6 for DSR).
+            Ip sourceIp = new Ip(pub6.getAddress());
+            LoadBalancingRule loadBalancing = new LoadBalancingRule(rule, new ArrayList<>(), new ArrayList<>(), new ArrayList<>(),
+                    sourceIp, null, lbProtocol);
+            if (kind.isCtLb() && !validateLbRule(loadBalancing)) {
+                throw new InvalidParameterValueException("LB service provider cannot support this public IPv6 rule");
+            }
+            if (kind.isDsr() && !validateLbRule(loadBalancing)) {
+                throw new InvalidParameterValueException("DSR_SOFTWARE provider cannot support this public IPv6 rule");
+            }
+
             rule = _lbDao.persist(rule);
+            persistDsrDesiredStateIfNeeded(rule, null, pub6.getAddress());
 
             try {
                 if (!_firewallDao.setStateToAdd(rule)) {
                     throw new CloudRuntimeException("Unable to update the state to add for " + rule);
                 }
-                logger.debug("Public IPv6 load balancer {} for VIP {}, public port {}, private port {} is added successfully.",
-                        rule, pub6.getAddress(), srcPortStart, defPortStart);
+                logger.debug("Public IPv6 load balancer {} for VIP {}, public port {}, private port {}, kind {} is added successfully.",
+                        rule, pub6.getAddress(), srcPortStart, defPortStart, kind);
                 CallContext.current().setEventDetails("Load balancer ID: " + rule.getUuid());
                 UsageEventUtils.publishUsageEvent(EventTypes.EVENT_LOAD_BALANCER_CREATE, accountId, pub6.getDataCenterId(),
                         rule.getId(), null, LoadBalancingRule.class.getName(), rule.getUuid());
@@ -1983,7 +2082,9 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             }
         });
 
-        kickPublicIpv6LbReconciler(pub6.getDataCenterId());
+        if (newRule.getLbKind().isCtLb()) {
+            kickPublicIpv6LbReconciler(pub6.getDataCenterId());
+        }
         return newRule;
     }
 
@@ -2105,6 +2206,14 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
     public LoadBalancer createPublicLoadBalancer(final String xId, final String name, final String description, final int srcPort, final int destPort, final long sourceIpId,
                                                  final String protocol, final String algorithm, final boolean openFirewall, final CallContext caller, final String lbProtocol,
                                                  final Boolean forDisplay, String cidrList, Long networkIdParam) throws NetworkRuleConflictException {
+        return createPublicLoadBalancer(xId, name, description, srcPort, destPort, sourceIpId, protocol, algorithm, openFirewall, caller, lbProtocol, forDisplay,
+                cidrList, networkIdParam, null);
+    }
+
+    @DB
+    public LoadBalancer createPublicLoadBalancer(final String xId, final String name, final String description, final int srcPort, final int destPort, final long sourceIpId,
+                                                 final String protocol, final String algorithm, final boolean openFirewall, final CallContext caller, final String lbProtocol,
+                                                 final Boolean forDisplay, String cidrList, Long networkIdParam, String lbKind) throws NetworkRuleConflictException {
         if (!NetUtils.isValidPort(destPort)) {
             throw new InvalidParameterValueException("privatePort is an invalid value: " + destPort);
         }
@@ -2112,6 +2221,8 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
         if ((algorithm == null) || !NetUtils.isValidAlgorithm(algorithm)) {
             throw new InvalidParameterValueException("Invalid algorithm: " + algorithm);
         }
+
+        final LbKind kind = parseLbKind(lbKind);
 
         try {
             final IPAddressVO ipAddr = _ipAddressDao.acquireInLockTable(sourceIpId);
@@ -2144,11 +2255,17 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             // verify that lb service is supported by the network
             isLbServiceSupportedInNetwork(networkId, Scheme.Public);
 
+            Network networkForKind = _networkModel.getNetwork(networkId);
+            if (dsrSoftwareLbValidator != null) {
+                dsrSoftwareLbValidator.validateCreate(kind, networkForKind, sourceIpId, null, srcPort, algorithm, null);
+            }
+
             _firewallMgr.validateFirewallRule(caller.getCallingAccount(), ipAddr, srcPort, srcPort, protocol, Purpose.LoadBalancing, FirewallRuleType.User, networkId, null);
 
             return Transaction.execute((TransactionCallbackWithException<LoadBalancerVO, NetworkRuleConflictException>) status -> {
                 LoadBalancerVO newRule = new LoadBalancerVO(xId, name, description, sourceIpId, srcPort, destPort, algorithm, networkId, ipAddr.getAllocatedToAccountId(),
                         ipAddr.getAllocatedInDomainId(), lbProtocol, cidrList);
+                newRule.setLbKind(kind);
 
                 if (forDisplay != null) {
                     newRule.setDisplay(forDisplay);
@@ -2162,6 +2279,7 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
                 }
 
                 newRule = _lbDao.persist(newRule);
+                persistDsrDesiredStateIfNeeded(newRule, ipAddr.getAddress() == null ? null : ipAddr.getAddress().addr(), null);
 
                 //create rule for all CIDRs
                 if (openFirewall) {
@@ -2175,7 +2293,8 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
                     if (!_firewallDao.setStateToAdd(newRule)) {
                         throw new CloudRuntimeException("Unable to update the state to add for " + newRule);
                     }
-                    logger.debug("Load balancer {} for Ip address: {}, public port {}, private port {} is added successfully.", newRule, ipAddr, srcPort, destPort);
+                    logger.debug("Load balancer {} for Ip address: {}, public port {}, private port {}, kind {} is added successfully.",
+                            newRule, ipAddr, srcPort, destPort, kind);
                     CallContext.current().setEventDetails("Load balancer ID: " + newRule.getUuid());
                     UsageEventUtils.publishUsageEvent(EventTypes.EVENT_LOAD_BALANCER_CREATE, ipAddr.getAllocatedToAccountId(), ipAddr.getDataCenterId(), newRule.getId(),
                             null, LoadBalancingRule.class.getName(), newRule.getUuid());

@@ -32,6 +32,8 @@ public class ApiConstants {
     public static final String ADDITONAL_CONFIG_ENABLED = "additionalconfigenabled";
     public static final String ADDRESS = "address";
     public static final String ALGORITHM = "algorithm";
+    /** Load balancer datapath kind: {@code ct_lb} (default) or {@code dsr_software}. */
+    public static final String LB_KIND = "lbkind";
     public static final String ALIAS = "alias";
     public static final String ALLOCATED = "allocated";
     public static final String ALLOCATED_DATE = "allocateddate";

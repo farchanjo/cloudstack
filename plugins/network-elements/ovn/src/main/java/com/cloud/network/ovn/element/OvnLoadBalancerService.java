@@ -172,6 +172,14 @@ public class OvnLoadBalancerService extends AdapterBase {
         final OvnNbClient nb = pluginManager.nbClient(zoneId);
         boolean overall = true;
         for (final LoadBalancingRule rule : rules) {
+            // Hard assert: never program OVN Load_Balancer for DSR_SOFTWARE.
+            if (rule.getLb() != null && rule.getLb().getLbKind() != null
+                    && rule.getLb().getLbKind().isDsr()) {
+                LOGGER.error("OvnLoadBalancerService: refusing DSR_SOFTWARE rule id={} — "
+                        + "must use DsrSoftwareLbService (no ct_lb)", rule.getId());
+                overall = false;
+                continue;
+            }
             try {
                 applyOne(nb, controller, lrUuid, network, rule);
             } catch (final OvnException oe) {
@@ -183,6 +191,12 @@ public class OvnLoadBalancerService extends AdapterBase {
     }
 
     public boolean validateLBRule(final Network network, final LoadBalancingRule rule) {
+        // OVN element only accepts CT_LB; DSR must not half-apply via this path.
+        if (rule.getLb() != null && rule.getLb().getLbKind() != null && rule.getLb().getLbKind().isDsr()) {
+            LOGGER.warn("OvnLoadBalancerService: DSR_SOFTWARE rule id={} rejected by CT_LB provider",
+                    rule.getId());
+            return false;
+        }
         // Reject algorithms OVN cannot represent before the rule is committed.
         final String algo = rule.getAlgorithm() == null ? "" : rule.getAlgorithm().toLowerCase(Locale.ROOT);
         if ("leastconn".equals(algo) || "least-connections".equals(algo) || "leastconnection".equals(algo)) {
@@ -654,6 +668,8 @@ public class OvnLoadBalancerService extends AdapterBase {
         final Map<String, String> ext = new HashMap<>();
         ext.put(OvnConstants.EXT_ID_KIND, Kind.LOAD_BALANCER.name());
         ext.put(OvnConstants.EXT_ID_ID, String.valueOf(rule.getId()));
+        // Kind tag for reconciler filters (CT_LB only on this path).
+        ext.put("cs_lb_kind", "CT_LB");
         if (rule.getUuid() != null) {
             ext.put("cs_uuid", rule.getUuid());
         }

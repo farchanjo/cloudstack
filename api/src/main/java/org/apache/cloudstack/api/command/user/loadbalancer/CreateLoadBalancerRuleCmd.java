@@ -129,6 +129,11 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
     @Parameter(name = ApiConstants.FOR_DISPLAY, type = CommandType.BOOLEAN, description = "An optional field, whether to the display the rule to the end user or not", since = "4.4", authorized = {RoleType.Admin})
     private Boolean display;
 
+    @Parameter(name = ApiConstants.LB_KIND, type = CommandType.STRING, since = "4.24.1.32",
+            description = "Load balancer datapath kind: ct_lb (default, OVN conntrack LB) or dsr_software "
+                    + "(software Direct Server Return; feature-gated, disabled by default).")
+    private String lbKind;
+
     /////////////////////////////////////////////////////
     /////////////////// Accessors ///////////////////////
     /////////////////////////////////////////////////////
@@ -144,6 +149,13 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
 
     public String getAlgorithm() {
         return algorithm;
+    }
+
+    /**
+     * Wire name {@code ct_lb} / {@code dsr_software}; null defaults to ct_lb in the service.
+     */
+    public String getLbKind() {
+        return lbKind;
     }
 
     public String getDescription() {
@@ -365,11 +377,11 @@ public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements L
             if (isPublicIpv6Path()) {
                 result = _lbService.createPublicIpv6LoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(),
                         getSourcePortEnd(), getDefaultPortStart(), getDefaultPortEnd(), publicIpv6Id, getProtocol(), getAlgorithm(),
-                        getNetworkId(), getEntityOwnerId(), getLbProtocol(), isDisplay(), getCidrList());
+                        getNetworkId(), getEntityOwnerId(), getLbProtocol(), isDisplay(), getCidrList(), getLbKind());
             } else {
                 result = _lbService.createPublicLoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(), getSourcePortEnd(), getDefaultPortStart(),
                         getDefaultPortEnd(), getSourceIpAddressId(), getProtocol(), getAlgorithm(), getNetworkId(), getEntityOwnerId(), getOpenFirewall(), getLbProtocol(), isDisplay(),
-                        getCidrList());
+                        getCidrList(), getLbKind());
             }
             this.setEntityId(result.getId());
             this.setEntityUuid(result.getUuid());

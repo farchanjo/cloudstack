@@ -170,6 +170,10 @@
         <property name="lbProviders" value="#{loadBalancingServiceProvidersRegistry.registered}" />
     </bean>
 
+    <!-- DSR_SOFTWARE feature gate (ConfigKey) + create-time mutex validator. -->
+    <bean id="dsrSoftwareLbConfig" class="com.cloud.network.lb.DsrSoftwareLbConfig"/>
+    <bean id="dsrSoftwareLbValidator" class="com.cloud.network.lb.DsrSoftwareLbValidator"/>
+
     <bean id="networkACLManagerImpl" class="com.cloud.network.vpc.NetworkACLManagerImpl" >
         <property name="networkAclElements" value="#{networkACLServiceProvidersRegistry.registered}" />
     </bean>

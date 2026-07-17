@@ -28,6 +28,7 @@ import javax.persistence.Table;
 import org.apache.cloudstack.network.lb.ApplicationLoadBalancerRule;
 
 import com.cloud.network.rules.FirewallRuleVO;
+import com.cloud.network.rules.LoadBalancerContainer.LbKind;
 import com.cloud.utils.net.Ip;
 import com.cloud.utils.net.NetUtils;
 import org.apache.cloudstack.utils.reflectiontostringbuilderutils.ReflectionToStringBuilderUtils;
@@ -73,6 +74,10 @@ public class ApplicationLoadBalancerRuleVO extends FirewallRuleVO implements App
 
     @Column(name = "cidr_list")
     String cidrList = null;
+
+    @Enumerated(value = EnumType.STRING)
+    @Column(name = "lb_kind")
+    private LbKind lbKind = LbKind.CT_LB;
 
     public ApplicationLoadBalancerRuleVO() {
     }
@@ -141,6 +146,15 @@ public class ApplicationLoadBalancerRuleVO extends FirewallRuleVO implements App
     @Override
     public Scheme getScheme() {
         return scheme;
+    }
+
+    @Override
+    public LbKind getLbKind() {
+        return lbKind == null ? LbKind.CT_LB : lbKind;
+    }
+
+    public void setLbKind(LbKind lbKind) {
+        this.lbKind = lbKind == null ? LbKind.CT_LB : lbKind;
     }
 
     @Override

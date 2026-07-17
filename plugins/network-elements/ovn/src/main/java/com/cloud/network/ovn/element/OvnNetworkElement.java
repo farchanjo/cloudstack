@@ -171,6 +171,8 @@ public class OvnNetworkElement extends AdapterBase
     @Inject
     private OvnLoadBalancerService loadBalancerService;
     @Inject
+    private DsrSoftwareLbService dsrSoftwareLbService;
+    @Inject
     private OvnDhcpService dhcpService;
     @Inject
     private OvnDnsService dnsService;
@@ -1228,12 +1230,38 @@ public class OvnNetworkElement extends AdapterBase
     @Override
     public boolean applyLBRules(final Network network, final List<LoadBalancingRule> rules)
             throws ResourceUnavailableException {
-        return loadBalancerService.applyLBRules(network, rules);
+        if (rules == null || rules.isEmpty()) {
+            return true;
+        }
+        final List<LoadBalancingRule> ctLb = new ArrayList<>();
+        final List<LoadBalancingRule> dsr = new ArrayList<>();
+        for (final LoadBalancingRule rule : rules) {
+            if (DsrSoftwareLbService.isDsrRule(rule)) {
+                dsr.add(rule);
+            } else {
+                ctLb.add(rule);
+            }
+        }
+        boolean ok = true;
+        if (!ctLb.isEmpty()) {
+            ok = loadBalancerService.applyLBRules(network, ctLb) && ok;
+        }
+        if (!dsr.isEmpty() && dsrSoftwareLbService != null) {
+            ok = dsrSoftwareLbService.applyLBRules(network, dsr) && ok;
+        } else if (!dsr.isEmpty()) {
+            LOGGER.error("OvnNetworkElement: DSR rules present but DsrSoftwareLbService is not wired");
+            ok = false;
+        }
+        return ok;
     }
 
     @Override
     public boolean validateLBRule(final Network network, final LoadBalancingRule rule) {
-        return true;
+        if (DsrSoftwareLbService.isDsrRule(rule)) {
+            return dsrSoftwareLbService != null && dsrSoftwareLbService.validateLBRule(network, rule);
+        }
+        // CT_LB: assert provider can represent the rule (leastconn reject, etc.).
+        return loadBalancerService == null || loadBalancerService.validateLBRule(network, rule);
     }
 
     @Override
@@ -2475,6 +2503,8 @@ public class OvnNetworkElement extends AdapterBase
         m.put(Capability.SupportedProtocols, "tcp,udp");
         m.put(Capability.SupportedLBIsolation, "dedicated,shared");
         m.put(Capability.LbSchemes, "Public,Internal");
+        // Advertise both kinds; DSR create still requires feature gate + offering.
+        m.put(Capability.SupportedLbKinds, "ct_lb,dsr_software");
         return m;
     }
 

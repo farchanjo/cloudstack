@@ -81,6 +81,10 @@
     <bean id="ovnLoadBalancerService" class="com.cloud.network.ovn.element.OvnLoadBalancerService">
         <property name="name" value="OvnLoadBalancerService"/>
     </bean>
+    <!-- DSR_SOFTWARE programmer: never creates OVN Load_Balancer / NAT. -->
+    <bean id="dsrSoftwareLbService" class="com.cloud.network.ovn.element.DsrSoftwareLbService">
+        <property name="name" value="DsrSoftwareLbService"/>
+    </bean>
 
     <!-- Phase 3 — DHCP / DNS / PF / QoS / Public network helpers. -->
     <bean id="ovnDhcpService" class="com.cloud.network.ovn.element.OvnDhcpService"/>

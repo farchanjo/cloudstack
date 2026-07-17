@@ -67,6 +67,10 @@ public class LoadBalancerResponse extends BaseResponse implements ControlledEnti
     @Param(description = "The Load balancer algorithm (source, roundrobin, leastconn)")
     private String algorithm;
 
+    @SerializedName(ApiConstants.LB_KIND)
+    @Param(description = "Load balancer datapath kind (ct_lb or dsr_software)", since = "4.24.1.32")
+    private String lbKind;
+
     @SerializedName(ApiConstants.NETWORK_ID)
     @Param(description = "The ID of the guest Network the LB rule belongs to")
     private String networkId;
@@ -153,6 +157,10 @@ public class LoadBalancerResponse extends BaseResponse implements ControlledEnti
 
     public void setAlgorithm(String algorithm) {
         this.algorithm = algorithm;
+    }
+
+    public void setLbKind(String lbKind) {
+        this.lbKind = lbKind;
     }
 
     @Override
