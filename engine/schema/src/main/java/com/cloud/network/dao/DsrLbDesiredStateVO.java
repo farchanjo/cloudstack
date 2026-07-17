@@ -25,6 +25,8 @@ import javax.persistence.GeneratedValue;
 import javax.persistence.GenerationType;
 import javax.persistence.Id;
 import javax.persistence.Table;
+import javax.persistence.Temporal;
+import javax.persistence.TemporalType;
 
 import com.cloud.utils.db.GenericDao;
 import org.apache.cloudstack.api.InternalIdentity;
@@ -88,6 +90,10 @@ public class DsrLbDesiredStateVO implements InternalIdentity {
     @Column(name = GenericDao.REMOVED_COLUMN)
     private Date removed;
 
+    // Must carry @Temporal so GenericDaoBase.prepareAttribute binds the Date
+    // (Flag.TimeStamp). Without it, non-null Date fields fall through unbound
+    // → MySQL "No value specified for parameter N" on INSERT (2026-07-17 canary).
+    @Temporal(TemporalType.TIMESTAMP)
     @Column(name = "updated")
     private Date updated;
 
