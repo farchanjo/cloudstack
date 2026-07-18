@@ -2212,12 +2212,10 @@ public class OvnNbClient implements AutoCloseable {
         columns.add("external_ids");
         final OvnTransaction tx = newTransaction();
         tx.add(OvnOpFactory.select("Logical_Router_Static_Route", OvnOpFactory.whereAll(), columns));
-        final OvnTransaction.Result r;
-        try {
-            r = tx.commit();
-        } catch (OvnException e) {
-            return out;
-        }
+        // Fail closed: do not return an empty list on transport/OVSDB errors —
+        // callers would treat "no owned routes" as truth and skip converge or
+        // incorrectly report success. Propagate OvnException.
+        final OvnTransaction.Result r = tx.commit();
         final ArrayNode arr = r.raw();
         final var entry = arr == null || arr.size() == 0 ? null : arr.get(0);
         final var rows = entry == null ? null : entry.get("rows");

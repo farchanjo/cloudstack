@@ -87,12 +87,27 @@ create/apply LB rule
     │                      createLoadBalancer, hairpin, force SNAT (as today)
     └─ lb_kind = DSR_SOFTWARE → DsrSoftwareLbService
                                never nb.createLoadBalancer / NAT / hairpin / force SNAT
-                               1) program VPC LR Logical_Router_Static_Route ECMP
-                                  VIP/32 + VIP/128 → Ready guest backends
-                                  external_ids: cs-dsr-route=<ruleId>, cs_lb_kind=DSR_SOFTWARE
-                               2) withdraw CT_LB host BGP (dual-stack atomic)
+                               0) FAIL if residual CT/pub6 LB still owns VIP:port (B4)
+                               1) VIP-scoped ECMP on VPC LR (union of 80+443 members)
+                                  cs-dsr-route=<vpcId>|<prefix>  (not per-rule duplicate)
+                                  add-before-remove; dual-stack atomic
+                               2) CT host BGP withdraw only on first sibling; restore only on last
+                               3) inventory-eligible backends (Running VM+NIC); Envoy Ready = external
                                guest Calico anycast remains the fabric attractor
 ```
+
+### Cutover order (normative)
+
+1. Guest lo + Calico BGP prepared; fabric DSR import **off**
+2. Delete CT rules 80/443 + pub6 via API; prove NB clean (no CT LB on VIP)
+3. `network.lb.dsr.software.enabled=true`
+4. Create DSR rules + assign members → PROGRAMMED + VIP-scoped `cs-dsr-route`
+5. Control-plane `dsr_nb_cutover_verify.sh` PASS (v4+v6 backends)
+6. Enable RR/data enforcer; kernel via `.32/::32` OK as OVN transport
+7. Traffic + direct-return proof
+
+**Rollback:** disable fabric/guest → revoke last DSR sibling (routes cleared, CT BGP restore) →
+recreate CT rules/members/pub6 via API (service never recreates OVN LB) → gate false.
 
 `OvnLoadBalancerService.validateLBRule` / apply **must assert kind == CT_LB**
 before any NB LB write. OVN element returns false for DSR (no half-apply).
