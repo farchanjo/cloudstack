@@ -1339,6 +1339,18 @@ public class DsrSoftwareLbService extends AdapterBase {
         }
     }
 
+    /**
+     * Withdraw CT dual-stack BGP <em>advertisement</em> for a VIP pair so guest /
+     * OVN DSR ownership can take the control plane.
+     *
+     * <p><b>Contract (RCA 2026-07-18):</b> this path only ends BGP {@code network}
+     * origination via {@link OvnBgpRedistributeManager#withdraw} /
+     * {@link OvnBgpRedistributeManager#withdrawHost6}. Kernel transport host
+     * routes ({@code /32}/{@code /128} via public LRP on {@code pub-anchor}) are
+     * <em>not</em> owned here — config-mgmt {@code public_vip_host_routes} keeps
+     * them installed for OVN LR DSR recursive resolution. Agent withdraw must
+     * preserve those routes (see {@code LibvirtOvnBgpAnnounceCommandWrapper}).
+     */
     DualStackBgpResult withdrawCtLbBgpDualStack(final Network network, final LoadBalancingRule rule,
             final String vipV4In, final String vipV6In) {
         if (network == null || network.getVpcId() == null || bgpRedistributeManager == null) {

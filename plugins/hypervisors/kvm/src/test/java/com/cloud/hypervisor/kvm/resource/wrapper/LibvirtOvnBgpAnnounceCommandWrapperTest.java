@@ -253,7 +253,10 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
     }
 
     @Test
-    public void withdrawDeletesKernelRouteAndWritesNoNetwork() {
+    public void withdrawPreservesKernelRouteAndWritesNoNetwork() {
+        // RCA 2026-07-18: CT BGP withdraw must NOT ip route del transport host
+        // routes (config-mgmt public_vip_host_routes owns continuous install for
+        // OVN LR DSR). Only BGP no-network is applied.
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
 
@@ -264,10 +267,11 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
             Assert.assertTrue(answer.getResult());
             final ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
-            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeast(2));
+            scriptMock.verify(() -> Script.executeCommand(captor.capture()), atLeastOnce());
             final java.util.List<String> issued = captor.getAllValues();
-            Assert.assertTrue("kernel /32 route deleted by prefix",
-                    issued.stream().anyMatch(s -> s.equals("ip route del " + PUBLIC_IP + "/32")));
+            Assert.assertTrue("kernel /32 transport route must be preserved on withdraw",
+                    issued.stream().noneMatch(s -> s.contains("ip route del ")
+                            || s.contains("ip -6 route del ")));
             Assert.assertTrue("vtysh no-network line written",
                     issued.stream().anyMatch(s -> s.contains("\"no network " + PUBLIC_IP + "/32\"")));
         }
@@ -455,7 +459,9 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
     }
 
     @Test
-    public void withdrawIpv6DeletesV6RouteAndWritesNoNetworkInV6Af() {
+    public void withdrawIpv6PreservesV6RouteAndWritesNoNetworkInV6Af() {
+        // Same ownership split as v4: DSR CT withdrawHost6 must not remove the
+        // kernel /128 transport route needed by OVN LR DSR (Snape ::101 RCA).
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
 
@@ -466,13 +472,36 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
 
             Assert.assertTrue(answer.getResult());
             final ArgumentCaptor<String> exec = ArgumentCaptor.forClass(String.class);
-            scriptMock.verify(() -> Script.executeCommand(exec.capture()), atLeast(2));
+            scriptMock.verify(() -> Script.executeCommand(exec.capture()), atLeastOnce());
             final java.util.List<String> issued = exec.getAllValues();
-            Assert.assertTrue("v6 route deleted by prefix with ip -6",
-                    issued.stream().anyMatch(s -> s.equals("ip -6 route del " + V6_TIER + "/64")));
+            Assert.assertTrue("v6 kernel transport route must be preserved on withdraw",
+                    issued.stream().noneMatch(s -> s.contains("ip -6 route del ")
+                            || s.contains("ip route del ")));
             Assert.assertTrue("no-network line written in the IPv6 unicast AF",
                     issued.stream().anyMatch(s -> s.contains("\"address-family ipv6 unicast\"")
                             && s.contains("\"no network " + V6_TIER + "/64\"")));
+        }
+    }
+
+    @Test
+    public void withdrawHostVip128PreservesTransportRoute() {
+        // Exact Snape public VIP shape that flapped on norbert/nagini/trevor.
+        final String vip6 = "2a13:8740:0:7::101";
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    vip6, OvnBgpAnnounceCommand.OP_WITHDRAW, "/usr/bin/vtysh", CONFIGURED_ASN);
+            cmd.setPrefixLength(128);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            final ArgumentCaptor<String> exec = ArgumentCaptor.forClass(String.class);
+            scriptMock.verify(() -> Script.executeCommand(exec.capture()), atLeastOnce());
+            final java.util.List<String> issued = exec.getAllValues();
+            Assert.assertTrue(issued.stream().noneMatch(s -> s.contains("route del ")));
+            Assert.assertTrue(issued.stream().anyMatch(s ->
+                    s.contains("\"no network " + vip6 + "/128\"")));
         }
     }
 

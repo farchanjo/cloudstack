@@ -163,16 +163,31 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
     }
 
     /**
-     * Install (announce) or remove (withdraw) the {@code <publicIp>/32} kernel
-     * route that delivers inbound N-S traffic into OVN via the VPC public
-     * LRP next-hop.
+     * Install (announce) the {@code <publicIp>/<prefix>} kernel route that
+     * steers inbound N-S traffic into OVN via the VPC public LRP next-hop.
+     *
+     * <p><b>Ownership split (RCA 2026-07-18 Snape canary):</b>
+     * <ul>
+     *   <li><b>BGP advertisement lifecycle</b> ({@code network} / {@code no network}
+     *       in FRR) is owned by this wrapper on announce/withdraw. CT cutover
+     *       (DSR {@code withdrawCtLbBgpDualStack}) may withdraw the control-plane
+     *       host advertisement.</li>
+     *   <li><b>Kernel transport host route</b> ({@code via <pub-LRP> dev pub-anchor})
+     *       is fleet-owned by config-mgmt {@code public_vip_host_routes} and must
+     *       remain continuously installed for OVN LR DSR recursive resolution.
+     *       Withdraw must <em>never</em> {@code ip route del} / {@code ip -6 route del}
+     *       that prefix — deleting it lets the covering {@code 2a13:8740::/48}
+     *       blackhole win and blackholes VIP N-S (observed: {@code ::101/128}
+     *       flapped on worker HVs after {@code ctWithdrawn=1} while v4 stayed
+     *       because v4 announce bookkeeping hit fewer hosts).</li>
+     * </ul>
      *
      * <ul>
-     *   <li>withdraw → {@code ip route del <ip>/32} (best-effort; a never-installed
-     *       route or a stale one is not an error).</li>
+     *   <li>withdraw → <b>preserve</b> kernel transport route; only BGP
+     *       {@code no network} is applied by the caller.</li>
      *   <li>announce with a non-blank {@code gatewayIp} → {@code ip route replace
-     *       <ip>/32 via <gatewayIp>} (idempotent; the device is auto-resolved
-     *       from the on-link gateway).</li>
+     *       <ip>/<len> via <gatewayIp>} (idempotent bootstrap; config-mgmt
+     *       re-converges the same prefix if an external actor deletes it).</li>
      *   <li>announce with a blank {@code gatewayIp} → no route (advertise-only
      *       fall-back for pre-datapath managers / unbound VPCs).</li>
      * </ul>
@@ -196,9 +211,13 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // `ip -6` for the v6 family; the on-link next-hop is the VPC public LRP.
         final String ipTool = ipv6 ? "ip -6 route" : "ip route";
         if (withdraw) {
-            // Best-effort delete by prefix; ignore "No such process" etc.
-            // Do NOT remove the LRP neighbour — it is shared across tier/FIP announces.
-            Script.executeCommand(String.format("%s del %s/%d", ipTool, publicIp, prefixLen));
+            // BGP-only withdraw: do NOT delete the kernel transport host route.
+            // config-mgmt public_vip_host_routes + public-vip-transport-routes
+            // own continuous install for OVN LR DSR. LRP neighbour is chassis-
+            // shared and must also stay.
+            LOGGER.info("OvnBgpAnnounce: withdraw preserves kernel transport {}/{} "
+                    + "(BGP no-network only; transport owned by config-mgmt)",
+                    publicIp, prefixLen);
             return null;
         }
         if (gatewayIp == null || gatewayIp.isEmpty()) {
