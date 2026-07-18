@@ -293,6 +293,47 @@ public class OvnReconcilerService {
     }
 
     /**
+     * Reconcile one mapped OVN resource without running zone-wide repair
+     * tasks. This is intentionally restricted to load balancers because the
+     * admin API uses it for surgical removal of deleted-rule leftovers.
+     */
+    public Result reconcileResource(final long zoneId, final Kind kind, final long csId, final boolean dryRun) {
+        if (kind != Kind.LOAD_BALANCER) {
+            throw new OvnException("scoped reconciliation supports only LOAD_BALANCER");
+        }
+        final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
+        if (controller == null) {
+            throw new OvnException("OvnReconcilerService: no controller for zone " + zoneId);
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(kind, csId, controller.getId());
+        if (mapping == null) {
+            throw new OvnException("no " + kind + " mapping for cs_id=" + csId);
+        }
+        final Result out = new Result(dryRun);
+        if (cloudstackEntityExists(kind, csId)) {
+            return out;
+        }
+        reconcileDeletedLoadBalancer(pluginManager.nbClient(zoneId), controller, mapping, dryRun, out);
+        return out;
+    }
+
+    private void reconcileDeletedLoadBalancer(final OvnNbClient nb, final OvnControllerVO controller,
+                                               final OvnLogicalIdMapVO mapping, final boolean dryRun,
+                                               final Result out) {
+        final boolean nbExists = nb.rowExistsByUuid("Load_Balancer", mapping.getOvnUuid());
+        out.recordStaleMapping("Load_Balancer", mapping);
+        if (nbExists) {
+            out.recordOrphan("Load_Balancer", mapping.getOvnUuid(), Kind.LOAD_BALANCER);
+        }
+        if (!dryRun) {
+            if (nbExists) {
+                deleteLoadBalancerRow(nb, controller, mapping.getOvnUuid());
+            }
+            logicalIdMapDao.remove(mapping.getId());
+        }
+    }
+
+    /**
      * PARSEL-V6 — ensure every public-bound VPC in the zone has its IPv6 public
      * foot (per-VPC GUA on the public LRP + {@code ::/0} default route). Iterates
      * the {@link Kind#VPC_PUBLIC_LRP} mappings and delegates to
@@ -2327,13 +2368,7 @@ public class OvnReconcilerService {
                     }
                     break;
                 case "Load_Balancer":
-                    for (final OvnLogicalIdMapVO ls : logicalIdMapDao.listByKind(Kind.NETWORK, controller.getId())) {
-                        nb.detachLoadBalancerFromLogicalSwitch(ls.getOvnUuid(), uuid);
-                    }
-                    for (final OvnLogicalIdMapVO lr : logicalIdMapDao.listByKind(Kind.VPC, controller.getId())) {
-                        nb.detachLoadBalancerFromLogicalRouter(lr.getOvnUuid(), uuid);
-                    }
-                    nb.deleteLoadBalancer(uuid);
+                    deleteLoadBalancerRow(nb, controller, uuid);
                     break;
                 case "Logical_Switch_Port":
                     nb.deleteLogicalSwitchPort(uuid);
@@ -2358,6 +2393,16 @@ public class OvnReconcilerService {
         } catch (OvnException e) {
             LOGGER.warn("OvnReconcilerService: drop {} row {} failed: {}", table, uuid, e.getMessage());
         }
+    }
+
+    private void deleteLoadBalancerRow(final OvnNbClient nb, final OvnControllerVO controller, final String uuid) {
+        for (final OvnLogicalIdMapVO ls : logicalIdMapDao.listByKind(Kind.NETWORK, controller.getId())) {
+            nb.detachLoadBalancerFromLogicalSwitch(ls.getOvnUuid(), uuid);
+        }
+        for (final OvnLogicalIdMapVO lr : logicalIdMapDao.listByKind(Kind.VPC, controller.getId())) {
+            nb.detachLoadBalancerFromLogicalRouter(lr.getOvnUuid(), uuid);
+        }
+        nb.deleteLoadBalancer(uuid);
     }
 
     private static Map<String, Kind[]> buildTableKinds() {

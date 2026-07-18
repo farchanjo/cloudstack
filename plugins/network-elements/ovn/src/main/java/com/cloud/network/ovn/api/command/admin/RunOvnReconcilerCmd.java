@@ -20,6 +20,7 @@ import javax.inject.Inject;
 
 import org.apache.cloudstack.api.APICommand;
 import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.api.ApiErrorCode;
 import org.apache.cloudstack.api.BaseCmd;
 import org.apache.cloudstack.api.Parameter;
 import org.apache.cloudstack.api.ServerApiException;
@@ -68,11 +69,24 @@ public class RunOvnReconcilerCmd extends BaseCmd {
                     + "sessions or pre-plugin state). Destructive — off by default.")
     private Boolean purgeUntagged;
 
+    @Parameter(name = "resourcekind", type = CommandType.STRING,
+            description = "optional scoped reconciliation kind; currently only LOAD_BALANCER is supported")
+    private String resourceKind;
+
+    @Parameter(name = "resourceid", type = CommandType.LONG,
+            description = "internal CloudStack entity ID for scoped reconciliation; requires resourcekind")
+    private Long resourceId;
+
     @Override
     public void execute() throws ServerApiException {
         final boolean isDryRun = Boolean.TRUE.equals(dryRun);
         final boolean isPurgeUntagged = Boolean.TRUE.equals(purgeUntagged);
-        final OvnReconcileResultResponse response = ovnAdminService.runReconciler(zoneId, isDryRun, isPurgeUntagged);
+        if ((resourceKind == null) != (resourceId == null)) {
+            throw new ServerApiException(ApiErrorCode.PARAM_ERROR,
+                    "resourcekind and resourceid must be supplied together");
+        }
+        final OvnReconcileResultResponse response = ovnAdminService.runReconciler(zoneId, isDryRun,
+                isPurgeUntagged, resourceKind, resourceId);
         response.setResponseName(getCommandName());
         setResponseObject(response);
     }

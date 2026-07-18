@@ -18,6 +18,7 @@ package com.cloud.network.ovn.manager;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 import javax.inject.Inject;
 
@@ -35,6 +36,7 @@ import com.cloud.network.ovn.client.OvnNbReader.Topology;
 import com.cloud.network.ovn.dao.OvnControllerDao;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
+import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 @Component
@@ -165,19 +167,50 @@ public class OvnAdminServiceImpl implements OvnAdminService {
 
     @Override
     public OvnReconcileResultResponse runReconciler(final long zoneId, final boolean dryRun,
-                                                    final boolean purgeUntagged) {
+                                                     final boolean purgeUntagged) {
+        return runReconciler(zoneId, dryRun, purgeUntagged, null, null);
+    }
+
+    @Override
+    public OvnReconcileResultResponse runReconciler(final long zoneId, final boolean dryRun,
+                                                     final boolean purgeUntagged, final String resourceKind,
+                                                     final Long resourceId) {
+        if ((resourceKind == null) != (resourceId == null)) {
+            throw new CloudRuntimeException("resourcekind and resourceid must be supplied together");
+        }
+        if (resourceKind != null && purgeUntagged) {
+            throw new CloudRuntimeException("purgeuntagged is not valid for scoped reconciliation");
+        }
         try {
-            final OvnReconcilerService.Result result = reconcilerService.reconcileZone(zoneId, dryRun, purgeUntagged);
-            final OvnReconcileResultResponse r = new OvnReconcileResultResponse();
-            r.setDryRun(result.isDryRun());
-            r.setOrphansByTable(result.getOrphansByTable());
-            r.setStaleMappingsByTable(result.getStaleMappingsByTable());
-            r.setTotalOrphans(result.totalOrphans());
-            r.setTotalStaleMappings(result.totalStaleMappings());
-            r.setObjectName("ovnreconcile");
-            return r;
+            final OvnReconcilerService.Result result = resourceKind == null
+                    ? reconcilerService.reconcileZone(zoneId, dryRun, purgeUntagged)
+                    : reconcilerService.reconcileResource(zoneId, parseScopedKind(resourceKind), resourceId, dryRun);
+            return toReconcileResponse(result);
         } catch (OvnException e) {
             throw new CloudRuntimeException("OVN reconciler failed for zone " + zoneId + ": " + e.getMessage());
         }
+    }
+
+    private Kind parseScopedKind(final String value) {
+        try {
+            final Kind kind = Kind.valueOf(value.trim().toUpperCase(Locale.ROOT));
+            if (kind != Kind.LOAD_BALANCER) {
+                throw new IllegalArgumentException();
+            }
+            return kind;
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new CloudRuntimeException("scoped OVN reconciliation supports only resourcekind=LOAD_BALANCER");
+        }
+    }
+
+    private OvnReconcileResultResponse toReconcileResponse(final OvnReconcilerService.Result result) {
+        final OvnReconcileResultResponse response = new OvnReconcileResultResponse();
+        response.setDryRun(result.isDryRun());
+        response.setOrphansByTable(result.getOrphansByTable());
+        response.setStaleMappingsByTable(result.getStaleMappingsByTable());
+        response.setTotalOrphans(result.totalOrphans());
+        response.setTotalStaleMappings(result.totalStaleMappings());
+        response.setObjectName("ovnreconcile");
+        return response;
     }
 }

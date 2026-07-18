@@ -72,4 +72,12 @@ public interface OvnAdminService {
      * @return per-table counts + dry-run flag
      */
     OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun, boolean purgeUntagged);
+
+    /**
+     * Run either the zone-wide reconciler or a narrowly scoped resource pass.
+     * Scoped reconciliation currently supports only {@code LOAD_BALANCER}; it
+     * refuses to remove a mapping while the CloudStack rule still exists.
+     */
+    OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun, boolean purgeUntagged,
+                                             String resourceKind, Long resourceId);
 }
