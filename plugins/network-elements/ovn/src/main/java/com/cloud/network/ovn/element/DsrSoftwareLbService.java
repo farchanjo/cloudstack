@@ -25,9 +25,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
-
 import javax.inject.Inject;
 
 import org.apache.commons.lang3.StringUtils;
@@ -54,6 +51,7 @@ import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.client.OvnNbClient.EcmpStaticRoute;
 import com.cloud.network.ovn.client.OvnNbClient.OwnedLoadBalancer;
+import com.cloud.network.ovn.client.OvnNbClient.OwnedNat;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
@@ -65,6 +63,7 @@ import com.cloud.network.rules.LoadBalancerContainer.LbKind;
 import com.cloud.network.rules.LoadBalancerContainer.Scheme;
 import com.cloud.utils.component.AdapterBase;
 import com.cloud.utils.db.EntityManager;
+import com.cloud.utils.db.GlobalLock;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
 import com.cloud.vm.VMInstanceVO;
@@ -106,8 +105,14 @@ public class DsrSoftwareLbService extends AdapterBase {
     private static final String FAMILY_V6 = "v6";
     private static final String POLICY_DST_IP = "dst-ip";
 
-    /** Multi-MS lock: one concurrent programmer per VPC+VIP family key. */
-    private final ConcurrentHashMap<String, ReentrantLock> vipLocks = new ConcurrentHashMap<>();
+    /** DB-backed multi-MS lock timeout for VPC+VIP DSR programmer. */
+    public static final int DSR_VIP_LOCK_TIMEOUT_SECS = 60;
+
+    /**
+     * When false, {@link #withVipLock} runs the body without acquiring a DB
+     * GlobalLock (unit tests without a data source). Production leaves true.
+     */
+    volatile boolean dsrDistributedLockEnabled = true;
 
     @Inject
     private DsrLbDesiredStateDao dsrLbDesiredStateDao;
@@ -222,16 +227,12 @@ public class DsrSoftwareLbService extends AdapterBase {
             throw new IllegalStateException("DSR requires a VPC network");
         }
 
-        final String vipV4 = resolveVipV4(rule);
-        final String vipV6 = resolvePublicIpv6(rule);
-        final String lockKey = vipLockKey(network.getVpcId(), vipV4, vipV6);
-        final ReentrantLock lock = vipLocks.computeIfAbsent(lockKey, k -> new ReentrantLock());
-        lock.lock();
-        try {
+        final String vipV4 = canonicalizeVip(resolveVipV4(rule));
+        final String vipV6 = canonicalizeVip(resolvePublicIpv6(rule));
+        withVipLock(network.getVpcId(), vipV4, vipV6, () -> {
             applyOneLocked(network, rule, vipV4, vipV6);
-        } finally {
-            lock.unlock();
-        }
+            return null;
+        });
     }
 
     private void applyOneLocked(final Network network, final LoadBalancingRule rule,
@@ -244,10 +245,10 @@ public class DsrSoftwareLbService extends AdapterBase {
             refreshDesiredState(desired, rule, vipV4, vipV6);
         }
 
-        // B4: refuse PROGRAMMED while residual CT LB/NAT/hairpin owns VIP:port.
+        // B4: refuse PROGRAMMED while residual CT LB/NAT owns VIP.
         final CtResidual residual = findResidualCtOnVip(network, rule, vipV4, vipV6);
         if (residual != null) {
-            final String err = "residual CT LB/pub6 on VIP:port " + residual;
+            final String err = "residual CT LB/NAT/pub6 on VIP:port " + residual;
             if (desired != null) {
                 desired.setState(DsrLbDesiredStateVO.STATE_ROLLBACK);
                 desired.setLastError(truncate(err, 1000));
@@ -284,20 +285,20 @@ public class DsrSoftwareLbService extends AdapterBase {
             throw new IllegalStateException("DSR OVN route programming failed: " + routes.error);
         }
 
-        // BGP withdraw only when this is the first active DSR sibling on the VIP family.
+        // BGP withdraw: only when NO peer has proven ctWithdrawn=true in desired-state.
+        // Never infer from sibling Add count (80+443 both Add would false-skip).
+        final boolean peerWithdrew = peerAlreadyWithdrewCtBgp(network, vipV4, vipV6, rule.getId());
         final DualStackBgpResult bgp;
-        if (countActiveDsrSiblings(network, vipV4, vipV6, /*excludeRuleId*/ -1L) <= 1) {
-            // Only this rule (or first) — withdraw CT host BGP.
-            bgp = withdrawCtLbBgpDualStack(network, rule, vipV4, vipV6);
-        } else {
+        if (peerWithdrew) {
             bgp = new DualStackBgpResult(true, false, false, false, null, vipV4, vipV6);
-            LOGGER.info("DsrSoftwareLbService: sibling DSR already active on VIP; skip BGP withdraw rule id={}",
+            LOGGER.info("DsrSoftwareLbService: peer already withdrew CT BGP for VIP; inherit ctWithdrawn rule id={}",
                     rule.getId());
+        } else {
+            bgp = withdrawCtLbBgpDualStack(network, rule, vipV4, vipV6);
         }
         if (!bgp.ok) {
-            // H3: compensate — tear down DSR routes we just programmed for this VIP
-            // only if we are sole sibling; otherwise leave shared ECMP and fail rule.
-            if (countActiveDsrSiblings(network, vipV4, vipV6, -1L) <= 1) {
+            // H3: compensate — tear down DSR routes when no peer holds the VIP plane.
+            if (!peerWithdrew) {
                 try {
                     removeVipScopedRoutes(network, vipV4, vipV6);
                 } catch (final Exception e) {
@@ -316,64 +317,70 @@ public class DsrSoftwareLbService extends AdapterBase {
         }
 
         if (desired != null) {
-            desired.setCtWithdrawn(bgp.withdrewV4 || bgp.withdrewV6
-                    || countActiveDsrSiblings(network, vipV4, vipV6, -1L) > 1);
-            // H5: inventory-eligible only — not Envoy Ready. External preflight.
+            // ctWithdrawn=true only after proven withdraw or proven peer inheritance.
+            // Never set true merely because another rule is in Add/Active.
+            desired.setCtWithdrawn(peerWithdrew || bgp.withdrewV4 || bgp.withdrewV6);
             desired.setBackendReady(true);
             desired.setState(DsrLbDesiredStateVO.STATE_PROGRAMMED);
             desired.setLastError(null);
             desired.setUpdated(new Date());
             dsrLbDesiredStateDao.update(desired.getId(), desired);
         }
-        LOGGER.info("DsrSoftwareLbService: DSR rule id={} PROGRAMMED routes={} bgp={} "
+        LOGGER.info("DsrSoftwareLbService: DSR rule id={} PROGRAMMED routes={} bgp={} peerWithdrew={} "
                         + "(inventory-eligible backends; Envoy health is external preflight)",
-                rule.getId(), routes, bgp);
+                rule.getId(), routes, bgp, peerWithdrew);
     }
 
     private void revokeOne(final Network network, final LoadBalancingRule rule) {
         if (network == null || network.getVpcId() == null) {
             return;
         }
-        final String vipV4 = resolveVipV4(rule);
-        final String vipV6 = resolvePublicIpv6(rule);
-        final String lockKey = vipLockKey(network.getVpcId(), vipV4, vipV6);
-        final ReentrantLock lock = vipLocks.computeIfAbsent(lockKey, k -> new ReentrantLock());
-        lock.lock();
-        try {
+        final String vipV4 = canonicalizeVip(resolveVipV4(rule));
+        final String vipV6 = canonicalizeVip(resolvePublicIpv6(rule));
+        withVipLock(network.getVpcId(), vipV4, vipV6, () -> {
             revokeOneLocked(network, rule, vipV4, vipV6);
-        } finally {
-            lock.unlock();
-        }
+            return null;
+        });
     }
 
     private void revokeOneLocked(final Network network, final LoadBalancingRule rule,
             final String vipV4, final String vipV6) {
-        // Count siblings EXCLUDING this rule (already Revoke in inventory or about to be).
+        // Remaining siblings EXCLUDING this rule.
         final int remaining = countActiveDsrSiblings(network, vipV4, vipV6, rule.getId());
+        // Restore CT BGP only when last sibling AND someone had withdrawn (self or peer).
+        final boolean selfWithdrew = wasCtWithdrawn(rule.getId());
+        final boolean peerWithdrew = peerAlreadyWithdrewCtBgp(network, vipV4, vipV6, rule.getId());
         if (remaining == 0) {
-            // Last sibling: remove VIP-scoped ECMP and restore CT host BGP.
+            // Last sibling: recompute union (empty) and remove VIP-scoped ECMP always.
             try {
                 removeVipScopedRoutes(network, vipV4, vipV6);
             } catch (final Exception e) {
                 LOGGER.warn("DsrSoftwareLbService: route cleanup on last-sibling revoke failed: {}",
                         e.getMessage());
             }
-            restoreCtLbBgpDualStack(network, rule, vipV4, vipV6);
+            if (selfWithdrew || peerWithdrew) {
+                restoreCtLbBgpDualStack(network, rule, vipV4, vipV6);
+            }
             LOGGER.info("DsrSoftwareLbService: last DSR sibling rule id={} revoked; "
-                            + "VIP routes cleared; CT BGP restore attempted. "
+                            + "VIP routes cleared; CT BGP restore={} (selfWithdrew={} peerWithdrew={}). "
                             + "CT Load_Balancer must be recreated via API if rollback requires it.",
-                    rule.getId());
+                    rule.getId(), selfWithdrew || peerWithdrew, selfWithdrew, peerWithdrew);
         } else {
-            // Sibling remains: re-converge ECMP from remaining members; keep BGP withdrawn.
+            // Sibling remains: re-converge ECMP from remaining inventory members.
             try {
                 final MemberSet members = collectEligibleUnionMembers(network, vipV4, vipV6, null);
-                programVipScopedRoutes(network, rule, vipV4, vipV6, members);
+                if (members.backends.isEmpty()) {
+                    // No eligible members left among siblings — clear VIP routes but keep BGP withdrawn.
+                    removeVipScopedRoutes(network, vipV4, vipV6);
+                } else {
+                    programVipScopedRoutes(network, rule, vipV4, vipV6, members);
+                }
             } catch (final Exception e) {
                 LOGGER.warn("DsrSoftwareLbService: sibling re-converge after revoke id={} failed: {}",
                         rule.getId(), e.getMessage());
             }
             LOGGER.info("DsrSoftwareLbService: DSR rule id={} revoked; {} sibling(s) remain — "
-                            + "VIP ECMP retained; CT BGP not restored",
+                            + "VIP ECMP retained/reconverged; CT BGP not restored",
                     rule.getId(), remaining);
         }
         if (dsrLbDesiredStateDao != null) {
@@ -395,10 +402,112 @@ public class DsrSoftwareLbService extends AdapterBase {
 
     /**
      * Ownership marker value: {@code <vpcId>|<prefix>} (e.g. {@code 924|217.179.89.38/32}).
+     * IPv6 prefixes are canonicalized (RFC 5952) so expanded/compressed forms share one owner.
      * Visible for tests.
      */
     public static String vipOwnerKey(final long vpcId, final String prefix) {
-        return vpcId + "|" + prefix;
+        return vpcId + "|" + canonicalizePrefix(prefix);
+    }
+
+    /** Canonicalize VIP address (v6 compressed). Visible for tests. */
+    public static String canonicalizeVip(final String vip) {
+        if (StringUtils.isBlank(vip)) {
+            return vip;
+        }
+        final String t = vip.trim();
+        if (t.contains(":")) {
+            try {
+                return NetUtils.standardizeIp6Address(t);
+            } catch (final Exception e) {
+                return t.toLowerCase(Locale.ROOT);
+            }
+        }
+        return t;
+    }
+
+    /** Canonicalize {@code ip/len} prefix. Visible for tests. */
+    public static String canonicalizePrefix(final String prefix) {
+        if (StringUtils.isBlank(prefix)) {
+            return prefix;
+        }
+        final int slash = prefix.indexOf('/');
+        if (slash <= 0) {
+            return canonicalizeVip(prefix);
+        }
+        return canonicalizeVip(prefix.substring(0, slash)) + prefix.substring(slash);
+    }
+
+    /**
+     * Distributed multi-MS lock for one VPC+VIP family key.
+     * Visible for tests (timeout constant).
+     */
+    <T> T withVipLock(final Long vpcId, final String vipV4, final String vipV6,
+            final java.util.concurrent.Callable<T> body) {
+        if (!dsrDistributedLockEnabled) {
+            try {
+                return body.call();
+            } catch (final RuntimeException re) {
+                throw re;
+            } catch (final Exception e) {
+                throw new IllegalStateException("DSR locked operation failed: " + e.getMessage(), e);
+            }
+        }
+        final String name = "dsr.vip." + vipLockKey(vpcId, vipV4, vipV6);
+        final GlobalLock lock = GlobalLock.getInternLock(name);
+        try {
+            if (!lock.lock(DSR_VIP_LOCK_TIMEOUT_SECS)) {
+                throw new IllegalStateException("DSR VIP lock timeout after "
+                        + DSR_VIP_LOCK_TIMEOUT_SECS + "s for " + name);
+            }
+            try {
+                return body.call();
+            } catch (final RuntimeException re) {
+                throw re;
+            } catch (final Exception e) {
+                throw new IllegalStateException("DSR locked operation failed: " + e.getMessage(), e);
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            lock.releaseRef();
+        }
+    }
+
+    /**
+     * True when a peer DSR sibling on the same VIP already has desired-state
+     * {@code PROGRAMMED} (or non-revoked active) with {@code ctWithdrawn=true}.
+     * Never infers from rule Add count alone. Visible for tests.
+     */
+    boolean peerAlreadyWithdrewCtBgp(final Network network, final String vipV4, final String vipV6,
+            final long excludeRuleId) {
+        if (dsrLbDesiredStateDao == null) {
+            return false;
+        }
+        for (final LoadBalancerVO lb : listDsrSiblings(network, vipV4, vipV6, excludeRuleId)) {
+            final DsrLbDesiredStateVO d = dsrLbDesiredStateDao.findByLoadBalancerId(lb.getId());
+            if (d == null || d.getRemoved() != null) {
+                continue;
+            }
+            if (DsrLbDesiredStateVO.STATE_REVOKED.equals(d.getState())
+                    || DsrLbDesiredStateVO.STATE_ROLLBACK.equals(d.getState())) {
+                continue;
+            }
+            // Only trust proven PROGRAMMED/MIGRATING rows with ctWithdrawn=true.
+            if (d.isCtWithdrawn()
+                    && (DsrLbDesiredStateVO.STATE_PROGRAMMED.equals(d.getState())
+                    || DsrLbDesiredStateVO.STATE_MIGRATING.equals(d.getState()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean wasCtWithdrawn(final long ruleId) {
+        if (dsrLbDesiredStateDao == null) {
+            return false;
+        }
+        final DsrLbDesiredStateVO d = dsrLbDesiredStateDao.findByLoadBalancerId(ruleId);
+        return d != null && d.isCtWithdrawn();
     }
 
     /**
@@ -411,11 +520,13 @@ public class DsrSoftwareLbService extends AdapterBase {
         if (route == null || StringUtils.isBlank(route.getPrefix())) {
             return false;
         }
-        if (!prefix.equals(route.getPrefix())) {
+        final String wantPrefix = canonicalizePrefix(prefix);
+        final String gotPrefix = canonicalizePrefix(route.getPrefix());
+        if (!wantPrefix.equals(gotPrefix)) {
             return false;
         }
         final String owner = route.getOwner();
-        if (vipOwnerKey(vpcId, prefix).equals(owner)) {
+        if (vipOwnerKey(vpcId, wantPrefix).equals(owner)) {
             return true;
         }
         // Legacy ruleId owner from first DSR route commit.
@@ -484,16 +595,48 @@ public class DsrSoftwareLbService extends AdapterBase {
             if (d == null || d.isRevoked() || StringUtils.isBlank(d.getIpAddress())) {
                 continue;
             }
-            // Without VM id on LbDestination, accept IP if syntactically valid;
-            // inventory path applies Running filter when map is available.
-            final String ip = d.getIpAddress().trim();
-            // LbDestination has no VM id; IP shape check here. Running-VM filter
-            // is applied in inventoryEligibleBackends when VM maps are available.
-            if (NetUtils.isValidIp4(ip) || NetUtils.isValidIp6(ip)) {
-                out.add(ip);
+            final String ip = canonicalizeVip(d.getIpAddress().trim());
+            if (!(NetUtils.isValidIp4(ip) || NetUtils.isValidIp6(ip))) {
+                continue;
             }
+            // Require Running VM bound to this IP on the rule network.
+            if (!isIpBoundToRunningVm(ip, rule.getNetworkId())) {
+                LOGGER.debug("DsrSoftwareLbService: skip destination {} — no Running VM/NIC on network {}",
+                        ip, rule.getNetworkId());
+                continue;
+            }
+            out.add(ip);
         }
         return out;
+    }
+
+    /**
+     * True when {@code ip} is on a NIC whose VM is Running in {@code networkId}.
+     * When DAOs are unwired (unit tests), falls back to syntactic validity.
+     * Visible for tests.
+     */
+    boolean isIpBoundToRunningVm(final String ip, final long networkId) {
+        if (StringUtils.isBlank(ip)) {
+            return false;
+        }
+        if (nicDao == null && vmInstanceDao == null) {
+            return NetUtils.isValidIp4(ip) || NetUtils.isValidIp6(ip);
+        }
+        if (nicDao == null) {
+            return false;
+        }
+        NicVO nic = null;
+        if (NetUtils.isValidIp4(ip)) {
+            nic = nicDao.findByIp4AddressAndNetworkId(ip, networkId);
+        }
+        if (nic == null) {
+            return false;
+        }
+        if (vmInstanceDao == null) {
+            return true;
+        }
+        final VMInstanceVO vm = vmInstanceDao.findById(nic.getInstanceId());
+        return vm != null && vm.getState() == VirtualMachine.State.Running;
     }
 
     List<String> inventoryEligibleBackends(final LoadBalancerVO lb) {
@@ -680,12 +823,6 @@ public class DsrSoftwareLbService extends AdapterBase {
                 continue;
             }
             final String owner = lb.getOwner() == null ? "" : lb.getOwner();
-            final boolean ctish = OvnConstants.EXT_VAL_DSR_SOFTWARE.equals(owner) ? false
-                    : ("CT_LB".equals(owner) || "LOAD_BALANCER".equals(owner)
-                    || owner.contains("|") /* pub6 entry key */);
-            if (!ctish && !owner.isEmpty() && !OvnConstants.EXT_VAL_DSR_SOFTWARE.equals(owner)) {
-                // Unknown marker value — still inspect VIP keys for safety.
-            }
             if (OvnConstants.EXT_VAL_DSR_SOFTWARE.equals(owner)) {
                 continue;
             }
@@ -697,7 +834,54 @@ public class DsrSoftwareLbService extends AdapterBase {
                 }
             }
         }
+        // Residual DNAT / dnat_and_snat on the same VIP (CT/PF leftovers). Does NOT
+        // block pure SNAT (type=snat) used for private egress, nor StaticNat on a
+        // different public IP. Same-VIP floating/PF NAT conflicts with DSR.
+        for (final String vip : new String[] {vipV4, vipV6}) {
+            if (StringUtils.isBlank(vip)) {
+                continue;
+            }
+            for (final OwnedNat nat : nb.listNatsByExternalIp(vip)) {
+                if (nat == null) {
+                    continue;
+                }
+                final String type = nat.getType() == null ? "" : nat.getType();
+                if ("snat".equals(type)) {
+                    continue;
+                }
+                if ("dnat".equals(type) || "dnat_and_snat".equals(type)) {
+                    // Port-scoped PF: if external_port_range present and does not
+                    // cover this rule's port, skip (other PF on same VIP).
+                    if (StringUtils.isNotBlank(nat.getExternalPortRange()) && port != null) {
+                        if (!portRangeCovers(nat.getExternalPortRange(), port)) {
+                            continue;
+                        }
+                    }
+                    return new CtResidual(nat.getUuid(), vip + " type=" + type, "NAT");
+                }
+            }
+        }
         return null;
+    }
+
+    /** Visible for tests. */
+    public static boolean portRangeCovers(final String range, final int port) {
+        if (StringUtils.isBlank(range)) {
+            return true;
+        }
+        // Formats: "80" or "80-90"
+        final String r = range.trim();
+        final int dash = r.indexOf('-');
+        try {
+            if (dash < 0) {
+                return Integer.parseInt(r) == port;
+            }
+            final int a = Integer.parseInt(r.substring(0, dash));
+            final int b = Integer.parseInt(r.substring(dash + 1));
+            return port >= Math.min(a, b) && port <= Math.max(a, b);
+        } catch (final NumberFormatException e) {
+            return true; // fail closed on unparsable
+        }
     }
 
     /**
@@ -807,7 +991,7 @@ public class DsrSoftwareLbService extends AdapterBase {
                 if (StringUtils.isBlank(b)) {
                     continue;
                 }
-                final String ip = b.trim();
+                final String ip = canonicalizeVip(b.trim());
                 if (NetUtils.isValidIp4(ip)) {
                     v4Backends.add(ip);
                 } else if (NetUtils.isValidIp6(ip)) {
@@ -816,14 +1000,16 @@ public class DsrSoftwareLbService extends AdapterBase {
             }
         }
         final List<DesiredHop> out = new ArrayList<>();
-        if (StringUtils.isNotBlank(vipV4) && NetUtils.isValidIp4(vipV4)) {
-            final String prefix = vipV4 + "/32";
+        final String c4 = canonicalizeVip(vipV4);
+        final String c6 = canonicalizeVip(vipV6);
+        if (StringUtils.isNotBlank(c4) && NetUtils.isValidIp4(c4)) {
+            final String prefix = c4 + "/32";
             for (final String nh : new LinkedHashSet<>(v4Backends)) {
                 out.add(new DesiredHop(prefix, nh, FAMILY_V4));
             }
         }
-        if (StringUtils.isNotBlank(vipV6) && NetUtils.isValidIp6(vipV6)) {
-            final String prefix = vipV6 + "/128";
+        if (StringUtils.isNotBlank(c6) && NetUtils.isValidIp6(c6)) {
+            final String prefix = c6 + "/128";
             for (final String nh : new LinkedHashSet<>(v6Backends)) {
                 out.add(new DesiredHop(prefix, nh, FAMILY_V6));
             }

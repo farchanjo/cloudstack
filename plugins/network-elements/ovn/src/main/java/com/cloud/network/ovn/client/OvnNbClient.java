@@ -2377,6 +2377,90 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
+     * List NAT rows whose {@code external_ip} equals {@code externalIp}
+     * (used by DSR residual-CT precheck). Returns uuid/type/external_port_range.
+     */
+    public List<OwnedNat> listNatsByExternalIp(final String externalIp) {
+        final List<OwnedNat> out = new ArrayList<>();
+        if (externalIp == null || externalIp.isEmpty()) {
+            return out;
+        }
+        final ArrayNode where = JsonNodeFactory.instance.arrayNode();
+        where.add(equalityCondition("external_ip", externalIp));
+        final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
+        columns.add("_uuid");
+        columns.add("type");
+        columns.add("external_ip");
+        columns.add("external_port_range");
+        columns.add("logical_ip");
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.select("NAT", where, columns));
+        final OvnTransaction.Result r = tx.commit();
+        final ArrayNode arr = r.raw();
+        final var entry = arr == null || arr.size() == 0 ? null : arr.get(0);
+        final var rows = entry == null ? null : entry.get("rows");
+        if (rows == null) {
+            return out;
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            final var row = rows.get(i);
+            if (row == null) {
+                continue;
+            }
+            final var uuid = row.get("_uuid");
+            if (uuid == null || uuid.size() < 2) {
+                continue;
+            }
+            final String type = row.get("type") == null || row.get("type").isNull()
+                    ? "" : row.get("type").asText();
+            final String epr = row.get("external_port_range") == null || row.get("external_port_range").isNull()
+                    ? null : row.get("external_port_range").asText();
+            final String lip = row.get("logical_ip") == null || row.get("logical_ip").isNull()
+                    ? null : row.get("logical_ip").asText();
+            out.add(new OwnedNat(uuid.get(1).asText(), type, externalIp, epr, lip));
+        }
+        return out;
+    }
+
+    /** Immutable NAT row descriptor for residual checks. */
+    public static final class OwnedNat {
+        private final String uuid;
+        private final String type;
+        private final String externalIp;
+        private final String externalPortRange;
+        private final String logicalIp;
+
+        public OwnedNat(final String uuid, final String type, final String externalIp,
+                final String externalPortRange, final String logicalIp) {
+            this.uuid = uuid;
+            this.type = type;
+            this.externalIp = externalIp;
+            this.externalPortRange = externalPortRange;
+            this.logicalIp = logicalIp;
+        }
+
+        public String getUuid() {
+            return uuid;
+        }
+
+        public String getType() {
+            return type;
+        }
+
+        public String getExternalIp() {
+            return externalIp;
+        }
+
+        public String getExternalPortRange() {
+            return externalPortRange;
+        }
+
+        public String getLogicalIp() {
+            return logicalIp;
+        }
+    }
+
+    /**
      * Immutable descriptor of a plugin-owned ECMP static route as read from the
      * NB DB: the route row UUID, destination {@code ip_prefix}, {@code nexthop},
      * and the marker value ({@code external_ids:cs-ecmp-route}) identifying the

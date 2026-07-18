@@ -91,8 +91,11 @@ create/apply LB rule
                                1) VIP-scoped ECMP on VPC LR (union of 80+443 members)
                                   cs-dsr-route=<vpcId>|<prefix>  (not per-rule duplicate)
                                   add-before-remove; dual-stack atomic
-                               2) CT host BGP withdraw only on first sibling; restore only on last
+                               2) CT host BGP withdraw only when NO peer desired-state has
+                                  PROGRAMMED+ctWithdrawn=true (never infer from Add count);
+                                  restore only on last sibling that had proven withdraw
                                3) inventory-eligible backends (Running VM+NIC); Envoy Ready = external
+                               4) GlobalLock dsr.vip.<vpc>|<vip> multi-MS
                                guest Calico anycast remains the fabric attractor
 ```
 
