@@ -2045,9 +2045,16 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             }
 
             // Provider validate for both CT_LB and DSR (G3: do not skip IPv6 for DSR).
-            Ip sourceIp = new Ip(pub6.getAddress());
+            // com.cloud.utils.net.Ip is IPv4-only (ip2Long); public IPv6 VIPs must not
+            // pass through Ip(String). Source VIP for OVN pub6 is programmed from
+            // inventory (public_ipv6_address_id) by the reconciler, not from this
+            // LoadBalancingRule.sourceIp field.
+            if (!NetUtils.isValidIp6(pub6.getAddress())) {
+                throw new InvalidParameterValueException(
+                        "Public IPv6 address is not a valid IPv6 address: " + pub6.getAddress());
+            }
             LoadBalancingRule loadBalancing = new LoadBalancingRule(rule, new ArrayList<>(), new ArrayList<>(), new ArrayList<>(),
-                    sourceIp, null, lbProtocol);
+                    /* sourceIp */ null, null, lbProtocol);
             if (kind.isCtLb() && !validateLbRule(loadBalancing)) {
                 throw new InvalidParameterValueException("LB service provider cannot support this public IPv6 rule");
             }
