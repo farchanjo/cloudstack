@@ -693,6 +693,11 @@ public class OvnReconcilerService {
     /**
      * Package-visible for tests. Returns true when membership differs from
      * desired worker set (and applies when {@code dryRun=false}).
+     *
+     * <p>HostNetwork public Istio / accounting edges use <strong>explicit</strong>
+     * {@code assignToLoadBalancerRule} membership (Ready backends only). Those
+     * rules must never be force-rewritten to the full CKS worker set — see
+     * {@link #isExplicitMembershipOnlyLbRule(LoadBalancerVO)}.
      */
     boolean syncOneLbAutoCks(final OvnLbAutoCks.Binding binding, final long zoneId, final boolean dryRun) {
         if (binding == null) {
@@ -701,6 +706,19 @@ public class OvnReconcilerService {
         final LoadBalancerVO rule = loadBalancerDao.findById(binding.getRuleId());
         if (rule == null) {
             LOGGER.warn("OvnReconcilerService: LB auto rule id={} not found; skipping", binding.getRuleId());
+            return false;
+        }
+        if (isExplicitMembershipOnlyLbRule(rule)) {
+            LOGGER.warn("OvnReconcilerService: refusing LB auto-CKS rewrite for explicit-membership "
+                            + "rule id={} name={} — remove it from ovn.lb.auto.cks; membership is "
+                            + "operator/API assign only (Ready hostNetwork backends)",
+                    rule.getId(), rule.getName());
+            return false;
+        }
+        // DSR_SOFTWARE inventory is owned by DsrSoftwareLbService; never rewrite maps here.
+        if (!isCtLbInventoryRule(rule)) {
+            LOGGER.warn("OvnReconcilerService: refusing LB auto-CKS for non-CT_LB rule id={} kind={}",
+                    rule.getId(), rule.getLbKind());
             return false;
         }
         final Network network = networkDao.findById(rule.getNetworkId());
@@ -1201,6 +1219,24 @@ public class OvnReconcilerService {
         }
         // LoadBalancerContainer.LbKind.getLbKind() defaults null → CT_LB on VO.
         return rule.getLbKind() == null || rule.getLbKind().isCtLb();
+    }
+
+    /**
+     * Public hostNetwork Istio / accounting LB rules use operator-assigned
+     * Ready-only backends (not every CKS worker). {@code ovn.lb.auto.cks} must
+     * never rewrite their {@code load_balancer_vm_map} to the full worker set.
+     * Visible for unit tests.
+     */
+    static boolean isExplicitMembershipOnlyLbRule(final LoadBalancerVO rule) {
+        if (rule == null || StringUtils.isBlank(rule.getName())) {
+            return false;
+        }
+        final String n = rule.getName().toLowerCase(java.util.Locale.ROOT);
+        // Salazar public + accounting (v4 and pub6 inventory names).
+        return n.contains("istio-public")
+                || n.contains("istio-accounting")
+                || n.contains("pub6-istio")
+                || n.startsWith("pub6-");
     }
 
     /**

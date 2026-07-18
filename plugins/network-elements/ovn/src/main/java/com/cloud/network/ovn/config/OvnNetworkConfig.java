@@ -304,7 +304,11 @@ public class OvnNetworkConfig implements Configurable {
             OVN_LB_AUTO_CKS, "",
             "Auto-refresh CloudStack LB rule backends from CKS worker guest IPs. Syntax: "
                     + "'<lb-rule-id>=<cks-cluster-uuid>:<dest-port>;...'. Empty disables. Rewrites "
-                    + "load_balancer_vm_map for listed rules then re-applies OVN LB. Does not follow pods.",
+                    + "load_balancer_vm_map for listed rules then re-applies OVN LB. Does not follow pods. "
+                    + "Do NOT list hostNetwork public Istio/accounting edges (istio-public-*, "
+                    + "istio-accounting-*, pub6-istio-*) — those use explicit assignToLoadBalancerRule "
+                    + "Ready-only membership; the reconciler refuses to rewrite them even if listed. "
+                    + "DSR_SOFTWARE rules are also refused. Intended for full-worker sets (e.g. API LB).",
             true);
 
     public static final ConfigKey<String> LrPublicIpv6Lb = new ConfigKey<>(CATEGORY, String.class,
