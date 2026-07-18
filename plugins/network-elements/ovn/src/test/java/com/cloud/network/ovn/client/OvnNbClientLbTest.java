@@ -17,8 +17,10 @@
 package com.cloud.network.ovn.client;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -117,7 +119,7 @@ public class OvnNbClientLbTest {
     }
 
     @Test
-    public void attachLbSetsRouterForceSnatWhenAbsent() {
+    public void attachLbSetsRouterForceSnatWhenAbsentOnCentralizedRouter() {
         when(pool.call(anyString(), any())).thenReturn(
                 emptyReply(),
                 selectOptionsReply("chassis", "gw1"),
@@ -142,17 +144,89 @@ public class OvnNbClientLbTest {
                 preserved = true;
             }
         }
-        assertEquals("lb_force_snat_ip must be written", true, found);
+        assertEquals("lb_force_snat_ip must be written on centralized LR", true, found);
         assertEquals("pre-existing option keys must be preserved", true, preserved);
     }
 
     @Test
-    public void attachLbForceSnatIsIdempotentWhenAlreadySet() {
+    public void attachLbForceSnatIsIdempotentWhenAlreadySetOnCentralizedRouter() {
         when(pool.call(anyString(), any())).thenReturn(
                 emptyReply(),
-                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP));
+                selectOptionsReply("chassis", "gw1",
+                        OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP));
 
         client.attachLoadBalancerToLogicalRouter("lr-uuid", "lb-uuid-11");
+
+        // mutate + options probe only; NO third update transaction.
+        captureTransactCalls(2);
+    }
+
+    /**
+     * Regression for OVN northd {@code "bad ip router_ip"} log spam on
+     * CloudStack distributed VPC logical routers. The {@code router_ip}
+     * magic value is only resolvable by northd when the LR carries
+     * {@code options:chassis}; a distributed LR (no {@code options:chassis})
+     * must never receive it, and any legacy value left by a prior plugin
+     * version must be stripped on the next attach / reconcile pass.
+     */
+    @Test
+    public void attachLbOnDistributedRouterStripsLegacyRouterIpMagic() {
+        when(pool.call(anyString(), any())).thenReturn(
+                emptyReply(),
+                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP),
+                emptyReply());
+
+        client.attachLoadBalancerToLogicalRouter("lr-uuid-distributed", "lb-uuid-strip");
+
+        final List<JsonNode> calls = captureTransactCalls(3);
+        final JsonNode update = ((ArrayNode) calls.get(2)).get(1);
+        assertEquals("update", update.get("op").asText());
+        assertEquals("Logical_Router", update.get("table").asText());
+        final JsonNode options = update.get("row").get("options");
+        assertEquals("map", options.get(0).asText());
+        for (final JsonNode pair : options.get(1)) {
+            assertFalse("distributed LR must not carry lb_force_snat_ip=router_ip",
+                    OvnNbClient.LR_OPT_LB_FORCE_SNAT.equals(pair.get(0).asText())
+                            && OvnNbClient.LB_FORCE_SNAT_ROUTER_IP.equals(pair.get(1).asText()));
+        }
+        assertEquals("legacy router_ip must be the only key removed", 0, options.get(1).size());
+    }
+
+    /**
+     * Distributed router with no {@code lb_force_snat_ip} at all: the
+     * attach path probes options, sees a distributed topology + absent
+     * magic value, and must NOT emit any third update transaction (nothing
+     * to write, nothing to strip).
+     */
+    @Test
+    public void attachLbOnDistributedRouterWithoutLegacyValueIsNoOp() {
+        when(pool.call(anyString(), any())).thenReturn(
+                emptyReply(),
+                // Some unrelated option (e.g. always_learn_from_arp) but NO
+                // chassis and NO lb_force_snat_ip -> distributed + clean.
+                selectOptionsReply("always_learn_from_arp", "true"));
+
+        client.attachLoadBalancerToLogicalRouter("lr-uuid-distributed", "lb-uuid-noop");
+
+        // mutate + options probe only; NO third update transaction.
+        captureTransactCalls(2);
+    }
+
+    /**
+     * A distributed router may still carry an explicit IPv4/IPv6
+     * {@code lb_force_snat_ip} set by an operator (or a future CloudStack
+     * feature that derives one). The plugin must NOT touch that value on a
+     * distributed router — only the magic {@code router_ip} token is
+     * provably inert there.
+     */
+    @Test
+    public void attachLbOnDistributedRouterPreservesExplicitSnatIp() {
+        when(pool.call(anyString(), any())).thenReturn(
+                emptyReply(),
+                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT, "203.0.113.10"),
+                emptyReply());
+
+        client.attachLoadBalancerToLogicalRouter("lr-uuid-distributed", "lb-uuid-explicit");
 
         // mutate + options probe only; NO third update transaction.
         captureTransactCalls(2);
@@ -331,6 +405,132 @@ public class OvnNbClientLbTest {
         assertNull("options must be absent when not supplied", row.get("options"));
     }
 
+    // ------------------------------------------------------------------
+    // ensureLbForceSnatOnRoutersWithLb — reconcile-time safety net.
+    // Drives the topology-aware forced-SNAT reconcile: centralized routers
+    // get router_ip asserted; distributed routers get any legacy
+    // router_ip magic value stripped. This is the live-cleanup path that
+    // removes the legacy options={lb_force_snat_ip=router_ip} CloudStack
+    // wrote on the two distributed Slytherin VPC LRs before the fix.
+    // ------------------------------------------------------------------
+
+    @Test
+    public void reconcileLbForceSnatAssertsRouterIpOnCentralizedRouter() {
+        // LR-A: centralized (options:chassis set), no lb_force_snat_ip yet.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-centralized",
+                        new String[]{"lb-1"},
+                        new String[][]{{"chassis", "gw1"}})),
+                // ensureLbForceSnat re-reads options then writes the merge.
+                selectOptionsReply("chassis", "gw1"),
+                emptyReply());
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("centralized router missing router_ip must be fixed", 1, fixed);
+        final List<JsonNode> calls = captureTransactCalls(3);
+        final JsonNode update = ((ArrayNode) calls.get(2)).get(1);
+        assertEquals("update", update.get("op").asText());
+        final JsonNode options = update.get("row").get("options");
+        boolean found = false;
+        boolean preserved = false;
+        for (final JsonNode pair : options.get(1)) {
+            if (OvnNbClient.LR_OPT_LB_FORCE_SNAT.equals(pair.get(0).asText())) {
+                assertEquals(OvnNbClient.LB_FORCE_SNAT_ROUTER_IP, pair.get(1).asText());
+                found = true;
+            }
+            if ("chassis".equals(pair.get(0).asText())) {
+                preserved = true;
+            }
+        }
+        assertTrue("router_ip must be asserted on centralized LR", found);
+        assertTrue("chassis must be preserved", preserved);
+    }
+
+    @Test
+    public void reconcileLbForceSnatStripsLegacyRouterIpOnDistributedRouter() {
+        // LR-B: distributed (no chassis), carries stale router_ip magic.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-distributed",
+                        new String[]{"lb-2"},
+                        new String[][]{{OvnNbClient.LR_OPT_LB_FORCE_SNAT,
+                                OvnNbClient.LB_FORCE_SNAT_ROUTER_IP}})),
+                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT,
+                        OvnNbClient.LB_FORCE_SNAT_ROUTER_IP),
+                emptyReply());
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("distributed router with legacy router_ip must be cleaned", 1, fixed);
+        final List<JsonNode> calls = captureTransactCalls(3);
+        final JsonNode update = ((ArrayNode) calls.get(2)).get(1);
+        assertEquals("update", update.get("op").asText());
+        final JsonNode options = update.get("row").get("options");
+        assertEquals("map", options.get(0).asText());
+        assertEquals("router_ip must be the only key removed from distributed LR",
+                0, options.get(1).size());
+    }
+
+    @Test
+    public void reconcileLbForceSnatLeavesCleanDistributedRouterAlone() {
+        // LR-C: distributed, no legacy router_ip -> no write.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-distributed-clean",
+                        new String[]{"lb-3"},
+                        new String[][]{{"always_learn_from_arp", "true"}})));
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("clean distributed router must not be touched", 0, fixed);
+        captureTransactCalls(1);
+    }
+
+    @Test
+    public void reconcileLbForceSnatLeavesCentralizedRouterWithRouterIpAlone() {
+        // LR-D: centralized + already has router_ip -> no write.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-centralized-ok",
+                        new String[]{"lb-4"},
+                        new String[][]{{"chassis", "gw1"},
+                                {OvnNbClient.LR_OPT_LB_FORCE_SNAT,
+                                        OvnNbClient.LB_FORCE_SNAT_ROUTER_IP}})));
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("centralized router already carrying router_ip must not be touched", 0, fixed);
+        captureTransactCalls(1);
+    }
+
+    @Test
+    public void reconcileLbForceSnatSkipsRouterWithoutLb() {
+        // LR-E: distributed, stale router_ip, but NO LB attached -> skip.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-empty",
+                        new String[]{},
+                        new String[][]{{OvnNbClient.LR_OPT_LB_FORCE_SNAT,
+                                OvnNbClient.LB_FORCE_SNAT_ROUTER_IP}})));
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("router without LB must be skipped", 0, fixed);
+        captureTransactCalls(1);
+    }
+
+    @Test
+    public void reconcileLbForceSnatPreservesExplicitSnatIpOnDistributedRouter() {
+        // LR-F: distributed, carries an explicit IPv4 lb_force_snat_ip
+        // (operator-set or future-derived). Plugin must NOT touch it.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectRoutersReply(routerRow("lr-distributed-explicit",
+                        new String[]{"lb-5"},
+                        new String[][]{{OvnNbClient.LR_OPT_LB_FORCE_SNAT, "203.0.113.10"}})));
+
+        final int fixed = client.ensureLbForceSnatOnRoutersWithLb();
+
+        assertEquals("explicit SNAT IP on distributed router must be preserved", 0, fixed);
+        captureTransactCalls(1);
+    }
+
     @Test(expected = OvnException.class)
     public void updateBackendsWithNullMapFails() {
         client.updateLoadBalancerBackends("lb-uuid", null);
@@ -389,5 +589,60 @@ public class OvnNbClientLbTest {
         uuidArr.add(uuid);
         node.set("uuid", uuidArr);
         return node;
+    }
+
+    /**
+     * Builds a {@code select} reply carrying one Logical_Router row with
+     * {@code _uuid}, {@code load_balancer} (uuid set), and {@code options}
+     * (map). Used by the {@code ensureLbForceSnatOnRoutersWithLb}
+     * reconcile-path tests.
+     */
+    private ArrayNode selectRoutersReply(final ObjectNode row) {
+        final ObjectNode result = mapper.createObjectNode();
+        result.set("rows", mapper.createArrayNode().add(row));
+        final ArrayNode reply = mapper.createArrayNode();
+        reply.add(result);
+        return reply;
+    }
+
+    /**
+     * Builds one Logical_Router row for {@link #selectRoutersReply}.
+     *
+     * @param uuid    the LR _uuid value
+     * @param lbUuids load_balancer set members (empty array = no LBs)
+     * @param opts    options map entries as {@code [[k, v], ...]}
+     */
+    private ObjectNode routerRow(final String uuid, final String[] lbUuids, final String[][] opts) {
+        final ObjectNode row = mapper.createObjectNode();
+        // _uuid -> ["uuid", "<uuid>"]
+        final ArrayNode uuidCol = JsonNodeFactory.instance.arrayNode();
+        uuidCol.add("uuid");
+        uuidCol.add(uuid);
+        row.set("_uuid", uuidCol);
+        // load_balancer -> ["set", [ ["uuid", "<lb1>"], ... ]]
+        final ArrayNode lbSet = JsonNodeFactory.instance.arrayNode();
+        lbSet.add("set");
+        final ArrayNode lbElements = JsonNodeFactory.instance.arrayNode();
+        for (final String lb : lbUuids) {
+            final ArrayNode lbRef = JsonNodeFactory.instance.arrayNode();
+            lbRef.add("uuid");
+            lbRef.add(lb);
+            lbElements.add(lbRef);
+        }
+        lbSet.add(lbElements);
+        row.set("load_balancer", lbSet);
+        // options -> ["map", [ ["k", "v"], ... ]]
+        final ArrayNode optMap = JsonNodeFactory.instance.arrayNode();
+        optMap.add("map");
+        final ArrayNode optPairs = JsonNodeFactory.instance.arrayNode();
+        for (final String[] kv : opts) {
+            final ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+            pair.add(kv[0]);
+            pair.add(kv[1]);
+            optPairs.add(pair);
+        }
+        optMap.add(optPairs);
+        row.set("options", optMap);
+        return row;
     }
 }

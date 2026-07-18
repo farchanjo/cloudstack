@@ -149,17 +149,43 @@ DB blip.
 the resync must **skip** rewriting on an errored discovery, never treat it as authoritative
 empty. Log the DB error explicitly.
 
-### 10. 🟡 PLAUSIBLE — `lb_force_snat_ip=router_ip` on distributed LR
-**File:** `client/OvnNbClient.java:1388` (`ensureLbForceSnat`), :1426
-**Cause:** only writer of a `router_ip`-valued option; runs on every LR with an LB. On a
+### 10. ✅ FIXED — `lb_force_snat_ip=router_ip` on distributed LR
+**File:** `client/OvnNbClient.java` (`ensureLbForceSnat`, `ensureLbForceSnatOnRoutersWithLb`, `fixLrForceSnatIfNeeded`)
+**Cause:** only writer of a `router_ip`-valued option; ran on every LR with an LB. On a
 CloudStack distributed VPC LR northd cannot resolve `router_ip` → logs
 `bad ip router_ip in options of router e74045b8-…`.
-**Impact:** the east-west VIP force-SNAT this method guarantees is not applied →
-same-subnet client→VIP fails.
-**Verify first:** confirm the router topology with a live `ovn-nbctl list logical_router`
-and northd log correlation before changing. If confirmed, set an explicit SNAT IP (the
-VPC public/gateway IP) instead of the `router_ip` magic value, or gate the option to
-gateway routers only.
+**Impact:** the east-west VIP force-SNAT this method guaranteed was not applied →
+same-subnet client→VIP fails (and `ovn-northd.log` polluted).
+**Live confirmation (2026-07-18):** both Slytherin VPC LRs (`lr-0d415ee9-…` Snape,
+`lr-765d9159-…` Salazar) are distributed (no `options:chassis`) and carry
+`options={lb_force_snat_ip=router_ip}` — exactly the broken shape. DSR uses static
+routes and is unaffected; CT LBs are currently functional but the intended
+forced-SNAT option is inert.
+**Fix (implemented):** topology gate in `ensureLbForceSnat` — the `router_ip` magic
+value is written only on centralized LRs (those carrying `options:chassis`, where
+northd's `en-lr-nat.c` special-cases it); on a distributed LR the magic value is
+stripped (legacy cleanup) and never re-written. An explicit IPv4/IPv6
+`lb_force_snat_ip` set by an operator or future feature is preserved on a
+distributed LR — only the inert `router_ip` token is provably broken and removed.
+The reconcile safety-net (`ensureLbForceSnatOnRoutersWithLb`) walks every LR with
+an LB and applies the same rule, so the two live Slytherin LRs are cleaned on the
+next CloudStack-owned `cmk run ovnreconciler` pass (no manual OVN ops). Centralized
+gateway-chassis routers keep the valid `router_ip` write. DSR, CT LB, NAT and
+dual-stack behavior preserved. Regression tests in `OvnNbClientLbTest`:
+`attachLbSetsRouterForceSnatWhenAbsentOnCentralizedRouter`,
+`attachLbForceSnatIsIdempotentWhenAlreadySetOnCentralizedRouter`,
+`attachLbOnDistributedRouterStripsLegacyRouterIpMagic`,
+`attachLbOnDistributedRouterWithoutLegacyValueIsNoOp`,
+`attachLbOnDistributedRouterPreservesExplicitSnatIp`,
+`reconcileLbForceSnatAssertsRouterIpOnCentralizedRouter`,
+`reconcileLbForceSnatStripsLegacyRouterIpOnDistributedRouter`,
+`reconcileLbForceSnatLeavesCleanDistributedRouterAlone`,
+`reconcileLbForceSnatLeavesCentralizedRouterWithRouterIpAlone`,
+`reconcileLbForceSnatSkipsRouterWithoutLb`,
+`reconcileLbForceSnatPreservesExplicitSnatIpOnDistributedRouter`.
+**Test results:** `OvnNbClientLbTest` 28/28 PASS;
+`OvnReconcilerServiceTest`+`OvnLoadBalancerServiceTest`+`OvnPortForwardingServiceTest`+`OvnReconcilerLbKindFilterTest`
+38/38 PASS; Checkstyle 0 violations. Not deployed.
 
 ### 11. 🟡 `cloudstackEntityExists` fail-open for rule kinds
 **File:** `manager/OvnReconcilerService.java:2229-2243`
@@ -294,7 +320,7 @@ performed in this worktree.
 | 8b | PASS (local) | LB detach precedes delete in synchronous, pending, and stale-reap paths. |
 | 8c | PASS (local) | Equal-width ranges expand 1:1; incompatible ranges reject, with tests. |
 | 9 | PASS (local) | SQL errors propagate as `OvnException`; callers do not interpret failure as zero. SQLException injection test remains blocked by static `TransactionLegacy` seam. |
-| 10 | UNCHANGED / LIVE REQUIRED | Plausible `OvnNbClient.java` issue intentionally not changed. |
+| 10 | PASS (local) | `lb_force_snat_ip=router_ip` is now topology-gated: written only on centralized LRs (`options:chassis` set, where northd resolves the magic value); stripped from distributed LRs (CloudStack VPC default) where northd logs `bad ip router_ip`. Legacy cleanup runs on the `ensureLbForceSnatOnRoutersWithLb` reconcile pass. Covered by `OvnNbClientLbTest` regression (centralized write/idempotent, distributed strip/no-op/explicit-IP-preserving, reconcile skip-router-without-LB). Live `cmk run ovnreconciler` will clean the two Slytherin VPC LRs after deploy. |
 | 11 | PASS (local) | Reconciler probes ACL/LB/PF/firewall DAOs. |
 | 12 | PASS (local) | Reused DHCP rows are content-resynced. |
 | 13 | PASS (local) | ICMP4/ICMP6 and dual-stack egress behavior covered locally. |

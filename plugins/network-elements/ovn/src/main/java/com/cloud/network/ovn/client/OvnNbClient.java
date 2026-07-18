@@ -1287,6 +1287,18 @@ public class OvnNbClient implements AutoCloseable {
     public static final String LB_FORCE_SNAT_ROUTER_IP = "router_ip";
 
     /**
+     * Logical_Router options key that pins a router to one chassis. OVN's
+     * northd ({@code northd/en-lr-nat.c}) only special-cases the
+     * {@link #LB_FORCE_SNAT_ROUTER_IP} magic value when the router also has
+     * {@code options:chassis} set (centralized / gateway-chassis router).
+     * On a distributed router (no {@code options:chassis}) the magic value
+     * is fed to {@code extract_ip_address("router_ip")}, which logs
+     * {@code bad ip router_ip} and leaves forced-SNAT unset — so the magic
+     * value must never be written on a distributed router.
+     */
+    public static final String LR_OPT_CHASSIS = "chassis";
+
+    /**
      * Inserts one {@code load_balancer} row. Returns the new UUID. The caller
      * is responsible for attaching the row to a Logical_Router or
      * Logical_Switch via {@link #attachLoadBalancerToLogicalRouter} /
@@ -1373,29 +1385,63 @@ public class OvnNbClient implements AutoCloseable {
 
     /**
      * Ensure the LR SNATs load-balanced flows to its egress LRP IP
-     * ({@code options:lb_force_snat_ip="router_ip"}, per ovn-nb(5)).
-     * Without it, a client on the same subnet as a VIP backend receives
-     * the backend's reply directly over the logical switch (src = backend
-     * IP, not the VIP) and drops it — east-west VIP traffic fails 100%.
-     * The per-LB {@code hairpin_snat_ip} only covers client == backend.
-     * Scope: affects load-balanced flows only; {@code snat} /
+     * ({@code options:lb_force_snat_ip="router_ip"}, per ovn-nb(5)) <em>only
+     * when the router is centralized</em>. Without it, a client on the same
+     * subnet as a VIP backend receives the backend's reply directly over the
+     * logical switch (src = backend IP, not the VIP) and drops it — east-west
+     * VIP traffic fails 100%. The per-LB {@code hairpin_snat_ip} only covers
+     * client == backend.
+     *
+     * <p><b>Topology gate (mandatory):</b> OVN northd
+     * ({@code northd/en-lr-nat.c}) only resolves the {@code "router_ip"}
+     * magic value when the router also carries {@code options:chassis} (a
+     * centralized / gateway-chassis router). On a distributed router the
+     * magic value is fed verbatim to {@code extract_ip_address("router_ip")},
+     * which logs {@code bad ip router_ip} and leaves forced-SNAT unset — the
+     * exact east-west break the option was meant to prevent. CloudStack VPC
+     * logical routers are distributed by design (no {@code options:chassis}
+     * is ever written by {@code OvnVpcElement.createLogicalRouterFor}), so
+     * writing the magic value there is provably inert and only pollutes
+     * {@code ovn-northd.log}. Centralized routers (gateway chassis, an HA
+     * chassis group, or any future topology that sets {@code options:chassis})
+     * keep the valid {@code router_ip} write.
+     *
+     * <p>Scope: affects load-balanced flows only; {@code snat} /
      * {@code dnat_and_snat} NAT rows are untouched. Idempotent — writes
-     * only when the option is absent or different. The option is
-     * deliberately NOT removed on LB detach: it is inert without LBs and
-     * removal would race concurrent attaches.
+     * only when the option must change. The option is deliberately NOT
+     * removed on LB detach: it is inert without LBs and removal would race
+     * concurrent attaches. The legacy cleanup of an invalid
+     * {@code router_ip} value on a distributed router runs on the
+     * {@link #ensureLbForceSnatOnRoutersWithLb} reconcile path (and here,
+     * the first time an LB is attached to an already-drifted row).
      */
     public void ensureLbForceSnat(final String lrUuid) {
         final Map<String, String> options = readLogicalRouterOptions(lrUuid);
-        if (options == null || LB_FORCE_SNAT_ROUTER_IP.equals(options.get(LR_OPT_LB_FORCE_SNAT))) {
+        if (options == null) {
+            return;
+        }
+        final boolean centralized = options.containsKey(LR_OPT_CHASSIS);
+        final String current = options.get(LR_OPT_LB_FORCE_SNAT);
+        if (centralized) {
+            // Gateway / centralized router — the magic value is valid.
+            if (LB_FORCE_SNAT_ROUTER_IP.equals(current)) {
+                return;
+            }
+            final Map<String, String> merged = new LinkedHashMap<>(options);
+            merged.put(LR_OPT_LB_FORCE_SNAT, LB_FORCE_SNAT_ROUTER_IP);
+            writeLogicalRouterOptions(lrUuid, merged);
+            return;
+        }
+        // Distributed router — the magic value is inert and produces the
+        // northd "bad ip router_ip" log line. Drop any legacy value left
+        // behind by a prior plugin version; leave an explicit IPv4/IPv6
+        // SNAT IP untouched (a caller may have set one directly via NB).
+        if (!LB_FORCE_SNAT_ROUTER_IP.equals(current)) {
             return;
         }
         final Map<String, String> merged = new LinkedHashMap<>(options);
-        merged.put(LR_OPT_LB_FORCE_SNAT, LB_FORCE_SNAT_ROUTER_IP);
-        final ObjectNode row = JsonNodeFactory.instance.objectNode();
-        row.set("options", buildMap(merged));
-        final OvnTransaction tx = newTransaction();
-        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(lrUuid), row));
-        tx.commit();
+        merged.remove(LR_OPT_LB_FORCE_SNAT);
+        writeLogicalRouterOptions(lrUuid, merged);
     }
 
     /**
@@ -1419,10 +1465,29 @@ public class OvnNbClient implements AutoCloseable {
     }
 
     /**
-     * Reconcile-time safety net: asserts {@code lb_force_snat_ip=router_ip}
-     * on every Logical_Router that carries at least one Load_Balancer.
-     * Attach-time enforcement covers new LBs; this covers routers whose
-     * LBs pre-date the option. Returns the number of routers fixed.
+     * Replaces the {@code options} column of one Logical_Router with the
+     * supplied map. Caller is responsible for preserving any keys it did
+     * not intend to touch (read-modify-write against
+     * {@link #readLogicalRouterOptions}).
+     */
+    private void writeLogicalRouterOptions(final String lrUuid, final Map<String, String> options) {
+        final ObjectNode row = JsonNodeFactory.instance.objectNode();
+        row.set("options", buildMap(options));
+        final OvnTransaction tx = newTransaction();
+        tx.add(OvnOpFactory.update("Logical_Router", OvnOpFactory.whereUuid(lrUuid), row));
+        tx.commit();
+    }
+
+    /**
+     * Reconcile-time safety net: walks every Logical_Router carrying at
+     * least one Load_Balancer and applies the topology-aware
+     * {@link #ensureLbForceSnat} rule — write {@code lb_force_snat_ip=router_ip}
+     * on centralized routers (where the {@code router_ip} magic value is
+     * valid), and strip any stale {@code lb_force_snat_ip=router_ip} on
+     * distributed routers (where northd logs {@code bad ip router_ip} and
+     * leaves forced-SNAT unset). Attach-time enforcement covers new LBs;
+     * this covers routers whose LBs pre-date the topology gate. Returns
+     * the number of routers fixed.
      */
     public int ensureLbForceSnatOnRoutersWithLb() {
         final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
@@ -1448,13 +1513,25 @@ public class OvnNbClient implements AutoCloseable {
         return fixed;
     }
 
-    /** One row of {@link #ensureLbForceSnatOnRoutersWithLb}: fix + report. */
+    /**
+     * One row of {@link #ensureLbForceSnatOnRoutersWithLb}: classify by
+     * topology, return {@code true} when a write was needed. The
+     * centralized case needs a write whenever the option is missing or set
+     * to something other than the magic value; the distributed case needs a
+     * write only when a stale legacy {@code router_ip} magic value is
+     * present (any other value is left to its owner).
+     */
     private boolean fixLrForceSnatIfNeeded(final JsonNode row) {
         if (row == null || OvnNbReader.decodeUuidSet(row.get("load_balancer")).isEmpty()) {
             return false;
         }
         final Map<String, String> options = OvnNbReader.decodeMap(row.get("options"));
-        if (LB_FORCE_SNAT_ROUTER_IP.equals(options.get(LR_OPT_LB_FORCE_SNAT))) {
+        final boolean centralized = options.containsKey(LR_OPT_CHASSIS);
+        final String current = options.get(LR_OPT_LB_FORCE_SNAT);
+        final boolean needsWrite = centralized
+                ? !LB_FORCE_SNAT_ROUTER_IP.equals(current)
+                : LB_FORCE_SNAT_ROUTER_IP.equals(current);
+        if (!needsWrite) {
             return false;
         }
         ensureLbForceSnat(OvnNbReader.decodeUuidColumn(row, "_uuid"));

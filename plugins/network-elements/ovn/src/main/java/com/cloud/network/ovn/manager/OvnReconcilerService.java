@@ -226,14 +226,21 @@ public class OvnReconcilerService {
         reassertOvsPolicy(zoneId, dryRun, out);
         // East-west LB force-SNAT drift — a router carrying LBs must SNAT
         // load-balanced flows to its own IP (lb_force_snat_ip=router_ip) or
-        // same-subnet clients never see VIP replies (asymmetric return).
-        // Attach-time enforcement covers new LBs; this covers routers whose
-        // LBs pre-date the option.
+        // same-subnet clients never see VIP replies (asymmetric return), BUT
+        // only when the router is centralized (options:chassis set). OVN
+        // northd's en-lr-nat.c only resolves the "router_ip" magic value on
+        // centralized routers; on a distributed router it logs
+        // "bad ip router_ip" and leaves forced-SNAT unset, so the option is
+        // provably inert there. Attach-time enforcement covers new LBs; this
+        // pass covers routers whose LBs pre-date the topology gate, including
+        // legacy "router_ip" values left on distributed routers by a prior
+        // plugin version (the two live Slytherin VPC LRs).
         if (!dryRun) {
             final int snatFixed = nb.ensureLbForceSnatOnRoutersWithLb();
             if (snatFixed > 0) {
-                LOGGER.info("OvnReconcilerService: zone={} set {}={} on {} logical router(s) carrying LBs",
-                        zoneId, OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP, snatFixed);
+                LOGGER.info("OvnReconcilerService: zone={} reconciled {} on {} logical router(s) carrying LBs "
+                        + "(centralized: asserted router_ip / distributed: stripped legacy router_ip)",
+                        zoneId, OvnNbClient.LR_OPT_LB_FORCE_SNAT, snatFixed);
             }
         }
         // Per-network extra CIDR port-security resync — repairs EXISTING guest
