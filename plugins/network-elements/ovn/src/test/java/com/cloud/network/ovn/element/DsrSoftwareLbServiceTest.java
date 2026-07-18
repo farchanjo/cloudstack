@@ -490,6 +490,115 @@ public class DsrSoftwareLbServiceTest {
     }
 
     @Test
+    public void twoRulesAdd_reverseOrder_onlyFirstWithdrawsBgp() throws Exception {
+        // Apply 443 first then 80 — same single-withdraw invariant.
+        LoadBalancerVO lb80 = new LoadBalancerVO("a", "dsr80", "d", 1L, 80, 8080, "roundrobin", 10L, 1L, 1L, "tcp", null);
+        lb80.setLbKind(LbKind.DSR_SOFTWARE);
+        lb80.setState(FirewallRule.State.Add);
+        setEntityId(lb80, 80L);
+        LoadBalancerVO lb443 = new LoadBalancerVO("b", "dsr443", "d", 1L, 443, 8443, "roundrobin", 10L, 1L, 1L, "tcp", null);
+        lb443.setLbKind(LbKind.DSR_SOFTWARE);
+        lb443.setState(FirewallRule.State.Add);
+        setEntityId(lb443, 443L);
+
+        final List<LbDestination> dests = List.of(
+                new LbDestination(8080, 8080, B4A, false),
+                new LbDestination(8080, 8080, B4B, false),
+                new LbDestination(8080, 8080, B4C, false));
+        final LoadBalancingRule r80 = new LoadBalancingRule(lb80, dests, List.of(), List.of(), new Ip(VIP4), null, "tcp");
+        final LoadBalancingRule r443 = new LoadBalancingRule(lb443, dests, List.of(), List.of(), new Ip(VIP4), null, "tcp");
+
+        when(loadBalancerDao.listByNetworkIdOrVpcIdAndScheme(anyLong(), any(), eq(Scheme.Public)))
+                .thenReturn(List.of(lb80, lb443));
+
+        final java.util.Map<Long, DsrLbDesiredStateVO> store = new java.util.HashMap<>();
+        when(dsrLbDesiredStateDao.findByLoadBalancerId(anyLong())).thenAnswer(inv -> store.get(inv.getArgument(0)));
+        when(dsrLbDesiredStateDao.persist(any(DsrLbDesiredStateVO.class))).thenAnswer(inv -> {
+            final DsrLbDesiredStateVO d = inv.getArgument(0);
+            store.put(d.getLoadBalancerId(), d);
+            return d;
+        });
+        org.mockito.Mockito.doAnswer(inv -> {
+            final DsrLbDesiredStateVO d = inv.getArgument(1);
+            store.put(d.getLoadBalancerId() > 0 ? d.getLoadBalancerId() : (Long) inv.getArgument(0), d);
+            return true;
+        }).when(dsrLbDesiredStateDao).update(anyLong(), any(DsrLbDesiredStateVO.class));
+
+        when(nbClient.listEcmpStaticRoutes(OvnConstants.EXT_ID_DSR_ROUTE))
+                .thenReturn(List.of())
+                .thenReturn(List.of(
+                        new EcmpStaticRoute("r-a", VIP4 + "/32", B4A, OWNER_V4),
+                        new EcmpStaticRoute("r-b", VIP4 + "/32", B4B, OWNER_V4),
+                        new EcmpStaticRoute("r-c", VIP4 + "/32", B4C, OWNER_V4)))
+                .thenReturn(List.of(
+                        new EcmpStaticRoute("r-a", VIP4 + "/32", B4A, OWNER_V4),
+                        new EcmpStaticRoute("r-b", VIP4 + "/32", B4B, OWNER_V4),
+                        new EcmpStaticRoute("r-c", VIP4 + "/32", B4C, OWNER_V4)))
+                .thenReturn(List.of(
+                        new EcmpStaticRoute("r-a", VIP4 + "/32", B4A, OWNER_V4),
+                        new EcmpStaticRoute("r-b", VIP4 + "/32", B4B, OWNER_V4),
+                        new EcmpStaticRoute("r-c", VIP4 + "/32", B4C, OWNER_V4)));
+
+        assertTrue(service.applyLBRules(network, List.of(r443)));
+        assertTrue(service.applyLBRules(network, List.of(r80)));
+
+        verify(bgpRedistributeManager, times(1)).withdraw(eq(VIP4), eq(1L), eq(100L), eq(1L));
+        assertTrue(store.get(443L).isCtWithdrawn());
+        assertTrue(store.get(80L).isCtWithdrawn());
+    }
+
+    @Test
+    public void firstWithdrawFailureThenRetryWithdrawsOnceOnSuccess() throws Exception {
+        // First apply: BGP withdraw fails → ctWithdrawn stays false / ROLLBACK.
+        // Second apply: withdraw succeeds → PROGRAMMED ctWithdrawn=true.
+        org.mockito.Mockito.doThrow(new RuntimeException("agent down"))
+                .doNothing()
+                .when(bgpRedistributeManager).withdraw(eq(VIP4), eq(1L), eq(100L), eq(1L));
+
+        final java.util.Map<Long, DsrLbDesiredStateVO> store = new java.util.HashMap<>();
+        when(dsrLbDesiredStateDao.findByLoadBalancerId(anyLong())).thenAnswer(inv -> store.get(inv.getArgument(0)));
+        when(dsrLbDesiredStateDao.persist(any(DsrLbDesiredStateVO.class))).thenAnswer(inv -> {
+            final DsrLbDesiredStateVO d = inv.getArgument(0);
+            store.put(d.getLoadBalancerId(), d);
+            return d;
+        });
+        org.mockito.Mockito.doAnswer(inv -> {
+            final DsrLbDesiredStateVO d = inv.getArgument(1);
+            final long id = d.getLoadBalancerId() > 0 ? d.getLoadBalancerId() : (Long) inv.getArgument(0);
+            store.put(id, d);
+            return true;
+        }).when(dsrLbDesiredStateDao).update(anyLong(), any(DsrLbDesiredStateVO.class));
+
+        when(nbClient.listEcmpStaticRoutes(OvnConstants.EXT_ID_DSR_ROUTE))
+                .thenReturn(List.of())
+                .thenReturn(List.of(
+                        new EcmpStaticRoute("r1", VIP4 + "/32", B4A, OWNER_V4),
+                        new EcmpStaticRoute("r2", VIP4 + "/32", B4B, OWNER_V4),
+                        new EcmpStaticRoute("r3", VIP4 + "/32", B4C, OWNER_V4)))
+                .thenReturn(List.of())
+                .thenReturn(List.of(
+                        new EcmpStaticRoute("r1", VIP4 + "/32", B4A, OWNER_V4),
+                        new EcmpStaticRoute("r2", VIP4 + "/32", B4B, OWNER_V4),
+                        new EcmpStaticRoute("r3", VIP4 + "/32", B4C, OWNER_V4)));
+
+        assertFalse(service.applyLBRules(network, List.of(dsrRule)));
+        final DsrLbDesiredStateVO afterFail = store.get(dsrLb.getId());
+        assertNotNull(afterFail);
+        assertFalse(afterFail.isCtWithdrawn());
+        assertEquals(DsrLbDesiredStateVO.STATE_ROLLBACK, afterFail.getState());
+
+        // Clear error state for retry path (reconciler would re-enter PENDING/Add).
+        afterFail.setState(DsrLbDesiredStateVO.STATE_PENDING);
+        afterFail.setLastError(null);
+
+        assertTrue(service.applyLBRules(network, List.of(dsrRule)));
+        verify(bgpRedistributeManager, times(2)).withdraw(eq(VIP4), eq(1L), eq(100L), eq(1L));
+        final DsrLbDesiredStateVO afterOk = store.get(dsrLb.getId());
+        assertTrue(afterOk.isCtWithdrawn());
+        assertEquals(DsrLbDesiredStateVO.STATE_PROGRAMMED, afterOk.getState());
+    }
+
+    @Test
     public void peerProgrammedWithCtWithdrawn_skipsWithdraw() throws Exception {
         LoadBalancerVO lb80 = new LoadBalancerVO("a", "dsr80", "d", 1L, 80, 8080, "roundrobin", 10L, 1L, 1L, "tcp", null);
         lb80.setLbKind(LbKind.DSR_SOFTWARE);
