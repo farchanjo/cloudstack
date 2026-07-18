@@ -628,6 +628,21 @@ public class DsrSoftwareLbService extends AdapterBase {
         NicVO nic = null;
         if (NetUtils.isValidIp4(ip)) {
             nic = nicDao.findByIp4AddressAndNetworkId(ip, networkId);
+        } else if (NetUtils.isValidIp6(ip)) {
+            // G1: resolve guest NIC by IPv6 address on the rule network.
+            final List<NicVO> nics = nicDao.listByNetworkId(networkId);
+            if (nics != null) {
+                final String want = canonicalizeVip(ip);
+                for (final NicVO candidate : nics) {
+                    if (candidate == null || StringUtils.isBlank(candidate.getIPv6Address())) {
+                        continue;
+                    }
+                    if (want.equals(canonicalizeVip(candidate.getIPv6Address().trim()))) {
+                        nic = candidate;
+                        break;
+                    }
+                }
+            }
         }
         if (nic == null) {
             return false;

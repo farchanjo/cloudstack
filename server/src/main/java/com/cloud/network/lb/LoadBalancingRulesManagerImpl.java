@@ -2424,21 +2424,23 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
 
     @DB
     protected boolean applyLoadBalancerRules(List<LoadBalancerVO> lbs, boolean updateRulesInDB) throws ResourceUnavailableException {
-        // Public IPv6 VIP rules are programmed by OvnReconcilerService, not by
-        // IPv4-oriented LoadBalancingServiceProvider (e.g. OvnLoadBalancerService).
-        List<LoadBalancerVO> ipv4Lbs = new ArrayList<>();
-        List<LoadBalancerVO> pub6Lbs = new ArrayList<>();
+        // Public IPv6 CT_LB VIP rules are programmed by OvnReconcilerService
+        // (not IPv4-oriented OvnLoadBalancerService). DSR_SOFTWARE pub6 rules
+        // MUST go through LoadBalancingServiceProvider → DsrSoftwareLbService
+        // so VIP-scoped ECMP + BGP cutover run for the IPv6 family.
+        List<LoadBalancerVO> providerLbs = new ArrayList<>();
+        List<LoadBalancerVO> pub6CtLbs = new ArrayList<>();
         for (LoadBalancerVO lb : lbs) {
-            if (isPublicIpv6LoadBalancer(lb)) {
-                pub6Lbs.add(lb);
+            if (isPublicIpv6LoadBalancer(lb) && (lb.getLbKind() == null || lb.getLbKind().isCtLb())) {
+                pub6CtLbs.add(lb);
             } else {
-                ipv4Lbs.add(lb);
+                providerLbs.add(lb);
             }
         }
 
-        if (!ipv4Lbs.isEmpty()) {
+        if (!providerLbs.isEmpty()) {
             List<LoadBalancingRule> rules = new ArrayList<LoadBalancingRule>();
-            for (LoadBalancerVO lb : ipv4Lbs) {
+            for (LoadBalancerVO lb : providerLbs) {
                 rules.add(getLoadBalancerRuleToApply(lb));
             }
 
@@ -2532,10 +2534,10 @@ public class LoadBalancingRulesManagerImpl<Type> extends ManagerBase implements 
             }
         }
 
-        // After DB state is updated, soft-kick OVN reconciler for pub6 rules
-        if (!pub6Lbs.isEmpty()) {
+        // After DB state is updated, soft-kick OVN reconciler for CT_LB pub6 only.
+        if (!pub6CtLbs.isEmpty()) {
             Long zoneId = null;
-            for (LoadBalancerVO lb : pub6Lbs) {
+            for (LoadBalancerVO lb : pub6CtLbs) {
                 Network ntwk = _networkModel.getNetwork(lb.getNetworkId());
                 if (ntwk != null) {
                     zoneId = ntwk.getDataCenterId();
