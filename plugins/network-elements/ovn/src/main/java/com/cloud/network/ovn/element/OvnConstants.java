@@ -63,6 +63,29 @@ public final class OvnConstants {
      *  manual rows. */
     public static final String EXT_ID_PUBLIC_IPV6_LB = "cs-pub6-lb";
 
+    /**
+     * external_ids key marking a plugin-owned {@code DSR_SOFTWARE}
+     * {@code Logical_Router_Static_Route} row (VIP {@code /32} or {@code /128}
+     * ECMP to guest backends). The value is the CloudStack load-balancer rule
+     * id so apply / revoke / reconcile touch ONLY routes owned by that rule
+     * and never disturb {@link #EXT_ID_ECMP_ROUTE},
+     * {@link #EXT_ID_STATIC_ROUTE}, defaults, or manual rows. Multi-NH ECMP is
+     * one row per next-hop sharing the same VIP prefix.
+     */
+    public static final String EXT_ID_DSR_ROUTE = "cs-dsr-route";
+
+    /** external_ids value / companion key for DSR datapath kind. */
+    public static final String EXT_VAL_DSR_SOFTWARE = "DSR_SOFTWARE";
+
+    /** external_ids key for LB datapath kind on DSR-owned NB objects. */
+    public static final String EXT_ID_LB_KIND = "cs_lb_kind";
+
+    /** external_ids key for VIP address family on a DSR route row ({@code v4}/{@code v6}). */
+    public static final String EXT_ID_VIP_FAMILY = "cs_vip_family";
+
+    /** external_ids key for the backend/member next-hop IP on a DSR route row. */
+    public static final String EXT_ID_BACKEND = "cs_backend";
+
     private OvnConstants() {
     }
 }

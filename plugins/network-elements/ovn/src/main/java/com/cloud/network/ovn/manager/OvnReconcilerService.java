@@ -163,6 +163,8 @@ public class OvnReconcilerService {
     private OvnCksWorkerDiscovery cksWorkerDiscovery;
     @Inject
     private OvnLoadBalancerService loadBalancerService;
+    @Inject
+    private com.cloud.network.ovn.element.DsrSoftwareLbService dsrSoftwareLbService;
 
     /**
      * Run a reconcile pass against the supplied zone's NB DB.
@@ -256,6 +258,15 @@ public class OvnReconcilerService {
         if (ecmpChanged > 0) {
             LOGGER.info("OvnReconcilerService: zone={} ECMP static-route resync {} {} route row(s)",
                     zoneId, dryRun ? "would change" : "changed", ecmpChanged);
+        }
+        // DSR_SOFTWARE VIP→guest ECMP on VPC LR (cs-dsr-route). Never creates
+        // Load_Balancer / NAT. Self-gated by inventory dsr_lb_desired_state.
+        if (!dryRun && dsrSoftwareLbService != null) {
+            final int dsrOk = dsrSoftwareLbService.reconcileAll();
+            if (dsrOk > 0) {
+                LOGGER.info("OvnReconcilerService: zone={} DSR_SOFTWARE route reconcile ok={} rule(s)",
+                        zoneId, dsrOk);
+            }
         }
         // CKS auto LB backends (inventory + OVN); no-op when ConfigKey empty.
         ensureLbAutoCksForZone(zoneId, dryRun);

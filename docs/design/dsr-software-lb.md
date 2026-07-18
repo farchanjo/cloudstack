@@ -85,10 +85,13 @@ create/apply LB rule
     ├─ gate off or kind missing → reject DSR
     ├─ lb_kind = CT_LB  → OvnLoadBalancerService
     │                      createLoadBalancer, hairpin, force SNAT (as today)
-    └─ lb_kind = DSR_SOFTWARE → DsrSoftwareLbService (new)
-                               never nb.createLoadBalancer
-                               never hairpin_snat_ip / lb_force_snat_ip
-                               program guest/VIP ownership contract + BGP withdraw CT path
+    └─ lb_kind = DSR_SOFTWARE → DsrSoftwareLbService
+                               never nb.createLoadBalancer / NAT / hairpin / force SNAT
+                               1) program VPC LR Logical_Router_Static_Route ECMP
+                                  VIP/32 + VIP/128 → Ready guest backends
+                                  external_ids: cs-dsr-route=<ruleId>, cs_lb_kind=DSR_SOFTWARE
+                               2) withdraw CT_LB host BGP (dual-stack atomic)
+                               guest Calico anycast remains the fabric attractor
 ```
 
 `OvnLoadBalancerService.validateLBRule` / apply **must assert kind == CT_LB**
@@ -225,8 +228,23 @@ engine/schema/.../dao/LoadBalancerVO.java
 | Parent ADR accepted | ✅ 2026-07-17 |
 | This design contract | ✅ written |
 | Schema / API / code | ✅ 4.24.1.32: `lb_kind`, feature gate, mutex, DsrSoftwareLbService, OVN CT_LB assert, tests (gate default **false**) |
+| OVN LR DSR routes | ✅ VIP `/32`+`/128` ECMP `Logical_Router_Static_Route` (`cs-dsr-route`) on VPC LR; no LB/NAT; dual-stack atomic; reconciler re-converge |
 | Feature gate live | ❌ default off (`network.lb.dsr.software.enabled=false`) — do not enable in production until acceptance green |
 | Istio public cutover | ❌ (CKS + CS coordinated) |
+
+### Packet path (data node → guest) — normative
+
+```
+Client → fabric / data FRR (guest BGP /32+/128 OR recursive via VPC GW .32/::32)
+       → pub-anchor (kernel FIB may recurse via .32/::32 — transport to OVN, not L2 direct)
+       → OVN public LS → VPC LR
+       → DSR Logical_Router_Static_Route ECMP: VIP/32|/128 → guest NIC IPs
+       → guest tier LS → Envoy hostNetwork (lo owns VIP)
+       → direct return src=VIP (no ct_lb reverse, no CR-LRP pin)
+```
+
+**PASS criteria (verifier):** BGP guest RIB has paths + OVN LR has DSR-owned VIP→guest routes + direct-return works.
+**Not required:** kernel FIB next-hop L2-adjacent to guest (recursive via `.32`/`::32` is normal).
 
 ---
 
