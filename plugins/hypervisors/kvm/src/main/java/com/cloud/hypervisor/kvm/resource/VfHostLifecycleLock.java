@@ -28,7 +28,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>The key is the canonical BDF, not the mutable representor or vDPA name.
  * Callers must hold this lock from identity observation through the final
  * mutation and postcondition. Missing or non-canonical BDFs are rejected by
- * callers before a lock can be acquired.
+ * callers before a lock can be acquired. This is a CloudStack-agent lifecycle
+ * fence only; it does not fence arbitrary external root actors, so callers
+ * must retain atomic host-side checks and fail closed when identity is not
+ * provable.
  */
 public final class VfHostLifecycleLock {
 
