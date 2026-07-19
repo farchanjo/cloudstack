@@ -50,6 +50,14 @@ public class OvnReconcileResultResponse extends BaseResponse {
     @Param(description = "Per-table count of stale mapping rows")
     private Map<String, Integer> staleMappingsByTable;
 
+    /** Per-zone sweep ACK / status counters (hairpin-swept, tc-policy-swept).
+     *  Surfaced for operator visibility but do NOT contribute to
+     *  {totalorphans}. */
+    @SerializedName("acksbytable")
+    @Param(description = "Per-zone sweep ACK/status counters (hairpin/tc-policy sweep ran); "
+            + "do not contribute to totalorphans")
+    private Map<String, Integer> acksByTable;
+
     public boolean isDryRun() {
         return dryRun;
     }
@@ -88,5 +96,13 @@ public class OvnReconcileResultResponse extends BaseResponse {
 
     public void setStaleMappingsByTable(final Map<String, Integer> staleMappingsByTable) {
         this.staleMappingsByTable = staleMappingsByTable;
+    }
+
+    public Map<String, Integer> getAcksByTable() {
+        return acksByTable;
+    }
+
+    public void setAcksByTable(final Map<String, Integer> acksByTable) {
+        this.acksByTable = acksByTable;
     }
 }

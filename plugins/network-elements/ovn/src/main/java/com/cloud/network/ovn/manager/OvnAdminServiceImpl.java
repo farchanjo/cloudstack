@@ -182,24 +182,49 @@ public class OvnAdminServiceImpl implements OvnAdminService {
             throw new CloudRuntimeException("purgeuntagged is not valid for scoped reconciliation");
         }
         try {
-            final OvnReconcilerService.Result result = resourceKind == null
-                    ? reconcilerService.reconcileZone(zoneId, dryRun, purgeUntagged)
-                    : reconcilerService.reconcileResource(zoneId, parseScopedKind(resourceKind), resourceId, dryRun);
+            final OvnReconcilerService.Result result;
+            if (resourceKind == null) {
+                result = reconcilerService.reconcileZone(zoneId, dryRun, purgeUntagged);
+            } else {
+                final ScopedKind scoped = parseScopedKind(resourceKind);
+                result = reconcilerService.reconcileResource(zoneId, scoped.kind, resourceId, dryRun);
+            }
             return toReconcileResponse(result);
         } catch (OvnException e) {
             throw new CloudRuntimeException("OVN reconciler failed for zone " + zoneId + ": " + e.getMessage());
         }
     }
 
-    private Kind parseScopedKind(final String value) {
-        try {
-            final Kind kind = Kind.valueOf(value.trim().toUpperCase(Locale.ROOT));
-            if (kind != Kind.LOAD_BALANCER) {
-                throw new IllegalArgumentException();
-            }
-            return kind;
-        } catch (IllegalArgumentException | NullPointerException e) {
-            throw new CloudRuntimeException("scoped OVN reconciliation supports only resourcekind=LOAD_BALANCER");
+    /** Internal (kind, api-label) pair so the API layer can surface the
+     *  accepted resourcekind values (LOAD_BALANCER, VPC, OVS_POLICY) while
+     *  the service layer dispatches on the internal {Kind} enum. OVS_POLICY
+     *  maps to {Kind#NIC} because the service uses NIC as the resourcekind
+     *  token for "host port sweep" (no new enum value is introduced); the
+     *  host id is carried by {resourceId}. */
+    private static final class ScopedKind {
+        final Kind kind;
+        ScopedKind(final Kind kind) { this.kind = kind; }
+    }
+
+    private ScopedKind parseScopedKind(final String value) {
+        if (value == null) {
+            throw new CloudRuntimeException("scoped OVN reconciliation requires resourcekind "
+                    + "(LOAD_BALANCER | VPC | OVS_POLICY)");
+        }
+        final String token = value.trim().toUpperCase(Locale.ROOT);
+        switch (token) {
+            case "LOAD_BALANCER":
+                return new ScopedKind(Kind.LOAD_BALANCER);
+            case "VPC":
+                return new ScopedKind(Kind.VPC);
+            case "OVS_POLICY":
+                // OVS_POLICY is keyed by host id (carried on resourceId); the
+                // internal Kind.NIC token is the dispatch hook in
+                // OvnReconcilerService.reconcileResource.
+                return new ScopedKind(Kind.NIC);
+            default:
+                throw new CloudRuntimeException("scoped OVN reconciliation supports only resourcekind="
+                        + "LOAD_BALANCER | VPC | OVS_POLICY");
         }
     }
 
@@ -208,6 +233,7 @@ public class OvnAdminServiceImpl implements OvnAdminService {
         response.setDryRun(result.isDryRun());
         response.setOrphansByTable(result.getOrphansByTable());
         response.setStaleMappingsByTable(result.getStaleMappingsByTable());
+        response.setAcksByTable(result.getAcksByTable());
         response.setTotalOrphans(result.totalOrphans());
         response.setTotalStaleMappings(result.totalStaleMappings());
         response.setObjectName("ovnreconcile");

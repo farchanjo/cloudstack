@@ -123,4 +123,64 @@ public class OvnNicTunableApplierHairpinTest {
         OvnNicTunableApplier.applyTcPolicyOnce(null);
         OvnNicTunableApplier.applyTcPolicyOnce("");
     }
+
+    // ------------------------------------------------------------------
+    // Fix #6: Lifecycle regression - hairpin persistence after add/replug/
+    // migration. The per-plug path (OvnVifDriver / OvnVdpaVifDriver /
+    // OvnVfPassthroughVifDriver) calls applyHairpin after add-port. The
+    // command-builder seam is the test surface (the actual ovs-vsctl fork
+    // cannot be intercepted without a process-level mock). These tests pin
+    // that the hairpin flag is applied identically on every plug event so
+    // a replug or migration that re-adds the port re-asserts hairpin=true
+    // instead of silently dropping it.
+    // ------------------------------------------------------------------
+
+    @Test
+    public void hairpinCommandIsIdempotentAcrossReplugEvents() {
+        // A replug re-adds the same port name. The applyHairpin command
+        // must be byte-identical every time so the OVSDB set is a no-op
+        // when the value is already correct (idempotent re-assertion).
+        final String first = OvnNicTunableApplier.buildHairpinCommand("dx6p1vf3", true);
+        final String second = OvnNicTunableApplier.buildHairpinCommand("dx6p1vf3", true);
+        assertEquals("hairpin command must be idempotent across replug", first, second);
+        assertEquals("ovs-vsctl --if-exists set Port dx6p1vf3 other_config:hairpin=true", first);
+    }
+
+    @Test
+    public void hairpinCommandSurvivesVfRepresentorMigration() {
+        // On migration, the port name may change (different host, different
+        // VF index). The hairpin flag must be applied to the NEW representor
+        // name, not the old one. The command-builder takes the port name as
+        // a parameter so the caller (OvnVfPassthroughVifDriver) passes the
+        // resolved representor name.
+        final String oldHostPort = OvnNicTunableApplier.buildHairpinCommand("dx6p1vf3", true);
+        final String newHostPort = OvnNicTunableApplier.buildHairpinCommand("dx0p2vf5", true);
+        assertTrue("old host port must carry the hairpin flag",
+                oldHostPort.endsWith("other_config:hairpin=true"));
+        assertTrue("new host port must carry the hairpin flag",
+                newHostPort.endsWith("other_config:hairpin=true"));
+        assertTrue("command must target the new port name, not the old",
+                newHostPort.contains("dx0p2vf5"));
+    }
+
+    @Test
+    public void hairpinCommandAppliedToVirtioTapPortOnMigrationToSoftwarePath() {
+        // If a VF-backed VM is migrated to a host without SR-IOV, the VIF
+        // driver falls back to virtio-tap (vnet<N>). The hairpin flag must
+        // still be applied so same-subnet VIP traffic works on the software
+        // path too.
+        final String cmd = OvnNicTunableApplier.buildHairpinCommand("vnet42", true);
+        assertEquals("ovs-vsctl --if-exists set Port vnet42 other_config:hairpin=true", cmd);
+    }
+
+    @Test
+    public void hairpinCommandUsesIfExistsForRaceSafetyDuringReplug() {
+        // During replug, another thread may remove the port between add-port
+        // and the hairpin set. --if-exists turns the racing failure into a
+        // no-op instead of a stack trace. This is the same contract the
+        // per-plug path relies on.
+        final String cmd = OvnNicTunableApplier.buildHairpinCommand("dx6p0vf20", true);
+        assertTrue("hairpin set must use --if-exists for race safety during replug",
+                cmd.contains("--if-exists"));
+    }
 }

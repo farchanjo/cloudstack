@@ -1449,6 +1449,18 @@ public class OvnNbClient implements AutoCloseable {
      * {@code null} when the row does not exist.
      */
     private Map<String, String> readLogicalRouterOptions(final String lrUuid) {
+        return readLogicalRouterOptionsPublic(lrUuid);
+    }
+
+    /**
+     * Public read of a Logical_Router's {options} map. Returns {null} when
+     * the row does not exist or the read fails. Used by the scoped VPC
+     * force-SNAT reconciler so dry-run can classify topology + report
+     * "would strip" / "would assert" without mutating OVN. The private
+     * sibling delegates here so the existing ensureLbForceSnat path is
+     * unaffected.
+     */
+    public Map<String, String> readLogicalRouterOptionsPublic(final String lrUuid) throws OvnException {
         final ArrayNode columns = JsonNodeFactory.instance.arrayNode();
         columns.add("options");
         final OvnTransaction tx = newTransaction();

@@ -23,7 +23,7 @@ import static org.junit.Assert.assertTrue;
 import org.junit.Test;
 
 /**
- * Exercise the new OVS hairpin / tc-policy reconcile sweep on
+ * Exercise the OVS hairpin / tc-policy reconcile sweep on
  * {@link OvnReconcilerService}. The actual {@code ovs-vsctl} invocation
  * runs agent-side at every NIC plug; the management-side reconciler hook
  * simply records that the sweep ran by ticking the synthetic table
@@ -31,6 +31,11 @@ import org.junit.Test;
  * pin that contract so a future regression that drops the categories from
  * the API surface fails loudly here rather than silently in the admin
  * dashboard.
+ *
+ * <p><b>Fix #3:</b> ACK counters (hairpin-swept, tc-policy-swept) are now
+ * recorded under the separate {acks} map and do NOT inflate
+ * {totalorphans}. A prior version merged these into {orphans}, which made
+ * a clean zone report totalorphans=2 even when zero ports drifted.
  */
 public class OvnReconcilerOvsPolicyTest {
 
@@ -39,12 +44,12 @@ public class OvnReconcilerOvsPolicyTest {
         OvnReconcilerService svc = new OvnReconcilerService();
         OvnReconcilerService.Result out = new OvnReconcilerService.Result(false);
         svc.reassertOvsPolicy(7L, false, out);
-        assertNotNull(out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
-        assertNotNull(out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
+        assertNotNull(out.getAcksByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
+        assertNotNull(out.getAcksByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
         assertEquals(Integer.valueOf(1),
-                out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
         assertEquals(Integer.valueOf(1),
-                out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
     }
 
     @Test
@@ -55,15 +60,15 @@ public class OvnReconcilerOvsPolicyTest {
         svc.reassertOvsPolicy(2L, true, out);
         svc.reassertOvsPolicy(3L, true, out);
         assertEquals(Integer.valueOf(3),
-                out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
         assertEquals(Integer.valueOf(3),
-                out.getOrphansByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
     }
 
     @Test
     public void reassertOvsPolicyTolerateNullResult() {
         OvnReconcilerService svc = new OvnReconcilerService();
-        // Must not throw — defensive null check inside the hook.
+        // Must not throw - defensive null check inside the hook.
         svc.reassertOvsPolicy(1L, false, null);
     }
 
@@ -101,12 +106,44 @@ public class OvnReconcilerOvsPolicyTest {
     @Test
     public void synthethicTableKeysAreNamedDistinctly() {
         // The two new categories must not collide with the existing
-        // localnet-vlan synthetic key — distinct rows in the admin output.
+        // localnet-vlan synthetic key - distinct rows in the admin output.
         assertTrue(!OvnReconcilerService.Result.OVS_HAIRPIN_TABLE
                 .equals(OvnReconcilerService.Result.LOCALNET_VLAN_TABLE));
         assertTrue(!OvnReconcilerService.Result.OVS_TC_POLICY_TABLE
                 .equals(OvnReconcilerService.Result.LOCALNET_VLAN_TABLE));
         assertTrue(!OvnReconcilerService.Result.OVS_HAIRPIN_TABLE
                 .equals(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
+    }
+
+    // ------------------------------------------------------------------
+    // Fix #3 regression: ACK rows do not inflate totalorphans.
+    // ------------------------------------------------------------------
+
+    @Test
+    public void reassertOvsPolicyAckDoesNotInflateTotalOrphans() {
+        OvnReconcilerService svc = new OvnReconcilerService();
+        OvnReconcilerService.Result out = new OvnReconcilerService.Result(false);
+        svc.reassertOvsPolicy(1L, false, out);
+        // The ACK counters (hairpin-swept, tc-policy-swept) land in acks,
+        // NOT orphans. A clean zone must report totalorphans=0.
+        assertEquals("OVS policy ack must not inflate totalorphans", 0, out.totalOrphans());
+    }
+
+    @Test
+    public void reassertOvsPolicyCleanZoneReportsZeroOrphans() {
+        OvnReconcilerService svc = new OvnReconcilerService();
+        OvnReconcilerService.Result out = new OvnReconcilerService.Result(true);
+        // Two zones swept, no drift on either -> orphans=0. The acks map
+        // accumulates by key (HAIRPIN_TABLE, TC_POLICY_TABLE), so the map
+        // size is 2 (one per category), not 4 (one per zone x category).
+        // The VALUE of each key is the accumulated zone count.
+        svc.reassertOvsPolicy(1L, true, out);
+        svc.reassertOvsPolicy(2L, true, out);
+        assertEquals(0, out.totalOrphans());
+        assertEquals(2, out.getAcksByTable().size());
+        assertEquals(Integer.valueOf(2),
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_HAIRPIN_TABLE));
+        assertEquals(Integer.valueOf(2),
+                out.getAcksByTable().get(OvnReconcilerService.Result.OVS_TC_POLICY_TABLE));
     }
 }

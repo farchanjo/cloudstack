@@ -75,8 +75,11 @@ public interface OvnAdminService {
 
     /**
      * Run either the zone-wide reconciler or a narrowly scoped resource pass.
-     * Scoped reconciliation currently supports only {@code LOAD_BALANCER}; it
-     * refuses to remove a mapping while the CloudStack rule still exists.
+     * Scoped reconciliation supports {LOAD_BALANCER} (surgical removal of
+     * deleted-rule leftovers), {VPC} (topology-aware force-SNAT reconcile on
+     * one VPC's Logical_Router), and {OVS_POLICY} (hairpin + tc-policy drift
+     * sweep on one host). The VPC and OVS_POLICY scopes are fail-closed and
+     * never invoke zone-wide repair tasks.
      */
     OvnReconcileResultResponse runReconciler(long zoneId, boolean dryRun, boolean purgeUntagged,
                                              String resourceKind, Long resourceId);

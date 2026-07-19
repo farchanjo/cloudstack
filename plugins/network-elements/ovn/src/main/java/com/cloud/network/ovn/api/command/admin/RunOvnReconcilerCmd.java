@@ -70,11 +70,19 @@ public class RunOvnReconcilerCmd extends BaseCmd {
     private Boolean purgeUntagged;
 
     @Parameter(name = "resourcekind", type = CommandType.STRING,
-            description = "optional scoped reconciliation kind; currently only LOAD_BALANCER is supported")
+            description = "optional scoped reconciliation kind. Accepted values: "
+                    + "LOAD_BALANCER (surgical removal of a deleted LB rule's mapping), "
+                    + "VPC (topology-aware force-SNAT reconcile on one VPC's Logical_Router), "
+                    + "OVS_POLICY (hairpin + tc-policy drift sweep on one host's OVN bridge). "
+                    + "Defaults to zone-wide reconciliation when omitted.")
     private String resourceKind;
 
     @Parameter(name = "resourceid", type = CommandType.LONG,
-            description = "internal CloudStack entity ID for scoped reconciliation; requires resourcekind")
+            description = "internal CloudStack entity ID for scoped reconciliation; "
+                    + "requires resourcekind. For LOAD_BALANCER: the LB rule id. "
+                    + "For VPC: the VPC id. For OVS_POLICY: the host id. "
+                    + "No resourcekind filter on zone-wide reconciliation "
+                    + "because the force-SNAT safety-net is in the zone path.")
     private Long resourceId;
 
     @Override

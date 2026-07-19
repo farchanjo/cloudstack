@@ -73,6 +73,10 @@ import com.cloud.network.ovn.element.OvnConstants;
 import com.cloud.network.ovn.element.OvnNetworkElement;
 import com.cloud.network.ovn.element.OvnPublicNetworkManager;
 import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.rules.PortForwardingRuleVO;
+import com.cloud.network.rules.dao.PortForwardingRulesDao;
+import com.cloud.network.vpc.Vpc;
+import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.NicVO;
@@ -80,6 +84,10 @@ import com.cloud.vm.VMInstanceVO;
 import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.dao.NicDao;
 import com.cloud.vm.dao.VMInstanceDao;
+import com.cloud.host.Host;
+import com.cloud.host.HostVO;
+import com.cloud.host.Status;
+import com.cloud.host.dao.HostDao;
 
 /**
  * Periodic / on-demand reconciler. Walks every NB table and the mapping
@@ -152,6 +160,10 @@ public class OvnReconcilerService {
     @Inject
     private UserPublicIpv6AddressDao userPublicIpv6AddressDao;
     @Inject
+    private PortForwardingRulesDao portForwardingRulesDao;
+    @Inject
+    private HostDao hostDao;
+    @Inject
     private OvnPublicNetworkManager publicNetworkManager;
     @Inject
     private OvnBgpRedistributeManager bgpRedistributeManager;
@@ -203,11 +215,12 @@ public class OvnReconcilerService {
                 sweepUntaggedRows(nb, controller, table, dryRun, out);
             }
         }
-        // Legacy migration sweep — drop Load_Balancer rows still tagged with
-        // cs_kind=PORT_FORWARDING (pre-migration shape). Any mapping whose
-        // ovn_uuid matches one of these LB rows will get rebuilt as a NAT
-        // row on the next applyPF call; the row itself is now orphan from
-        // the LR.load_balancer set perspective so we drop it.
+        // Legacy-NAT sweep — drop dnat_and_snat NAT rows still tagged with
+        // cs_kind=PORT_FORWARDING (the legacy pre-plugin PF shape). The
+        // current PF representation is an OVN Load_Balancer row; any mapping
+        // whose ovn_uuid matches one of these legacy NAT rows will be
+        // rebuilt as a Load_Balancer row on the next applyPF call; the NAT
+        // row itself is now orphan so we drop it.
         sweepLegacyPortForwardingLb(nb, controller, dryRun, out);
         // Public localnet VLAN drift sweep — keeps the per-zone localnet LSP
         // tag aligned with operator config. Runs unconditionally because the
@@ -312,16 +325,41 @@ public class OvnReconcilerService {
 
     /**
      * Reconcile one mapped OVN resource without running zone-wide repair
-     * tasks. This is intentionally restricted to load balancers because the
-     * admin API uses it for surgical removal of deleted-rule leftovers.
+     * tasks. Fail-closed scoped paths:
+     * <ul>
+     *   <li>{@link Kind#LOAD_BALANCER} — surgical removal of deleted-rule
+     *       leftovers (existing behavior).</li>
+     *   <li>{@link Kind#VPC} — topology-aware force-SNAT reconcile on the
+     *       single VPC's Logical_Router. Dry-run reports whether the legacy
+     *       {OvnNbClient#LB_FORCE_SNAT_ROUTER_IP} token would be stripped
+     *       from a distributed LR (or asserted on a centralized LR). Apply
+     *       calls {OvnNbClient#ensureLbForceSnat} on that one LR only.
+     *       NEVER calls reconcileZone, TABLE_KINDS, OVS sweep, NAT/PF
+     *       sweep, DSR/ECMP, port-security, or BGP. Preserves explicit
+     *       IPv4/IPv6 lb_force_snat_ip values and centralized
+     *       router_ip assertions.</li>
+     * </ul>
      */
     public Result reconcileResource(final long zoneId, final Kind kind, final long csId, final boolean dryRun) {
-        if (kind != Kind.LOAD_BALANCER) {
-            throw new OvnException("scoped reconciliation supports only LOAD_BALANCER");
+        if (kind != Kind.LOAD_BALANCER && kind != Kind.VPC && kind != Kind.NIC) {
+            throw new OvnException("scoped reconciliation supports only LOAD_BALANCER, VPC, and OVS_POLICY");
         }
         final OvnControllerVO controller = pluginManager.findControllerForZone(zoneId);
         if (controller == null) {
             throw new OvnException("OvnReconcilerService: no controller for zone " + zoneId);
+        }
+        if (kind == Kind.VPC) {
+            return reconcileVpcForceSnat(zoneId, controller, csId, dryRun);
+        }
+        if (kind == Kind.NIC) {
+            // OVS_POLICY scope is keyed by internal host ID (passed as csId).
+            // Kind.NIC is the existing enum value closest to "host port"; it
+            // is NOT used to look up a NIC here — the host ID drives the
+            // chassis sweep. We accept NIC as the resourcekind token for
+            // OVS_POLICY to avoid introducing a new Kind enum value (the API
+            // command surfaces resourcekind=OVS_POLICY, mapped to NIC
+            // internally so existing Kind-based dispatch works).
+            return reconcileOvsPolicyHost(zoneId, controller, csId, dryRun);
         }
         final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(kind, csId, controller.getId());
         if (mapping == null) {
@@ -332,6 +370,139 @@ public class OvnReconcilerService {
             return out;
         }
         reconcileDeletedLoadBalancer(pluginManager.nbClient(zoneId), controller, mapping, dryRun, out);
+        return out;
+    }
+
+    /**
+     * Scoped force-SNAT reconcile for one VPC. Validates the VPC is Enabled,
+     * has a {Kind#VPC} mapping, and the mapped Logical_Router exists in NB.
+     * Dry-run reports whether the legacy router_ip token would be stripped
+     * (distributed) or asserted (centralized) without mutating OVN. Apply
+     * calls {OvnNbClient#ensureLbForceSnat} on that one LR only. Explicit
+     * IPv4/IPv6 lb_force_snat_ip values are always preserved; centralized
+     * routers keep the valid router_ip assertion.
+     */
+    private Result reconcileVpcForceSnat(final long zoneId, final OvnControllerVO controller,
+                                         final long vpcId, final boolean dryRun) {
+        // Validate CloudStack-side ownership.
+        final VpcVO vpc = vpcDao.findById(vpcId);
+        if (vpc == null) {
+            throw new OvnException("scoped VPC reconcile: no VPC id=" + vpcId);
+        }
+        if (vpc.getZoneId() != zoneId) {
+            // Fail closed — wrong zone.
+            throw new OvnException("scoped VPC reconcile: VPC id=" + vpcId
+                    + " belongs to zone " + vpc.getZoneId() + ", not " + zoneId);
+        }
+        if (vpc.getState() != Vpc.State.Enabled) {
+            throw new OvnException("scoped VPC reconcile: VPC id=" + vpcId
+                    + " state=" + vpc.getState() + " (requires Enabled)");
+        }
+        final OvnLogicalIdMapVO mapping = logicalIdMapDao.findByCsId(Kind.VPC, vpcId, controller.getId());
+        if (mapping == null) {
+            throw new OvnException("scoped VPC reconcile: no VPC mapping for vpc id=" + vpcId);
+        }
+        final OvnNbClient nb = pluginManager.nbClient(zoneId);
+        if (!nb.rowExistsByUuid("Logical_Router", mapping.getOvnUuid())) {
+            throw new OvnException("scoped VPC reconcile: Logical_Router " + mapping.getOvnUuid()
+                    + " for VPC id=" + vpcId + " not found in NB");
+        }
+        final Result out = new Result(dryRun);
+        // Read the LR options to classify topology + decide whether a write
+        // is needed. This is the exact same read performed by
+        // {OvnNbClient#ensureLbForceSnat} — we duplicate it here so dry-run
+        // reports "would strip" / "would assert" without mutating.
+        final java.util.Map<String, String> options = readScopedLrOptions(nb, mapping.getOvnUuid());
+        final boolean centralized = options != null && options.containsKey(OvnNbClient.LR_OPT_CHASSIS);
+        final String current = options == null ? null : options.get(OvnNbClient.LR_OPT_LB_FORCE_SNAT);
+        final boolean needsWrite;
+        final String action;
+        if (centralized) {
+            // Centralized router — router_ip magic is valid. Assert it when
+            // missing or different.
+            needsWrite = !OvnNbClient.LB_FORCE_SNAT_ROUTER_IP.equals(current);
+            action = needsWrite ? "would_assert_router_ip" : "no_change";
+        } else {
+            // Distributed router — router_ip magic is inert and logs
+            // "bad ip router_ip" in northd. Strip ONLY the magic value; an
+            // explicit IPv4/IPv6 lb_force_snat_ip is preserved.
+            needsWrite = OvnNbClient.LB_FORCE_SNAT_ROUTER_IP.equals(current);
+            action = needsWrite ? "would_strip_legacy_router_ip" : "no_change";
+        }
+        // Record the scoped action under a synthetic table key so the API
+        // response surfaces a machine-checkable counter without inventing a
+        // new response column.
+        out.recordScopedForcesnat(action, centralized, needsWrite);
+        if (!dryRun && needsWrite) {
+            nb.ensureLbForceSnat(mapping.getOvnUuid());
+            LOGGER.info("OvnReconcilerService: scoped VPC reconcile zone={} vpc={} lr={} topology={} action={}",
+                    zoneId, vpcId, mapping.getOvnUuid(), centralized ? "centralized" : "distributed", action);
+        }
+        return out;
+    }
+
+    /** Read Logical_Router options via the NB client read helper. Package-private
+     *  seam so unit tests can stub the client; the client itself returns
+     *  {null} when the row is gone, which the caller treats as a fail-closed
+     *  condition above. */
+    private java.util.Map<String, String> readScopedLrOptions(final OvnNbClient nb, final String lrUuid) {
+        try {
+            return nb.readLogicalRouterOptionsPublic(lrUuid);
+        } catch (final OvnException oe) {
+            return null;
+        }
+    }
+
+    /**
+     * Scoped OVS_POLICY reconcile for one host. Validates the host belongs
+     * to the zone, is Up, and is registered as an OVN chassis under this
+     * zone's controller. Calls only {#sweepOneChassis} for that host —
+     * never reconcileZone, TABLE_KINDS, NAT/PF sweep, DSR/ECMP, port-
+     * security, or BGP. Aggregates scanned/drifted/fixed/tc-policy into
+     * the {Result} so the API response is machine-checkable. The per-zone
+     * hairpin/tc-policy ACK counters are NOT ticked (only the per-host ack
+     * is recorded, so a clean host reports totalorphans=0).
+     */
+    private Result reconcileOvsPolicyHost(final long zoneId, final OvnControllerVO controller,
+                                          final long hostId, final boolean dryRun) {
+        // Validate CloudStack-side host ownership.
+        final HostVO host = hostDao.findById(hostId);
+        if (host == null) {
+            throw new OvnException("scoped OVS_POLICY reconcile: no host id=" + hostId);
+        }
+        if (host.getDataCenterId() != zoneId) {
+            throw new OvnException("scoped OVS_POLICY reconcile: host id=" + hostId
+                    + " belongs to zone " + host.getDataCenterId() + ", not " + zoneId);
+        }
+        if (host.getStatus() != Status.Up) {
+            throw new OvnException("scoped OVS_POLICY reconcile: host id=" + hostId
+                    + " status=" + host.getStatus() + " (requires Up)");
+        }
+        if (host.getType() != Host.Type.Routing) {
+            throw new OvnException("scoped OVS_POLICY reconcile: host id=" + hostId
+                    + " type=" + host.getType() + " (requires Routing)");
+        }
+        final OvnChassisMapVO chassis = chassisMapDao.findByHostId(hostId);
+        if (chassis == null || chassis.getControllerId() != controller.getId()) {
+            throw new OvnException("scoped OVS_POLICY reconcile: host id=" + hostId
+                    + " not registered as OVN chassis under controller " + controller.getId());
+        }
+        final Result out = new Result(dryRun);
+        out.recordScopedOvsPolicyHost(hostId);
+        // Resolve the same defaults the zone-wide sweep uses.
+        final Boolean hairpinDefault = resolveHairpinDefault();
+        final String tcPolicyDefault = resolveTcPolicyDefault();
+        if (hairpinDefault == null && StringUtils.isBlank(tcPolicyDefault)) {
+            LOGGER.debug("OvnReconcilerService.reconcileOvsPolicyHost: zone={} host={} no defaults; sweep skipped",
+                    zoneId, hostId);
+            return out;
+        }
+        final String portRegex = resolveSweepPortRegex();
+        // Delegate to the existing per-chassis sweep — same code path the
+        // zone-wide reconciler uses, just for one host.
+        sweepOneChassis(hostId, hairpinDefault, tcPolicyDefault, portRegex, dryRun, out);
+        LOGGER.info("OvnReconcilerService: scoped OVS_POLICY reconcile zone={} host={} dryRun={} orphans={} acks={}",
+                zoneId, hostId, dryRun, out.totalOrphans(), out.getAcksByTable().size());
         return out;
     }
 
@@ -2208,14 +2379,17 @@ public class OvnReconcilerService {
     }
 
     /**
-     * Migration-window sweep: drop legacy {@code Load_Balancer} rows still
-     * tagged with {@code cs_kind=PORT_FORWARDING} (pre-NAT plugin shape)
-     * whose UUID has no live mapping back to them, OR whose mapping has
-     * already moved to a NAT row. The first
+     * Legacy-NAT sweep: drop OVN NAT rows still tagged with
+     * {@code cs_kind=PORT_FORWARDING} (the pre-plugin legacy shape that
+     * represented PFs as dnat_and_snat NAT rows). The current plugin
+     * represents each PF rule as an OVN Load_Balancer row; a NAT-tagged
+     * PF row is legacy and is swept here when it has no live mapping
+     * pointing at it, or when the mapping has already moved to the
+     * Load_Balancer UUID. The first
      * {@link OvnPortForwardingService#applyPFRules} touch on the rule
-     * rewrites the mapping to the new NAT UUID; this sweep cleans up the
-     * now-orphan LB row. Keeps reconcile correct after hot upgrade without
-     * forcing the operator to revoke and re-add PF rules.
+     * rewrites the mapping to the Load_Balancer UUID; this sweep cleans up
+     * the now-orphan legacy NAT row. Keeps reconcile correct after hot
+     * upgrade without forcing the operator to revoke and re-add PF rules.
      */
     private void sweepLegacyPortForwardingLb(final OvnNbClient nb, final OvnControllerVO controller,
                                               final boolean dryRun, final Result out) {
@@ -2295,11 +2469,14 @@ public class OvnReconcilerService {
             for (final OvnLogicalIdMapVO mapping : mappings) {
                 boolean nbGone = !nb.rowExistsByUuid(table, mapping.getOvnUuid());
                 String liveTable = nbGone ? null : table;
-                // PORT_FORWARDING migrated from Load_Balancer to NAT; during
-                // the migration window a mapping persisted by a pre-migration
-                // plugin version still references a Load_Balancer UUID. Probe
-                // the legacy table as a fallback so reconcile does not flag
-                // those mappings as stale (next applyPF call rewrites them).
+                // Port-forwarding rules are currently represented as OVN
+                // Load_Balancer rows (single-backend VIP), so a PF mapping
+                // carries an OVN Load_Balancer UUID, not a NAT UUID. Probe
+                // the Load_Balancer table as a fallback so the NAT-table
+                // sweep recognises a live PF mapping as live instead of
+                // flagging it as stale. A legacy pre-plugin shape used
+                // dnat_and_snat NAT rows; the applyPF path migrates those to
+                // Load_Balancer on the next touch.
                 if (nbGone && kind == Kind.PORT_FORWARDING && "NAT".equals(table)
                         && nb.rowExistsByUuid("Load_Balancer", mapping.getOvnUuid())) {
                     nbGone = false;
@@ -2364,7 +2541,16 @@ public class OvnReconcilerService {
             case LOAD_BALANCER:
                 return loadBalancerDao.findById(csId) != null;
             case PORT_FORWARDING:
-                return loadBalancerDao.findById(csId) != null;
+                // Port-forwarding rules live in port_forwarding_rules (a
+                // FirewallRuleVO subtype), NOT in load_balancing_rules. The
+                // plugin represents each PF rule as an OVN Load_Balancer row
+                // (single-backend VIP) tagged cs_kind=PORT_FORWARDING; the
+                // CloudStack-side lifecycle ownership, however, is the PF
+                // rule itself. Using LoadBalancerDao here caused every live
+                // PF rule to be misclassified as stale (csGone=true) because
+                // no LoadBalancerVO row exists for a PF cs_id.
+                final PortForwardingRuleVO pf = portForwardingRulesDao.findById(csId);
+                return pf != null;
             case NETWORK_ACL:
                 return networkACLItemDao.findById(csId) != null;
             case FIREWALL:
@@ -2469,13 +2655,14 @@ public class OvnReconcilerService {
         // QoS rows have no parent-set referential-integrity contract (unlike
         // ACL/LB/LSP): they are deleted directly by UUID, same as DNS.
         m.put("QoS", new Kind[]{Kind.QOS});
-        // PORT_FORWARDING migrated from Load_Balancer (legacy) to NAT
-        // (current). The kind is registered against NAT here — its post-
-        // migration home — and sweepStaleMappings probes Load_Balancer as a
-        // fallback so legacy LB-PF rows are recognised as live (not stale)
-        // during the migration window. The Load_Balancer entry below covers
-        // any LB-PF row still tagged with cs_kind=PORT_FORWARDING in
-        // external_ids so a reconcile after upgrade reports + drops them.
+        // Port-forwarding rules are currently represented as OVN
+        // Load_Balancer rows (single-backend VIP) tagged
+        // cs_kind=PORT_FORWARDING. The NAT-table registration here drives
+        // sweepStaleMappings to probe the Load_Balancer table as the live
+        // fallback so a mapping whose OVN UUID is still a Load_Balancer row
+        // is recognised as live, not stale. (A legacy pre-plugin shape
+        // represented PFs as dnat_and_snat NAT rows; that path is the
+        // migration legacy, NOT the current representation.)
         m.put("NAT", new Kind[]{Kind.STATIC_NAT, Kind.SOURCE_NAT, Kind.VPC_SOURCE_NAT, Kind.PORT_FORWARDING});
         // FIREWALL (standalone-isolated Firewall service: baseline deny +
         // infra allow + per-rule ACLs) maps to the same NB `ACL` table as
@@ -2529,6 +2716,13 @@ public class OvnReconcilerService {
         private final boolean dryRun;
         private final Map<String, Integer> orphans = new LinkedHashMap<>();
         private final Map<String, Integer> staleMappings = new LinkedHashMap<>();
+        // Synthetic per-zone ACK/status counters (hairpin sweep ran, tc-policy
+        // sweep ran). Separated from {orphans} so totalorphans reports ONLY
+        // genuine drift (hairpin drift, tc-policy apply events, localnet VLAN
+        // drift) and NOT the "the sweep category was ticked for zone N" ack.
+        // A prior version merged these acks into orphans, which made a clean
+        // zone report totalorphans=2 even when zero ports drifted.
+        private final Map<String, Integer> acks = new LinkedHashMap<>();
 
         public Result(final boolean dryRun) {
             this.dryRun = dryRun;
@@ -2544,6 +2738,13 @@ public class OvnReconcilerService {
 
         public Map<String, Integer> getStaleMappingsByTable() {
             return staleMappings;
+        }
+
+        /** Per-zone sweep ACK / status counters (hairpin-swept, tc-policy-swept).
+         *  These are surfaced in the response for operator visibility but do
+         *  NOT contribute to {#totalOrphans}. */
+        public Map<String, Integer> getAcksByTable() {
+            return acks;
         }
 
         public int totalOrphans() {
@@ -2585,11 +2786,13 @@ public class OvnReconcilerService {
         /**
          * Record an OVS hairpin / tc-policy reconciliation pass for a zone.
          * Counts the per-zone ack so the admin API surfaces that the sweep
-         * categories were ticked, even when no chassis returned drift.
+         * categories were ticked, even when no chassis returned drift. The
+         * ack is recorded under the {acks} map, NOT under {orphans}, so a
+         * clean zone (zero drift) reports totalorphans=0 instead of 2.
          */
         public void recordOvsPolicyAck(final long zoneId) {
-            orphans.merge(OVS_HAIRPIN_TABLE, 1, Integer::sum);
-            orphans.merge(OVS_TC_POLICY_TABLE, 1, Integer::sum);
+            acks.merge(OVS_HAIRPIN_TABLE, 1, Integer::sum);
+            acks.merge(OVS_TC_POLICY_TABLE, 1, Integer::sum);
             LOGGER.debug("OvnReconcilerService: ovs policy ack for zone={}", zoneId);
         }
 
@@ -2612,6 +2815,43 @@ public class OvnReconcilerService {
             }
             LOGGER.debug("OvnReconcilerService: sweep host={} scanned={} drifted={} fixed={} tcApplied={}",
                     hostId, portsScanned, hairpinDrifted, hairpinFixed, tcPolicyApplied);
+        }
+
+        /** Synthetic ack key for the scoped VPC force-SNAT action so the
+         *  API response surfaces a machine-checkable counter. */
+        public static final String FORCESNAT_ACTION_TABLE = "Logical_Router_ForceSnat";
+
+        /** Synthetic ack key for the scoped OVS_POLICY host sweep so the
+         *  API response surfaces which host was swept. */
+        public static final String OVS_POLICY_HOST_TABLE = "Open_vSwitch_Policy_Host";
+
+        /**
+         * Record the scoped VPC force-SNAT action. The action string is one
+         * of {would_strip_legacy_router_ip, would_assert_router_ip,
+         * no_change}; {centralized} is the topology classification;
+         * {needsWrite} is whether an apply pass would mutate OVN. Recorded
+         * under {acks} (NOT orphans) so a clean dry-run does not inflate
+         * totalorphans.
+         */
+        public void recordScopedForcesnat(final String action, final boolean centralized, final boolean needsWrite) {
+            acks.merge(FORCESNAT_ACTION_TABLE + ":" + action, 1, Integer::sum);
+            acks.merge(FORCESNAT_ACTION_TABLE + ":topology",
+                    centralized ? 1 : 0, Integer::sum);
+            acks.merge(FORCESNAT_ACTION_TABLE + ":needsWrite",
+                    needsWrite ? 1 : 0, Integer::sum);
+            LOGGER.debug("OvnReconcilerService: scoped forcesnat action={} centralized={} needsWrite={}",
+                    action, centralized, needsWrite);
+        }
+
+        /**
+         * Record the scoped OVS_POLICY host sweep result. Aggregates
+         * scanned/drifted/fixed under {orphans} (real drift — these are
+         * ports whose hairpin flag differs from the desired default) and
+         * the host ack under {acks} so the response surfaces which host
+         * was swept without inflating totalorphans when the host was clean.
+         */
+        public void recordScopedOvsPolicyHost(final long hostId) {
+            acks.merge(OVS_POLICY_HOST_TABLE + ":" + hostId, 1, Integer::sum);
         }
     }
 }
