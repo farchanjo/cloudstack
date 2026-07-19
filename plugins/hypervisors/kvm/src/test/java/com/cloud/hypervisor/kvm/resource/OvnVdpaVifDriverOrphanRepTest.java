@@ -86,19 +86,18 @@ public class OvnVdpaVifDriverOrphanRepTest {
     }
 
     @Test
-    public void freeRepresentorOnOvs_clearsExternalIdsThenDelPort() {
+    public void freeRepresentorOnOvs_passesArgumentVector() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.runSimpleBashScript(org.mockito.ArgumentMatchers.anyString()))
-                    .thenReturn("");
+            scriptMock.when(() -> Script.executeCommandForExitValue(any(String[].class))).thenReturn(0);
 
             OvnVifDriver.freeRepresentorOnOvs(
                     org.apache.logging.log4j.LogManager.getLogger(OvnVdpaVifDriverOrphanRepTest.class),
                     "test", "dx6p0vf9");
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("clear Interface dx6p0vf9 external_ids")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf9")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port br-")), never());
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p0vf9", "external_ids"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "del-port", "dx6p0vf9"), times(1));
         }
     }
 

@@ -497,11 +497,11 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         return atom;
     }
 
-    private JsonArray stringAtom(final String value) {
-        final JsonArray atom = new JsonArray();
-        atom.add("string");
-        atom.add(value);
-        return atom;
+    private JsonElement stringAtom(final String value) {
+        // RFC7047 string columns use JSON strings directly. The typed atom
+        // form is valid for UUID/set/map values only; OVSDB 3.3 rejects
+        // ["string", value] with "expected string".
+        return new com.google.gson.JsonPrimitive(value);
     }
 
     private void addEquals(final JsonArray where, final String field, final JsonElement value) {

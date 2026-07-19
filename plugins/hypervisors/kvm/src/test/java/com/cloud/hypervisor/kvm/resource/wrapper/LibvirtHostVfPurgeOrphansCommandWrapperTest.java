@@ -372,6 +372,24 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         assertTrue(LibvirtHostVfPurgeOrphansCommandWrapper.matchesExpectedMac(OWNER_MAC, OWNER_MAC));
     }
 
+    @Test
+    public void strictVdpaJsonAcceptsEmptyInventoryAndRejectsUnknownShapes() {
+        assertTrue(LibvirtHostVfPurgeOrphansCommandWrapper
+                .parseVdpaDevicesByBdfStrict("{\"dev\":{}}").isEmpty());
+        expectIllegalArgument("[]");
+        expectIllegalArgument("{\"dev\":{\"vdpa0\":{}}}");
+        expectIllegalArgument("{\"dev\":{\"vdpa0\":{\"mgmtdev\":\"pci/not-a-bdf\"}}}");
+    }
+
+    private void expectIllegalArgument(final String json) {
+        try {
+            LibvirtHostVfPurgeOrphansCommandWrapper.parseVdpaDevicesByBdfStrict(json);
+        } catch (IllegalArgumentException expected) {
+            return;
+        }
+        throw new AssertionError("expected strict vDPA parser rejection");
+    }
+
     private FakeHost preparedHost(final String name) throws Exception {
         final FakeHost host = new FakeHost(temporaryFolder.newFolder(name).toPath());
         host.prepareExactParentTopology();
@@ -573,6 +591,14 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 return CommandResult.success(response.toString());
             }
             for (int index = 1; index <= 3; index++) {
+                final JsonObject wait = operations.get(index).getAsJsonObject();
+                assertEquals("wait", wait.get("op").getAsString());
+                assertTrue("RFC7047 timeout must be numeric zero",
+                        wait.get("timeout").isJsonPrimitive()
+                                && wait.get("timeout").getAsJsonPrimitive().isNumber());
+                assertEquals(0, wait.get("timeout").getAsInt());
+            }
+            for (int index = 1; index <= 3; index++) {
                 final JsonObject result = new JsonObject();
                 final JsonArray rows = new JsonArray();
                 rows.add(new JsonObject());
@@ -595,7 +621,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             for (int index = 0; index < where.size(); index++) {
                 final JsonArray clause = where.get(index).getAsJsonArray();
                 if ("name".equals(clause.get(0).getAsString())) {
-                    return clause.get(2).getAsJsonArray().get(1).getAsString();
+                    assertTrue("OVSDB string predicate must be a plain JSON string",
+                            clause.get(2).isJsonPrimitive() && clause.get(2).getAsJsonPrimitive().isString());
+                    return clause.get(2).getAsString();
                 }
             }
             return ovsName;
