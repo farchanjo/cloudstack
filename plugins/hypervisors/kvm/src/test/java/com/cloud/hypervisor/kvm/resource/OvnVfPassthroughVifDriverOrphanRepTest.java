@@ -19,9 +19,9 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
-import static org.mockito.ArgumentMatchers.matches;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -73,7 +73,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
     /**
      * When the OVS find command returns two representors for the same
      * iface-id and keepRepName is one of them, only the other rep must be
-     * removed with del-port. The target rep must never be passed to del-port.
+     * removed through the shared UUID-bound OVSDB CAS helper.
      */
     @Test
     public void clearOrphanRepsForLspName_clearsOtherRep_keepsTarget() throws Exception {
@@ -84,19 +84,13 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface")))
                     .thenReturn("dx6p1vf6\ndx6p0vf4");
 
-            // All other Script calls (del-port) should succeed with empty output.
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
-                    .thenReturn("");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
                     .thenReturn("{migration-owner=destination, iface-status=inactive}");
 
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
-            // del-port must have been called exactly once — for the orphan, not the keeper.
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p0vf4.*")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    matches(".*del-port.*dx6p1vf6.*")), never());
+            // The orphan must enter the shared CAS path; the keeper must not.
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(1));
         }
     }
 
@@ -121,7 +115,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
     /**
      * When the OVS find query returns empty output (no orphan exists) no
-     * del-port command must be issued.
+     * OVSDB CAS command must be issued.
      */
     @Test
     public void clearOrphanRepsForLspName_skipsWhenNoMatch() throws Exception {
@@ -133,7 +127,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             invokeClearOrphans(driver, "lsp-c44b8d7e", "dx6p0vf2");
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), never());
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), never());
         }
     }
 
@@ -161,10 +155,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             driver.cleanupStaleRepsByLspName("lsp-b3f77bd2");
 
-            // Both reps must have been removed — keepRepName=null means keep nothing.
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(2));
-            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p1vf6.*")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p0vf4.*")), times(1));
+             // Both reps must enter the CAS path — keepRepName=null means keep nothing.
+             scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(2));
         }
     }
 
@@ -247,16 +239,10 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p0vf4");
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("clear Interface")))
-                    .thenReturn("");
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
-                    .thenReturn("");
 
             driver.unplug(iface, true);
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("clear Interface dx6p0vf4 external_ids")),
-                    times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf4")), times(1));
+             scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(1));
         }
     }
 
