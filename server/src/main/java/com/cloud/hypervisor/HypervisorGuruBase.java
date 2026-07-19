@@ -712,6 +712,13 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
 
     private void allocateVfIfHwOffload(NicTO nicTo, NicProfile nicProfile, VirtualMachineProfile vmProfile) {
         if (vfPoolManager == null) {
+            final NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
+            final com.cloud.offerings.NetworkOfferingVO offering = network == null ? null
+                    : networkOfferingDao.findById(network.getNetworkOfferingId());
+            if (offering != null && offering.isVdpaEnabled()) {
+                throw vdpaCapacityFailure(vmProfile.getHostId(), nicProfile.getId(),
+                        new IllegalStateException("vDPA pool manager is unavailable"));
+            }
             return;
         }
         final boolean isVr = vmProfile.getType() == com.cloud.vm.VirtualMachine.Type.DomainRouter;
