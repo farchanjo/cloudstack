@@ -337,7 +337,9 @@ public class OvnVifDriver extends VifDriverBase {
 
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
         try {
-            return new OvsRepresentorCas.Result(true, Script.executeCommand(argv), "");
+            final String output = Script.executeCommand(argv);
+            return output == null ? new OvsRepresentorCas.Result(false, "", "no OVSDB output")
+                    : new OvsRepresentorCas.Result(true, output, "");
         } catch (RuntimeException e) {
             return new OvsRepresentorCas.Result(false, "", e.getMessage());
         }
