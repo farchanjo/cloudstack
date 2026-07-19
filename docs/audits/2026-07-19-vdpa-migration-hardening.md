@@ -1062,7 +1062,35 @@ path requires an Argo-version-specific diff inspection or a controlled GitOps
 application-definition ownership fix; it must not be worked around by broad
 annotation ignores or an imperative child-workload patch.
 
-### 16.1 Mandatory serial evidence matrix before rollout resumes
+### 16.1 Cluster-consistency hard gate
+
+**Availability is insufficient.** At every mutation checkpoint, capture a
+comparable named **BEFORE** snapshot and **AFTER** snapshot for both production
+clusters, Snape and Salazar. The AFTER snapshot must be compared field-by-field
+with BEFORE; printing a healthy current status without comparison is not a gate.
+
+The consistency tuple is:
+
+| Domain | Required comparable evidence | Immediate abort condition |
+|---|---|---|
+| etcd / control plane | Member and cluster IDs, membership set, endpoint health/status, quorum `3/3`, leader present, alarms, and raft/applied-index values where exposed | Any membership/ID change, missing leader, quorum loss, alarm, or unexpected raft/applied-index divergence |
+| Kubernetes API | API endpoint status and all three control-plane API members responding | Any API member loss, identity change, or endpoint inconsistency |
+| Nodes / placement | Node names, UIDs, readiness/taints, and authoritative CloudStack VM-to-host placement | Any node transition, UID/name change, placement drift, or unexpected reschedule |
+| Production VM set | Exact 19 Kubernetes VM identities, states, host placement, and NIC identity | Any VM not `Running`, duplicate/missing VM, host/NIC identity change, or unintended migration |
+| Controllers / workloads | Desired = current = ready for controllers, DaemonSets, StatefulSets, CloneSets, and critical workloads; pod names/UIDs, restart counts, and revisions | Any restart, reschedule, revision change, replica mismatch, or readiness divergence |
+| GitOps / applications | Argo Applications `Synced` + `Healthy`, including `accouting` and StarRocks; workload identities/revisions stable | Any OutOfSync/Unhealthy state or identity/revision drift |
+| Accounting / StarRocks | Accounting three endpoints and actuator v4/v6; StarRocks FE/CN identities, revisions, endpoints, and Secret hashes | Any endpoint, identity, revision, or secret-hash change not explicitly part of the step |
+| CloudStack / dataplane | Host/VM/NIC state, OVN Raft/northd/chassis authoritative state (`Chassis_Private`), OVS bridges/bonds/OpenFlow/representors/vDPA identity, CT_LB `.35/.33`, all dual-stack DSR endpoints | Any dataplane, binding, quorum, placement, or endpoint inconsistency |
+| Physical / CRC exception | Timestamped raw counters for every physical host, bond slave, and relevant representor before/after each phase | CRC increments alone are observe/report; link-down, carrier/LACP loss, storm/BUM, or accelerating discard/error rate is immediate abort |
+
+Evidence must retain timestamps, source command/API, stable IDs, and the
+BEFORE→AFTER delta. A mutation may proceed only when every tuple is unchanged
+except for the explicitly expected identity/state transition documented for that
+step. Any membership, identity, placement, revision, restart, quorum, or
+dataplane inconsistency is an immediate rollback/`NO_GO`, even when HTTP/API
+endpoints still answer.
+
+### 16.2 Mandatory serial evidence matrix before rollout resumes
 
 The exact 19-VM placement and blast-radius table is still a prerequisite artifact,
 not an inferred value. It must be captured from authoritative CloudStack inventory
