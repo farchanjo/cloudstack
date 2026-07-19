@@ -6,6 +6,9 @@
 > vDPA migration-hardening workstream. Every later phase MUST update the checklist
 > at the bottom (status / evidence / commit / blockers / decisions) instead of
 > spawning a parallel tracker.
+>
+> **Phase A (Architecture / tracker) — COMPLETED** at commit `1975addd90`
+> (local + Aragog `main` aligned). Phases B–E pending.
 
 Target release line: **`4.24.1.33-SNAPSHOT`** (confirmed).
 Baseline pom at audit time: `pom.xml` line 32 = `4.24.1.32-SNAPSHOT`.
@@ -524,9 +527,9 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | A8 | Version bump checklist §9 | completed | this file §9 | — | — |
 | A9 | Runbook + invariants §10, §11 | completed | this file §10, §11 | — | — |
 | A10 | Git hygiene §12 | completed | this file §12 | — | — |
-| A11 | Commit tracker + index on local main | in_progress | (this commit) | — | rollback: `git reset --hard HEAD~1` before push |
-| A12 | Push to Aragog main (selective stash if needed) | pending | — | — | — |
-| A13 | Phase A close-out report | pending | — | — | — |
+| A11 | Commit tracker + index on local main | completed | `1975addd90` `docs(ovn): plan vDPA migration hardening` | — | rollback: `git reset --hard ecfeddce2f` before push |
+| A12 | Push to Aragog main (selective stash if needed) | completed | push `ecfeddce2f..1975addd90 main -> main`; aragog stash `b7fd8281` dropped clean, only `tools/marvin/setup.py` dirty (known stamp), stash list empty | — | — |
+| A13 | Phase A close-out report | completed | this section + report to caller | — | — |
 
 ### Phase B — Code (PENDING; not started in this task)
 
