@@ -17,6 +17,7 @@
 package com.cloud.network.router.dao;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -107,6 +108,42 @@ public class SriovVfPoolBookkeepingTest {
         assertEquals(VdpaKind.PASSTHROUGH.name(), row.getVdpaKind());
         assertNull(row.getVdpaName());
         assertNull(row.getVdpaDevice());
+    }
+
+    @Test
+    public void exactReleasePredicateRejectsDirectAllocatedReservedAndWrongOwnerRows() {
+        SriovVfPoolVO allocated = staleVdpaRow();
+        allocated.setState(State.ALLOCATED);
+        assertFalse(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(allocated, NIC_ID));
+
+        SriovVfPoolVO reserved = staleVdpaRow();
+        reserved.setState(State.RESERVED);
+        assertFalse(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(reserved, NIC_ID));
+
+        SriovVfPoolVO wrongOwner = staleVdpaRow();
+        wrongOwner.setState(State.SUSPECT);
+        assertFalse(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(wrongOwner, NIC_ID + 1));
+    }
+
+    @Test
+    public void exactReleasePredicateAcceptsSuspectAndRejectsReplayAfterFree() {
+        SriovVfPoolVO row = staleVdpaRow();
+        row.setState(State.SUSPECT);
+        assertTrue(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(row, NIC_ID));
+        SriovVfPoolDaoImpl.applyFreeState(row);
+        assertFalse(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(row, NIC_ID));
+    }
+
+    @Test
+    public void sameHostAllocationRejectsPassthroughVdpaKindMismatchBothDirections() {
+        SriovVfPoolVO vdpa = staleVdpaRow();
+        assertFalse(SriovVfPoolDaoImpl.sameHostModeMatches(vdpa, VdpaKind.PASSTHROUGH));
+        assertTrue(SriovVfPoolDaoImpl.sameHostModeMatches(vdpa, VdpaKind.VDPA));
+
+        SriovVfPoolVO passthrough = staleVdpaRow();
+        passthrough.setVdpaKind(VdpaKind.PASSTHROUGH);
+        assertFalse(SriovVfPoolDaoImpl.sameHostModeMatches(passthrough, VdpaKind.VDPA));
+        assertTrue(SriovVfPoolDaoImpl.sameHostModeMatches(passthrough, VdpaKind.PASSTHROUGH));
     }
 
     /** Row shaped like a leak after vDPA allocate + incomplete free. */

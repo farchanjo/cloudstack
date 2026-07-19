@@ -242,7 +242,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     if (row.getHostId() == hostId) {
                         if (State.ALLOCATED.name().equals(row.getState())
                                 || State.RESERVED.name().equals(row.getState())) {
-                            if (row.getVdpaKindEnum() != kind) {
+                            if (!sameHostModeMatches(row, kind)) {
                                 throw new CloudRuntimeException(String.format(
                                         "VF pool row %d for nic=%d is %s but %s was requested; refusing mode mismatch",
                                         row.getId(), nicId, row.getVdpaKind(), kind));
@@ -388,8 +388,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 lockVmForNic(expectedNicId);
                 lockNicAndReadVfPoolId(expectedNicId);
                 final SriovVfPoolVO row = lockRow(vfPoolId, true);
-                if (row == null || !Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())
-                        || !State.SUSPECT.name().equals(row.getState())) {
+                if (!exactSuspectOwnershipMatches(row, expectedNicId)) {
                     return false;
                 }
                 SriovVfPoolVO updateVo = createForUpdate();
@@ -399,6 +398,17 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 return true;
             }
         });
+    }
+
+    /** Exact release predicate kept pure so direct/replay state regressions are testable. */
+    static boolean exactSuspectOwnershipMatches(final SriovVfPoolVO row, final long expectedNicId) {
+        return row != null && Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())
+                && State.SUSPECT.name().equals(row.getState());
+    }
+
+    /** Same-host allocation may replay only the requested binding mode. */
+    static boolean sameHostModeMatches(final SriovVfPoolVO row, final VdpaKind requestedKind) {
+        return row != null && requestedKind != null && row.getVdpaKindEnum() == requestedKind;
     }
 
     @Override

@@ -48,7 +48,6 @@ import org.xml.sax.SAXException;
 import org.xml.sax.SAXParseException;
 import org.xml.sax.helpers.DefaultHandler;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -59,6 +58,7 @@ import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
 import com.cloud.agent.api.HostVfPurgeOrphansAnswer.TargetResult;
 import com.cloud.agent.api.HostVfPurgeOrphansCommand;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
+import com.cloud.hypervisor.kvm.resource.OvsRepresentorCas;
 import com.cloud.hypervisor.kvm.resource.VfPassthroughVifDriver;
 import com.cloud.hypervisor.kvm.resource.VfHostLifecycleLock;
 import com.cloud.resource.CommandWrapper;
@@ -142,9 +142,15 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         final HostVfPurgeOrphansAnswer answer = new HostVfPurgeOrphansAnswer(cmd, success,
                 success ? "all explicit targets observed/cleaned" : "one or more explicit targets failed closed");
         answer.setTargetResults(results);
-        answer.setVdpaDeleted((int) results.stream().filter(TargetResult::isVdpaRemoved).count());
-        answer.setVfsRebound((int) results.stream().filter(TargetResult::isVfioRebound).count());
-        answer.setOvsRepsFreed((int) results.stream().filter(TargetResult::isRepresentorRemoved).count());
+        answer.setVdpaDeleted(results.stream().mapToInt(TargetResult::getVdpaRemovedCount).sum());
+        answer.setVfsRebound(results.stream().mapToInt(TargetResult::getVfioReboundCount).sum());
+        answer.setOvsRepsFreed(results.stream().mapToInt(TargetResult::getRepresentorsRemovedCount).sum());
+        answer.setVdpaDeletedNames(results.stream().flatMap(result -> result.getVdpaNames().stream())
+                .filter(StringUtils::isNotBlank).limit(64).toList());
+        answer.setVfsReboundBdfs(results.stream().filter(TargetResult::isVfioRebound)
+                .map(TargetResult::getPciBdf).limit(64).toList());
+        answer.setOvsRepsFreedNames(results.stream().filter(TargetResult::isRepresentorRemoved)
+                .map(TargetResult::getRepresentorName).filter(StringUtils::isNotBlank).limit(64).toList());
         return answer;
     }
 
@@ -209,9 +215,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
     TargetResult cleanupTarget(final String bdf, final TargetResult observation,
                                final List<String> vdpaNames, final String expectedRepresentor,
                                final String expectedInterfaceId) {
-        boolean vdpaRemoved = false;
-        boolean representorRemoved = false;
-        boolean rebound = false;
+        int vdpaRemoved = 0;
+        int representorsRemoved = 0;
+        int rebound = 0;
+        final List<String> vdpaRemovedNames = new ArrayList<>();
         try {
             if (vdpaNames != null) {
                 for (final String name : vdpaNames) {
@@ -219,7 +226,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                             expectedInterfaceId, "vDPA deletion", true, observation.isLifecycleAuthorizationUsed());
                     requireSuccess(environment.runner.run("/usr/sbin/vdpa", "dev", "del", name),
                             "vdpa dev del " + name);
-                    vdpaRemoved = true;
+                    vdpaRemoved++;
+                    vdpaRemovedNames.add(name);
                 }
                 final VdpaInventory postVdpa = inventoryVdpa();
                 if (!postVdpa.success || postVdpa.byBdf.containsKey(bdf)) {
@@ -233,7 +241,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             if (representor != null) {
                 removeRepresentorChecked(bdf, observation.getExpectedMac(), representor, expectedInterfaceId,
                         observation.isLifecycleAuthorizationUsed());
-                representorRemoved = true;
+                representorsRemoved++;
             }
             if (observation.isDevicePresent()) {
                 revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
@@ -244,7 +252,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     if (!DRV_MLX5.equals(currentDriverOf(driver))) {
                         throw new IllegalStateException("VF rebind postcondition did not observe mlx5_core");
                     }
-                    rebound = true;
+                    rebound++;
                 }
                 revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
                         expectedInterfaceId, "VF identity clear", true, observation.isLifecycleAuthorizationUsed());
@@ -256,12 +264,16 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             }
             final TargetResult result = copyObservation(observation, true, "target cleanup and postconditions complete");
             result.setVdpaName(first(vdpaNames));
-            setActions(result, representorRemoved, vdpaRemoved, rebound);
+            result.setVdpaNames(vdpaRemovedNames);
+            result.setRepresentorName(expectedRepresentor);
+            setActions(result, representorsRemoved, vdpaRemoved, rebound);
             return result;
         } catch (RuntimeException e) {
             final TargetResult result = copyObservation(observation, false, e.getMessage());
             result.setVdpaName(first(vdpaNames));
-            setActions(result, representorRemoved, vdpaRemoved, rebound);
+            result.setVdpaNames(vdpaRemovedNames);
+            result.setRepresentorName(expectedRepresentor);
+            setActions(result, representorsRemoved, vdpaRemoved, rebound);
             return result;
         }
     }
@@ -290,226 +302,11 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                                           final boolean allowUnassignedMac) {
         revalidateBeforeDestructiveAction(bdf, expectedMac, representor, expectedInterfaceId,
                 "OVS deletion", false, allowUnassignedMac);
-        final OvsIdentity identity = discoverOvsIdentity(representor);
-        if (identity == null) {
-            return;
+        if (!OvsRepresentorCas.remove(environment.runner::run, "unix:/var/run/openvswitch/db.sock",
+                representor, expectedInterfaceId)) {
+            throw new IllegalStateException("atomic OVS representor deletion failed or postcondition was not proven: "
+                    + representor);
         }
-        final CommandResult transaction = environment.runner.run(
-                "/usr/bin/ovsdb-client", "transact", "unix:/var/run/openvswitch/db.sock",
-                buildOvsDeleteTransaction(identity, expectedInterfaceId));
-        requireSuccess(transaction, "atomic OVS representor deletion " + representor);
-        validateOvsTransaction(transaction.output, identity);
-        if (discoverOvsIdentity(representor) != null) {
-            throw new IllegalStateException("OVS representor postcondition ambiguous or row was recreated: " + representor);
-        }
-    }
-
-    private OvsIdentity discoverOvsIdentity(final String representor) {
-        final JsonArray interfaceWhere = whereEquals("name", stringAtom(representor));
-        final JsonArray interfaceRows = ovsdbSelect("Interface", interfaceWhere,
-                List.of("_uuid", "name", "external_ids"));
-        final JsonArray portRows = ovsdbSelect("Port", whereEquals("name", stringAtom(representor)),
-                List.of("_uuid", "name", "interfaces"));
-        if (interfaceRows.size() == 0 && portRows.size() == 0) {
-            return null;
-        }
-        if (interfaceRows.size() != 1 || portRows.size() != 1) {
-            throw new IllegalStateException("OVS discovery did not identify exactly one Interface and Port");
-        }
-        final JsonObject iface = interfaceRows.get(0).getAsJsonObject();
-        final JsonObject port = portRows.get(0).getAsJsonObject();
-        final String ifaceUuid = uuid(iface.get("_uuid"));
-        final String portUuid = uuid(port.get("_uuid"));
-        if (!representor.equals(text(port.get("name"))) || !representor.equals(text(iface.get("name")))) {
-            throw new IllegalStateException("OVS discovery name changed for " + representor);
-        }
-        final JsonArray interfaces = unwrapSet(port.getAsJsonArray("interfaces"));
-        if (interfaces == null || interfaces.size() != 1 || !ifaceUuid.equals(uuid(interfaces.get(0)))) {
-            throw new IllegalStateException("OVS Port interface set changed for " + representor);
-        }
-        final JsonArray bridgeRows = ovsdbSelect("Bridge", whereIncludes("ports", uuidAtom(portUuid)),
-                List.of("_uuid", "name", "ports"));
-        if (bridgeRows.size() != 1) {
-            throw new IllegalStateException("OVS discovery did not identify exactly one Bridge");
-        }
-        final JsonObject bridge = bridgeRows.get(0).getAsJsonObject();
-        final String bridgeUuid = uuid(bridge.get("_uuid"));
-        if (StringUtils.isBlank(text(bridge.get("name")))) {
-            throw new IllegalStateException("OVS Bridge name is missing");
-        }
-        return new OvsIdentity(bridgeUuid, text(bridge.get("name")), portUuid, ifaceUuid, representor);
-    }
-
-    private JsonArray ovsdbSelect(final String table, final JsonArray where, final List<String> columns) {
-        final JsonObject operation = new JsonObject();
-        operation.addProperty("op", "select");
-        operation.addProperty("table", table);
-        operation.add("where", where);
-        final JsonArray columnArray = new JsonArray();
-        columns.forEach(columnArray::add);
-        operation.add("columns", columnArray);
-        final JsonArray request = new JsonArray();
-        request.add("Open_vSwitch");
-        request.add(operation);
-        final CommandResult result = environment.runner.run("/usr/bin/ovsdb-client", "transact",
-                "unix:/var/run/openvswitch/db.sock", new Gson().toJson(request));
-        requireSuccess(result, "read OVS " + table);
-        final JsonArray response = parseArray(result.output, "OVS " + table + " discovery");
-        if (response.size() != 1 || !response.get(0).isJsonObject()) {
-            throw new IllegalStateException("malformed OVS " + table + " discovery response");
-        }
-        final JsonObject resultObject = response.get(0).getAsJsonObject();
-        if (resultObject.has("error") || !resultObject.has("rows") || !resultObject.get("rows").isJsonArray()) {
-            throw new IllegalStateException("OVS " + table + " discovery failed");
-        }
-        return resultObject.getAsJsonArray("rows");
-    }
-
-    private String buildOvsDeleteTransaction(final OvsIdentity identity, final String expectedInterfaceId) {
-        final JsonArray operations = new JsonArray();
-        operations.add(waitOperation("Interface", whereAll(whereEquals("_uuid", uuidAtom(identity.interfaceUuid),
-                "name", stringAtom(identity.name)),
-                whereIncludes("external_ids", includesMap("iface-id", expectedInterfaceId))),
-                List.of("_uuid", "name", "external_ids"), new JsonArray(), "!=", "Interface"));
-        operations.add(waitOperation("Port", whereAll(whereEquals("_uuid", uuidAtom(identity.portUuid),
-                "name", stringAtom(identity.name), "interfaces", equalsSet(identity.interfaceUuid))),
-                List.of("_uuid", "name", "interfaces"), new JsonArray(), "!=", "Port"));
-        operations.add(waitOperation("Bridge", whereAll(whereEquals("_uuid", uuidAtom(identity.bridgeUuid),
-                "name", stringAtom(identity.bridgeName)), whereIncludes("ports", includesUuid(identity.portUuid))),
-                List.of("_uuid", "name", "ports"), new JsonArray(), "!=", "Bridge"));
-
-        final JsonObject mutate = new JsonObject();
-        mutate.addProperty("op", "mutate");
-        mutate.addProperty("table", "Bridge");
-        mutate.add("where", whereEquals("_uuid", uuidAtom(identity.bridgeUuid)));
-        final JsonArray mutations = new JsonArray();
-        final JsonArray mutation = new JsonArray();
-        mutation.add("ports");
-        mutation.add("delete");
-        mutation.add(singletonUuid(identity.portUuid));
-        mutations.add(mutation);
-        mutate.add("mutations", mutations);
-        operations.add(mutate);
-
-        final JsonObject delete = new JsonObject();
-        delete.addProperty("op", "delete");
-        delete.addProperty("table", "Port");
-        delete.add("where", whereAll(whereEquals("_uuid", uuidAtom(identity.portUuid), "name",
-                stringAtom(identity.name), "interfaces", equalsSet(identity.interfaceUuid))));
-        operations.add(delete);
-        final JsonArray request = new JsonArray();
-        request.add("Open_vSwitch");
-        request.addAll(operations);
-        return new Gson().toJson(request);
-    }
-
-    private JsonObject waitOperation(final String table, final JsonArray where, final List<String> columns,
-                                     final JsonArray rows, final String until, final String label) {
-        final JsonObject operation = new JsonObject();
-        operation.addProperty("op", "wait");
-        operation.addProperty("table", table);
-        operation.add("where", where);
-        final JsonArray columnArray = new JsonArray();
-        columns.forEach(columnArray::add);
-        operation.add("columns", columnArray);
-        operation.addProperty("until", until);
-        operation.add("rows", rows);
-        operation.addProperty("timeout", 0);
-        operation.addProperty("comment", label);
-        return operation;
-    }
-
-    private JsonArray whereAll(final JsonArray... clauses) {
-        final JsonArray result = new JsonArray();
-        for (JsonArray clause : clauses) {
-            result.add(clause);
-        }
-        return result;
-    }
-
-    private JsonArray whereEquals(final String field, final JsonElement value, final Object... additional) {
-        final JsonArray result = new JsonArray();
-        addEquals(result, field, value);
-        for (int index = 0; index < additional.length; index += 2) {
-            addEquals(result, (String) additional[index], (JsonElement) additional[index + 1]);
-        }
-        return result;
-    }
-
-    private JsonArray whereIncludes(final String field, final JsonElement value) {
-        final JsonArray clause = new JsonArray();
-        clause.add(field);
-        clause.add("includes");
-        clause.add(value);
-        final JsonArray result = new JsonArray();
-        result.add(clause);
-        return result;
-    }
-
-    private JsonArray includesMap(final String key, final String value) {
-        final JsonArray pair = new JsonArray();
-        pair.add(key);
-        pair.add(value);
-        final JsonArray pairs = new JsonArray();
-        pairs.add(pair);
-        final JsonArray map = new JsonArray();
-        map.add("map");
-        map.add(pairs);
-        return map;
-    }
-
-    private JsonArray equalsSet(final String uuid) {
-        final JsonArray set = new JsonArray();
-        set.add("set");
-        final JsonArray values = new JsonArray();
-        values.add(uuidAtom(uuid));
-        set.add(values);
-        return set;
-    }
-
-    private JsonArray singletonUuid(final String uuid) {
-        final JsonArray set = new JsonArray();
-        set.add("set");
-        final JsonArray values = new JsonArray();
-        values.add(uuidAtom(uuid));
-        set.add(values);
-        return set;
-    }
-
-    private JsonArray unwrapSet(final JsonArray value) {
-        if (value == null) {
-            return null;
-        }
-        if (value.size() == 2 && "set".equals(value.get(0).getAsString())) {
-            return value.get(1).getAsJsonArray();
-        }
-        return value;
-    }
-
-    private JsonArray includesUuid(final String uuid) {
-        return singletonUuid(uuid);
-    }
-
-    private JsonArray uuidAtom(final String uuid) {
-        final JsonArray atom = new JsonArray();
-        atom.add("uuid");
-        atom.add(uuid);
-        return atom;
-    }
-
-    private JsonElement stringAtom(final String value) {
-        // RFC7047 string columns use JSON strings directly. The typed atom
-        // form is valid for UUID/set/map values only; OVSDB 3.3 rejects
-        // ["string", value] with "expected string".
-        return new com.google.gson.JsonPrimitive(value);
-    }
-
-    private void addEquals(final JsonArray where, final String field, final JsonElement value) {
-        final JsonArray clause = new JsonArray();
-        clause.add(field);
-        clause.add("==");
-        clause.add(value);
-        where.add(clause);
     }
 
     private JsonArray parseArray(final String output, final String operation) {
@@ -521,41 +318,6 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             return parsed.getAsJsonArray();
         } catch (RuntimeException e) {
             throw new IllegalStateException("malformed " + operation + " response", e);
-        }
-    }
-
-    private String uuid(final JsonElement value) {
-        if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() != 2
-                || !"uuid".equals(value.getAsJsonArray().get(0).getAsString())) {
-            throw new IllegalStateException("OVS response did not contain a UUID");
-        }
-        return value.getAsJsonArray().get(1).getAsString();
-    }
-
-    private String text(final JsonElement value) {
-        if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() != 2) {
-            throw new IllegalStateException("OVS response did not contain a typed string");
-        }
-        return value.getAsJsonArray().get(1).getAsString();
-    }
-
-    private void validateOvsTransaction(final String output, final OvsIdentity identity) {
-        final JsonArray response = parseArray(output, "atomic OVS deletion");
-        if (response.size() != 5) {
-            throw new IllegalStateException("atomic OVS deletion returned an unexpected operation count");
-        }
-        for (int index = 0; index < response.size(); index++) {
-            final JsonElement element = response.get(index);
-            if (!element.isJsonObject() || element.getAsJsonObject().has("error")) {
-                throw new IllegalStateException("atomic OVS deletion operation failed");
-            }
-            final JsonObject result = element.getAsJsonObject();
-            if (index <= 2 && (!result.has("rows") || result.getAsJsonArray("rows").size() != 1)) {
-                throw new IllegalStateException("atomic OVS wait did not prove ownership");
-            }
-            if (index >= 3 && (!result.has("count") || result.get("count").getAsInt() != 1)) {
-                throw new IllegalStateException("atomic OVS mutation did not affect exactly one row");
-            }
         }
     }
 
@@ -1002,6 +764,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         result.setBindingState(source.getBindingState());
         result.setDriver(source.getDriver());
         result.setVdpaName(source.getVdpaName());
+        result.setVdpaNames(source.getVdpaNames());
+        result.setRepresentorName(source.getRepresentorName());
         result.setDomainReferenced(source.isDomainReferenced());
         result.setDomainState(source.getDomainState());
         result.setLifecycleAuthorizationUsed(source.isLifecycleAuthorizationUsed());
@@ -1009,11 +773,11 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         return result;
     }
 
-    private static void setActions(final TargetResult result, final boolean representorRemoved,
-                                   final boolean vdpaRemoved, final boolean rebound) {
-        result.setRepresentorRemoved(representorRemoved);
-        result.setVdpaRemoved(vdpaRemoved);
-        result.setVfioRebound(rebound);
+    private static void setActions(final TargetResult result, final int representorsRemoved,
+                                   final int vdpaRemoved, final int rebound) {
+        result.setRepresentorsRemovedCount(representorsRemoved);
+        result.setVdpaRemovedCount(vdpaRemoved);
+        result.setVfioReboundCount(rebound);
     }
 
     interface HostCommandRunner {
@@ -1075,23 +839,6 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
 
         static CommandResult failure(final String error) {
             return new CommandResult(false, null, error);
-        }
-    }
-
-    private static final class OvsIdentity {
-        private final String bridgeUuid;
-        private final String bridgeName;
-        private final String portUuid;
-        private final String interfaceUuid;
-        private final String name;
-
-        private OvsIdentity(final String bridgeUuid, final String bridgeName, final String portUuid,
-                            final String interfaceUuid, final String name) {
-            this.bridgeUuid = bridgeUuid;
-            this.bridgeName = bridgeName;
-            this.portUuid = portUuid;
-            this.interfaceUuid = interfaceUuid;
-            this.name = name;
         }
     }
 

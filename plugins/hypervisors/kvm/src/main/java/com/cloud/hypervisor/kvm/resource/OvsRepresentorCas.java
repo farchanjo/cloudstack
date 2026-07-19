@@ -99,7 +99,7 @@ public final class OvsRepresentorCas {
         final String iu = uuid(i.get("_uuid"));
         final String pu = uuid(p.get("_uuid"));
         final JsonArray interfaces = unwrap(p.get("interfaces"));
-        if (!name.equals(i.get("name").getAsString()) || !name.equals(p.get("name").getAsString())
+        if (!name.equals(text(i.get("name"))) || !name.equals(text(p.get("name")))
                 || interfaces.size() != 1 || !iu.equals(uuid(interfaces.get(0)))) {
             throw new IllegalStateException("OVS representor identity changed during discovery");
         }
@@ -176,6 +176,16 @@ public final class OvsRepresentorCas {
     private static JsonArray uuidSet(final String value) { final JsonArray set = new JsonArray(); set.add("set"); final JsonArray values = new JsonArray(); values.add(uuid(value)); set.add(values); return set; }
     private static JsonArray uuid(final String value) { final JsonArray u = new JsonArray(); u.add("uuid"); u.add(value); return u; }
     private static String uuid(final JsonElement value) { return value.getAsJsonArray().get(1).getAsString(); }
+    private static String text(final JsonElement value) {
+        if (value == null || !value.isJsonPrimitive()) {
+            if (value != null && value.isJsonArray() && value.getAsJsonArray().size() == 2
+                    && "string".equals(value.getAsJsonArray().get(0).getAsString())) {
+                return value.getAsJsonArray().get(1).getAsString();
+            }
+            throw new IllegalStateException("OVS string value is malformed");
+        }
+        return value.getAsString();
+    }
     private static JsonArray unwrap(final JsonElement value) { return "set".equals(value.getAsJsonArray().get(0).getAsString()) ? value.getAsJsonArray().get(1).getAsJsonArray() : value.getAsJsonArray(); }
     private static boolean validResponse(final String output) { try { final JsonArray r = JsonParser.parseString(output).getAsJsonArray(); return r.size() >= 5 && !r.get(1).getAsJsonObject().has("error"); } catch (RuntimeException e) { return false; } }
     private static final class Identity {

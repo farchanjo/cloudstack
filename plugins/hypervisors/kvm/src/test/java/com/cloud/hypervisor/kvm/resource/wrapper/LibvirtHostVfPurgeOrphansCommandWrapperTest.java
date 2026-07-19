@@ -72,6 +72,19 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
     }
 
     @Test
+    public void invalidExplicitTargetFailsBeforeAnyInventoryOrMutation() throws Exception {
+        final FakeHost host = new FakeHost(temporaryFolder.newFolder("invalid-target").toPath());
+        final HostVfPurgeOrphansCommand command = new HostVfPurgeOrphansCommand();
+        command.setTargetPciBdfs(Collections.singleton("not-a-pci-bdf"));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command);
+
+        assertFalse(answer.getResult());
+        assertTrue(answer.getDetails().contains("invalid explicit target"));
+        assertTrue(host.commands.isEmpty());
+    }
+
+    @Test
     public void zeroMacNeverAuthorizesPresentTarget() throws Exception {
         final FakeHost host = preparedHost("zero");
         host.currentMac = "00:00:00:00:00:00";
@@ -252,6 +265,22 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         assertTrue(answer.getTargetResults().get(0).isVdpaRemoved());
         assertTrue(host.commands.stream().anyMatch(value -> value.endsWith("vdpa dev del vdpa-target")));
         assertFalse(host.vdpaPresent);
+    }
+
+    @Test
+    public void countersReportEveryVdpaDeviceAndPreservePartialFailure() throws Exception {
+        final FakeHost host = preparedHost("vdpa-multiple");
+        host.vdpaPresent = true;
+        host.vdpaNames = new ArrayList<>(java.util.Arrays.asList("vdpa-first", "vdpa-second"));
+        host.vdpaDeleteFailsName = "vdpa-second";
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command(false));
+
+        assertFalse(answer.getResult());
+        assertEquals(1, answer.getVdpaDeleted());
+        assertEquals(Collections.singletonList("vdpa-first"), answer.getVdpaDeletedNames());
+        assertEquals(1, answer.getTargetResults().get(0).getVdpaRemovedCount());
+        assertTrue(answer.getTargetResults().get(0).isVdpaRemoved());
     }
 
     @Test
@@ -447,6 +476,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         private String domainXml;
         private boolean vdpaInventoryFails;
         private boolean vdpaPresent;
+        private List<String> vdpaNames = new ArrayList<>(Collections.singletonList("vdpa-target"));
+        private String vdpaDeleteFailsName;
         private boolean identityClearFails;
         private boolean macReadFails;
         private boolean macOutputMissing;
@@ -489,7 +520,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         public CommandResult run(final String... command) {
             final String value = String.join(" ", command);
             commands.add(value);
-            if (value.contains("/usr/bin/ovsdb-client") && value.contains(" transact ")) {
+            if (value.contains("ovsdb-client") && value.contains(" transact ")) {
                 return ovsdbTransaction(command[command.length - 1]);
             }
             if (value.endsWith("vdpa dev show -j")) {
@@ -497,11 +528,16 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                     return CommandResult.failure("vdpa unavailable");
                 }
                 return CommandResult.success(vdpaPresent
-                        ? "{\"dev\":{\"vdpa-target\":{\"mgmtdev\":\"pci/" + BDF + "\"}}}"
+                        ? vdpaJson()
                         : "{\"dev\":{}}");
             }
-            if (value.endsWith("vdpa dev del vdpa-target")) {
-                vdpaPresent = false;
+            if (value.contains("vdpa dev del ")) {
+                final String name = value.substring(value.indexOf("vdpa dev del ") + "vdpa dev del ".length()).trim();
+                if (name.equals(vdpaDeleteFailsName)) {
+                    return CommandResult.failure("vDPA delete failed");
+                }
+                vdpaNames.remove(name);
+                vdpaPresent = !vdpaNames.isEmpty();
                 return CommandResult.success("");
             }
             if (value.endsWith("virsh list --all --name")) {
@@ -615,6 +651,18 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             removedRepresentors.add(ovsName);
             ovsIfaceId = null;
             return CommandResult.success(response.toString());
+        }
+
+        private String vdpaJson() {
+            final StringBuilder json = new StringBuilder("{\"dev\":{");
+            for (int index = 0; index < vdpaNames.size(); index++) {
+                if (index > 0) {
+                    json.append(',');
+                }
+                json.append('\"').append(vdpaNames.get(index)).append("\":{\"mgmtdev\":\"pci/")
+                        .append(BDF).append("\"}");
+            }
+            return json.append("}}").toString();
         }
 
         private String selectName(final JsonObject select) {

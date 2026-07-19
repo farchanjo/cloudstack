@@ -21,6 +21,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Collections;
+import java.util.Arrays;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
@@ -82,6 +83,36 @@ public class HostVfPurgeOrphansSerializationTest {
         assertFalse(legacy.purgeVdpa);
         assertFalse(legacy.rebindPassthroughVfs);
         assertFalse(legacy.purgeStaleOvsReps);
+    }
+
+    @Test
+    public void mixedVersionAnswerPreservesActionCountersAndLegacyBooleans() {
+        HostVfPurgeOrphansAnswer answer = new HostVfPurgeOrphansAnswer();
+        HostVfPurgeOrphansAnswer.TargetResult target = new HostVfPurgeOrphansAnswer.TargetResult(
+                "0000:01:00.2", false, true, true, true, true, "partial");
+        target.setVdpaRemovedCount(2);
+        target.setRepresentorsRemovedCount(1);
+        target.setVfioReboundCount(1);
+        target.setVdpaNames(Arrays.asList("vdpa-a", "vdpa-b"));
+        target.setRepresentorName("rep-a");
+        answer.setTargetResults(Collections.singletonList(target));
+        answer.setVdpaDeleted(2);
+        answer.setVdpaDeletedNames(Arrays.asList("vdpa-a", "vdpa-b"));
+        answer.setOvsRepsFreed(1);
+        answer.setOvsRepsFreedNames(Collections.singletonList("rep-a"));
+        answer.setVfsRebound(1);
+        answer.setVfsReboundBdfs(Collections.singletonList("0000:01:00.2"));
+
+        HostVfPurgeOrphansAnswer copy = gson.fromJson(gson.toJson(answer), HostVfPurgeOrphansAnswer.class);
+        HostVfPurgeOrphansAnswer.TargetResult copiedTarget = copy.getTargetResults().get(0);
+        assertEquals(2, copiedTarget.getVdpaRemovedCount());
+        assertEquals(1, copiedTarget.getRepresentorsRemovedCount());
+        assertEquals(1, copiedTarget.getVfioReboundCount());
+        assertTrue(copiedTarget.isVdpaRemoved());
+        assertEquals(Arrays.asList("vdpa-a", "vdpa-b"), copiedTarget.getVdpaNames());
+        assertEquals(2, copy.getVdpaDeleted());
+        assertEquals(1, copy.getOvsRepsFreed());
+        assertEquals(1, copy.getVfsRebound());
     }
 
     private String readGolden(final String name) {

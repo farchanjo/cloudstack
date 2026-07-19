@@ -35,6 +35,10 @@ public class HostVfPurgeOrphansAnswer extends Answer {
         private boolean representorRemoved;
         private boolean vdpaRemoved;
         private boolean vfioRebound;
+        /** Actual actions completed for this target; booleans remain legacy compatibility fields. */
+        private int representorsRemovedCount;
+        private int vdpaRemovedCount;
+        private int vfioReboundCount;
         private String currentMac;
         /** MAC observation state: READ_ERROR, UNASSIGNED_ZERO, or NONZERO. */
         private String macObservation;
@@ -45,6 +49,8 @@ public class HostVfPurgeOrphansAnswer extends Answer {
         private String bindingState;
         private String driver;
         private String vdpaName;
+        private List<String> vdpaNames = new ArrayList<>();
+        private String representorName;
         private boolean domainReferenced;
         private String domainState;
         private boolean lifecycleAuthorizationUsed;
@@ -84,6 +90,11 @@ public class HostVfPurgeOrphansAnswer extends Answer {
 
         public void setRepresentorRemoved(final boolean representorRemoved) {
             this.representorRemoved = representorRemoved;
+            if (!representorRemoved) {
+                representorsRemovedCount = 0;
+            } else if (representorsRemovedCount == 0) {
+                representorsRemovedCount = 1;
+            }
         }
 
         public boolean isVdpaRemoved() {
@@ -92,6 +103,11 @@ public class HostVfPurgeOrphansAnswer extends Answer {
 
         public void setVdpaRemoved(final boolean vdpaRemoved) {
             this.vdpaRemoved = vdpaRemoved;
+            if (!vdpaRemoved) {
+                vdpaRemovedCount = 0;
+            } else if (vdpaRemovedCount == 0) {
+                vdpaRemovedCount = 1;
+            }
         }
 
         public boolean isVfioRebound() {
@@ -100,6 +116,28 @@ public class HostVfPurgeOrphansAnswer extends Answer {
 
         public void setVfioRebound(final boolean vfioRebound) {
             this.vfioRebound = vfioRebound;
+            if (!vfioRebound) {
+                vfioReboundCount = 0;
+            } else if (vfioReboundCount == 0) {
+                vfioReboundCount = 1;
+            }
+        }
+
+        public int getRepresentorsRemovedCount() { return representorsRemovedCount > 0 ? representorsRemovedCount
+                : representorRemoved ? 1 : 0; }
+        public void setRepresentorsRemovedCount(final int count) {
+            representorsRemovedCount = Math.max(0, count);
+            representorRemoved = representorsRemovedCount > 0;
+        }
+        public int getVdpaRemovedCount() { return vdpaRemovedCount > 0 ? vdpaRemovedCount : vdpaRemoved ? 1 : 0; }
+        public void setVdpaRemovedCount(final int count) {
+            vdpaRemovedCount = Math.max(0, count);
+            vdpaRemoved = vdpaRemovedCount > 0;
+        }
+        public int getVfioReboundCount() { return vfioReboundCount > 0 ? vfioReboundCount : vfioRebound ? 1 : 0; }
+        public void setVfioReboundCount(final int count) {
+            vfioReboundCount = Math.max(0, count);
+            vfioRebound = vfioReboundCount > 0;
         }
 
         public String getDetails() {
@@ -154,6 +192,14 @@ public class HostVfPurgeOrphansAnswer extends Answer {
         public void setVdpaName(final String vdpaName) {
             this.vdpaName = vdpaName;
         }
+
+        public List<String> getVdpaNames() { return vdpaNames == null ? Collections.emptyList() : vdpaNames; }
+        public void setVdpaNames(final List<String> vdpaNames) {
+            this.vdpaNames = vdpaNames == null ? new ArrayList<>() : new ArrayList<>(vdpaNames);
+            this.vdpaName = this.vdpaNames.isEmpty() ? null : this.vdpaNames.get(0);
+        }
+        public String getRepresentorName() { return representorName; }
+        public void setRepresentorName(final String representorName) { this.representorName = representorName; }
 
         public boolean isDomainReferenced() {
             return domainReferenced;

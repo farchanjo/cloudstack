@@ -196,6 +196,31 @@ public class SriovVfPoolDaoMySqlIT {
     }
 
     @Test
+    public void exactReleaseRejectsDirectAllocatedAndReservedRows() throws Exception {
+        fixtureSingleNic();
+        insertPool(1001L, 1L, "0000:01:00.2", "ALLOCATED", 100L);
+        insertPool(1002L, 1L, "0000:01:00.3", "RESERVED", 100L);
+
+        assertFalse(dao.releaseExact(1000L, 100L));
+        assertFalse(dao.releaseExact(1001L, 100L));
+        assertFalse(dao.releaseExact(1002L, 100L));
+        assertEquals("ALLOCATED", poolState(1000L));
+        assertEquals("ALLOCATED", poolState(1001L));
+        assertEquals("RESERVED", poolState(1002L));
+    }
+
+    @Test
+    public void sameHostPassthroughVdpaKindMismatchIsRejected() throws Exception {
+        fixtureSingleNic();
+        update("UPDATE sriov_vf_pool SET vdpa_kind='VDPA', vdpa_name='vdpa-100' WHERE id=1000");
+
+        expectCloudRuntime(() -> dao.allocateOrReserve(1L, 100L, VdpaKind.PASSTHROUGH, null));
+
+        update("UPDATE sriov_vf_pool SET vdpa_kind='PASSTHROUGH', vdpa_name=NULL WHERE id=1000");
+        expectCloudRuntime(() -> dao.allocateOrReserve(1L, 100L, VdpaKind.VDPA, "vdpa-100"));
+    }
+
+    @Test
     public void softRemovedNicWithNullReversePointerReplaysSuspectCleanupUntilExactRelease() throws Exception {
         insertHost(22L);
         insertVm(1591L, 22L);
