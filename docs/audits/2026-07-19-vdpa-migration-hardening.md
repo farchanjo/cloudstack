@@ -1348,4 +1348,111 @@ this RCA, no host/API/DB write was made, and no Kubernetes or migration action
 was attempted. Rollback evidence is the restored `.32` hash above and the
 authoritative host state `Up`.
 
+### 16.9 Bellatrix management `.33` RCA (read-only, 2026-07-19)
+
+The Bellatrix management canary is **NO_GO** and was rolled back. Current
+read-only state is `cloudstack-management active/running`, service result
+`success`, and the restored management JAR SHA256 is
+`3121d7a9ac1fdee3408537d79af6b8dbfec510e898c7ec476f742bbe1279b29e`.
+No Barty, Voldemort, canary, migration, Kubernetes, OVN, OVS, or GitOps state
+was changed by this RCA.
+
+#### First causal failure
+
+At backup/replacement timestamp `20260719144255`, Bellatrix loaded the
+candidate management artifact and reached the database integrity checker. The
+first causal message was:
+
+```text
+2026-07-19 14:43:01,431  DB version = 4.24.1.32 Code Version = 4.24.1.33
+2026-07-19 14:43:01,434  Database upgrade is required but the management server
+                         is running in a clustered environment.
+                         Please perform the database upgrade when the management
+                         server is not running in a clustered environment.
+```
+
+The service then exited exactly as the source specifies: systemd recorded
+`status=5/NOTINSTALLED` at `14:43:01`, `14:43:35`, `14:44:08`, `14:44:42`,
+`14:45:15`, and `14:45:49`. `Restart=on-failure` with `RestartSec=30` created
+the observed restart loop. There was no Spring bean failure, missing class,
+JVM/GC failure, port bind error, permission error, or database connectivity
+failure. GC logs show normal G1 startup pauses and an 8–16 GiB heap; JDK is
+`21.0.11`. The initial `14:42:55` exit `143` was the intentional rollback
+stop, not the `.33` causal failure.
+
+#### Source correlation
+
+`DatabaseUpgradeChecker.doUpgrades()` compares the database and implementation
+versions, sees `4.24.1.32` versus `4.24.1.33`, and calls `isStandalone()`.
+That method returns false when any row in `cloud.mshost` has `state='UP'`.
+`handleClusteredUpgradeRequired()` then calls `System.exit(5)` by design
+(`engine/schema/.../DatabaseUpgradeChecker.java:515-590`). The schema step
+`Upgrade42432to42433` is an explicit no-op version-row upgrade and declares
+`supportsRollingUpgrade() == false`. This is correct CloudStack upgrade
+semantics, not a migration/VF Spring-bean regression.
+
+The authoritative read-only database state was:
+
+```text
+voldemort  Up  4.24.1.32-SNAPSHOT
+bellatrix  Up  4.24.1.32-SNAPSHOT
+barty      Up  4.24.1.32-SNAPSHOT
+cloud.version: 4.24.1.32 Complete
+```
+
+#### Payload and classpath
+
+The candidate is the correct shaded management runtime despite its Maven
+artifact name `cloud-client-ui`: its manifest has `Main-Class:
+org.apache.cloudstack.ServerDaemon`, `Implementation-Version:
+4.24.1.33-SNAPSHOT`, and revision `6e1d85160d8177f18b2b9c64883d5a60cc206373`.
+It is 144,891,107 bytes, SHA256
+`d387bd36fd7503a637efee5158b563d229ea79c103ae2dbd24426f406e47e112`, MD5
+`63c80dba1fcd13873f9c04e60fb3ecae`. It contains the ServerDaemon, Spring
+module contexts, and DatabaseUpgradeChecker, and successfully reached the
+version check.
+
+Bellatrix uses `/usr/share/cloudstack-management/lib/*` with
+`org.apache.cloudstack.ServerDaemon`; only the active `.32` management JAR is
+loaded (backup names do not end in `.jar`). The shaded build intentionally
+excludes Linstor, StorPool, MySQL, and Bouncy Castle. The matching external
+payload from the same Aragog build is therefore also required:
+
+| External artifact | Size | SHA256 |
+|---|---:|---|
+| `cloud-plugin-storage-volume-linstor-4.24.1.33-SNAPSHOT.jar` | 112,096 | `b539b390e84d8d8d030ac4f288843fb15d65f07c34b92e5b2c4b958f4cdb8683` |
+| `cloud-plugin-storage-volume-storpool-4.24.1.33-SNAPSHOT.jar` | 208,158 | `f8a47f49d2ddcfea79bc21b72c891bd0956ed2643b7193d6bb595e8f30f875c2` |
+| `java-linstor-0.6.1.jar` | 499,763 | `3581dbf3eb7479ed62ef6871d2a8243360823e68563a12ea5e05851098ad3cdb` |
+| `mysql-connector-j-8.0.33.jar` | 2,481,560 | `e2a3b2fc726a1ac64e998585db86b30fa8bf3f706195b78bb77c5f99bf877bd9` |
+| `bcpkix-jdk15on-1.70.jar` | 963,713 | `e5b9cb821df57f70b0593358e89c0e8d7266515da9d088af6c646f63d433c07c` |
+| `bcprov-jdk15on-1.70.jar` | 5,867,298 | `8f3c20e3e2d565d26f33e8d4857a37d0d7f8ac39b62a7026496fcab1bdac30d4` |
+| `bctls-jdk15on-1.70.jar` | 1,457,398 | `17d0209f6363920d024092acdca249c5b3c55b006e689d13f25df782a6f2e27b` |
+
+The three Bouncy Castle, Linstor runtime, and MySQL hashes already match the
+active Bellatrix external files. The active `.30` Linstor/StorPool plugin JARs
+do not match the built `.33` set and must not remain alongside `.33` under the
+wildcard classpath. This is a complete management payload requirement, but it
+was not the cause of this attempt because startup stopped at the schema gate.
+
+#### Safe-order decision
+
+There is no safe Bellatrix-only retry with the database at `4.24.1.32` while
+Barty and Voldemort remain Up: CloudStack deliberately refuses the upgrade.
+The eventual transactional procedure must stop all three management servers,
+verify zero `mshost.state='UP'` rows, install the shaded `.33` JAR plus the
+matching external set, and start one designated management node to perform the
+`4.24.1.32 → 4.24.1.33` upgrade. Only after the database reaches
+`4.24.1.33 Complete` and that node passes the API/membership/Kubernetes gates
+may the other two nodes start with the identical payload. Do not bypass the
+standalone check or manually edit the version table.
+
+No source fix, regression test, agent second rollout, or Maven build is
+warranted. The six agents already carry the matching four-JAR `.33` payload;
+the management failure is an upgrade-order/cluster-state gate.
+
+**Exact decision: NO_GO with rollback.** The current Bellatrix service and
+`.32` artifact are healthy. The next action requires explicit authorization to
+quiesce Barty and Voldemort; until then `BELLATRIX_MANAGEMENT_PASS` cannot be
+earned without violating the no-other-management-mutation constraint.
+
 **End of tracker.**
