@@ -29,6 +29,11 @@ public interface OvnChassisLookup {
         return -1;
     }
 
+    default boolean hasExactActiveClaim(final long dataCenterId, final String lspName,
+            final String chassisUuid) {
+        return false;
+    }
+
     /** Resolves the configured requested-chassis policy without writing OVN state. */
     default String resolveRequestedChassis(final Map<String, String> vmDetails) {
         return vmDetails == null ? null : vmDetails.get("ovn.requested_chassis");

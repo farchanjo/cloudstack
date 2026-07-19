@@ -57,4 +57,11 @@ public class OvnChassisLookupImpl implements OvnChassisLookup {
         final OvnSbClient sb = pluginManager.sbClient(dataCenterId);
         return sb == null ? -1 : sb.countActivePortBindingClaims(lspName);
     }
+
+    @Override
+    public boolean hasExactActiveClaim(final long dataCenterId, final String lspName,
+            final String chassisUuid) {
+        final OvnSbClient sb = pluginManager.sbClient(dataCenterId);
+        return sb != null && sb.hasExactPortBindingClaim(lspName, chassisUuid);
+    }
 }

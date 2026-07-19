@@ -97,12 +97,38 @@ public class OvnSbClient implements AutoCloseable {
         return count;
     }
 
+    public boolean hasExactPortBindingClaim(final String logicalPort, final String chassisUuid) {
+        final ArrayNode params = JsonNodeFactory.instance.arrayNode();
+        params.add(DB_SB);
+        params.add(OvnOpFactory.select("Port_Binding", OvnOpFactory.whereAll(),
+                stringArray("logical_port", "chassis")));
+        final JsonNode reply = pool.call("transact", params);
+        if (!(reply instanceof ArrayNode) || reply.size() == 0 || !reply.get(0).has("rows")) {
+            return false;
+        }
+        for (final JsonNode row : reply.get(0).get("rows")) {
+            if (logicalPort.equals(row.path("logical_port").asText())
+                    && hasExactChassis(row.get("chassis"), chassisUuid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean hasChassis(final JsonNode chassis) {
         if (chassis == null || !chassis.isArray() || chassis.size() == 0) {
             return false;
         }
         return !(chassis.size() == 2 && "set".equals(chassis.get(0).asText())
                 && chassis.get(1).isArray() && chassis.get(1).size() == 0);
+    }
+
+    private boolean hasExactChassis(final JsonNode chassis, final String expected) {
+        if (!hasChassis(chassis) || expected == null || expected.isBlank()) {
+            return false;
+        }
+        return java.util.Arrays.stream(chassis.toString().split("[,\\[\\]\"\\s]+"))
+                .anyMatch(expected::equals);
     }
 
     private List<ChassisRow> decodeChassisRows(final JsonNode reply) {

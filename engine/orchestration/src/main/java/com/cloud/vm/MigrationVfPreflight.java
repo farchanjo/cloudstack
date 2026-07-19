@@ -32,6 +32,7 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
+import com.cloud.vm.dao.NicDao;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 /**
@@ -52,6 +53,7 @@ public class MigrationVfPreflight {
     private final VfPoolManager vfPoolManager;
     private final NetworkDao networkDao;
     private final NetworkOfferingDao networkOfferingDao;
+    private final NicDao nicDao;
     private final ConcurrentMap<String, ReentrantLock> admissionLocks = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, ReentrantLock> clusterLocks = new ConcurrentHashMap<>();
     private OvnChassisLookup chassisLookup;
@@ -59,10 +61,17 @@ public class MigrationVfPreflight {
 
     @Inject
     public MigrationVfPreflight(final VfPoolManager vfPoolManager,
-            final NetworkDao networkDao, final NetworkOfferingDao networkOfferingDao) {
+            final NetworkDao networkDao, final NetworkOfferingDao networkOfferingDao,
+            final NicDao nicDao) {
         this.vfPoolManager = vfPoolManager;
         this.networkDao = networkDao;
         this.networkOfferingDao = networkOfferingDao;
+        this.nicDao = nicDao;
+    }
+
+    public MigrationVfPreflight(final VfPoolManager vfPoolManager,
+            final NetworkDao networkDao, final NetworkOfferingDao networkOfferingDao) {
+        this(vfPoolManager, networkDao, networkOfferingDao, null);
     }
 
     @Autowired(required = false)
@@ -135,6 +144,7 @@ public class MigrationVfPreflight {
 
     private void verifyInternal(final VirtualMachineProfile profile, final Host destination,
             final MigrationMode mode) {
+        validateNicInventory(profile);
         validateHostdev(profile, mode);
         final int required = countVdpaNics(profile);
         final int requiredHostdev = mode == MigrationMode.COLD ? countColdHostdevNics(profile) : 0;
@@ -157,6 +167,23 @@ public class MigrationVfPreflight {
             throw new CloudRuntimeException(String.format(
                     "VM requires %d cold SR-IOV hostdev VF(s) on host %s, but capacity is unavailable",
                     requiredHostdev, destination.getId()));
+        }
+    }
+
+    private void validateNicInventory(final VirtualMachineProfile profile) {
+        if (nicDao == null) {
+            return;
+        }
+        final java.util.List<NicVO> inventory = nicDao.listByVmId(profile.getId());
+        final java.util.List<NicProfile> profiles = profile.getNics();
+        if (inventory == null || profiles == null || inventory.size() != profiles.size()) {
+            throw new CloudRuntimeException("VM NIC inventory/profile count mismatch; refusing migration");
+        }
+        final java.util.Set<Long> inventoryIds = inventory.stream().map(NicVO::getId).collect(java.util.stream.Collectors.toSet());
+        final java.util.Set<Long> profileIds = profiles.stream().map(NicProfile::getId).collect(java.util.stream.Collectors.toSet());
+        if (inventoryIds.size() != inventory.size() || profileIds.size() != profiles.size()
+                || !inventoryIds.equals(profileIds)) {
+            throw new CloudRuntimeException("VM NIC inventory/profile identity mismatch; refusing migration");
         }
     }
 
@@ -239,12 +266,18 @@ public class MigrationVfPreflight {
         if (destinationChassis == null || destinationChassis.isBlank()) {
             throw new CloudRuntimeException("destination OVN chassis identity is unresolved; refusing vDPA migration");
         }
+        final Long sourceHostId = profile.getVirtualMachine().getHostId();
+        final String sourceChassis = sourceHostId == null ? null : chassisLookup.findChassisUuid(sourceHostId);
+        if (sourceChassis == null || sourceChassis.isBlank()) {
+            throw new CloudRuntimeException("source OVN chassis identity is unresolved; refusing vDPA migration");
+        }
         for (final NicProfile nic : profile.getNics()) {
             if (!isVdpaNic(nic)) {
                 continue;
             }
             final int claims = chassisLookup.countActiveClaims(destination.getDataCenterId(), "lsp-" + nic.getUuid());
-            if (claims != 1) {
+            final String lsp = "lsp-" + nic.getUuid();
+            if (claims != 1 || !chassisLookup.hasExactActiveClaim(destination.getDataCenterId(), lsp, sourceChassis)) {
                 throw new CloudRuntimeException(String.format(
                         "expected exactly one pre-cutover source Port_Binding claim for NIC %s, found %d",
                         nic.getUuid(), claims));
@@ -252,11 +285,15 @@ public class MigrationVfPreflight {
         }
     }
 
-    private boolean isVdpaNic(final NicProfile nic) {
+    public boolean isVdpaNic(final NicProfile nic) {
         final NetworkVO network = networkDao.findById(nic.getNetworkId());
         final NetworkOfferingVO offering = network == null ? null
                 : networkOfferingDao.findById(network.getNetworkOfferingId());
         return offering != null && offering.isVdpaEnabled();
+    }
+
+    public int requiredVdpaVfs(final NicProfile nic) {
+        return isVdpaNic(nic) ? 1 : 0;
     }
 
     private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination) {

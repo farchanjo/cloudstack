@@ -42,7 +42,8 @@ public class LibvirtVerifySourceBindingDownCommandWrapperTest {
             script.when(() -> Script.runSimpleBashScript(contains("Port_Binding"))).thenReturn("[uuid, source-chassis]");
 
             final Answer answer = new LibvirtVerifySourceBindingDownCommandWrapper().execute(
-                    new VerifySourceBindingDownCommand("i-1-VM", new String[]{"lsp-1"}, "source-chassis"), resource);
+                    new VerifySourceBindingDownCommand("i-1-VM", new String[]{"lsp-1"}, "source-chassis",
+                            "destination-chassis"), resource);
 
             assertFalse(answer.getResult());
         }
@@ -57,9 +58,27 @@ public class LibvirtVerifySourceBindingDownCommandWrapperTest {
             script.when(() -> Script.runSimpleBashScript(contains("Port_Binding"))).thenReturn("[uuid, destination-chassis]");
 
             final Answer answer = new LibvirtVerifySourceBindingDownCommandWrapper().execute(
-                    new VerifySourceBindingDownCommand("i-1-VM", new String[]{"lsp-1"}, "source-chassis"), resource);
+                    new VerifySourceBindingDownCommand("i-1-VM", new String[]{"lsp-1"}, "source-chassis",
+                            "destination-chassis"), resource);
 
             assertTrue(answer.getResult());
+        }
+    }
+
+    @Test
+    public void rejectsWrongAndMultipleRemainingChassisClaims() {
+        final LibvirtComputingResource resource = mock(LibvirtComputingResource.class);
+        try (MockedStatic<Script> script = mockStatic(Script.class)) {
+            script.when(() -> Script.runSimpleBashScript(contains("virsh domstate"))).thenReturn("shut off");
+            script.when(() -> Script.runSimpleBashScript(contains("find Interface"))).thenReturn("");
+            script.when(() -> Script.runSimpleBashScript(contains("Port_Binding")))
+                    .thenReturn("[uuid, wrong-chassis, destination-chassis]");
+
+            final Answer answer = new LibvirtVerifySourceBindingDownCommandWrapper().execute(
+                    new VerifySourceBindingDownCommand("i-1-VM", new String[]{"lsp-1"}, "source-chassis",
+                            "destination-chassis"), resource);
+
+            assertFalse(answer.getResult());
         }
     }
 }

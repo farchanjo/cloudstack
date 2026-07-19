@@ -3407,7 +3407,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
                 throw new CloudRuntimeException("Destination OVN post-migration stamp failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId)) {
+            if (!verifySourceBindingDown(vm, to, srcHostId, dstHostId)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after cutover");
             }
             try {
@@ -3526,7 +3526,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     }
 
     private boolean verifySourceBindingDown(final VMInstanceVO vm, final VirtualMachineTO to,
-            final long sourceHostId) {
+            final long sourceHostId, final long destinationHostId) {
         if (!hasVdpaNic(to)) {
             return true;
         }
@@ -3539,7 +3539,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         try {
             final Answer answer = _agentMgr.send(sourceHostId,
                     new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
-                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId))));
+                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId)),
+                            migrationVfPreflight.expectedChassis(_hostDao.findById(destinationHostId))));
             return answer instanceof VerifySourceBindingDownAnswer && answer.getResult();
         } catch (Exception e) {
             logger.error("Source vDPA binding proof failed for VM {} after cutover", vm.getInstanceName(), e);
@@ -3986,7 +3987,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!dispatchPostMigrateOvnStamp(vm, to, destHostId)) {
                 throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId)) {
+            if (!verifySourceBindingDown(vm, to, srcHostId, destHostId)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after storage cutover");
             }
             requireVfOwnershipManager(profile);
@@ -4263,7 +4264,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             advanceStop(vmUuid, true);
             final Answer bindingDown = _agentMgr.send(sourceHostId,
                     new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
-                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId))));
+                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId)),
+                            migrationVfPreflight.expectedChassis(destination.getHost())));
             if (!(bindingDown instanceof VerifySourceBindingDownAnswer) || !bindingDown.getResult()) {
                 throw new CloudRuntimeException("source vDPA binding-down proof failed; refusing cold relocation");
             }
@@ -5398,7 +5400,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
                 throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId)) {
+            if (!verifySourceBindingDown(vm, to, srcHostId, dstHostId)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after scale cutover");
             }
             requireVfOwnershipManager(profile);

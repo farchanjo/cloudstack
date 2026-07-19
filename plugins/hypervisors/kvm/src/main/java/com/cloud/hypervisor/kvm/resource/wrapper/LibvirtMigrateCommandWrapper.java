@@ -711,18 +711,25 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
         Document doc = docBuilder.parse(in);
 
         Node domainNode = doc.getFirstChild();
+        java.util.Set<String> xmlMacs = new java.util.HashSet<>();
         NodeList domainChildren = domainNode.getChildNodes();
         for (int i = 0; i < domainChildren.getLength(); i++) {
             Node child = domainChildren.item(i);
             if (!"devices".equals(child.getNodeName())) {
                 continue;
             }
-            rewriteVdpaDevicesNode(child, vdpaMapping);
+            xmlMacs.addAll(rewriteVdpaDevicesNode(child, vdpaMapping));
+        }
+        java.util.Set<String> mappingMacs = vdpaMapping.keySet().stream()
+                .map(mac -> mac.toLowerCase(java.util.Locale.ROOT)).collect(java.util.stream.Collectors.toSet());
+        if (!mappingMacs.equals(xmlMacs) || vdpaMapping.values().stream().distinct().count() != vdpaMapping.size()) {
+            throw new CloudRuntimeException("vDPA destination mapping is not bijective with migration XML");
         }
         return LibvirtXMLParser.getXml(doc);
     }
 
-    private void rewriteVdpaDevicesNode(final Node devicesNode, final Map<String, String> vdpaMapping) {
+    private java.util.Set<String> rewriteVdpaDevicesNode(final Node devicesNode, final Map<String, String> vdpaMapping) {
+        final java.util.Set<String> xmlMacs = new java.util.HashSet<>();
         NodeList devChildren = devicesNode.getChildNodes();
         for (int x = 0; x < devChildren.getLength(); x++) {
             Node devChild = devChildren.item(x);
@@ -734,8 +741,13 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
             if (typeAttr == null || !"vdpa".equals(typeAttr.getNodeValue())) {
                 continue;
             }
+            final String mac = extractMacFromInterface(devChild);
+            if (mac != null) {
+                xmlMacs.add(mac.toLowerCase(java.util.Locale.ROOT));
+            }
             rewriteSingleVdpaInterface(devChild, vdpaMapping);
         }
+        return xmlMacs;
     }
 
     private void rewriteSingleVdpaInterface(final Node ifaceNode, final Map<String, String> vdpaMapping) {

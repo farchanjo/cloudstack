@@ -604,6 +604,8 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | Slice 0 P0.3 schema registry | completed | `Upgrade42432to42433` and `DatabaseUpgradeChecker` registration | scoped schema/tool validation on Aragog |
 | Slice 0 P0.4 Aragog validation | pending | not run from this workstation by policy | Aragog build and clean-worktree verification |
 | Slice 0 P0.5 safety | completed | no runtime implementation, deployment, CMK, Foreman, or infrastructure operation performed | maintain boundary for later slices |
+| SP7 live evidence | pending | Code hard-abort triggers and tests are present; no Aragog/canary observation has been performed | C5, then dedicated canary only |
+| SP6 live evidence | pending | Read-only observation plan is documented; no observation window has been performed | C5, then dedicated canary only |
 
 ---
 

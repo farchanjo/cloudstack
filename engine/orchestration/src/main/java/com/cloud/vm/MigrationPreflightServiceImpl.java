@@ -86,7 +86,9 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
         }
         return profile.getNics().stream()
                 .map(nic -> new MigrationNicPreflightStatus(nic.getUuid(), allowed,
-                        preflight.requiredVdpaVfs(profile), free, denialReason))
+                        preflight.requiredVdpaVfs(nic), free,
+                        denialReason != null && denialReason.contains("SR-IOV hostdev")
+                                && !nic.isUseHwOffload() ? null : denialReason))
                 .toList();
     }
 }

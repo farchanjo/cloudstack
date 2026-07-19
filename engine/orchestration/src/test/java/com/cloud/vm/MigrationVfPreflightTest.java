@@ -76,6 +76,7 @@ public class MigrationVfPreflightTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);
         when(networkDao.findById(NETWORK_ID)).thenReturn(network);
@@ -115,6 +116,7 @@ public class MigrationVfPreflightTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);
         when(nic.isUseHwOffload()).thenReturn(true);
@@ -139,6 +141,7 @@ public class MigrationVfPreflightTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(vm.isHaEnabled()).thenReturn(true);
         when(vm.getDetails()).thenReturn(java.util.Map.of());
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
@@ -167,6 +170,7 @@ public class MigrationVfPreflightTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(vm.isHaEnabled()).thenReturn(true);
         when(vm.getDetails()).thenReturn(java.util.Map.of("fencing.configured", "false"));
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
@@ -195,6 +199,7 @@ public class MigrationVfPreflightTest {
         final OvnChassisLookup lookup = mock(OvnChassisLookup.class);
         preflight.setChassisLookup(lookup);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(vm.getDetails()).thenReturn(java.util.Map.of("ovn.requested_chassis", "source-chassis"));
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);
@@ -221,6 +226,7 @@ public class MigrationVfPreflightTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getHostId()).thenReturn(19L);
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.isUseHwOffload()).thenReturn(true);
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);

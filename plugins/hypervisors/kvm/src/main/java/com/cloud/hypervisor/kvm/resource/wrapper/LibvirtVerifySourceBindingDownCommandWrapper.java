@@ -58,6 +58,11 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
             if (hasExactIdentity(bindings, command.getSourceChassis())) {
                 return failure(command, "source chassis still owns Port_Binding " + lsp);
             }
+            final String[] identities = identities(bindings);
+            if (identities.length > 0 && (StringUtils.isBlank(command.getDestinationChassis())
+                    || identities.length != 1 || !command.getDestinationChassis().equals(identities[0]))) {
+                return failure(command, "Port_Binding chassis identity is not the authoritative destination for " + lsp);
+            }
         }
         return new VerifySourceBindingDownAnswer(command, true, "source vDPA bindings are down");
     }
@@ -73,5 +78,12 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
         }
         return java.util.Arrays.stream(output.split("[,\\[\\]\"\\s]+"))
                 .anyMatch(expected::equals);
+    }
+
+    private String[] identities(final String output) {
+        return java.util.Arrays.stream(output.split("[,\\[\\]\"\\s]+"))
+                .filter(StringUtils::isNotBlank)
+                .filter(value -> !"uuid".equals(value))
+                .toArray(String[]::new);
     }
 }
