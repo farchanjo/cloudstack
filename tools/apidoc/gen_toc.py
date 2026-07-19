@@ -60,6 +60,7 @@ known_categories = {
     'Volume': 'Volume',
     'Vlan': 'VLAN',
     'IpAddress': 'Address',
+    'listMigrationPreflight': 'Host',
     # Public IPv6 inventory / LB (Option B dual-stack) — gen_toc matches substring in API name
     'PublicIpv6': 'Address',
     'PublicIpv6Address': 'Address',
