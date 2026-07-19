@@ -116,10 +116,12 @@ public class MigrationPreflightServiceImplTest {
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO networkOffering = mock(NetworkOfferingVO.class);
         when(vm.getId()).thenReturn(99L);
+        when(vm.getUuid()).thenReturn("vm-1");
         when(vm.getServiceOfferingId()).thenReturn(1L);
         when(vm.getHostId()).thenReturn(10L);
         when(host.getId()).thenReturn(44L);
         when(hostDao.findById(44L)).thenReturn(host);
+        when(vmDao.findById(99L)).thenReturn(vm);
         when(host.getStatus()).thenReturn(Status.Up);
         when(host.getClusterId()).thenReturn(1L);
         when(host.getDataCenterId()).thenReturn(1L);
