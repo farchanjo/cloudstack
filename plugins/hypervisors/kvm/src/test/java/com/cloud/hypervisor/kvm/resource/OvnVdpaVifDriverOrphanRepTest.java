@@ -54,6 +54,7 @@ public class OvnVdpaVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
 
             driver.unplug(iface, true);
 
@@ -82,6 +83,7 @@ public class OvnVdpaVifDriverOrphanRepTest {
     @Test
     public void freeRepresentorOnOvs_unknownBdfFailsClosed() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
             OvnVifDriver.freeRepresentorOnOvs(
                     org.apache.logging.log4j.LogManager.getLogger(OvnVdpaVifDriverOrphanRepTest.class),
                     "test", "dx6p0vf9");
