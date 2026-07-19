@@ -1524,4 +1524,63 @@ set.
 production service, DB, management node, KVM host, canary, migration, or
 Kubernetes/OVN/OVS state was mutated in this generation.
 
+## 16.11 Management deployment attempt — integral rollback (2026-07-19)
+
+The authorized non-rolling management deployment was attempted from the resolved
+precheck state and ended in an integral rollback before any `.33` artifact was
+installed. The transaction was `20260719T173053Z`.
+
+### Precheck evidence
+
+* Aragog was clean at commit `0266ba17eb51d37589817a0317e9cd95fff68930`.
+* Approved source hashes were verified: management
+  `a87322d3f117be00716c09800fa4b0e82dc60f413753351e0667caccb9a9c30`, Linstor
+  `2f34923868c61fb670680952be06e76c6371ff0e6456d5fec11f9f4016e0f65b`, and
+  StorPool `21b78c577f1a199900286b0dcb1d238fa170cff30903f7f9b3d27568dda3f900`.
+* All three management APIs were `.32`, HTTP 200, and active before the attempt.
+* PXC was `Primary`, size `3`, `Synced`, and `wsrep_ready=ON`; schema was
+  `4.24.1.32` with three active management hosts.
+* The fresh production gate passed before the stop: Snape `6/6` and Salazar
+  `13/13` nodes Ready, API/etcd `3/3` in each cluster, critical workloads
+  healthy under the accepted Flink exception, CT_LB `.35/.33` ready, expected
+  DSR responses healthy, and `19/19` CloudStack VMs Running with the expected
+  system-UUID set.
+
+### Backup and rollback evidence
+
+* Full backup:
+  `/var/backups/cloudstack-management-upgrade-20260719T173053Z/cloud.sql.gz`
+* Size: `8559937` bytes; owner/mode: `root:root`, `0644`.
+* Backup passed `gzip -t` and decompression readability validation.
+* SHA-256:
+  `dc4e07ac2928b5c9b5b906abba419f77b8ea3804e85fa0bdc4d0b1cae7f0a993`.
+* Current `.32` and `.30` artifacts were captured on Bellatrix, Barty, and
+  Voldemort before the stop. Rollback restored them from the per-host backup
+  directories.
+* The transaction returned `rc=141` during the backup-readability pipeline
+  (the validation reader intentionally consumed only its header, causing the
+  decompressor SIGPIPE). The defined rollback handler ran immediately and
+  returned `ROLLBACK_COMPLETE`; no `.33` artifact was deployed and no schema
+  upgrade was attempted.
+
+### Terminal rollback postcheck
+
+* Bellatrix, Barty, and Voldemort management services: `active`.
+* Each management API: HTTP `200`, version `4.24.1.32-SNAPSHOT`.
+* Restored management JAR SHA-256 on all three:
+  `3121d7a9ac1fdee3408537d79af6b8dbfec510e898c7ec476f742bbe1279b29e`.
+* Restored Linstor plugin SHA-256 on all three:
+  `a04f802abbee55e6bdfe97cf627de97243f6b5d8b920c1010840189e01b52d3a`.
+* Restored StorPool plugin SHA-256 on all three:
+  `0c139ea27e666260beac1d402dcd97009cb651523583b55bd9bedff74e03dc06`.
+* `.33` management and external plugin paths were absent after rollback.
+* Database schema remained `4.24.1.32`; active management hosts remained `3`.
+* PXC remained `Primary`, size `3`, `Synced`, and `wsrep_ready=ON`.
+* No Kubernetes, VM, UUID, agent, DSR/CT_LB, OVN/OVS, physical, vDPA, DNS,
+  nftables, Puppet, Foreman, or KVM-agent state was mutated. The vDPA canary
+  was not started.
+
+**Terminal result: `ROLLBACK_COMPLETE`.** Audit tracker updated after the
+terminal rollback. No vDPA canary authorization is implied.
+
 **End of tracker.**
