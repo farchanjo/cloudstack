@@ -242,6 +242,11 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                     if (row.getHostId() == hostId) {
                         if (State.ALLOCATED.name().equals(row.getState())
                                 || State.RESERVED.name().equals(row.getState())) {
+                            if (row.getVdpaKindEnum() != kind) {
+                                throw new CloudRuntimeException(String.format(
+                                        "VF pool row %d for nic=%d is %s but %s was requested; refusing mode mismatch",
+                                        row.getId(), nicId, row.getVdpaKind(), kind));
+                            }
                             return row;
                         }
                         throw new CloudRuntimeException(String.format(
@@ -383,7 +388,8 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 lockVmForNic(expectedNicId);
                 lockNicAndReadVfPoolId(expectedNicId);
                 final SriovVfPoolVO row = lockRow(vfPoolId, true);
-                if (row == null || !Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())) {
+                if (row == null || !Long.valueOf(expectedNicId).equals(row.getAllocatedToNicId())
+                        || !State.SUSPECT.name().equals(row.getState())) {
                     return false;
                 }
                 SriovVfPoolVO updateVo = createForUpdate();

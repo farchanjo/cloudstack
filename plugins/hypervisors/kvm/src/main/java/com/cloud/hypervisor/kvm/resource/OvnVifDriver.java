@@ -293,10 +293,9 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return;
         }
-        Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
-        Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s", repName));
+        validateOvsName(repName);
+        Script.executeCommandForExitValue("ovs-vsctl", "--if-exists", "clear", "Interface", repName, "external_ids");
+        Script.executeCommandForExitValue("ovs-vsctl", "--if-exists", "del-port", repName);
         log.info("{}: freed OVS representor {} (cleared external_ids + del-port)", callerLabel, repName);
     }
 
@@ -305,18 +304,24 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return true;
         }
-        final Script script = new Script("/bin/bash", 5_000, log);
-        script.add("-c");
-        script.add(String.format("ovs-vsctl --if-exists clear Interface %s external_ids"
-                + " && ovs-vsctl --if-exists del-port %s", repName, repName));
-        final String error = script.execute();
-        if (error != null) {
-            log.warn("{}: failed to free OVS representor {}: {}", callerLabel, repName, error);
+        validateOvsName(repName);
+        final int clearExit = Script.executeCommandForExitValue(5_000,
+                "ovs-vsctl", "--if-exists", "clear", "Interface", repName, "external_ids");
+        final int deleteExit = clearExit == 0 ? Script.executeCommandForExitValue(5_000,
+                "ovs-vsctl", "--if-exists", "del-port", repName) : clearExit;
+        if (deleteExit != 0) {
+            log.warn("{}: failed to free OVS representor {} (exit={})", callerLabel, repName, deleteExit);
             return false;
         }
         log.info("{}: freed OVS representor {} (cleared external_ids + del-port)",
                 callerLabel, repName);
         return true;
+    }
+
+    private static void validateOvsName(final String value) {
+        if (!value.matches("[A-Za-z0-9_.:-]{1,64}")) {
+            throw new IllegalArgumentException("invalid OVS interface name");
+        }
     }
 
     /** Matches {@code <mac address='..'/>} / {@code ".." } in virsh dumpxml. */

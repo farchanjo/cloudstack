@@ -105,7 +105,12 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
 
     @Override
     public Answer execute(final HostVfPurgeOrphansCommand cmd, final LibvirtComputingResource resource) {
-        final Set<String> targets = normalizeTargets(cmd.getTargetPciBdfs());
+        final Set<String> rawTargets = cmd.getTargetPciBdfs();
+        final Set<String> targets = normalizeTargets(rawTargets);
+        if (rawTargets.size() != targets.size()) {
+            return new HostVfPurgeOrphansAnswer(cmd, false,
+                    "invalid explicit target PCI BDF; refusing all cleanup");
+        }
         if (targets.isEmpty()) {
             return new HostVfPurgeOrphansAnswer(cmd, true, "no explicit target PCI BDFs; no-op");
         }
@@ -409,7 +414,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         operation.add("columns", columnArray);
         operation.addProperty("until", until);
         operation.add("rows", rows);
-        operation.addProperty("timeout", "immediate");
+        operation.addProperty("timeout", 0);
         operation.addProperty("comment", label);
         return operation;
     }
@@ -631,9 +636,15 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
     }
 
     private VdpaInventory inventoryVdpa() {
-        final CommandResult result = environment.runner.run("/usr/sbin/vdpa", "dev", "show");
-        return result.success ? VdpaInventory.success(parseVdpaDevicesByBdf(result.output))
-                : VdpaInventory.failure(result.error);
+        final CommandResult result = environment.runner.run("/usr/sbin/vdpa", "dev", "show", "-j");
+        if (!result.success) {
+            return VdpaInventory.failure(result.error);
+        }
+        try {
+            return VdpaInventory.success(parseVdpaDevicesByBdfStrict(result.output));
+        } catch (IllegalArgumentException e) {
+            return VdpaInventory.failure(e.getMessage());
+        }
     }
 
     private DomainInventory inventoryDomains(final VdpaInventory vdpa) {
@@ -856,6 +867,40 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             if (PCI_BDF.matcher(bdf).matches()) {
                 byBdf.computeIfAbsent(bdf, ignored -> new ArrayList<>()).add(name);
             }
+        }
+        return byBdf;
+    }
+
+    /** Strict JSON inventory parser; malformed successful output is unsafe. */
+    static Map<String, List<String>> parseVdpaDevicesByBdfStrict(final String output) {
+        final Map<String, List<String>> byBdf = new HashMap<>();
+        final JsonElement root;
+        try {
+            root = JsonParser.parseString(output);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("malformed vDPA JSON inventory", e);
+        }
+        if (!root.isJsonObject() || !root.getAsJsonObject().has("dev")
+                || !root.getAsJsonObject().get("dev").isJsonObject()) {
+            throw new IllegalArgumentException("unknown vDPA JSON inventory schema");
+        }
+        for (final Map.Entry<String, JsonElement> device
+                : root.getAsJsonObject().getAsJsonObject("dev").entrySet()) {
+            if (StringUtils.isBlank(device.getKey()) || !device.getValue().isJsonObject()) {
+                throw new IllegalArgumentException("invalid vDPA inventory entry");
+            }
+            final JsonElement mgmtdev = device.getValue().getAsJsonObject().get("mgmtdev");
+            if (mgmtdev == null || !mgmtdev.isJsonPrimitive()
+                    || !mgmtdev.getAsJsonPrimitive().isString()) {
+                throw new IllegalArgumentException("vDPA entry is missing mgmtdev");
+            }
+            final String value = mgmtdev.getAsString();
+            final String bdf = value.startsWith("pci/") ? value.substring("pci/".length()) : value;
+            if (!PCI_BDF.matcher(bdf).matches()) {
+                throw new IllegalArgumentException("vDPA entry has invalid management BDF");
+            }
+            byBdf.computeIfAbsent(bdf.toLowerCase(Locale.ROOT), ignored -> new ArrayList<>())
+                    .add(device.getKey());
         }
         return byBdf;
     }

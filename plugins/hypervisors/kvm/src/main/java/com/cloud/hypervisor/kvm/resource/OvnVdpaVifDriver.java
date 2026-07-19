@@ -407,8 +407,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                         "duplicate active/source representor claim cannot be proven orphaned: rep=%s iface-id=%s target=%s",
                         name, lspName, keepRepName));
             }
-            Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port %s %s",
-                    integrationBridge, name));
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.orphan", name);
             logger.warn("Removed provably orphaned inactive destination representor {} for LSP {}", name, lspName);
         }
     }
@@ -480,8 +479,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             if (!owned || !inactive) {
                 throw new CloudRuntimeException("refusing to remove non-destination-owned representor " + rep);
             }
-            Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port %s %s",
-                    integrationBridge, rep));
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.rollback", rep);
         }
     }
 

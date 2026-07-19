@@ -133,8 +133,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             }
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin());
             final String repFinal = repName;
-            rollback.push(() -> Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, repFinal)));
+            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(logger,
+                    "OvnVfPassthroughVifDriver.rollback", repFinal));
 
             final InterfaceDef intf = new InterfaceDef();
             // xmlVlanTag=0 → no <vlan> element in domain XML; OVN handles
@@ -350,8 +350,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             if (!destinationOwned || !inactive) {
                 throw new CloudRuntimeException("refusing to remove representor with unproven ownership: " + name);
             }
-            Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port %s %s", integrationBridge, name));
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.orphan", name);
             logger.info("OvnVfPassthroughVifDriver: cleared orphan rep={} carrying stale iface-id={} (kept rep={})",
                     name, lspName, keepRepName);
         }

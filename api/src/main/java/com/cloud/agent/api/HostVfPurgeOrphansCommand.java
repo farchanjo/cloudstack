@@ -113,7 +113,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Set<String> getKeepVdpaNames() {
-        return keepVdpaNames;
+        return keepVdpaNames == null ? Collections.emptySet() : new HashSet<>(keepVdpaNames);
     }
 
     public void setKeepVdpaNames(final Set<String> keepVdpaNames) {
@@ -121,7 +121,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Set<String> getKeepPciBdfs() {
-        return keepPciBdfs;
+        return keepPciBdfs == null ? Collections.emptySet() : new HashSet<>(keepPciBdfs);
     }
 
     public void setKeepPciBdfs(final Set<String> keepPciBdfs) {
@@ -129,7 +129,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Set<String> getTargetPciBdfs() {
-        return targetPciBdfs == null ? Collections.emptySet() : targetPciBdfs;
+        return targetPciBdfs == null ? Collections.emptySet() : new HashSet<>(targetPciBdfs);
     }
 
     public void setTargetPciBdfs(final Set<String> targetPciBdfs) {
@@ -137,7 +137,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getExpectedMacsByPciBdf() {
-        return expectedMacsByPciBdf == null ? Collections.emptyMap() : expectedMacsByPciBdf;
+        return expectedMacsByPciBdf == null ? Collections.emptyMap() : new HashMap<>(expectedMacsByPciBdf);
     }
 
     public void setExpectedMacsByPciBdf(final Map<String, String> expectedMacsByPciBdf) {
@@ -146,7 +146,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getExpectedRepresentorsByPciBdf() {
-        return expectedRepresentorsByPciBdf == null ? Collections.emptyMap() : expectedRepresentorsByPciBdf;
+        return expectedRepresentorsByPciBdf == null ? Collections.emptyMap() : new HashMap<>(expectedRepresentorsByPciBdf);
     }
 
     public void setExpectedRepresentorsByPciBdf(final Map<String, String> values) {
@@ -154,7 +154,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getExpectedInterfaceIdsByPciBdf() {
-        return expectedInterfaceIdsByPciBdf == null ? Collections.emptyMap() : expectedInterfaceIdsByPciBdf;
+        return expectedInterfaceIdsByPciBdf == null ? Collections.emptyMap() : new HashMap<>(expectedInterfaceIdsByPciBdf);
     }
 
     public void setExpectedInterfaceIdsByPciBdf(final Map<String, String> values) {
@@ -170,7 +170,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getOwnerOperationIdsByPciBdf() {
-        return ownerOperationIdsByPciBdf == null ? Collections.emptyMap() : ownerOperationIdsByPciBdf;
+        return ownerOperationIdsByPciBdf == null ? Collections.emptyMap() : new HashMap<>(ownerOperationIdsByPciBdf);
     }
 
     public void setOwnerOperationIdsByPciBdf(final Map<String, String> values) {
@@ -178,7 +178,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getOwnerPurposesByPciBdf() {
-        return ownerPurposesByPciBdf == null ? Collections.emptyMap() : ownerPurposesByPciBdf;
+        return ownerPurposesByPciBdf == null ? Collections.emptyMap() : new HashMap<>(ownerPurposesByPciBdf);
     }
 
     public void setOwnerPurposesByPciBdf(final Map<String, String> values) {
@@ -186,7 +186,7 @@ public class HostVfPurgeOrphansCommand extends Command {
     }
 
     public Map<String, String> getOwnerTokensByPciBdf() {
-        return ownerTokensByPciBdf == null ? Collections.emptyMap() : ownerTokensByPciBdf;
+        return ownerTokensByPciBdf == null ? Collections.emptyMap() : new HashMap<>(ownerTokensByPciBdf);
     }
 
     public void setOwnerTokensByPciBdf(final Map<String, String> values) {

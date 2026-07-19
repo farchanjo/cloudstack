@@ -204,36 +204,43 @@ public class VdpaPoolReconciler {
     /**
      * Parse the JSON shape that iproute2 emits:
      * <pre>{"dev":{"vdpa-vmA2":{"mgmtdev":"pci/0000:01:00.3","mac":"...","max_vqs":33}}}</pre>
-     * Returns map keyed by SF name. Tolerant of an empty / missing payload.
+     * Returns map keyed by SF name. An empty device object is valid; any other
+     * malformed or unknown successful payload fails closed.
      */
-    static Map<String, VdpaSf> parseHostSfs(String json) {
+    public static Map<String, VdpaSf> parseHostSfs(String json) {
         Map<String, VdpaSf> out = new LinkedHashMap<>();
-        if (json == null || json.isEmpty()) {
-            return out;
+        if (json == null || json.trim().isEmpty()) {
+            throw new IllegalArgumentException("vDPA inventory is unavailable");
         }
         try {
             JsonElement root = JsonParser.parseString(json);
-            if (!root.isJsonObject()) {
-                return out;
+            if (!root.isJsonObject() || !root.getAsJsonObject().has("dev")
+                    || !root.getAsJsonObject().get("dev").isJsonObject()) {
+                throw new IllegalArgumentException("unknown vDPA inventory schema");
             }
             JsonObject dev = root.getAsJsonObject().getAsJsonObject("dev");
-            if (dev == null) {
-                return out;
-            }
             for (String name : dev.keySet()) {
-                JsonObject entry = dev.getAsJsonObject(name);
-                if (entry == null) {
-                    continue;
+                if (name == null || name.isEmpty() || !dev.get(name).isJsonObject()) {
+                    throw new IllegalArgumentException("invalid vDPA inventory entry");
                 }
-                String mgmtdev = entry.has("mgmtdev") ? entry.get("mgmtdev").getAsString() : null;
+                JsonObject entry = dev.getAsJsonObject(name);
+                if (!entry.has("mgmtdev") || !entry.get("mgmtdev").isJsonPrimitive()
+                        || !entry.getAsJsonPrimitive("mgmtdev").isString()) {
+                    throw new IllegalArgumentException("vDPA entry is missing mgmtdev");
+                }
+                String mgmtdev = entry.get("mgmtdev").getAsString();
                 String mac = entry.has("mac") ? entry.get("mac").getAsString() : null;
                 Integer maxVqs = entry.has("max_vqs") ? entry.get("max_vqs").getAsInt() : null;
                 String mgmtdevPci = mgmtdev != null && mgmtdev.startsWith("pci/")
                         ? mgmtdev.substring("pci/".length()) : mgmtdev;
+                if (mgmtdevPci == null || !mgmtdevPci.matches("[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-9a-fA-F]")) {
+                    throw new IllegalArgumentException("vDPA entry has invalid management BDF");
+                }
                 out.put(name, new VdpaSf(name, mgmtdevPci, mac, maxVqs, null));
             }
         } catch (RuntimeException e) {
             LOGGER.warn("VdpaPoolReconciler: failed to parse vdpa dev show -j output: {}", e.getMessage());
+            throw e;
         }
         return out;
     }

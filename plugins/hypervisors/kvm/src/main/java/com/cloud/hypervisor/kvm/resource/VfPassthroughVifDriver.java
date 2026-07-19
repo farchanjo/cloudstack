@@ -113,7 +113,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 final String repNameFinal = repName;
                 rollback.push(() -> {
                     Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
-                    Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repNameFinal));
+            OvnVifDriver.freeRepresentorOnOvs(logger, "VfPassthroughVifDriver.plug.rollback", repNameFinal);
                 });
                 // Register the tier / VM in DvrManager so OpenFlow cross-tier
                 // shortcut + ACL flows get installed on br-bond. Runs right after
@@ -190,7 +190,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
             Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
-            Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repName));
+            OvnVifDriver.freeRepresentorOnOvs(logger, "VfPassthroughVifDriver.unplug", repName);
             logger.info("VF unplug: removed rep {} from OVS and cleared TC", repName);
         }
         // Clear the static FDB pin OF rule installed at plug time. Match by

@@ -34,6 +34,7 @@ import com.cloud.agent.api.to.NicTO;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.network.Networks;
 import com.cloud.utils.script.Script;
+import com.cloud.hypervisor.kvm.resource.hwoffload.VdpaPoolReconciler;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -215,6 +216,10 @@ public class VdpaVifDriver extends VifDriverBase {
         lifecycleLock.lock();
         try {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+            if (VdpaPoolReconciler.parseHostSfs(
+                    Script.runSimpleBashScript("vdpa dev show -j 2>/dev/null", 5000)).containsKey(vdpaName)) {
+                throw new InternalErrorException("vDPA device remained after deletion: " + vdpaName);
+            }
             logger.info("vDPA unplug: deleted {} (vhost={} mac={})", vdpaName, vhostDev, mac);
 
         // Drop the VF representor from br-bond and clear PF-side VF VLAN/MAC,
@@ -224,7 +229,7 @@ public class VdpaVifDriver extends VifDriverBase {
             String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
-                Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repName));
+                OvnVifDriver.freeRepresentorOnOvs(logger, "VdpaVifDriver.unplug", repName);
                 logger.info("vDPA unplug: removed rep {} from OVS and cleared TC", repName);
             }
             String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
