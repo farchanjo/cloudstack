@@ -82,11 +82,33 @@ public class LibvirtMigrateCommandWrapperVdpaXmlTest {
     @Test
     public void rejectsExtraAndDuplicateDestinationMappings() {
         final String xml = "<domain><devices><interface type='vdpa'>"
-                + "<mac address='02:00:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "<mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
                 + "</devices></domain>";
         assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
                 new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml,
                 Map.of("02:00:00:00:00:01", "/dev/vhost-vdpa-new",
                         "02:00:00:00:00:02", "/dev/vhost-vdpa-new")));
+    }
+
+    @Test
+    public void rejectsCaseVariantDuplicateSourceMappingEvenWithSameDestination() {
+        final String xml = "<domain><devices><interface type='vdpa'>"
+                + "<mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "</devices></domain>";
+        assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
+                new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml,
+                Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new",
+                        "02:aa:00:00:00:01".toUpperCase(), "/dev/vhost-vdpa-new")));
+    }
+
+    @Test
+    public void rejectsCaseVariantDuplicateSourceMappingWithDifferentDestination() {
+        final String xml = "<domain><devices><interface type='vdpa'>"
+                + "<mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "</devices></domain>";
+        assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
+                new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml,
+                Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new1",
+                        "02:aa:00:00:00:01".toUpperCase(), "/dev/vhost-vdpa-new2")));
     }
 }

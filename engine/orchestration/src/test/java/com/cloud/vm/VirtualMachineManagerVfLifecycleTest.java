@@ -37,6 +37,8 @@ import com.cloud.host.Host;
 import com.cloud.host.dao.HostDao;
 import com.cloud.agent.api.StartAnswer;
 import com.cloud.network.router.VfPoolManager;
+import com.cloud.network.NetworkManager;
+import com.cloud.vm.dao.NicDao;
 
 public class VirtualMachineManagerVfLifecycleTest {
 
@@ -115,6 +117,48 @@ public class VirtualMachineManagerVfLifecycleTest {
 
         assertFalse(VirtualMachineManagerImpl.authorizeFailedStartHardwareCleanup(answer, false, true));
         assertTrue(VirtualMachineManagerImpl.authorizeFailedStartHardwareCleanup(answer, true, true));
+    }
+
+    @Test
+    public void coldDestinationProfileRejectsOmittedAuthoritativeNic() {
+        final NetworkManager networkManager = mock(NetworkManager.class);
+        final NicDao nicDao = mock(NicDao.class);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        final NicProfile profileNic = mock(NicProfile.class);
+        final NicVO inventoryNic = mock(NicVO.class);
+        when(vm.getId()).thenReturn(1553L);
+        when(vm.getUuid()).thenReturn("vm-1");
+        when(networkManager.getNicProfiles(vm)).thenReturn(java.util.List.of(profileNic));
+        when(profileNic.getId()).thenReturn(1L);
+        when(inventoryNic.getId()).thenReturn(1L);
+        when(nicDao.listByVmId(1553L)).thenReturn(java.util.List.of(inventoryNic, mock(NicVO.class)));
+        ReflectionTestUtils.setField(manager, "_networkMgr", networkManager);
+        ReflectionTestUtils.setField(manager, "_nicsDao", nicDao);
+
+        assertThrows(com.cloud.utils.exception.CloudRuntimeException.class,
+                () -> ReflectionTestUtils.invokeMethod(manager, "migrationProfile", vm, mock(Host.class)));
+    }
+
+    @Test
+    public void coldDestinationProfileRejectsDuplicateAuthoritativeNicIdentity() {
+        final NetworkManager networkManager = mock(NetworkManager.class);
+        final NicDao nicDao = mock(NicDao.class);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        final NicProfile first = mock(NicProfile.class);
+        final NicProfile second = mock(NicProfile.class);
+        final NicVO inventory = mock(NicVO.class);
+        when(vm.getId()).thenReturn(1553L);
+        when(vm.getUuid()).thenReturn("vm-1");
+        when(networkManager.getNicProfiles(vm)).thenReturn(java.util.List.of(first, second));
+        when(first.getId()).thenReturn(1L);
+        when(second.getId()).thenReturn(1L);
+        when(inventory.getId()).thenReturn(1L);
+        when(nicDao.listByVmId(1553L)).thenReturn(java.util.List.of(inventory, mock(NicVO.class)));
+        ReflectionTestUtils.setField(manager, "_networkMgr", networkManager);
+        ReflectionTestUtils.setField(manager, "_nicsDao", nicDao);
+
+        assertThrows(com.cloud.utils.exception.CloudRuntimeException.class,
+                () -> ReflectionTestUtils.invokeMethod(manager, "migrationProfile", vm, mock(Host.class)));
     }
 
     @Test

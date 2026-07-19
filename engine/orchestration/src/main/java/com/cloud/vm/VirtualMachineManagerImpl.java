@@ -4281,12 +4281,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             orchestrateStart(vmUuid, java.util.Map.of(), startPlan, null);
 
             final VMInstanceVO startedVm = _vmDao.findByUuid(vmUuid);
-            destinationProfile = new VirtualMachineProfileImpl(startedVm, null,
-                    _offeringDao.findById(startedVm.getId(), startedVm.getServiceOfferingId()), null, null);
-            destinationProfile.setHost(destination.getHost());
-            for (final NicProfile nic : _networkMgr.getNicProfiles(startedVm)) {
-                destinationProfile.addNic(nic);
-            }
+            destinationProfile = migrationProfile(startedVm, destination.getHost());
             final VirtualMachineTO destinationTo = toVmTO(destinationProfile);
             if (!dispatchPostMigrateOvnStamp(startedVm, destinationTo, destination.getHost().getId())) {
                 throw new CloudRuntimeException("destination vDPA stamp/dataplane proof failed; refusing cold relocation");

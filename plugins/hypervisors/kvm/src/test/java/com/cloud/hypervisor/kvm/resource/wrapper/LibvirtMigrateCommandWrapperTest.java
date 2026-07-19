@@ -46,6 +46,7 @@ import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.libvirt.Connect;
+import org.libvirt.Domain;
 import org.libvirt.StorageVol;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -59,6 +60,7 @@ import org.w3c.dom.Node;
 import org.xml.sax.SAXException;
 
 import com.cloud.agent.api.MigrateCommand;
+import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo;
 import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo.DiskType;
 import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo.DriverType;
@@ -69,6 +71,7 @@ import com.cloud.agent.api.to.GPUDeviceTO;
 import com.cloud.agent.api.to.VirtualMachineTO;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.resource.LibvirtConnection;
+import com.cloud.hypervisor.kvm.resource.LibvirtUtilitiesHelper;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.DiskDef;
 import com.cloud.utils.exception.CloudRuntimeException;
 import org.apache.cloudstack.gpu.GpuDevice;
@@ -954,6 +957,43 @@ public class LibvirtMigrateCommandWrapperTest {
         String replaced = lw.replaceDpdkInterfaces(sourceDPDKVMToMigrate, dpdkPortMapping);
         Assert.assertTrue(replaced.contains("csdpdk-7"));
         Assert.assertFalse(replaced.contains("csdpdk-1"));
+    }
+
+    @Test
+    public void executeRejectsUnsafeVdpaMappingsAtDispatchGuard() throws Exception {
+        final LibvirtUtilitiesHelper helper = Mockito.mock(LibvirtUtilitiesHelper.class);
+        final Connect conn = Mockito.mock(Connect.class);
+        final Domain domain = Mockito.mock(Domain.class);
+        Mockito.when(libvirtComputingResourceMock.getLibvirtUtilitiesHelper()).thenReturn(helper);
+        Mockito.when(helper.getConnectionByVmName("vm-1")).thenReturn(conn);
+        Mockito.when(libvirtComputingResourceMock.getInterfaces(conn, "vm-1")).thenReturn(List.of());
+        Mockito.when(libvirtComputingResourceMock.getDisks(conn, "vm-1")).thenReturn(List.of());
+        Mockito.when(conn.getLibVirVersion()).thenReturn(1000000L);
+        Mockito.when(conn.domainLookupByName("vm-1")).thenReturn(domain);
+        final String vdpaXml = "<domain><devices><interface type='vdpa'>"
+                + "<mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "</devices></domain>";
+        Mockito.when(domain.getXMLDesc(Mockito.anyInt())).thenReturn(vdpaXml);
+        Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
+        final VirtualMachineTO to = Mockito.mock(VirtualMachineTO.class);
+        Mockito.when(to.getVncPassword()).thenReturn("");
+        final MigrateCommand command = new MigrateCommand("vm-1", "10.0.0.2", false, to, false);
+
+        final List<Map<String, String>> invalidMappings = new ArrayList<>();
+        invalidMappings.add(null);
+        invalidMappings.add(Map.of());
+        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
+        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new",
+                "02:00:00:00:00:02", "/dev/vhost-vdpa-extra"));
+        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new",
+                "02:aa:00:00:00:01".toUpperCase(), "/dev/vhost-vdpa-new"));
+        for (Map<String, String> mapping : invalidMappings) {
+            command.setVdpaInterfaceMapping(mapping);
+            final Answer answer = libvirtMigrateCmdWrapper.execute(command, libvirtComputingResourceMock);
+            assertFalse("mapping must fail at the execute dispatch guard: " + mapping, answer.getResult());
+            assertTrue(String.valueOf(answer.getDetails()).contains("vDPA"));
+        }
+        Mockito.verify(domain, Mockito.times(invalidMappings.size())).getXMLDesc(Mockito.anyInt());
     }
 
     @Test

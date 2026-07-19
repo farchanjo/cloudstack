@@ -69,7 +69,7 @@ public class MigrateCommand extends Command {
     }
 
     public void setVdpaInterfaceMapping(final Map<String, String> vdpaInterfaceMapping) {
-        this.vdpaInterfaceMapping = vdpaInterfaceMapping != null ? vdpaInterfaceMapping : new HashMap<>();
+        this.vdpaInterfaceMapping = vdpaInterfaceMapping;
     }
 
     public Map<String, Boolean> getVlanToPersistenceMap() {

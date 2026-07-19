@@ -722,9 +722,9 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
             }
             xmlMacs.addAll(rewriteVdpaDevicesNode(child, vdpaMapping, xmlDevices));
         }
-        java.util.Set<String> mappingMacs = vdpaMapping.keySet().stream()
-                .map(mac -> mac.toLowerCase(java.util.Locale.ROOT)).collect(java.util.stream.Collectors.toSet());
-        if (!mappingMacs.equals(xmlMacs) || vdpaMapping.values().stream().distinct().count() != vdpaMapping.size()
+        final Map<String, String> canonicalMapping = canonicalizeVdpaMapping(vdpaMapping);
+        java.util.Set<String> mappingMacs = canonicalMapping.keySet();
+        if (!mappingMacs.equals(xmlMacs) || canonicalMapping.values().stream().distinct().count() != canonicalMapping.size()
                 || xmlDevices.size() != xmlMacs.size()) {
             throw new CloudRuntimeException("vDPA destination mapping is not bijective with migration XML");
         }
@@ -754,9 +754,27 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
             if (dev == null || !xmlDevices.add(dev.getNodeValue())) {
                 throw new CloudRuntimeException("vDPA XML contains a missing or duplicate source device");
             }
-            rewriteSingleVdpaInterface(devChild, vdpaMapping);
+            rewriteSingleVdpaInterface(devChild, canonicalizeVdpaMapping(vdpaMapping));
         }
         return xmlMacs;
+    }
+
+    private Map<String, String> canonicalizeVdpaMapping(final Map<String, String> mapping) {
+        final Map<String, String> canonical = new java.util.HashMap<>();
+        for (Map.Entry<String, String> entry : mapping.entrySet()) {
+            if (entry.getKey() == null) {
+                throw new CloudRuntimeException("vDPA destination mapping contains a null source key");
+            }
+            final String key = entry.getKey().toLowerCase(java.util.Locale.ROOT);
+            if (canonical.containsKey(key)) {
+                throw new CloudRuntimeException("vDPA destination mapping contains duplicate canonical source MAC " + key);
+            }
+            canonical.put(key, entry.getValue());
+        }
+        if (canonical.size() != mapping.size()) {
+            throw new CloudRuntimeException("vDPA destination mapping contains duplicate source keys");
+        }
+        return canonical;
     }
 
     private boolean containsVdpaInterface(final String xmlDesc) throws TransformerException, ParserConfigurationException,
