@@ -234,8 +234,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
 
         assertTrue(answer.getTargetResults().get(0).getDetails(), answer.getResult());
         assertTrue(answer.getTargetResults().get(0).isRepresentorRemoved());
-        assertTrue(host.commands.stream().anyMatch(value -> value.contains("del-port br-bond zzz-correct-pf1vf24")));
-        assertFalse(host.commands.stream().anyMatch(value -> value.contains("del-port br-bond aaa-wrong-pf1vf24")));
+        assertTrue(host.commands.stream().anyMatch(value -> value.contains("ovsdb-client transact")
+                && value.contains("bridge-uuid") && value.contains("port-uuid")));
+        assertFalse(host.commands.stream().anyMatch(value -> value.contains("clear Interface")
+                || value.contains("del-port")));
         assertEquals("00:00:00:00:00:00", host.currentMac);
     }
 
