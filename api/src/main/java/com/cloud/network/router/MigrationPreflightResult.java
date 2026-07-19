@@ -21,10 +21,19 @@ import java.util.List;
 /** Structured, read-only migration admission result. */
 public record MigrationPreflightResult(boolean allowed, long vmId, long destinationHostId,
         int requiredVdpaVfs, int freeVdpaVfs, String denialReason,
-        List<MigrationNicPreflightStatus> nicStatuses) {
+        List<MigrationNicPreflightStatus> nicStatuses, boolean requestedChassisOk,
+        boolean hostdevLiveRejected) {
 
     public MigrationPreflightResult(final boolean allowed, final long vmId, final long destinationHostId,
             final int requiredVdpaVfs, final int freeVdpaVfs, final String denialReason) {
-        this(allowed, vmId, destinationHostId, requiredVdpaVfs, freeVdpaVfs, denialReason, List.of());
+        this(allowed, vmId, destinationHostId, requiredVdpaVfs, freeVdpaVfs, denialReason,
+                List.of(), true, false);
+    }
+
+    public MigrationPreflightResult(final boolean allowed, final long vmId, final long destinationHostId,
+            final int requiredVdpaVfs, final int freeVdpaVfs, final String denialReason,
+            final List<MigrationNicPreflightStatus> nicStatuses) {
+        this(allowed, vmId, destinationHostId, requiredVdpaVfs, freeVdpaVfs, denialReason,
+                nicStatuses, true, false);
     }
 }

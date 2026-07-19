@@ -692,9 +692,9 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
      * destination-allocated path supplied by the dest agent's
      * {@code PrepareForMigrationAnswer#getVdpaInterfaceMapping()}.
      *
-     * <p>The map is keyed by lower-case MAC address. If a vDPA interface has
-     * no matching entry (unexpected), it is left unchanged and a warning is
-     * logged.
+     * <p>The map is keyed by lower-case MAC address. Every vDPA interface must
+     * have a destination mapping; an incomplete or unsafe mapping fails closed
+     * before the source XML can be used for migration.
      *
      * @param xmlDesc    the migratable domain XML from the source domain.
      * @param vdpaMapping MAC (lower-case) → dest {@code /dev/vhost-vdpa-N} path.
@@ -702,6 +702,9 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
      */
     protected String replaceVdpaInterfaces(final String xmlDesc, final Map<String, String> vdpaMapping)
             throws TransformerException, ParserConfigurationException, IOException, SAXException {
+        if (vdpaMapping == null) {
+            throw new CloudRuntimeException("vDPA destination mapping is absent");
+        }
         InputStream in = IOUtils.toInputStream(xmlDesc);
         DocumentBuilderFactory docFactory = ParserUtils.getSaferDocumentBuilderFactory();
         DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
@@ -738,13 +741,11 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
     private void rewriteSingleVdpaInterface(final Node ifaceNode, final Map<String, String> vdpaMapping) {
         String mac = extractMacFromInterface(ifaceNode);
         if (mac == null) {
-            logger.warn("replaceVdpaInterfaces: vDPA interface has no mac element; skipping");
-            return;
+            throw new CloudRuntimeException("vDPA interface has no MAC; refusing migration XML rewrite");
         }
         String destPath = vdpaMapping.get(mac.toLowerCase(java.util.Locale.ROOT));
-        if (destPath == null) {
-            logger.warn("replaceVdpaInterfaces: no dest vDPA path for mac {}; interface left unchanged", mac);
-            return;
+        if (destPath == null || !destPath.startsWith("/dev/vhost-vdpa-")) {
+            throw new CloudRuntimeException("no safe destination vDPA mapping for MAC " + mac);
         }
         NodeList ifaceChildren = ifaceNode.getChildNodes();
         for (int z = 0; z < ifaceChildren.getLength(); z++) {
@@ -758,7 +759,7 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
                 return;
             }
         }
-        logger.warn("replaceVdpaInterfaces: no <source dev> child found for vDPA mac {}", mac);
+        throw new CloudRuntimeException("vDPA interface has no source dev for MAC " + mac);
     }
 
     private String extractMacFromInterface(final Node ifaceNode) {

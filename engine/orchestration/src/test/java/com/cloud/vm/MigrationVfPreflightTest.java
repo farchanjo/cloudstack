@@ -44,6 +44,7 @@ public class MigrationVfPreflightTest {
     private NetworkDao networkDao;
     private NetworkOfferingDao networkOfferingDao;
     private MigrationVfPreflight preflight;
+    private MigrationAuthoritativeGuard authoritativeGuard;
 
     @Before
     public void setUp() {
@@ -55,6 +56,12 @@ public class MigrationVfPreflightTest {
         when(lookup.countActiveClaims(anyLong(), anyString())).thenReturn(1);
         when(lookup.findChassisUuid(anyLong())).thenReturn("destination-chassis");
         preflight.setChassisLookup(lookup);
+        authoritativeGuard = mock(MigrationAuthoritativeGuard.class);
+        when(authoritativeGuard.fencingReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        when(authoritativeGuard.placementReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        when(authoritativeGuard.quorumReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        when(authoritativeGuard.antiAffinityReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        preflight.setAuthoritativeGuard(authoritativeGuard);
     }
 
     @Test
@@ -142,6 +149,7 @@ public class MigrationVfPreflightTest {
         when(offering.isVdpaEnabled()).thenReturn(true);
         when(host.getId()).thenReturn(HOST_ID);
         when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(1);
+        when(authoritativeGuard.fencingReady(vm, host)).thenReturn(false);
 
         assertThrows(CloudRuntimeException.class,
                 () -> preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.LIVE));

@@ -363,6 +363,8 @@ tracker records **HA crash-restart = NO-GO**.
 - Cold canary: stop a dedicated canary vDPA VM on source, relocate to a
   destination host with free VF capacity, start, assert dataplane (DHCP, ICMP,
   TCP, iperf) + OVN Port_Binding claimed on destination + source VF `FREE`.
+  Preserve and compare DSR/LB VIP reachability, router-chassis affinity,
+  load-balancer/PF/NAT behavior, and network-policy invariants before and after.
 - Live canary: live-migrate the same canary vDPA VM, assert zero packet loss
   during migration window + dataplane verification green.
 - These run against the Aragog-managed test segment only; **no production VM**
@@ -491,6 +493,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | Kubernetes | 3+3 control-plane, anti-affinity | 3+3 control-plane, anti-affinity preserved |
 | NIC UUID / MAC / IP | unchanged | unchanged |
 | `requested-chassis` | (operator choice) | validated vs destination; unchanged unless operator set it |
+| DSR LB VIP / router chassis affinity | VIP ownership and router affinity unchanged | unchanged except the intended VM Port_Binding chassis |
 
 ---
 

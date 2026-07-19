@@ -39,6 +39,9 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
                 || StringUtils.containsIgnoreCase(state, "paused")) {
             return failure(command, "source domain is still active: " + state.trim());
         }
+        if (command.getLspNames().length > 0 && StringUtils.isBlank(command.getSourceChassis())) {
+            return failure(command, "source chassis identity is unresolved");
+        }
         for (final String lsp : command.getLspNames()) {
             if (StringUtils.isBlank(lsp)) {
                 continue;
@@ -49,6 +52,12 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
             if (StringUtils.isNotBlank(interfaces)) {
                 return failure(command, "source still carries iface-id " + lsp);
             }
+            final String bindings = Script.runSimpleBashScript(String.format(
+                    "ovn-sbctl --bare --no-heading --columns=chassis find Port_Binding logical_port=%s 2>/dev/null",
+                    lsp));
+            if (hasExactIdentity(bindings, command.getSourceChassis())) {
+                return failure(command, "source chassis still owns Port_Binding " + lsp);
+            }
         }
         return new VerifySourceBindingDownAnswer(command, true, "source vDPA bindings are down");
     }
@@ -56,5 +65,13 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
     private Answer failure(final VerifySourceBindingDownCommand command, final String details) {
         logger.error("Source binding-down verification failed: {}", details);
         return new VerifySourceBindingDownAnswer(command, false, details);
+    }
+
+    private boolean hasExactIdentity(final String output, final String expected) {
+        if (StringUtils.isBlank(output) || StringUtils.isBlank(expected)) {
+            return false;
+        }
+        return java.util.Arrays.stream(output.split("[,\\[\\]\"\\s]+"))
+                .anyMatch(expected::equals);
     }
 }

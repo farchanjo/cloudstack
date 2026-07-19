@@ -67,6 +67,16 @@ public class VirtualMachineManagerVfLifecycleTest {
     }
 
     @Test
+    public void strictRollbackFailureIsPropagatedForColdRecovery() {
+        doThrow(new IllegalStateException("restore conflict")).when(vfPoolManager)
+                .rollbackReservationsForVm(1553L, 16L, true, "cold-migration");
+
+        assertThrows(com.cloud.utils.exception.CloudRuntimeException.class,
+                () -> manager.rollbackVfReservationsStrict(1553L, 16L, true,
+                        "cold-migration", "cold-migration"));
+    }
+
+    @Test
     public void migrationTimeoutRollsBackWithoutAuthorizingDestructiveCleanup() {
         manager.rollbackVfReservationsBestEffort(1553L, 16L, false, "migration-timeout", "work-2");
 

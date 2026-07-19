@@ -17,11 +17,19 @@
 package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 
 import org.junit.Test;
+import org.mockito.MockedStatic;
 
 import com.cloud.agent.api.VerifyDestinationDataplaneAnswer;
 import com.cloud.agent.api.VerifyDestinationDataplaneCommand;
+import com.cloud.agent.api.to.NicTO;
+import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
+import com.cloud.utils.script.Script;
 
 public class DestinationDataplaneVerifierTest {
 
@@ -33,5 +41,30 @@ public class DestinationDataplaneVerifierTest {
                 new VerifyDestinationDataplaneAnswer(command, false, "unclaimed Port_Binding");
 
         assertFalse(answer.getResult());
+    }
+
+    @Test
+    public void executionAcceptsExactBrIntChassisAndClaimProof() {
+        final NicTO nic = new NicTO();
+        nic.setUseVdpa(true);
+        nic.setUuid("nic-1");
+        nic.setMac("02:00:00:00:00:01");
+        nic.setVfRepName("rep1");
+        final LibvirtComputingResource resource = mock(LibvirtComputingResource.class);
+        try (MockedStatic<Script> script = mockStatic(Script.class)) {
+            script.when(() -> Script.runSimpleBashScript(anyString())).thenAnswer(invocation -> {
+                final String command = invocation.getArgument(0);
+                if (command.contains("find Interface external_ids:iface-id")) return "rep1";
+                if (command.contains("attached-mac")) return "rep1";
+                if (command.contains("get Interface")) return "{iface-status=active, ovn-installed=true}";
+                if (command.contains("port-to-br")) return "br-int";
+                if (command.contains("ip link show")) return "3: rep1: <UP>";
+                if (command.contains("Port_Binding")) return "[uuid, chassis-1]";
+                return "";
+            });
+            final Answer answer = new LibvirtVerifyDestinationDataplaneCommandWrapper().execute(
+                    new VerifyDestinationDataplaneCommand("i-1-VM", new NicTO[]{nic}, "chassis-1"), resource);
+            assertTrue(answer.getResult());
+        }
     }
 }

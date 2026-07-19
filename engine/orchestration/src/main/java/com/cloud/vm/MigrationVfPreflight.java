@@ -32,7 +32,6 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
-import com.cloud.resource.ResourceState;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 /**
@@ -56,6 +55,7 @@ public class MigrationVfPreflight {
     private final ConcurrentMap<String, ReentrantLock> admissionLocks = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, ReentrantLock> clusterLocks = new ConcurrentHashMap<>();
     private OvnChassisLookup chassisLookup;
+    private MigrationAuthoritativeGuard authoritativeGuard;
 
     @Inject
     public MigrationVfPreflight(final VfPoolManager vfPoolManager,
@@ -68,6 +68,11 @@ public class MigrationVfPreflight {
     @Autowired(required = false)
     public void setChassisLookup(final OvnChassisLookup chassisLookup) {
         this.chassisLookup = chassisLookup;
+    }
+
+    @Autowired(required = false)
+    public void setAuthoritativeGuard(final MigrationAuthoritativeGuard authoritativeGuard) {
+        this.authoritativeGuard = authoritativeGuard;
     }
 
     public void verify(final VirtualMachineProfile profile, final Host destination) {
@@ -140,7 +145,7 @@ public class MigrationVfPreflight {
             validateRequestedChassis(profile, destination);
             validateGlobalClaims(profile, destination);
         }
-        validateHaAndPlacement(profile, destination, mode);
+        validateHaAndPlacement(profile, destination);
         final int free = required == 0 ? Integer.MAX_VALUE : vfPoolManager.countFreeForVdpa(destination.getId());
         if (free < required) {
             final String message = String.format(
@@ -230,6 +235,10 @@ public class MigrationVfPreflight {
         if (chassisLookup == null) {
             throw new CloudRuntimeException("OVN global claim validation is unavailable; refusing vDPA migration");
         }
+        final String destinationChassis = chassisLookup.findChassisUuid(destination.getId());
+        if (destinationChassis == null || destinationChassis.isBlank()) {
+            throw new CloudRuntimeException("destination OVN chassis identity is unresolved; refusing vDPA migration");
+        }
         for (final NicProfile nic : profile.getNics()) {
             if (!isVdpaNic(nic)) {
                 continue;
@@ -250,18 +259,17 @@ public class MigrationVfPreflight {
         return offering != null && offering.isVdpaEnabled();
     }
 
-    private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination,
-            final MigrationMode mode) {
+    private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination) {
         if (destination.getState() != Host.State.Up) {
             throw new CloudRuntimeException("destination host is not Up; refusing vDPA migration");
         }
-        if (mode == MigrationMode.LIVE && profile.getVirtualMachine().isHaEnabled()
-                && destination.getResourceState() != ResourceState.Enabled) {
-            throw new CloudRuntimeException("HA vDPA migration requires an Enabled destination resource");
+        if (authoritativeGuard == null
+                || !authoritativeGuard.fencingReady(profile.getVirtualMachine(), destination)
+                || !authoritativeGuard.placementReady(profile.getVirtualMachine(), destination)
+                || !authoritativeGuard.quorumReady(profile.getVirtualMachine(), destination)
+                || !authoritativeGuard.antiAffinityReady(profile.getVirtualMachine(), destination)) {
+            throw new CloudRuntimeException(
+                    "authoritative fencing/placement guard is unavailable or denied vDPA migration");
         }
-        // Affinity, anti-affinity, quorum, and fencing are authoritative
-        // placement/HA decisions. They are evaluated by the deployment planner
-        // and HighAvailabilityManager before this narrow hardware admission
-        // gate; VM details are deliberately not treated as policy truth here.
     }
 }

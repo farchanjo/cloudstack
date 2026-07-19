@@ -71,8 +71,11 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
             return new MigrationPreflightResult(true, vmId, destinationHostId, required, free, null,
                     nicStatuses(profile, true, null, free));
         } catch (RuntimeException e) {
+            final String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             return new MigrationPreflightResult(false, vmId, destinationHostId, required, free,
-                    e.getMessage(), nicStatuses(profile, false, e.getMessage(), free));
+                    reason, nicStatuses(profile, false, reason, free),
+                    !reason.contains("requested OVN chassis"),
+                    reason.contains("SR-IOV hostdev"));
         }
     }
 

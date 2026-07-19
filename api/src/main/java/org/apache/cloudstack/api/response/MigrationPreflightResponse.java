@@ -34,6 +34,10 @@ public class MigrationPreflightResponse extends BaseResponse {
     @SerializedName("denialreason") @Param(description = "Structured denial reason") private String denialReason;
     @SerializedName("nicstatuses") @Param(description = "Per-NIC migration admission evidence")
     private List<MigrationNicPreflightStatus> nicStatuses;
+    @SerializedName("requestedchassisok") @Param(description = "Whether requested chassis policy passed")
+    private boolean requestedChassisOk;
+    @SerializedName("hostdevliverejected") @Param(description = "Whether live hostdev migration was rejected")
+    private boolean hostdevLiveRejected;
 
     public static MigrationPreflightResponse from(final MigrationPreflightResult result) {
         final MigrationPreflightResponse response = new MigrationPreflightResponse();
@@ -44,6 +48,8 @@ public class MigrationPreflightResponse extends BaseResponse {
         response.freeVdpaVfs = result.freeVdpaVfs();
         response.denialReason = result.denialReason();
         response.nicStatuses = result.nicStatuses();
+        response.requestedChassisOk = result.requestedChassisOk();
+        response.hostdevLiveRejected = result.hostdevLiveRejected();
         return response;
     }
 
@@ -54,4 +60,6 @@ public class MigrationPreflightResponse extends BaseResponse {
     public int getFreeVdpaVfs() { return freeVdpaVfs; }
     public String getDenialReason() { return denialReason; }
     public List<MigrationNicPreflightStatus> getNicStatuses() { return nicStatuses; }
+    public boolean isRequestedChassisOk() { return requestedChassisOk; }
+    public boolean isHostdevLiveRejected() { return hostdevLiveRejected; }
 }

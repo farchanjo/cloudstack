@@ -14,16 +14,21 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-package com.cloud.network.router;
+package com.cloud.vm;
 
-import java.util.List;
+import com.cloud.host.Host;
 
-/** Read-only VF pool status exposed to administrative API callers. */
-public record VfPoolStatus(long hostId, int free, int vdpaFree, int reserved,
-        int allocated, int suspect, List<VfDeviceStatus> devices) {
+/**
+ * Authoritative migration policy port. Its implementation must be backed by
+ * the configured CloudStack fencing/OOB and placement/affinity services.
+ */
+public interface MigrationAuthoritativeGuard {
 
-    public VfPoolStatus(final long hostId, final int free, final int vdpaFree,
-            final int reserved, final int allocated, final int suspect) {
-        this(hostId, free, vdpaFree, reserved, allocated, suspect, List.of());
-    }
+    boolean fencingReady(VirtualMachine vm, Host destination);
+
+    boolean placementReady(VirtualMachine vm, Host destination);
+
+    boolean quorumReady(VirtualMachine vm, Host destination);
+
+    boolean antiAffinityReady(VirtualMachine vm, Host destination);
 }

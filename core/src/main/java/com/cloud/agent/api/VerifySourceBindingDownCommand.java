@@ -21,19 +21,24 @@ public class VerifySourceBindingDownCommand extends Command {
 
     private String vmName;
     private String[] lspNames;
+    private String sourceChassis;
 
     protected VerifySourceBindingDownCommand() {
     }
 
-    public VerifySourceBindingDownCommand(final String vmName, final String[] lspNames) {
+    public VerifySourceBindingDownCommand(final String vmName, final String[] lspNames,
+            final String sourceChassis) {
         this.vmName = vmName;
         this.lspNames = lspNames == null ? new String[0] : lspNames.clone();
+        this.sourceChassis = sourceChassis;
         setWait(10);
     }
 
     public String getVmName() { return vmName; }
 
     public String[] getLspNames() { return lspNames.clone(); }
+
+    public String getSourceChassis() { return sourceChassis; }
 
     @Override
     public boolean executeInSequence() { return false; }

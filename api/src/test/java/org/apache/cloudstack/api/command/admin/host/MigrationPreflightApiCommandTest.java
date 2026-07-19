@@ -17,10 +17,20 @@
 package org.apache.cloudstack.api.command.admin.host;
 
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+
+import org.springframework.test.util.ReflectionTestUtils;
 
 import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.api.APICommand;
 import org.junit.Test;
+
+import com.cloud.network.router.MigrationPreflightResult;
+import com.cloud.network.router.MigrationPreflightService;
+import com.cloud.network.router.VfPoolService;
+import com.cloud.network.router.VfPoolStatus;
+import org.apache.cloudstack.api.response.MigrationPreflightResponse;
 
 public class MigrationPreflightApiCommandTest {
 
@@ -34,5 +44,39 @@ public class MigrationPreflightApiCommandTest {
     public void listHostVfPoolStatusCmdIsAdminOnly() {
         final APICommand command = ListHostVfPoolStatusCmd.class.getAnnotation(APICommand.class);
         assertTrue(java.util.Arrays.asList(command.authorized()).contains(RoleType.Admin));
+    }
+
+    @Test
+    public void listMigrationPreflightReturnsStructuredDenial() throws Exception {
+        final MigrationPreflightService service = org.mockito.Mockito.mock(MigrationPreflightService.class);
+        org.mockito.Mockito.when(service.preflight(11L, 22L)).thenReturn(
+                new MigrationPreflightResult(false, 11L, 22L, 2, 1, "capacity"));
+        final ListMigrationPreflightCmd cmd = new ListMigrationPreflightCmd();
+        ReflectionTestUtils.setField(cmd, "preflightService", service);
+        ReflectionTestUtils.setField(cmd, "vmId", 11L);
+        ReflectionTestUtils.setField(cmd, "destinationHostId", 22L);
+
+        cmd.execute();
+
+        final MigrationPreflightResponse response = (MigrationPreflightResponse) cmd.getResponseObject();
+        assertFalse(response.isAllowed());
+        assertEquals("capacity", response.getDenialReason());
+    }
+
+    @Test
+    public void listHostVfPoolStatusReturnsPerDeviceStatus() throws Exception {
+        final VfPoolService service = org.mockito.Mockito.mock(VfPoolService.class);
+        org.mockito.Mockito.when(service.getHostVfPoolStatus(22L)).thenReturn(
+                new VfPoolStatus(22L, 2, 1, 0, 1, 0));
+        final ListHostVfPoolStatusCmd cmd = new ListHostVfPoolStatusCmd();
+        ReflectionTestUtils.setField(cmd, "vfPoolService", service);
+        ReflectionTestUtils.setField(cmd, "hostId", 22L);
+
+        cmd.execute();
+
+        final org.apache.cloudstack.api.response.VfPoolStatusResponse response =
+                (org.apache.cloudstack.api.response.VfPoolStatusResponse) cmd.getResponseObject();
+        assertEquals("22", response.getHostId());
+        assertEquals(1, response.getVdpaFree());
     }
 }

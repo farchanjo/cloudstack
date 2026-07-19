@@ -38,6 +38,9 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
             if (!nic.isUseVdpa()) {
                 continue;
             }
+            if (StringUtils.isBlank(command.getExpectedChassis())) {
+                return failure(command, "destination chassis identity is unresolved");
+            }
             final String lsp = StringUtils.isBlank(nic.getUuid()) ? null : "lsp-" + nic.getUuid();
             if (StringUtils.isBlank(lsp)) {
                 return failure(command, "vDPA NIC has no logical switch port identity");
@@ -80,7 +83,7 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
                 return failure(command, "expected exactly one destination Port_Binding chassis claim for " + lsp);
             }
             if (StringUtils.isNotBlank(command.getExpectedChassis())
-                    && !chassis.contains(command.getExpectedChassis())) {
+                    && !hasExactIdentity(chassis, command.getExpectedChassis())) {
                 return failure(command, "destination Port_Binding chassis does not match expected chassis for " + lsp);
             }
         }
@@ -106,5 +109,10 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
     private boolean hasExternalId(final String externalIds, final String key, final String value) {
         return externalIds.contains(key + "=" + value)
                 || externalIds.contains(key + "=\"" + value + "\"");
+    }
+
+    private boolean hasExactIdentity(final String output, final String expected) {
+        return java.util.Arrays.stream(output.split("[,\\[\\]\"\\s]+"))
+                .anyMatch(expected::equals);
     }
 }

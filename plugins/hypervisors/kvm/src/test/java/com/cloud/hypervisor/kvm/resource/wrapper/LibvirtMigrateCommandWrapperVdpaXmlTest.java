@@ -17,6 +17,7 @@
 package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThrows;
 
 import java.util.Map;
 
@@ -42,14 +43,24 @@ public class LibvirtMigrateCommandWrapperVdpaXmlTest {
     }
 
     @Test
-    public void leavesUnmappedVdpaSourceDeviceUnchanged() {
+    public void rejectsUnmappedVdpaSourceDevice() {
         final String xml = "<domain><devices><interface type='vdpa'>"
                 + "<mac address='02:00:00:00:00:03'/><source dev='/dev/vhost-vdpa-old3'/></interface>"
                 + "</devices></domain>";
 
-        final String rewritten = ReflectionTestUtils.invokeMethod(new LibvirtMigrateCommandWrapper(),
-                "replaceVdpaInterfaces", xml, Map.of());
+        assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
+                new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml, Map.of()));
+    }
 
-        assertTrue(rewritten.contains("/dev/vhost-vdpa-old3"));
+    @Test
+    public void rejectsPartialMultiNicVdpaMapping() {
+        final String xml = "<domain><devices>"
+                + "<interface type='vdpa'><mac address='02:00:00:00:00:01'/><source dev='/dev/vhost-vdpa-old1'/></interface>"
+                + "<interface type='vdpa'><mac address='02:00:00:00:00:02'/><source dev='/dev/vhost-vdpa-old2'/></interface>"
+                + "</devices></domain>";
+
+        assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
+                new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml,
+                Map.of("02:00:00:00:00:01", "/dev/vhost-vdpa-new1")));
     }
 }

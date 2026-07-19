@@ -18,11 +18,14 @@ package org.apache.cloudstack.api.response;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationNicPreflightStatus;
+import com.cloud.network.router.VfDeviceStatus;
+import com.cloud.network.router.VfPoolStatus;
 import com.cloud.network.router.VfPoolStatus;
 
 public class MigrationPreflightResponseTest {
@@ -32,7 +35,7 @@ public class MigrationPreflightResponseTest {
         final MigrationPreflightResponse response = MigrationPreflightResponse.from(
                 new MigrationPreflightResult(false, 11L, 22L, 2, 1, "fencing unavailable",
                         java.util.List.of(new MigrationNicPreflightStatus("nic-1", false, 2, 1,
-                                "fencing unavailable"))));
+                                "fencing unavailable")), false, true));
 
         assertFalse(response.isAllowed());
         assertEquals(11L, response.getVmId());
@@ -40,15 +43,20 @@ public class MigrationPreflightResponseTest {
         assertEquals(1, response.getFreeVdpaVfs());
         assertEquals("fencing unavailable", response.getDenialReason());
         assertEquals("nic-1", response.getNicStatuses().get(0).nicId());
+        assertFalse(response.isRequestedChassisOk());
+        assertTrue(response.isHostdevLiveRejected());
     }
 
     @Test
     public void mapsReadOnlyHostPoolStatus() {
         final VfPoolStatusResponse response = VfPoolStatusResponse.from(
-                new VfPoolStatus(22L, 8, 4, 1, 3, 0));
+                new VfPoolStatus(22L, 8, 4, 1, 3, 0,
+                        java.util.List.of(new VfDeviceStatus(9L, "0000:01:00.1", 11L,
+                                "ALLOCATED", "VDPA"))));
 
         assertEquals("22", response.getHostId());
         assertEquals(4, response.getVdpaFree());
         assertEquals(3, response.getAllocated());
+        assertEquals("0000:01:00.1", response.getDevices().get(0).pciAddress());
     }
 }

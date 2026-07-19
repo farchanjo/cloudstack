@@ -3538,7 +3538,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 .toArray(String[]::new);
         try {
             final Answer answer = _agentMgr.send(sourceHostId,
-                    new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps));
+                    new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
+                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId))));
             return answer instanceof VerifySourceBindingDownAnswer && answer.getResult();
         } catch (Exception e) {
             logger.error("Source vDPA binding proof failed for VM {} after cutover", vm.getInstanceName(), e);
@@ -4261,7 +4262,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             migrationVfPreflight.verify(sourceProfile, destination.getHost(), MigrationVfPreflight.MigrationMode.COLD);
             advanceStop(vmUuid, true);
             final Answer bindingDown = _agentMgr.send(sourceHostId,
-                    new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps));
+                    new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
+                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId))));
             if (!(bindingDown instanceof VerifySourceBindingDownAnswer) || !bindingDown.getResult()) {
                 throw new CloudRuntimeException("source vDPA binding-down proof failed; refusing cold relocation");
             }

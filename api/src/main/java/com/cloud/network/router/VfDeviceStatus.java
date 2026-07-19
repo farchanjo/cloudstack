@@ -16,14 +16,7 @@
 // under the License.
 package com.cloud.network.router;
 
-import java.util.List;
-
-/** Read-only VF pool status exposed to administrative API callers. */
-public record VfPoolStatus(long hostId, int free, int vdpaFree, int reserved,
-        int allocated, int suspect, List<VfDeviceStatus> devices) {
-
-    public VfPoolStatus(final long hostId, final int free, final int vdpaFree,
-            final int reserved, final int allocated, final int suspect) {
-        this(hostId, free, vdpaFree, reserved, allocated, suspect, List.of());
-    }
+/** Per-device and per-NIC VF ownership evidence. */
+public record VfDeviceStatus(long vfPoolId, String pciAddress, Long nicId,
+        String state, String vdpaKind) {
 }

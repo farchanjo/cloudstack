@@ -16,10 +16,14 @@
 // under the License.
 package org.apache.cloudstack.api.response;
 
+import java.util.List;
+
+import org.apache.cloudstack.api.BaseResponse;
+
+import com.cloud.network.router.VfDeviceStatus;
 import com.cloud.network.router.VfPoolStatus;
 import com.cloud.serializer.Param;
 import com.google.gson.annotations.SerializedName;
-import org.apache.cloudstack.api.BaseResponse;
 
 public class VfPoolStatusResponse extends BaseResponse {
 
@@ -41,6 +45,8 @@ public class VfPoolStatusResponse extends BaseResponse {
     @SerializedName("suspect")
     @Param(description = "Suspect VF rows")
     private int suspect;
+    @SerializedName("devices") @Param(description = "Per-device VF ownership evidence")
+    private List<VfDeviceStatus> devices;
 
     public static VfPoolStatusResponse from(final VfPoolStatus status) {
         final VfPoolStatusResponse response = new VfPoolStatusResponse();
@@ -50,6 +56,7 @@ public class VfPoolStatusResponse extends BaseResponse {
         response.reserved = status.reserved();
         response.allocated = status.allocated();
         response.suspect = status.suspect();
+        response.devices = status.devices();
         return response;
     }
 
@@ -59,4 +66,5 @@ public class VfPoolStatusResponse extends BaseResponse {
     public int getReserved() { return reserved; }
     public int getAllocated() { return allocated; }
     public int getSuspect() { return suspect; }
+    public List<VfDeviceStatus> getDevices() { return devices; }
 }

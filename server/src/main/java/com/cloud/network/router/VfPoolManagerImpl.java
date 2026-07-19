@@ -761,12 +761,16 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     @Override
     public VfPoolStatus getHostVfPoolStatus(final long hostId) {
+        final java.util.List<VfDeviceStatus> devices = vfPoolDao.listByHost(hostId).stream()
+                .map(row -> new VfDeviceStatus(row.getId(), row.getPciAddress(),
+                        row.getAllocatedToNicId(), row.getState(), row.getVdpaKind()))
+                .toList();
         return new VfPoolStatus(hostId,
                 vfPoolDao.countByHostAndState(hostId, State.FREE),
                 vfPoolDao.countFreeVdpaCapable(hostId),
                 vfPoolDao.countByHostAndState(hostId, State.RESERVED),
                 vfPoolDao.countByHostAndState(hostId, State.ALLOCATED),
-                vfPoolDao.countByHostAndState(hostId, State.SUSPECT));
+                vfPoolDao.countByHostAndState(hostId, State.SUSPECT), devices);
     }
 
     @Override
