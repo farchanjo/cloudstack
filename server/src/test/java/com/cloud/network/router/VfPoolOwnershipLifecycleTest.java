@@ -154,7 +154,7 @@ public class VfPoolOwnershipLifecycleTest {
     }
 
     @Test
-    public void nullOperationIdUsesOneEffectiveTokenOperationId() {
+    public void nullOperationIdUsesOneEffectiveTokenOperationId() throws Exception {
         final NicVO nic = nic();
         final SriovVfPoolVO row = row(980L, SOURCE_HOST, "0000:01:04.1", State.ALLOCATED, NIC_ID);
         when(vfPoolDao.commitVmReservations(VM_ID, SOURCE_HOST, DESTINATION_HOST, null))
