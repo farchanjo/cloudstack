@@ -441,7 +441,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final String pciAddress = nic.getVfPciAddress();
         if (StringUtils.isNotBlank(pciAddress)) {
             try {
-                removeRepresentorAndClearVf(pciAddress);
+                removeRepresentorAndClearVf(pciAddress, "lsp-" + nic.getUuid());
             } catch (RuntimeException e) {
                 cleanupFailure = appendCleanupFailure(cleanupFailure, e);
             }
@@ -490,11 +490,11 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         return primary;
     }
 
-    private void removeRepresentorAndClearVf(final String pciAddress) {
+    private void removeRepresentorAndClearVf(final String pciAddress, final String expectedIfaceId) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
             OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback", repName,
-                    "lsp-" + nic.getUuid());
+                    expectedIfaceId);
         }
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);

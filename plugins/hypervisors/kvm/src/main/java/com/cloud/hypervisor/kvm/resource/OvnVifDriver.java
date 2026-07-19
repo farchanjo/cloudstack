@@ -42,6 +42,7 @@ import com.cloud.exception.InternalErrorException;
 import com.cloud.hypervisor.kvm.resource.hwoffload.VdpaPoolReconciler;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef.NicModel;
+import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.script.Script;
 
 /**
