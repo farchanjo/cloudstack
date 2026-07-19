@@ -87,15 +87,14 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
                     .thenReturn("{migration-owner=destination, iface-status=inactive}");
             scriptMock.when(() -> Script.executeCommand(any(String[].class)))
-                    .thenReturn(new OvsRepresentorCas.Result(true,
-                                    "[{\"rows\":[{\"_uuid\":[\"uuid\",\"iface-1\"],\"name\":\"dx6p0vf4\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-99640d2f\"]]]}]}]", ""),
-                            new OvsRepresentorCas.Result(true,
-                                    "[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"dx6p0vf4\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]", ""),
-                            new OvsRepresentorCas.Result(true,
-                                    "[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]", ""),
-                            new OvsRepresentorCas.Result(true, "[{},{},{},{\"count\":1},{\"count\":1},{\"count\":1}]", ""),
-                            new OvsRepresentorCas.Result(true, "[{\"rows\":[]}]", ""),
-                            new OvsRepresentorCas.Result(true, "[{\"rows\":[]}]", ""));
+                    .thenReturn(
+                            
+                                    "[{\"rows\":[{\"_uuid\":[\"uuid\",\"iface-1\"],\"name\":\"dx6p0vf4\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-99640d2f\"]]]}]}]",
+                            "[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"dx6p0vf4\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]",
+                            "[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]",
+                            "[{},{},{},{\"count\":1},{\"count\":1},{\"count\":1}]",
+                            "[{\"rows\":[]}]",
+                             "[{\"rows\":[]}]");
 
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
