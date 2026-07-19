@@ -25,6 +25,7 @@ import static org.mockito.Mockito.mockStatic;
 import org.junit.Test;
 import org.mockito.MockedStatic;
 
+import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.VerifyDestinationDataplaneAnswer;
 import com.cloud.agent.api.VerifyDestinationDataplaneCommand;
 import com.cloud.agent.api.to.NicTO;
