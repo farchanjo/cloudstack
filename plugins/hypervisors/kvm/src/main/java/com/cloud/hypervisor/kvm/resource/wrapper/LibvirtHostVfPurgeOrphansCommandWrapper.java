@@ -50,7 +50,6 @@ import org.xml.sax.helpers.DefaultHandler;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import com.cloud.agent.api.Answer;
