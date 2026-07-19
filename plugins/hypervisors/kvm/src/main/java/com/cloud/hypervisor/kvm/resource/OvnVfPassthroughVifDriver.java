@@ -134,7 +134,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin());
             final String repFinal = repName;
             rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(logger,
-                    "OvnVfPassthroughVifDriver.rollback", repFinal));
+                    "OvnVfPassthroughVifDriver.rollback", repFinal, nic.getOvnLspName()));
 
             final InterfaceDef intf = new InterfaceDef();
             // xmlVlanTag=0 → no <vlan> element in domain XML; OVN handles
@@ -280,8 +280,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         // removes reps carrying the same lspName; if this rep was previously
         // used by a different VM it may still hold an old iface-id that would
         // create a duplicate-iface-id conflict in ovn-controller.
-        Script.runSimpleBashScript(String.format(
-            "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
+        OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVfPassthroughVifDriver.attach",
+                repName, lspName);
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(

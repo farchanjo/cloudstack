@@ -55,10 +55,8 @@ public final class OvsRepresentorCas {
 
     public static boolean remove(final Executor executor, final String socket, final String name,
                                  final String expectedIfaceId) {
-        if (name == null || name.isBlank()) {
-            return true;
-        }
-        if (!NAME.matcher(name).matches() || executor == null || socket == null || socket.isBlank()) {
+        if (name == null || name.isBlank() || expectedIfaceId == null || expectedIfaceId.isBlank()
+                || !NAME.matcher(name).matches() || executor == null || socket == null || socket.isBlank()) {
             return false;
         }
         final Identity identity;
@@ -70,22 +68,53 @@ public final class OvsRepresentorCas {
         if (identity == null) {
             return true;
         }
+        if (!expectedIfaceId.equals(identity.ifaceId)) {
+            return false;
+        }
         final Result transaction = executor.run("ovsdb-client", "transact", socket,
                 transaction(identity, expectedIfaceId));
         if (!transaction.success() || !validResponse(transaction.output())) {
             return false;
         }
-        return discover(executor, socket, name) == null;
+        try {
+            return discover(executor, socket, name) == null;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Return the authoritative iface-id for a representor, or null if absent/invalid. */
+    public static String readIfaceId(final Executor executor, final String socket, final String name) {
+        if (executor == null || socket == null || socket.isBlank() || name == null || name.isBlank()
+                || !NAME.matcher(name).matches()) {
+            return null;
+        }
+        try {
+            final Identity identity = discover(executor, socket, name);
+            return identity == null ? null : identity.ifaceId;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Strict read used before a representor is reused for a new LSP identity. */
+    public static String readIfaceIdStrict(final Executor executor, final String socket, final String name) {
+        if (executor == null || socket == null || socket.isBlank() || name == null || name.isBlank()
+                || !NAME.matcher(name).matches()) {
+            throw new IllegalArgumentException("invalid representor identity lookup");
+        }
+        final Identity identity = discover(executor, socket, name);
+        return identity == null ? null : identity.ifaceId;
     }
 
     static String transactionForTest(final String ifaceUuid, final String portUuid, final String bridgeUuid,
                                      final String name, final String expectedIfaceId) {
-        return transaction(new Identity(ifaceUuid, portUuid, bridgeUuid, name), expectedIfaceId);
+        return transaction(new Identity(ifaceUuid, portUuid, bridgeUuid, name, expectedIfaceId), expectedIfaceId);
     }
 
     private static Identity discover(final Executor executor, final String socket, final String name) {
         final JsonArray iface = select(executor, socket, "Interface", where("name", name),
-                List.of("_uuid", "name"));
+                List.of("_uuid", "name", "external_ids"));
         final JsonArray port = select(executor, socket, "Port", where("name", name),
                 List.of("_uuid", "name", "interfaces"));
         if (iface.isEmpty() && port.isEmpty()) {
@@ -98,6 +127,10 @@ public final class OvsRepresentorCas {
         final JsonObject p = port.get(0).getAsJsonObject();
         final String iu = uuid(i.get("_uuid"));
         final String pu = uuid(p.get("_uuid"));
+        final String ifaceId = mapValue(i.get("external_ids"), "iface-id");
+        if (ifaceId == null || ifaceId.isBlank()) {
+            throw new IllegalStateException("OVS representor iface-id ownership is missing");
+        }
         final JsonArray interfaces = unwrap(p.get("interfaces"));
         if (!name.equals(text(i.get("name"))) || !name.equals(text(p.get("name")))
                 || interfaces.size() != 1 || !iu.equals(uuid(interfaces.get(0)))) {
@@ -108,7 +141,7 @@ public final class OvsRepresentorCas {
         if (bridge.size() != 1) {
             throw new IllegalStateException("OVS representor bridge identity is ambiguous");
         }
-        return new Identity(iu, pu, uuid(bridge.get(0).getAsJsonObject().get("_uuid")), name);
+        return new Identity(iu, pu, uuid(bridge.get(0).getAsJsonObject().get("_uuid")), name, ifaceId);
     }
 
     private static JsonArray select(final Executor executor, final String socket, final String table,
@@ -128,7 +161,9 @@ public final class OvsRepresentorCas {
             throw new IllegalStateException("OVSDB discovery failed: " + result.error());
         }
         final JsonArray response = JsonParser.parseString(result.output()).getAsJsonArray();
-        if (response.size() != 1 || !response.get(0).getAsJsonObject().has("rows")) {
+        if (response.size() != 1 || response.get(0).getAsJsonObject().has("error")
+                || !response.get(0).getAsJsonObject().has("rows")
+                || response.get(0).getAsJsonObject().entrySet().size() != 1) {
             throw new IllegalStateException("malformed OVSDB discovery response");
         }
         return response.get(0).getAsJsonObject().getAsJsonArray("rows");
@@ -187,19 +222,59 @@ public final class OvsRepresentorCas {
         return value.getAsString();
     }
     private static JsonArray unwrap(final JsonElement value) { return "set".equals(value.getAsJsonArray().get(0).getAsString()) ? value.getAsJsonArray().get(1).getAsJsonArray() : value.getAsJsonArray(); }
-    private static boolean validResponse(final String output) { try { final JsonArray r = JsonParser.parseString(output).getAsJsonArray(); return r.size() >= 5 && !r.get(1).getAsJsonObject().has("error"); } catch (RuntimeException e) { return false; } }
+    private static boolean validResponse(final String output) {
+        try {
+            final JsonArray response = JsonParser.parseString(output).getAsJsonArray();
+            if (response.size() != 6) {
+                return false;
+            }
+            for (int index = 0; index < 3; index++) {
+                final JsonObject wait = response.get(index).getAsJsonObject();
+                if (wait.has("error") || wait.entrySet().size() != 1
+                        || !wait.has("rows") || wait.getAsJsonArray("rows").size() != 1) {
+                    return false;
+                }
+            }
+            for (int index = 3; index < response.size(); index++) {
+                final JsonObject mutation = response.get(index).getAsJsonObject();
+                if (mutation.has("error") || mutation.entrySet().size() != 1
+                        || !mutation.has("count") || mutation.get("count").getAsInt() != 1) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static String mapValue(final JsonElement value, final String wantedKey) {
+        if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() != 2
+                || !"map".equals(value.getAsJsonArray().get(0).getAsString())) {
+            throw new IllegalStateException("OVS external_ids map is malformed");
+        }
+        for (JsonElement entry : value.getAsJsonArray().get(1).getAsJsonArray()) {
+            final JsonArray pair = entry.getAsJsonArray();
+            if (pair.size() == 2 && wantedKey.equals(pair.get(0).getAsString())) {
+                return pair.get(1).getAsString();
+            }
+        }
+        return null;
+    }
     private static final class Identity {
         private final String interfaceUuid;
         private final String portUuid;
         private final String bridgeUuid;
         private final String name;
+        private final String ifaceId;
 
         private Identity(final String interfaceUuid, final String portUuid, final String bridgeUuid,
-                         final String name) {
+                         final String name, final String ifaceId) {
             this.interfaceUuid = interfaceUuid;
             this.portUuid = portUuid;
             this.bridgeUuid = bridgeUuid;
             this.name = name;
+            this.ifaceId = ifaceId;
         }
     }
 }

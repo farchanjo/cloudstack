@@ -144,7 +144,7 @@ public class VdpaVifDriver extends VifDriverBase {
                 final String repNameFinal = repName;
                 rollback.push(() -> {
                     Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
-                    Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port br-bond %s", repNameFinal));
+                    OvnVifDriver.freeRepresentorOnOvs(logger, "VdpaVifDriver.plug-rollback", repNameFinal);
                 });
             }
 

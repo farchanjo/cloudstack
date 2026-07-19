@@ -422,18 +422,14 @@ public class IntentReconciler {
             vrId, guestRep, publicRep);
     }
 
-    /**
-     * Remove a VF representor from OVS br-bond. Idempotent and best-effort:
-     * if the rep isn't on the bridge (already removed by VifDriver.unplug or
-     * never added), ovs-vsctl returns 0 and we move on.
-     */
+    /** Remove a VF representor through the shared iface-id fenced CAS helper. */
     private void detachRepresentorFromBridge(String repName) {
         if (repName == null || repName.isEmpty()) {
             return;
         }
         try {
-            com.cloud.utils.script.Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists del-port br-bond %s", repName));
+            com.cloud.hypervisor.kvm.resource.OvnVifDriver.freeRepresentorOnOvs(
+                    LOGGER, "IntentReconciler.removeIntent", repName);
             LOGGER.debug("Detached VF representor {} from br-bond", repName);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to detach rep {} from br-bond: {}", repName, e.getMessage());

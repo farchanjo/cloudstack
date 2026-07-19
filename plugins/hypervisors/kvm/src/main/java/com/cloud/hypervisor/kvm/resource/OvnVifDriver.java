@@ -221,11 +221,10 @@ public class OvnVifDriver extends VifDriverBase {
             return;
         }
         try {
-            final String cmd = String.format("ovs-vsctl --if-exists del-port %s %s", br, dev);
-            Script.runSimpleBashScript(cmd);
-            logger.info("OvnVifDriver.unplug: del-port br={} dev={}", br, dev);
+            freeRepresentorOnOvs(logger, "OvnVifDriver.unplug", dev);
+            logger.info("OvnVifDriver.unplug: freed representor br={} dev={}", br, dev);
         } catch (RuntimeException e) {
-            logger.warn("OvnVifDriver.unplug: del-port {}/{} failed: {}", br, dev, e.getMessage());
+            logger.warn("OvnVifDriver.unplug: representor cleanup {}/{} failed: {}", br, dev, e.getMessage());
         }
     }
 
@@ -294,6 +293,22 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return;
         }
+        final String expectedIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(expectedIfaceId)) {
+            log.warn("{}: representor iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
+            return;
+        }
+        freeRepresentorOnOvs(log, callerLabel, repName, expectedIfaceId);
+    }
+
+    /** Remove a representor only when the caller supplies its exact iface-id. */
+    public static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName,
+                                            final String expectedIfaceId) {
+        if (StringUtils.isBlank(repName) || StringUtils.isBlank(expectedIfaceId)) {
+            log.warn("{}: representor or iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
+            return;
+        }
         final String bdf = resolveVfPciFromRepresentor(repName);
         if (StringUtils.isBlank(bdf)) {
             log.warn("{}: representor BDF is unknown; refusing unfenced CAS for {}", callerLabel, repName);
@@ -302,7 +317,8 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
+        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
+                expectedIfaceId)) {
             log.warn("{}: OVS representor CAS failed; refusing mutation for {}", callerLabel, repName);
             return;
         }
@@ -317,6 +333,12 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return true;
         }
+        final String expectedIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(expectedIfaceId)) {
+            log.warn("{}: representor iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
+            return false;
+        }
         final String bdf = resolveVfPciFromRepresentor(repName);
         if (StringUtils.isBlank(bdf)) {
             log.warn("{}: representor BDF is unknown; refusing unfenced CAS for {}", callerLabel, repName);
@@ -325,7 +347,8 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
+        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
+                expectedIfaceId)) {
             log.warn("{}: failed to free OVS representor {} by CAS", callerLabel, repName);
             return false;
         }
@@ -343,6 +366,34 @@ public class OvnVifDriver extends VifDriverBase {
                     : new OvsRepresentorCas.Result(true, output, "");
         } catch (RuntimeException e) {
             return new OvsRepresentorCas.Result(false, "", e.getMessage());
+        }
+    }
+
+    /** Remove a stale representor identity before a creation-only add/set sequence. */
+    public static void prepareRepresentorForAttach(final Logger log, final String callerLabel,
+                                                    final String repName, final String expectedIfaceId) {
+        if (StringUtils.isBlank(repName) || StringUtils.isBlank(expectedIfaceId)) {
+            throw new CloudRuntimeException("representor attach requires an exact iface-id");
+        }
+        final String current = OvsRepresentorCas.readIfaceIdStrict(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(current) || expectedIfaceId.equals(current)) {
+            return;
+        }
+        final String bdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(bdf)) {
+            throw new CloudRuntimeException("cannot resolve representor BDF for stale identity " + repName);
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        lock.lock();
+        try {
+            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
+                    repName, current)) {
+                throw new CloudRuntimeException("stale representor CAS failed for " + repName);
+            }
+            log.info("{}: removed stale representor identity rep={} iface-id={}", callerLabel, repName, current);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -912,7 +963,14 @@ public class OvnVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(repName)) {
                 continue;
             }
-            freeRepresentorOnOvs(log, callerLabel, repName);
+            final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                    "unix:/var/run/openvswitch/db.sock", repName);
+            if (StringUtils.isBlank(ifaceId)) {
+                log.warn("{}: attached-mac fallback found rep={} without iface-id; refusing cleanup",
+                        callerLabel, repName);
+                continue;
+            }
+            freeRepresentorOnOvs(log, callerLabel, repName, ifaceId);
             log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
                     callerLabel, repName, integrationBridge, mac);
             clearVfIdentityForRepBestEffort(log, callerLabel, repName);

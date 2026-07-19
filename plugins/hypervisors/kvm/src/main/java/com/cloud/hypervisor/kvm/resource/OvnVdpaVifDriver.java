@@ -158,7 +158,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin());
             final String repFinal = repName;
             rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(
-                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal));
+                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal, nic.getOvnLspName()));
 
             // (4) Domain XML <interface type='vdpa'>. queues defaults to
             //     max_vqs / 2 (TX+RX pair count); operator can override
@@ -358,8 +358,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         // DEF-1: a representor can retain an iface-id from a previous VM even
         // when that stale value does not match the current LSP. Clear the
         // complete external_ids map before stamping the new identity.
-        Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
+        OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVdpaVifDriver.attach", repName, lspName);
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -407,7 +406,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                         "duplicate active/source representor claim cannot be proven orphaned: rep=%s iface-id=%s target=%s",
                         name, lspName, keepRepName));
             }
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.orphan", name);
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.orphan", name, lspName);
             logger.warn("Removed provably orphaned inactive destination representor {} for LSP {}", name, lspName);
         }
     }
@@ -479,7 +478,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             if (!owned || !inactive) {
                 throw new CloudRuntimeException("refusing to remove non-destination-owned representor " + rep);
             }
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.rollback", rep);
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.rollback", rep, lsp);
         }
     }
 
@@ -494,7 +493,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
     private void removeRepresentorAndClearVf(final String pciAddress) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback", repName);
+            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback", repName,
+                    "lsp-" + nic.getUuid());
         }
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
