@@ -294,10 +294,10 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return;
         }
-        validateOvsName(repName);
-        Script.executeCommandForExitValue("ovs-vsctl", "--if-exists", "clear", "Interface", repName, "external_ids");
-        Script.executeCommandForExitValue("ovs-vsctl", "--if-exists", "del-port", repName);
-        log.info("{}: freed OVS representor {} (cleared external_ids + del-port)", callerLabel, repName);
+        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
+            throw new IllegalStateException(callerLabel + ": OVS representor CAS failed for " + repName);
+        }
+        log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
     }
 
     /** Checked variant used when management requires positive cleanup evidence. */
@@ -305,23 +305,19 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return true;
         }
-        validateOvsName(repName);
-        final int clearExit = Script.executeCommandForExitValue(5_000,
-                "ovs-vsctl", "--if-exists", "clear", "Interface", repName, "external_ids");
-        final int deleteExit = clearExit == 0 ? Script.executeCommandForExitValue(5_000,
-                "ovs-vsctl", "--if-exists", "del-port", repName) : clearExit;
-        if (deleteExit != 0) {
-            log.warn("{}: failed to free OVS representor {} (exit={})", callerLabel, repName, deleteExit);
+        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
+            log.warn("{}: failed to free OVS representor {} by CAS", callerLabel, repName);
             return false;
         }
-        log.info("{}: freed OVS representor {} (cleared external_ids + del-port)",
-                callerLabel, repName);
+        log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
         return true;
     }
 
-    private static void validateOvsName(final String value) {
-        if (!value.matches("[A-Za-z0-9_.:-]{1,64}")) {
-            throw new IllegalArgumentException("invalid OVS interface name");
+    private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
+        try {
+            return new OvsRepresentorCas.Result(true, Script.executeCommand(argv), "");
+        } catch (RuntimeException e) {
+            return new OvsRepresentorCas.Result(false, "", e.getMessage());
         }
     }
 
