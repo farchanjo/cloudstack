@@ -25,6 +25,7 @@ import java.util.List;
 import org.junit.Test;
 
 import com.cloud.host.Host;
+import com.cloud.host.Status;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.dao.NetworkOfferingDao;
@@ -98,7 +99,7 @@ public class MigrationVfPreflightInventoryTest {
 
     private Host readyHost() {
         final Host host = mock(Host.class);
-        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getStatus()).thenReturn(Status.Up);
         when(host.getClusterId()).thenReturn(1L);
         when(host.getDataCenterId()).thenReturn(1L);
         return host;

@@ -20,11 +20,11 @@ import java.util.List;
 
 import javax.inject.Inject;
 
+import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
-import com.cloud.network.NetworkModel;
 import com.cloud.network.router.MigrationNicPreflightStatus;
 import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationPreflightService;
@@ -38,18 +38,18 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
     private final VMInstanceDao vmDao;
     private final HostDao hostDao;
     private final ServiceOfferingDao offeringDao;
-    private final NetworkModel networkModel;
+    private final NetworkOrchestrationService networkOrchestrationService;
     private final MigrationVfPreflight preflight;
     private final NicDao nicDao;
 
     @Inject
     public MigrationPreflightServiceImpl(final VMInstanceDao vmDao, final HostDao hostDao,
-            final ServiceOfferingDao offeringDao, final NetworkModel networkModel,
+            final ServiceOfferingDao offeringDao, final NetworkOrchestrationService networkOrchestrationService,
             final MigrationVfPreflight preflight, final NicDao nicDao) {
         this.vmDao = vmDao;
         this.hostDao = hostDao;
         this.offeringDao = offeringDao;
-        this.networkModel = networkModel;
+        this.networkOrchestrationService = networkOrchestrationService;
         this.preflight = preflight;
         this.nicDao = nicDao;
     }
@@ -64,7 +64,7 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
         }
         final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null,
                 offeringDao.findById(vm.getId(), vm.getServiceOfferingId()), null, null);
-        for (final NicProfile nic : networkModel.getNicProfiles(vm)) {
+        for (final NicProfile nic : networkOrchestrationService.getNicProfiles(vm)) {
             profile.addNic(nic);
         }
         final List<NicVO> inventory = nicDao.listByVmId(vmId);

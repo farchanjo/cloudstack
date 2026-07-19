@@ -27,12 +27,13 @@ import static org.mockito.Mockito.when;
 
 import java.util.List;
 
+import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import org.junit.Test;
 
 import com.cloud.host.HostVO;
 import com.cloud.host.Host;
+import com.cloud.host.Status;
 import com.cloud.host.dao.HostDao;
-import com.cloud.network.NetworkModel;
 import com.cloud.network.NetworkVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.OvnChassisLookup;
@@ -99,7 +100,7 @@ public class MigrationPreflightServiceImplTest {
         final VMInstanceDao vmDao = mock(VMInstanceDao.class);
         final HostDao hostDao = mock(HostDao.class);
         final ServiceOfferingDao offeringDao = mock(ServiceOfferingDao.class);
-        final NetworkModel networkModel = mock(NetworkModel.class);
+        final NetworkOrchestrationService networkOrchestrationService = mock(NetworkOrchestrationService.class);
         final NicDao nicDao = mock(NicDao.class);
         final NetworkDao networkDao = mock(NetworkDao.class);
         final NetworkOfferingDao networkOfferingDao = mock(NetworkOfferingDao.class);
@@ -120,10 +121,10 @@ public class MigrationPreflightServiceImplTest {
         when(vm.getServiceOfferingId()).thenReturn(1L);
         when(vm.getHostId()).thenReturn(10L);
         when(host.getId()).thenReturn(44L);
-        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getStatus()).thenReturn(Status.Up);
         when(host.getClusterId()).thenReturn(1L);
         when(host.getDataCenterId()).thenReturn(1L);
-        when(networkModel.getNicProfiles(vm)).thenReturn(List.of(first, second));
+        when(networkOrchestrationService.getNicProfiles(vm)).thenReturn(List.of(first, second));
         when(first.getId()).thenReturn(1L);
         when(second.getId()).thenReturn(2L);
         when(first.getUuid()).thenReturn("nic-1");
@@ -154,7 +155,7 @@ public class MigrationPreflightServiceImplTest {
         preflight.setAuthoritativeGuard(guard);
 
         final MigrationPreflightResult result = new MigrationPreflightServiceImpl(vmDao, hostDao,
-                offeringDao, networkModel, preflight, nicDao).preflight(99L, 44L);
+                offeringDao, networkOrchestrationService, preflight, nicDao).preflight(99L, 44L);
 
         assertTrue(result.nicStatuses().get(0).allowed());
         assertFalse(result.nicStatuses().get(1).allowed());
@@ -167,7 +168,7 @@ public class MigrationPreflightServiceImplTest {
         final VMInstanceDao vmDao = mock(VMInstanceDao.class);
         final HostDao hostDao = mock(HostDao.class);
         final ServiceOfferingDao offeringDao = mock(ServiceOfferingDao.class);
-        final NetworkModel networkModel = mock(NetworkModel.class);
+        final NetworkOrchestrationService networkOrchestrationService = mock(NetworkOrchestrationService.class);
         final MigrationVfPreflight preflight = mock(MigrationVfPreflight.class);
         final NicDao nicDao = mock(NicDao.class);
         final VMInstanceVO vm = mock(VMInstanceVO.class);
@@ -180,7 +181,7 @@ public class MigrationPreflightServiceImplTest {
         when(vm.getServiceOfferingId()).thenReturn(1L);
         when(hostDao.findById(44L)).thenReturn(host);
         when(vmDao.findById(99L)).thenReturn(vm);
-        when(networkModel.getNicProfiles(vm)).thenReturn(List.of(first, second));
+        when(networkOrchestrationService.getNicProfiles(vm)).thenReturn(List.of(first, second));
         when(first.getId()).thenReturn(1L);
         when(second.getId()).thenReturn(2L);
         when(first.getUuid()).thenReturn("nic-1");
@@ -189,7 +190,7 @@ public class MigrationPreflightServiceImplTest {
         when(firstInventory.getId()).thenReturn(1L);
         when(secondInventory.getId()).thenReturn(2L);
         return new Fixture(new MigrationPreflightServiceImpl(vmDao, hostDao, offeringDao,
-                networkModel, preflight, nicDao), preflight, first, second);
+                networkOrchestrationService, preflight, nicDao), preflight, first, second);
     }
 
     private static final class Fixture {

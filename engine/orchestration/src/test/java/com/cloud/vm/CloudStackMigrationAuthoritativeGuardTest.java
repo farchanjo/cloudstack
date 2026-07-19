@@ -30,6 +30,7 @@ import org.junit.Test;
 
 import com.cloud.ha.FenceBuilder;
 import com.cloud.host.Host;
+import com.cloud.host.Status;
 import com.cloud.host.dao.HostDao;
 import com.cloud.resource.ResourceState;
 import com.cloud.vm.dao.VMInstanceDao;
@@ -80,7 +81,7 @@ public class CloudStackMigrationAuthoritativeGuardTest {
     private Host readyHost(final long id) {
         final Host host = mock(Host.class);
         when(host.getId()).thenReturn(id);
-        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getStatus()).thenReturn(Status.Up);
         when(host.getResourceState()).thenReturn(ResourceState.Enabled);
         return host;
     }

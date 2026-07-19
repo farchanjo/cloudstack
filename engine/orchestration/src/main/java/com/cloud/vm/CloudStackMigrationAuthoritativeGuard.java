@@ -27,6 +27,7 @@ import org.apache.cloudstack.outofbandmanagement.OutOfBandManagementService;
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.Host;
+import com.cloud.host.Status;
 import com.cloud.host.dao.HostDao;
 import com.cloud.resource.ResourceState;
 import com.cloud.vm.dao.VMInstanceDao;
@@ -67,7 +68,7 @@ public class CloudStackMigrationAuthoritativeGuard implements MigrationAuthorita
 
     @Override
     public boolean placementReady(final VirtualMachine vm, final Host destination) {
-        if (destination == null || destination.getState() != Host.State.Up
+        if (destination == null || destination.getStatus() != Status.Up
                 || destination.getResourceState() != ResourceState.Enabled) {
             return false;
         }

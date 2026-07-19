@@ -27,6 +27,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.Host;
+import com.cloud.host.Status;
 import com.cloud.network.ovn.OvnChassisLookup;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
@@ -388,7 +389,7 @@ public class MigrationVfPreflight {
     }
 
     private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination) {
-        if (destination.getState() != Host.State.Up) {
+        if (destination.getStatus() != Status.Up) {
             throw new CloudRuntimeException("destination host is not Up; refusing vDPA migration");
         }
         if (authoritativeGuard == null
