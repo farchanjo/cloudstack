@@ -1031,4 +1031,57 @@ Any F0.1–F0.8 means **FAIL — stop, correct, and re-evaluate before Slice 1**
 implementation or production migration is authorized until Slice 0 and all later
 slice gates pass.**
 
+## 16. 2026-07-19 production gate and accouting GitOps course correction
+
+> **Production dependency warning:** Snape and Salazar are production Kubernetes
+> clusters running inside the 19 CloudStack workload VMs in LAX. Kubernetes is a
+> hard pre/post gate around **every** agent restart, management restart, canary
+> admission, migration leg, rollback, and cleanup. No CloudStack rollout mutation
+> is permitted while either cluster gate, Argo gate, or the accounting gate is
+> not proven green.
+
+The fresh Salazar observation used a newly retrieved CloudStack cluster config (no
+credential material recorded). It proved all 13 nodes Ready, all three etcd pods
+Running/Ready, critical CNI/CSI/CoreDNS/ingress and StarRocks workloads healthy,
+and the socket CloneSet at 3/3 Ready with unchanged pod UIDs during the GitOps
+comparison work. The application nevertheless remained `OutOfSync` with only
+`CloneSet/socket` reported by Argo; `accouting` was `Healthy`, but not
+`Synced/Healthy/Succeeded`, so the rollout gate remained NO_GO.
+
+The following GitOps-only attempts were made on `backend/accouting.git` main:
+
+| Commit | Action | Evidence / outcome |
+|---|---|---|
+| `8764188` | Replaced the broad CloneSet annotation ignore with a name-scoped jq expression | Live Application spec was not changed because `infra/salazar/kustomization.yaml` does not render `argocd/application.yaml`; hard refresh left `CloneSet/socket` OutOfSync. |
+| `621ce39` | Fallback: declared the exact live CloneSet metadata tracking ID (`accouting:apps.kruise.io/CloneSet:accouting/socket`) on `socket` | Hard refresh and automated reconciliation still left `accouting` OutOfSync; pod UIDs stayed unchanged, but Kruise reported revision `socket-5986cd48b8` instead of the required `socket-68d9f8479c`. |
+| `dd484a9` | Reverted the fallback to preserve the required workload identity and avoid further drift | Rollback pushed; no imperative workload patch, force sync, prune, replace, or pod operation was performed. |
+
+The live-only identity observed was exactly
+`accouting:apps.kruise.io/CloneSet:accouting/socket`. The remaining comparison
+path requires an Argo-version-specific diff inspection or a controlled GitOps
+application-definition ownership fix; it must not be worked around by broad
+annotation ignores or an imperative child-workload patch.
+
+### 16.1 Mandatory serial evidence matrix before rollout resumes
+
+The exact 19-VM placement and blast-radius table is still a prerequisite artifact,
+not an inferred value. It must be captured from authoritative CloudStack inventory
+before the first KVM restart; the approved placement constraints remain Fluffy
+empty, Trevor workers-only, and Norbert/Nagini/Scabbers/Aragog carrying control
+plane or multiple cluster members. The only permitted order remains
+Fluffy → Norbert → Nagini → Scabbers → Trevor → Aragog unless fresh quorum and
+placement evidence justifies a documented serial change.
+
+| Step | Kubernetes / Argo | CloudStack | OVN / OVS / vDPA | DSR / CT_LB / CRC | Status |
+|---|---|---|---|---|---|
+| Every KVM-agent restart | Both clusters, 3/3 etcd, all nodes/workloads, `accouting` and StarRocks | 19 VMs Running and placement unchanged; host/VM/NIC connected | Chassis_Private/Raft/northd, bridges/bonds/flows/representors/vDPA | All dual-stack DSR, CT_LB `.35/.33`, raw per-host counters | **Not started — gate blocked** |
+| Every management restart | Same full gate | Inventory and membership unchanged | Chassis_Private `nb_cfg`, no dangling OVN aliases | Same endpoints and CRC exception observation | **Not started — gate blocked** |
+| Canary admission | Production clusters unchanged; canary non-Kubernetes only | Dedicated VM identity and placement | VF/representor/OVN identity baseline | DSR/CT and CRC baseline | **Not started — gate blocked** |
+| Cold migration | Full pre/during/post gate; mandatory first | Source stop/fencing/cleanup and destination ownership | Destination binding, no duplicate/leak | Same dataplane and raw counters | **COLD_MIGRATION_PASS not earned** |
+| Live migration SP6/SP7 | Unlocks only after `COLD_MIGRATION_PASS` | Same authoritative placement/quorum gate | Same SP1–SP7 hard aborts | Same DSR/CT/CRC gate | **Locked** |
+
+**Current decision: NO_GO.** No KVM-agent restart, management restart, canary
+creation, cold migration, live migration, physical remediation, or production
+CloudStack mutation has been performed.
+
 **End of tracker.**
