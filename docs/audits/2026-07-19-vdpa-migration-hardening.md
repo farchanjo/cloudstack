@@ -1138,4 +1138,35 @@ child-workload patch, force sync, prune, replace, or restart was issued. The
 remaining GitOps comparison blocker and unexpected restart delta are unresolved
 and keep every operational phase locked.
 
+### 16.4 Read-only RCA after rollback
+
+The fresh RCA found that exit-143 events were graceful container termination
+during Kruise in-place updates. Namespace events recorded
+`SuccessfulUpdatePodInPlace`, image transitions through `621ce391`, `dd484a96`,
+and `latest`, and repeated `Container socket definition changed, will be
+restarted` events. Argo history recorded automated/admin syncs for revisions
+`9c7b8d8` and `9cf84b6`; controller logs recorded auto-sync reconciliation.
+The live Application apply plus automated Argo reconciliation triggered these
+updates; a hard refresh was not a safe no-op under this automated policy. No pod
+was imperatively deleted or restarted.
+
+Current read-only state: CloneSet current/update revision
+`socket-68d9f8479c`, replicas `3`, ready `3`, all three pod UIDs unchanged, and
+restart counters `3,3,5`. The CloneSet has a `FailedUpdate` condition
+(`object has been modified`) and Argo remains `OutOfSync/Healthy`, with
+`CloneSet/socket` the only OutOfSync resource. Raw `kubectl diff` of the current
+Git socket manifest against live was empty after excluding status/generated
+metadata; the exact live tracking value is
+`accouting:apps.kruise.io/CloneSet:accouting/socket`. The remaining drift is in
+Argo's comparison/tracking path, not an unreviewed workload spec delta.
+
+The single comparative snapshot found Snape API/nodes/etcd healthy but Argo
+`istio-base` and `istiod` OutOfSync with ingress Applications Progressing.
+Salazar had healthy critical pods/StarRocks but retained the `accouting`
+OutOfSync gate. CloudStack inventory reported all 19 Kubernetes VMs Running
+with the recorded host placement. Because the comparison gate, restart history,
+CloneSet FailedUpdate condition, and Snape Argo drift are not clean, the exact
+tracking annotation was **not** added to Git and no further live
+Application/workload mutation was attempted. This remains `NO_GO`.
+
 **End of tracker.**
