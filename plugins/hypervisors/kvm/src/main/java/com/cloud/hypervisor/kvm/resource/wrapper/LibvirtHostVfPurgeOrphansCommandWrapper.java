@@ -213,7 +213,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     ? expectedRepresentor : VfPassthroughVifDriver.lookupRepresentor(
                             bdf, environment.pciDevices, environment.netClass);
             if (representor != null) {
-                removeRepresentorChecked(bdf, observation.getExpectedMac(), representor, expectedInterfaceId);
+                removeRepresentorChecked(bdf, observation.getExpectedMac(), representor, expectedInterfaceId,
+                        observation.isLifecycleAuthorizationUsed());
                 representorRemoved = true;
             }
             if (observation.isDevicePresent()) {
@@ -267,13 +268,14 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
     }
 
     private void removeRepresentorChecked(final String bdf, final String expectedMac,
-                                          final String representor, final String expectedInterfaceId) {
+                                          final String representor, final String expectedInterfaceId,
+                                          final boolean allowUnassignedMac) {
         final CommandResult port = environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "get",
                 "Port", representor, "name");
         requireSuccess(port, "observe OVS port " + representor);
         if (StringUtils.isNotBlank(port.output)) {
             revalidateBeforeDestructiveAction(bdf, expectedMac, representor, expectedInterfaceId,
-                    "OVS deletion", false, false);
+                    "OVS deletion", false, allowUnassignedMac);
             final CommandResult bridge = environment.runner.run("/usr/bin/ovs-vsctl", "port-to-br", representor);
             if (!bridge.success || StringUtils.isBlank(bridge.output)) {
                 throw new IllegalStateException("cannot resolve exact OVS bridge for " + representor);
