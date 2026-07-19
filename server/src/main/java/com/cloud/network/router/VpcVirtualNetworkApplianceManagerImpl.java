@@ -1177,10 +1177,10 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             return;
         }
         try {
-            int swept = _vfPoolManager.quarantineByVmId(vo.getId());
-            if (swept > 0) {
-                logger.warn("VR {} boot failed (event={}); quarantined {} VF row(s) pending exact cleanup",
-                        vo.getInstanceName(), event, swept);
+            int released = _vfPoolManager.quarantineByVmId(vo.getId());
+            if (released > 0) {
+                logger.warn("VR {} boot failed (event={}); released {} VF row(s) after exact cleanup",
+                        vo.getInstanceName(), event, released);
             }
         } catch (Exception e) {
             logger.warn("Phase H.1: failed to release VFs after VR {} boot fail (event={}): {}",
@@ -1237,9 +1237,10 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
             // and its VF stays ALLOCATED. releaseByVmId joins sriov_vf_pool against
             // nics.instance_id without the removed filter, catching the leak.
             try {
-                int swept = _vfPoolManager.quarantineByVmId(vo.getId());
-                if (swept > 0) {
-                    logger.info("Quarantined {} HW offload VF row(s) on VR {} expunge", swept, vo.getInstanceName());
+                int released = _vfPoolManager.quarantineByVmId(vo.getId());
+                if (released > 0) {
+                    logger.info("Released {} HW offload VF row(s) on VR {} expunge",
+                            released, vo.getInstanceName());
                 }
             } catch (Exception vmSweepEx) {
                 logger.warn("Failed VM-id VF sweep for VR {}: {}", vo.getInstanceName(), vmSweepEx.getMessage());

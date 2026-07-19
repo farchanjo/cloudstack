@@ -46,6 +46,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
 
     private static final String BDF = "0000:02:07.2";
     private static final String OWNER_MAC = "02:00:00:00:00:24";
+    private static final String EXPECTED_IFACE_ID = "lsp-db91cde8-e9ab-4f0a-a6f1-37f562be2536";
 
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
@@ -279,11 +280,11 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
     @Test
     public void staleRepresentorIsRemovedOnlyWhenExactIfaceIdMatches() throws Exception {
         final FakeHost host = preparedHost("stale-representor");
-        host.ovsIfaceId = "lsp-nic-980";
+        host.ovsIfaceId = EXPECTED_IFACE_ID;
         final HostVfPurgeOrphansCommand command = command(false);
         authorize(command, "op-stale", "LIFECYCLE_RELEASE");
         command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
-        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, "lsp-nic-980"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, EXPECTED_IFACE_ID));
 
         final HostVfPurgeOrphansAnswer answer = execute(host, command);
 
@@ -298,7 +299,41 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         final HostVfPurgeOrphansCommand command = command(false);
         authorize(command, "op-shared", "LIFECYCLE_RELEASE");
         command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
-        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, "lsp-nic-980"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, EXPECTED_IFACE_ID));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command);
+
+        assertFalse(answer.getResult());
+        assertTrue(host.removedRepresentors.isEmpty());
+    }
+
+    @Test
+    public void absentPciWithExactStaleRepresentorIsRemoved() throws Exception {
+        final FakeHost host = preparedHost("absent-pci");
+        final Path target = host.pciDevices.resolve(BDF);
+        Files.delete(target.resolve("physfn"));
+        Files.delete(target);
+        host.ovsIfaceId = EXPECTED_IFACE_ID;
+        final HostVfPurgeOrphansCommand command = command(false);
+        authorize(command, "op-absent", "LIFECYCLE_RELEASE");
+        command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, EXPECTED_IFACE_ID));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command);
+
+        assertTrue(answer.getResult());
+        assertTrue(host.removedRepresentors.contains("dx6p1vf24"));
+    }
+
+    @Test
+    public void representorIfaceIdRaceFailsClosedBeforeDeletion() throws Exception {
+        final FakeHost host = preparedHost("iface-race");
+        host.ovsIfaceId = EXPECTED_IFACE_ID;
+        host.changeIfaceBeforeDelete = true;
+        final HostVfPurgeOrphansCommand command = command(false);
+        authorize(command, "op-race", "LIFECYCLE_RELEASE");
+        command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, EXPECTED_IFACE_ID));
 
         final HostVfPurgeOrphansAnswer answer = execute(host, command);
 
@@ -334,6 +369,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         final HostVfPurgeOrphansCommand command = new HostVfPurgeOrphansCommand();
         command.setTargetPciBdfs(Collections.singleton(BDF));
         command.setExpectedMacsByPciBdf(Collections.singletonMap(BDF, OWNER_MAC));
+        command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "zzz-correct-pf1vf24"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, EXPECTED_IFACE_ID));
         command.setDryRun(dryRun);
         return command;
     }
@@ -382,7 +419,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         private boolean identityClearFails;
         private boolean macReadFails;
         private boolean macOutputMissing;
-        private String ovsIfaceId;
+        private String ovsIfaceId = EXPECTED_IFACE_ID;
+        private boolean changeIfaceBeforeDelete;
 
         private FakeHost(final Path root) throws Exception {
             pciDevices = Files.createDirectories(root.resolve("bus/pci/devices"));
@@ -464,6 +502,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                     return CommandResult.success(ovsIfaceId == null ? "" : "\"" + ovsIfaceId + "\"");
                 }
                 if (value.contains(" port-to-br ")) {
+                    if (changeIfaceBeforeDelete) {
+                        ovsIfaceId = "lsp-other-owner";
+                    }
                     return CommandResult.success("br-bond");
                 }
                 if (value.contains(" del-port ")) {

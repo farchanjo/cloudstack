@@ -236,7 +236,8 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 for (final SriovVfPoolVO row : existing) {
                     if (row.getHostId() == hostId) {
                         if (State.ALLOCATED.name().equals(row.getState())
-                                || State.RESERVED.name().equals(row.getState())) {
+                                || State.RESERVED.name().equals(row.getState())
+                                || State.SUSPECT.name().equals(row.getState())) {
                             return row;
                         }
                         throw new CloudRuntimeException(String.format(

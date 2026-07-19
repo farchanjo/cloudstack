@@ -5707,7 +5707,7 @@ public class UserVmManagerImpl extends ManagerBase implements UserVmManager, Vir
         try {
             int released = vfPoolManager.quarantineByVmId(vm.getId());
             if (released > 0) {
-                logger.info("Quarantined {} SR-IOV VF row(s) for expunged VM id={} pending exact cleanup",
+                logger.info("Released {} SR-IOV VF row(s) for expunged VM id={} after exact cleanup",
                         released, vm.getId());
             }
         } catch (Exception e) {

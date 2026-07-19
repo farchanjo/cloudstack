@@ -106,7 +106,10 @@ public class HostVfPurgeOrphansCommand extends Command {
 
     @Override
     public boolean executeInSequence() {
-        return false;
+        // This command mutates VF, vDPA and OVS state. Serializing it per
+        // agent prevents two lifecycle/reconciliation cleanups from both
+        // acting on the same ownership evidence concurrently.
+        return true;
     }
 
     public Set<String> getKeepVdpaNames() {

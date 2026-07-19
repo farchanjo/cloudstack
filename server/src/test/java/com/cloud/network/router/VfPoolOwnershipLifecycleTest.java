@@ -30,6 +30,7 @@ import java.util.Collections;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -150,6 +151,28 @@ public class VfPoolOwnershipLifecycleTest {
         assertEquals(0, manager.quarantineByVmId(VM_ID));
 
         verify(vfPoolDao, never()).releaseExact(anyLong(), anyLong());
+    }
+
+    @Test
+    public void nullOperationIdUsesOneEffectiveTokenOperationId() {
+        final NicVO nic = nic();
+        final SriovVfPoolVO row = row(980L, SOURCE_HOST, "0000:01:04.1", State.ALLOCATED, NIC_ID);
+        when(vfPoolDao.commitVmReservations(VM_ID, SOURCE_HOST, DESTINATION_HOST, null))
+                .thenReturn(Collections.singletonList(row));
+        when(nicDao.findByIdIncludingRemoved(NIC_ID)).thenReturn(nic);
+        when(nic.getMacAddress()).thenReturn("02:04:02:a6:00:01");
+        when(nic.getUuid()).thenReturn("db91cde8-e9ab-4f0a-a6f1-37f562be2536");
+        when(agentManager.send(eq(SOURCE_HOST), any(HostVfPurgeOrphansCommand.class)))
+                .thenReturn(successAnswer("0000:01:04.1", "ABSENT", null, null,
+                        "vf-operation-" + NIC_ID, "OWNERSHIP_COMMIT", NIC_ID,
+                        "02:04:02:a6:00:01"));
+        when(vfPoolDao.releaseExact(980L, NIC_ID)).thenReturn(true);
+
+        manager.commitOwnershipForVm(VM_ID, SOURCE_HOST, DESTINATION_HOST, null);
+
+        final ArgumentCaptor<HostVfPurgeOrphansCommand> captor = ArgumentCaptor.forClass(HostVfPurgeOrphansCommand.class);
+        verify(agentManager).send(eq(SOURCE_HOST), captor.capture());
+        assertEquals("vf-operation-" + NIC_ID, captor.getValue().getOwnerOperationId("0000:01:04.1"));
     }
 
     private static NicVO nic() {

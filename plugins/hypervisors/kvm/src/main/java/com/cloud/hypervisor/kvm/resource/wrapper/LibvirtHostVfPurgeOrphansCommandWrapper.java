@@ -76,6 +76,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
     private static final int MAX_TARGETS = 256;
     private static final String PCI_BDF_PATTERN = "[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f]";
     private static final Pattern PCI_BDF = Pattern.compile(PCI_BDF_PATTERN, Pattern.CASE_INSENSITIVE);
+    private static final Pattern EXPECTED_IFACE_ID = Pattern.compile(
+            "lsp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            Pattern.CASE_INSENSITIVE);
     private static final String DRV_VFIO = "vfio-pci";
     private static final String DRV_MLX5 = "mlx5_core";
     private static final String ZERO_MAC = "00:00:00:00:00:00";
@@ -157,6 +160,13 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         if (present && mac.isReadError()) {
             return withObservation(observation, false, "VF MAC observation failed: " + mac.details);
         }
+        final String expectedInterfaceId = cmd.getExpectedInterfaceId(bdf);
+        final String expectedRepresentor = cmd.getExpectedRepresentor(bdf);
+        if (!EXPECTED_IFACE_ID.matcher(StringUtils.defaultString(expectedInterfaceId)).matches()
+                || StringUtils.isBlank(expectedRepresentor)) {
+            return withObservation(observation, false,
+                    "exact representor and lsp iface-id ownership are required for destructive cleanup");
+        }
         final boolean tokenAuthorizesUnassignedMac = tokenValid && mac.isUnassigned();
         if (present && !matchesExpectedMac(expectedMac, mac.mac) && !tokenAuthorizesUnassignedMac) {
             return withObservation(observation, false,
@@ -174,8 +184,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     "inactive persistent domain references target; STAGE_ROLLBACK authorization required");
         }
         observation.setLifecycleAuthorizationUsed(tokenValid);
-        return cleanupTarget(bdf, observation, vdpa.byBdf.get(bdf),
-                cmd.getExpectedRepresentor(bdf), cmd.getExpectedInterfaceId(bdf));
+        return cleanupTarget(bdf, observation, vdpa.byBdf.get(bdf), expectedRepresentor, expectedInterfaceId);
     }
 
     /** Executes the real target mutation path; tests inject only the environment. */
@@ -188,6 +197,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         try {
             if (vdpaNames != null) {
                 for (final String name : vdpaNames) {
+                    revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
+                            expectedInterfaceId, "vDPA deletion", true);
                     requireSuccess(environment.runner.run("/usr/sbin/vdpa", "dev", "del", name),
                             "vdpa dev del " + name);
                     vdpaRemoved = true;
@@ -202,10 +213,12 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     ? expectedRepresentor : VfPassthroughVifDriver.lookupRepresentor(
                             bdf, environment.pciDevices, environment.netClass);
             if (representor != null) {
-                removeRepresentorChecked(representor, expectedInterfaceId);
+                removeRepresentorChecked(bdf, observation.getExpectedMac(), representor, expectedInterfaceId);
                 representorRemoved = true;
             }
             if (observation.isDevicePresent()) {
+                revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
+                        expectedInterfaceId, "VF rebind", true);
                 final Path driver = environment.pciDevices.resolve(bdf).resolve("driver");
                 if (DRV_VFIO.equals(currentDriverOf(driver))) {
                     rebindOne(bdf);
@@ -214,6 +227,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     }
                     rebound = true;
                 }
+                revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
+                        expectedInterfaceId, "VF identity clear", true);
                 clearVfIdentityExact(bdf);
                 final MacObservation postMac = readVfMacExact(bdf);
                 if (!postMac.isUnassigned()) {
@@ -251,19 +266,20 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 mac.mac, binding, driver, first(vdpaNames), references, complete, mac.status);
     }
 
-    private void removeRepresentorChecked(final String representor, final String expectedInterfaceId) {
+    private void removeRepresentorChecked(final String bdf, final String expectedMac,
+                                          final String representor, final String expectedInterfaceId) {
         final CommandResult port = environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "get",
                 "Port", representor, "name");
         requireSuccess(port, "observe OVS port " + representor);
         if (StringUtils.isNotBlank(port.output)) {
-            if (StringUtils.isNotBlank(expectedInterfaceId) && !hasInterfaceId(representor, expectedInterfaceId)) {
-                throw new IllegalStateException("OVS representor ownership does not match expected iface-id for " + representor);
-            }
-            requireSuccess(environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "clear",
-                    "Interface", representor, "external_ids"), "clear OVS external_ids for " + representor);
+            revalidateBeforeDestructiveAction(bdf, expectedMac, representor, expectedInterfaceId,
+                    "OVS deletion", false);
             final CommandResult bridge = environment.runner.run("/usr/bin/ovs-vsctl", "port-to-br", representor);
             if (!bridge.success || StringUtils.isBlank(bridge.output)) {
                 throw new IllegalStateException("cannot resolve exact OVS bridge for " + representor);
+            }
+            if (!hasInterfaceId(representor, expectedInterfaceId)) {
+                throw new IllegalStateException("OVS representor ownership changed before deletion: " + representor);
             }
             requireSuccess(environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "del-port",
                     bridge.output.trim(), representor), "delete OVS representor " + representor);
@@ -277,6 +293,40 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 "Port", representor, "name");
         if (!postPort.success || StringUtils.isNotBlank(postPort.output)) {
             throw new IllegalStateException("OVS port removal postcondition unavailable for " + representor);
+        }
+    }
+
+    private void revalidateBeforeDestructiveAction(final String bdf, final String expectedMac,
+                                                   final String expectedRepresentor, final String expectedInterfaceId,
+                                                   final String action, final boolean requireMac) {
+        final VdpaInventory vdpa = inventoryVdpa();
+        final DomainInventory domains = inventoryDomains(vdpa);
+        if (!vdpa.success || !domains.success) {
+            throw new IllegalStateException(action + " revalidation inventory unavailable");
+        }
+        if (!domains.byBdf.getOrDefault(bdf, Collections.emptyList()).isEmpty()) {
+            throw new IllegalStateException(action + " blocked: domain references target BDF");
+        }
+        if (!EXPECTED_IFACE_ID.matcher(StringUtils.defaultString(expectedInterfaceId)).matches()
+                || StringUtils.isBlank(expectedRepresentor)) {
+            throw new IllegalStateException(action + " blocked: exact representor ownership evidence is missing");
+        }
+        final boolean present = Files.isDirectory(environment.pciDevices.resolve(bdf));
+        if (requireMac && !present) {
+            throw new IllegalStateException(action + " blocked: target BDF disappeared");
+        }
+        if (present) {
+            final MacObservation mac = readVfMacExact(bdf);
+            if (mac.isReadError() || !matchesExpectedMac(expectedMac, mac.mac)) {
+                throw new IllegalStateException(action + " blocked: VF MAC evidence changed");
+            }
+            if (VfPassthroughVifDriver.lookupPfFromVf(bdf, environment.pciDevices, environment.netClass) == null
+                    || VfPassthroughVifDriver.lookupVfIdFromPci(bdf, environment.pciDevices) == null) {
+                throw new IllegalStateException(action + " blocked: VF topology changed");
+            }
+        }
+        if (action.startsWith("OVS") && !hasInterfaceId(expectedRepresentor, expectedInterfaceId)) {
+            throw new IllegalStateException(action + " blocked: OVS iface-id ownership changed");
         }
     }
 

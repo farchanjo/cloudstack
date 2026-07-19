@@ -254,17 +254,17 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
                                              final long nicId,
                                              final String operationId, final String purpose) {
         final NicVO nic = nicDao.findByIdIncludingRemoved(nicId);
-        if (nic == null || nic.getMacAddress() == null) {
+        if (nic == null || nic.getMacAddress() == null || nic.getUuid() == null
+                || representorName == null || representorName.isBlank()) {
             return false;
         }
+        final String safeOperationId = operationId == null ? "vf-operation-" + nicId : operationId;
+        final String expectedInterfaceId = "lsp-" + nic.getUuid();
         final HostVfPurgeOrphansCommand cmd = new HostVfPurgeOrphansCommand();
         cmd.setTargetPciBdfs(java.util.Collections.singleton(pciBdf));
         cmd.setExpectedMacsByPciBdf(java.util.Collections.singletonMap(pciBdf, nic.getMacAddress()));
         cmd.setExpectedRepresentorsByPciBdf(java.util.Collections.singletonMap(pciBdf, representorName));
-        if (nic.getUuid() != null) {
-            cmd.setExpectedInterfaceIdsByPciBdf(java.util.Collections.singletonMap(pciBdf, "lsp-" + nic.getUuid()));
-        }
-        final String safeOperationId = operationId == null ? "vf-operation-" + nicId : operationId;
+        cmd.setExpectedInterfaceIdsByPciBdf(java.util.Collections.singletonMap(pciBdf, expectedInterfaceId));
         cmd.setOwnerOperationIdsByPciBdf(java.util.Collections.singletonMap(pciBdf, safeOperationId));
         cmd.setOwnerPurposesByPciBdf(java.util.Collections.singletonMap(pciBdf, purpose));
         cmd.setOwnerTokensByPciBdf(java.util.Collections.singletonMap(pciBdf,
@@ -282,7 +282,7 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
                 return false;
             }
             final HostVfPurgeOrphansAnswer.TargetResult result = targeted.getTargetResults().get(0);
-            return validCleanupEvidence(result, pciBdf, nic.getMacAddress(), operationId, purpose);
+            return validCleanupEvidence(result, pciBdf, nic.getMacAddress(), safeOperationId, purpose);
         } catch (AgentUnavailableException | OperationTimedoutException e) {
             LOGGER.warn("Targeted VF cleanup host={} pci={} was not confirmed: {}", hostId, pciBdf, e.getMessage());
         }
@@ -334,8 +334,11 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
             }
         }
         if (rows.size() > released) {
-            LOGGER.warn("VM {} VF cleanup completed {}/{} rows; unresolved rows remain SUSPECT",
-                    vmId, released, rows.size());
+            LOGGER.warn("VM {} VF cleanup released {}/{} owned rows; {} remain SUSPECT and retryable",
+                    vmId, released, rows.size(), rows.size() - released);
+        }
+        if (released == rows.size() && released > 0) {
+            LOGGER.info("VM {} VF cleanup released all {} owned rows", vmId, released);
         }
         return released;
     }

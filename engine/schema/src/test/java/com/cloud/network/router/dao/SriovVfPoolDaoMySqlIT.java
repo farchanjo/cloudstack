@@ -196,6 +196,26 @@ public class SriovVfPoolDaoMySqlIT {
     }
 
     @Test
+    public void softRemovedNicWithNullReversePointerReplaysSuspectCleanupUntilExactRelease() throws Exception {
+        insertHost(22L);
+        insertVm(1591L, 22L);
+        insertNic(8934L, 1591L, 980L);
+        update("UPDATE nics SET removed=NOW(), vf_pool_id=NULL WHERE id=8934");
+        insertPool(980L, 22L, "0000:01:04.1", "ALLOCATED", 8934L);
+
+        assertEquals(1, dao.quarantineAndListByVmId(1591L).size());
+        assertEquals("SUSPECT", poolState(980L));
+        assertEquals(1, dao.quarantineAndListByVmId(1591L).size());
+        assertEquals("SUSPECT", poolState(980L));
+
+        assertTrue(dao.releaseExact(980L, 8934L));
+        assertEquals("FREE", poolState(980L));
+        assertNull(longValueOrNull("SELECT vf_pool_id FROM nics WHERE id=8934"));
+        assertTrue(dao.quarantineAndListByVmId(1591L).isEmpty());
+        assertFalse(dao.releaseExact(980L, 8934L));
+    }
+
+    @Test
     public void reconciliationRejectsReservedConflictingWorkAndVmHostDrift() throws Exception {
         fixtureReconciliation();
         final VfReconciliationCandidate candidate =
@@ -553,6 +573,15 @@ public class SriovVfPoolDaoMySqlIT {
              ResultSet result = statement.executeQuery(sql)) {
             assertTrue(result.next());
             return result.getLong(1);
+        }
+    }
+
+    private static Long longValueOrNull(final String sql) throws SQLException {
+        try (Connection connection = newConnection(); Statement statement = connection.createStatement();
+                ResultSet result = statement.executeQuery(sql)) {
+            assertTrue(result.next());
+            final long value = result.getLong(1);
+            return result.wasNull() ? null : value;
         }
     }
 
