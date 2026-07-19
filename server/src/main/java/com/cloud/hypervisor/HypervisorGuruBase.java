@@ -765,9 +765,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocateForVdpa(
                         hostId, nicProfile.getId(), nicTo.getMac(), maxVqs);
                 if (vf == null) {
-                    throw new CloudRuntimeException(String.format(
-                            "Insufficient vDPA VF capacity on host %s for NIC %s; refusing TAP fallback",
-                            hostId, nicProfile.getId()));
+                    throw vdpaCapacityFailure(hostId, nicProfile.getId(), null);
                 }
                 nicTo.setVfPciAddress(vf.getPciAddress());
                 nicTo.setVfPfName(vf.getPfName());
@@ -788,20 +786,24 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                     vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
         } catch (com.cloud.exception.InsufficientCapacityException e) {
             if (shouldVdpa) {
-                throw new CloudRuntimeException(String.format(
-                        "Insufficient vDPA VF capacity on host %s for NIC %s; refusing TAP fallback",
-                        vmProfile.getHostId(), nicProfile.getId()), e);
+                throw vdpaCapacityFailure(vmProfile.getHostId(), nicProfile.getId(), e);
             }
             logger.warn("No free VF for HW offload on host {}; NIC {} will use bridge/TAP fallback",
                     vmProfile.getHostId(), nicProfile.getId());
         } catch (Exception e) {
             if (shouldVdpa) {
-                throw new CloudRuntimeException(String.format(
-                        "Unable to allocate vDPA VF on host %s for NIC %s; refusing TAP fallback",
-                        vmProfile.getHostId(), nicProfile.getId()), e);
+                throw vdpaCapacityFailure(vmProfile.getHostId(), nicProfile.getId(), e);
             }
             logger.warn("Failed to allocate VF for HW offload", e);
         }
+    }
+
+    static CloudRuntimeException vdpaCapacityFailure(final Long hostId, final long nicId,
+            final Throwable cause) {
+        final String message = String.format(
+                "Insufficient vDPA VF capacity on host %s for NIC %s; refusing TAP fallback",
+                hostId, nicId);
+        return cause == null ? new CloudRuntimeException(message) : new CloudRuntimeException(message, cause);
     }
 
     static Long vfAllocationHostId(final VirtualMachineProfile vmProfile) {

@@ -24,6 +24,7 @@ import org.junit.Test;
 
 import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.VirtualMachineProfile;
+import com.cloud.utils.exception.CloudRuntimeException;
 
 public class HypervisorGuruBaseVfHostTest {
 
@@ -36,5 +37,13 @@ public class HypervisorGuruBaseVfHostTest {
         when(vm.getHostId()).thenReturn(269L);
 
         assertEquals(Long.valueOf(16L), HypervisorGuruBase.vfAllocationHostId(profile));
+    }
+
+    @Test
+    public void vdpaCapacityFailureIsExplicitlyNotTapFallback() {
+        final CloudRuntimeException failure = HypervisorGuruBase.vdpaCapacityFailure(16L, 7L, null);
+
+        assertEquals("Insufficient vDPA VF capacity on host 16 for NIC 7; refusing TAP fallback",
+                failure.getMessage());
     }
 }

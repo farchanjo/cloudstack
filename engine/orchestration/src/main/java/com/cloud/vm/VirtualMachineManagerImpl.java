@@ -3945,6 +3945,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         } finally {
             if (!migrated) {
                 logger.info("Migration was unsuccessful.  Cleaning up: {}", vm);
+                if (hasVdpaNic(to)) {
+                    try {
+                        _agentMgr.send(destHostId, new StopCommand(vm.getInstanceName(), false, true));
+                    } catch (Exception e) {
+                        logger.error("Unable to stop failed storage-migration vDPA destination {}; VM remains stopped",
+                                destHostId, e);
+                    }
+                }
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
                 volumeMgr.release(vm.getId(), destHostId);
 
@@ -5282,6 +5290,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         } finally {
             if (!migrated) {
                 logger.info("Migration was unsuccessful.  Cleaning up: {}", vm);
+                if (hasVdpaNic(to)) {
+                    try {
+                        _agentMgr.send(dstHostId, new StopCommand(vm.getInstanceName(), false, true));
+                    } catch (Exception e) {
+                        logger.error("Unable to stop failed scale-migration vDPA destination {}; VM remains stopped",
+                                dstHostId, e);
+                    }
+                }
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
 
                 String alertSubject = String.format("Unable to migrate %s from %s in Zone [%s] and Pod [%s].",

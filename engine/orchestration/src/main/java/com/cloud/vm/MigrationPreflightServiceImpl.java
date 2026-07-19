@@ -25,10 +25,6 @@ import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationPreflightService;
 import com.cloud.service.dao.ServiceOfferingDao;
 import com.cloud.vm.dao.VMInstanceDao;
-import com.cloud.vm.VirtualMachineProfileImpl;
-import com.cloud.vm.VirtualMachineProfile;
-import com.cloud.vm.VirtualMachine;
-import com.cloud.vm.NicProfile;
 import com.cloud.network.NetworkModel;
 import com.cloud.host.dao.HostDao;
 

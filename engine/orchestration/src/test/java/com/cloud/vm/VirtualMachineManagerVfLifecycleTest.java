@@ -17,8 +17,10 @@
 package com.cloud.vm;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -47,6 +49,15 @@ public class VirtualMachineManagerVfLifecycleTest {
         manager.commitVfOwnership(1553L, 269L, 16L, "migration", "work-1");
 
         verify(vfPoolManager).commitOwnershipForVm(1553L, 269L, 16L, "work-1");
+    }
+
+    @Test
+    public void ownershipCommitFailureIsPropagated() {
+        doThrow(new IllegalStateException("ownership conflict")).when(vfPoolManager)
+                .commitOwnershipForVm(1553L, 269L, 16L, "work-fail");
+
+        assertThrows(com.cloud.utils.exception.CloudRuntimeException.class,
+                () -> manager.commitVfOwnership(1553L, 269L, 16L, "migration", "work-fail"));
     }
 
     @Test
