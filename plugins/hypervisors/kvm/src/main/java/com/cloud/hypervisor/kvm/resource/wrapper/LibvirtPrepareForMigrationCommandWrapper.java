@@ -135,12 +135,14 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             skipDisconnect = true;
 
             if (!storagePoolMgr.connectPhysicalDisksViaVmSpec(vm, true)) {
+                releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
                 return new PrepareForMigrationAnswer(command, "failed to connect physical disks to host");
             }
 
             logger.info("Successfully prepared destination host for migration of VM {}", vm.getName());
             return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, vdpaInterfaceMapping, libvirtComputingResource, vm);
         } catch (final LibvirtException | CloudRuntimeException | InternalErrorException | URISyntaxException e) {
+            releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
             if (MapUtils.isNotEmpty(dpdkInterfaceMapping)) {
                 for (DpdkTO to : dpdkInterfaceMapping.values()) {
                     removeDpdkPort(to.getPort());
