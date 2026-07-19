@@ -28,8 +28,8 @@ import org.junit.Test;
 
 import com.cloud.host.Host;
 import com.cloud.host.Status;
-import com.cloud.network.NetworkVO;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.ovn.OvnChassisLookup;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;

@@ -32,12 +32,12 @@ import org.springframework.test.util.ReflectionTestUtils;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.agent.api.to.VirtualMachineTO;
-import com.cloud.agent.manager.AgentManager;
+import com.cloud.agent.AgentManager;
 import com.cloud.host.Host;
 import com.cloud.host.dao.HostDao;
 import com.cloud.agent.api.StartAnswer;
 import com.cloud.network.router.VfPoolManager;
-import com.cloud.network.NetworkManager;
+import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import com.cloud.vm.dao.NicDao;
 
 public class VirtualMachineManagerVfLifecycleTest {
@@ -121,7 +121,7 @@ public class VirtualMachineManagerVfLifecycleTest {
 
     @Test
     public void coldDestinationProfileRejectsOmittedAuthoritativeNic() {
-        final NetworkManager networkManager = mock(NetworkManager.class);
+        final NetworkOrchestrationService networkManager = mock(NetworkOrchestrationService.class);
         final NicDao nicDao = mock(NicDao.class);
         final VMInstanceVO vm = mock(VMInstanceVO.class);
         final NicProfile profileNic = mock(NicProfile.class);
@@ -141,7 +141,7 @@ public class VirtualMachineManagerVfLifecycleTest {
 
     @Test
     public void coldDestinationProfileRejectsDuplicateAuthoritativeNicIdentity() {
-        final NetworkManager networkManager = mock(NetworkManager.class);
+        final NetworkOrchestrationService networkManager = mock(NetworkOrchestrationService.class);
         final NicDao nicDao = mock(NicDao.class);
         final VMInstanceVO vm = mock(VMInstanceVO.class);
         final NicProfile first = mock(NicProfile.class);
