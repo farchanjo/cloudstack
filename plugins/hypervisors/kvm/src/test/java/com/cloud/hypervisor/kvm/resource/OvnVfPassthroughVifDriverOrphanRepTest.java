@@ -18,8 +18,8 @@
  */
 package com.cloud.hypervisor.kvm.resource;
 
-import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.mockStatic;
@@ -155,8 +155,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             driver.cleanupStaleRepsByLspName("lsp-b3f77bd2");
 
-             // Both reps must enter the CAS path — keepRepName=null means keep nothing.
-             scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(2));
+            // Both reps must enter the CAS path — keepRepName=null means keep nothing.
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(2));
         }
     }
 
@@ -242,7 +242,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             driver.unplug(iface, true);
 
-             scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(1));
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(1));
         }
     }
 
