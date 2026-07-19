@@ -49,6 +49,64 @@ only via Foreman REX (not relevant to this docs task). All build/test on Aragog.
 | HA host flag | `hahost=false` on LAX cluster (operator-provided); `vm.ha.enabled` default `true` but fencing not configured | operator + `HighAvailabilityManagerImpl` |
 | OOB / fencing | not available / not tested | operator-provided |
 
+### 1.1 Production Kubernetes dependency and mandatory gate
+
+Snape and Salazar are **production Kubernetes clusters running inside CloudStack
+guest VMs in LAX Slytherin**. They are not disposable test workloads. Any physical
+DX6/DAC/MLAG action, CloudStack KVM-agent rollout, CloudStack management rollout,
+OVN/OVS action, cold migration, or live migration MUST capture a Kubernetes
+pre/post baseline and abort on any degradation. Kubernetes health is a production
+dependency of the CloudStack operation, not an optional application check.
+
+The following gate is non-negotiable and is re-run after **every individual** KVM
+or management step, and before and after the SP6/SP7 evidence windows for both cold
+and live migration:
+
+1. Both cluster APIs authenticate successfully and `/readyz` is healthy.
+2. Every expected control-plane and worker node is `Ready`, with roles, versions,
+   taints, readiness transitions, and CloudStack VM UUID recorded.
+3. Control-plane and etcd quorum is healthy; no member is lost or degraded.
+4. Critical `kube-system`, CNI, CSI, CoreDNS, ingress, and critical DaemonSet /
+   Deployment workloads are healthy.
+5. No new Pending, CrashLoopBackOff, Error, readiness regression, or restart storm
+   exists relative to the pre-step baseline.
+6. Both CT_LB API paths (`.35:6443` and `.33:6443`) are healthy.
+7. All DSR public/accounting IPv4 and IPv6 endpoints and their expected backends
+   are healthy; endpoint counts and VIPs are recorded.
+8. CloudStack VM-to-hypervisor placement, tier/VPC, control-plane membership, and
+   backend placement are recorded before and after the step.
+
+The current read-only baseline is **K8S_PROD_BASELINE_NO_GO**: Salazar accounting
+has an active `socket` CrashLoopBackOff and returns HTTPS 500, and Salazar's
+`starrocks` Argo application is Degraded. No DX6 or CloudStack rollout may start
+until a fresh baseline passes this gate.
+
+The authoritative CloudStack LB baseline is **12 Active `dsr_software` rows plus
+2 Active `ct_lb` rows**. The older 6+2 figure is stale. Count authoritative raw
+CloudStack LB rows by `lbkind`, not address families: a dual-stack DSR service may
+have IPv4 and IPv6 VIP/backend realizations while remaining one logical row per
+programmed LB object. The two `ct_lb` rows are the CT_LB API paths; DSR remains a
+software/direct-server-return path and must not be counted as CT_LB.
+
+### 1.2 Failure-domain and rollout blockers
+
+Enforce **one physical host, link, control-plane member, or migration at a time**.
+Never act simultaneously on multiple hosts or links that contain Kubernetes
+quorum members or production DSR/CT_LB backends. Crash-restart remains excluded
+until OOB/fencing is available and tested.
+
+The current rollout blocker is active incoming CRC growth on the Nagini and
+Scabbers DX6 paths; no rollout has started. The strongest current fault-domain
+hypothesis is the provider switch / MLAG / DAC physical path. Do not remotely
+isolate an LACP member without switch-side evidence, capacity validation, and a
+passing Kubernetes/CloudStack pre-gate. Any such action must be followed by the
+individual-step Kubernetes gate above before proceeding.
+
+For OVN 26.03.2 realization, use `Chassis_Private.nb_cfg`; `Chassis.nb_cfg` is
+deprecated. The OVN Raft gate requires healthy leader-to-follower communication,
+all **3 members** present, an identified leader, and **zero unapplied and zero
+uncommitted backlog** before any rollout or migration action.
+
 **Prior-claim check (fail-closed honesty):** the user asked to review existing
 docs for a prior claim that "cold relocation is GO despite VF pool not exposed."
 A repo-wide grep of `docs/` for `cold relocate`, `cold relocation`, `cold migrate`,
@@ -780,6 +838,10 @@ abort.
 
 #### SP6 — Read-only pre/during/post observations
 
+Capture and pass the full §1.1 Kubernetes gate immediately before the SP6 window
+and immediately after it. For every individual KVM-agent or management-server
+step, re-run the Kubernetes gate before the next step; do not batch those checks.
+
 Capture pre-migration baseline, during-cutover, and post-steady-state observations
 of BUM/broadcast/multicast/unknown-unicast counters, TC/OVS flow state, and OVN
 Port_Binding claims. Use read-only OVS/OVN/switch observations; **do not clear
@@ -787,6 +849,10 @@ counters**. Record source/destination Interface state, `iface-id`,
 `iface-status`, Port_Binding chassis, and any `actions=FLOOD` path.
 
 #### SP7 — Hard-abort triggers
+
+The §1.1 Kubernetes gate is also mandatory immediately before and after SP7
+evidence. Any Kubernetes degradation is an SP7 hard abort even when the vDPA,
+OVS, or OVN-specific trigger below is not present.
 
 Any one of the following stops the migration/canary and blocks further rollout:
 
