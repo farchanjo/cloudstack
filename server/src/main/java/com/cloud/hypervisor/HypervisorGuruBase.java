@@ -765,9 +765,9 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 com.cloud.network.router.SriovVfPoolVO vf = vfPoolManager.allocateForVdpa(
                         hostId, nicProfile.getId(), nicTo.getMac(), maxVqs);
                 if (vf == null) {
-                    logger.warn("No free VF for vDPA on host {}; NIC {} will use bridge/TAP fallback",
-                            hostId, nicProfile.getId());
-                    return;
+                    throw new CloudRuntimeException(String.format(
+                            "Insufficient vDPA VF capacity on host %s for NIC %s; refusing TAP fallback",
+                            hostId, nicProfile.getId()));
                 }
                 nicTo.setVfPciAddress(vf.getPciAddress());
                 nicTo.setVfPfName(vf.getPfName());
@@ -787,9 +787,19 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             logger.info("Allocated VF {} (PCI {}) on host {} for NIC {} ({} traffic, HW offload)",
                     vf.getUuid(), vf.getPciAddress(), hostId, nicProfile.getId(), network.getTrafficType());
         } catch (com.cloud.exception.InsufficientCapacityException e) {
+            if (shouldVdpa) {
+                throw new CloudRuntimeException(String.format(
+                        "Insufficient vDPA VF capacity on host %s for NIC %s; refusing TAP fallback",
+                        vmProfile.getHostId(), nicProfile.getId()), e);
+            }
             logger.warn("No free VF for HW offload on host {}; NIC {} will use bridge/TAP fallback",
                     vmProfile.getHostId(), nicProfile.getId());
         } catch (Exception e) {
+            if (shouldVdpa) {
+                throw new CloudRuntimeException(String.format(
+                        "Unable to allocate vDPA VF on host %s for NIC %s; refusing TAP fallback",
+                        vmProfile.getHostId(), nicProfile.getId()), e);
+            }
             logger.warn("Failed to allocate VF for HW offload", e);
         }
     }
