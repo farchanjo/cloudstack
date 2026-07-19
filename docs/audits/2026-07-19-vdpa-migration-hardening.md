@@ -543,21 +543,21 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
 | B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
-| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | Current worktree adds a vDPA-kind-specific DAO count, chassis read port/adapter, requested-chassis validation, HA/fencing gate, and K8s quorum/anti-affinity checks | duplicate-claim/concurrency admission and cold wiring remain | continue Slice 2 before marking complete |
+| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | `e77119c3e5` adds serialized per-VM admission checks; the workstream includes a vDPA-kind-specific DAO count, chassis read port/adapter, requested-chassis validation, HA/fencing gate, and K8s quorum/anti-affinity checks | duplicate-claim proof and full cold wiring remain | continue Slice 2 before marking complete |
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `1b4e244850` extends `982672fe9f`: null manager, null allocation, checked allocation failure, and runtime failure all reject vDPA without TAP fallback; focused message test added | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | completed | `MigrationVfPreflight` rejects non-vDPA `useHwOffload` NICs for LIVE mode with an explicit unsupported-operation message; COLD mode remains available for later destination-device gates | cold hostdev capacity gate remains in Slice 5.5/6 | preserve live rejection |
 | B5 | `requested-chassis` validation (§5.4) | completed | `d37c03e0f0`: read-only `OvnChassisLookup` port/OVN adapter resolves the configured policy and rejects non-matching destination chassis without NB writes | Aragog integration validation pending | no auto-pin; preserve operator policy |
 | B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | in_progress | `ab5126839d` adds shared destination proof command/wrapper; `1b4e244850` applies synchronous stamp/verification before commit on live, storage, and scale paths | cold-restart proof and Aragog verifier tests remain | do not claim migration canary readiness |
 | B7 | VF commit/rollback gated on dataplane (§5.6) | in_progress | `1b4e244850` propagates ownership commit failures and performs destination stop/cleanup before failed migration cleanup on live/storage/scale paths | source cold-restart semantics and failure integration tests remain | fail closed; no ownership commit on failed proof |
 | B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | completed | Current worktree adds admin-only read-only command/response contracts and `VfPoolService` status façade; no force-release or repair operation exposed | Aragog API authorization/response tests pending | preserve read-only boundary |
-| B9 | Cold relocate preflight (§5.8) | in_progress | Shared source-binding-down command/wrapper added; orchestration wiring remains | wire after `advanceStop` and before destination start | leave VM stopped on failed proof |
+| B9 | Cold relocate preflight (§5.8) | in_progress | `ab5126839d` adds shared source-binding-down command/wrapper; `1b4e244850` wires a bounded proof into the vDPA migrate-away stop path | dedicated cold destination start transaction remains | leave VM stopped on failed proof |
 | B10 | Error/reporting semantics (§5.9) | pending | — | — | — |
 
 ### Phase C — Tests (PENDING)
 
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
-| C1 | Unit tests §7.1 | pending | Slice 1 negative test remains to be added with the migration-preflight test group | B2–B10 | — |
+| C1 | Unit tests §7.1 | in_progress | Focused fail-closed allocation, preflight capacity/hostdev/HA/chassis, ownership, and vDPA pool tests are present | destination/source verifier and rollback tests remain | — |
 | C2 | Wrapper/XML tests §7.2 | pending | — | B6 | — |
 | C3 | Orchestration failure tests §7.3 | pending | — | B2,B3,B6 | — |
 | C4 | API tests §7.4 | in_progress | API command/response slices added; authorization and structured response tests remain | Aragog API module validation | — |
