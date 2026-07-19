@@ -648,6 +648,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             final JsonObject delete = new JsonObject();
             delete.addProperty("count", 1);
             response.add(delete);
+            final JsonObject deleteInterface = new JsonObject();
+            deleteInterface.addProperty("count", 1);
+            response.add(deleteInterface);
             removedRepresentors.add(ovsName);
             ovsIfaceId = null;
             return CommandResult.success(response.toString());
@@ -682,6 +685,15 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             final JsonObject row = new JsonObject();
             row.add("_uuid", uuid("iface-uuid"));
             row.add("name", typed("string", name));
+            final JsonArray externalIds = new JsonArray();
+            final JsonArray pairs = new JsonArray();
+            final JsonArray pair = new JsonArray();
+            pair.add("iface-id");
+            pair.add(ovsIfaceId);
+            pairs.add(pair);
+            externalIds.add("map");
+            externalIds.add(pairs);
+            row.add("external_ids", externalIds);
             return row;
         }
 

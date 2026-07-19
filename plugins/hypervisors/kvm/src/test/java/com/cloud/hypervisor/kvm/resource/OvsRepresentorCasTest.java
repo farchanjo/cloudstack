@@ -86,7 +86,8 @@ public class OvsRepresentorCasTest {
         final int[] transactions = {0};
         assertFalse(OvsRepresentorCas.remove(args -> {
             final String response = responses.removeFirst();
-            if (args.length > 1 && "transact".equals(args[1])) {
+            if (args.length > 3 && "transact".equals(args[1])
+                    && JsonParser.parseString(args[3]).getAsJsonArray().size() > 2) {
                 transactions[0]++;
             }
             return new OvsRepresentorCas.Result(true, response, "");

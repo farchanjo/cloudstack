@@ -186,6 +186,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
                         callLog.add((String) inv.getArgument(0));
                         return "";
                     });
+            scriptMock.when(() -> Script.executeCommand(any(String[].class)))
+                    .thenReturn("[{\"rows\":[]}]");
 
             // Override find to return no orphans so no del-port side effects.
             scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface")))
