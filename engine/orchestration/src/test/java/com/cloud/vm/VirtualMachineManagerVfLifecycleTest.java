@@ -30,10 +30,12 @@ import org.junit.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.Command;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.agent.api.to.VirtualMachineTO;
 import com.cloud.agent.AgentManager;
 import com.cloud.host.Host;
+import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
 import com.cloud.agent.api.StartAnswer;
 import com.cloud.network.router.VfPoolManager;
@@ -167,7 +169,7 @@ public class VirtualMachineManagerVfLifecycleTest {
         final Answer failedStamp = mock(Answer.class);
         when(failedStamp.getResult()).thenReturn(false);
         when(agentManager.send(org.mockito.ArgumentMatchers.eq(16L),
-                org.mockito.ArgumentMatchers.any())).thenReturn(failedStamp);
+                org.mockito.ArgumentMatchers.any(Command.class))).thenReturn(failedStamp);
         final MigrationVfPreflight preflight = mock(MigrationVfPreflight.class);
         final VMInstanceVO vm = mock(VMInstanceVO.class);
         when(vm.getHypervisorType()).thenReturn(com.cloud.hypervisor.Hypervisor.HypervisorType.KVM);
@@ -191,9 +193,9 @@ public class VirtualMachineManagerVfLifecycleTest {
         when(stamp.getResult()).thenReturn(true);
         when(verifier.getResult()).thenReturn(false);
         when(agentManager.send(org.mockito.ArgumentMatchers.eq(16L),
-                org.mockito.ArgumentMatchers.any())).thenReturn(stamp, verifier);
+                org.mockito.ArgumentMatchers.any(Command.class))).thenReturn(stamp, verifier);
         final HostDao hostDao = mock(HostDao.class);
-        final Host host = mock(Host.class);
+        final HostVO host = mock(HostVO.class);
         final MigrationVfPreflight preflight = mock(MigrationVfPreflight.class);
         when(hostDao.findById(16L)).thenReturn(host);
         when(preflight.expectedChassis(host)).thenReturn("chassis-1");
