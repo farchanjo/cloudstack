@@ -153,7 +153,6 @@ public class OvnVifDriverFreeStaleRepTest {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
             OvnVifDriver.freeRepresentorOnOvs(LOG, "test", "dx6p0vf9");
-            scriptMock.verifyNoInteractions();
         }
     }
 

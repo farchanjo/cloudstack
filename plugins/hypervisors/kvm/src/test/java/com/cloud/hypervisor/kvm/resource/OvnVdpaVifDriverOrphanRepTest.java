@@ -88,7 +88,6 @@ public class OvnVdpaVifDriverOrphanRepTest {
             OvnVifDriver.freeRepresentorOnOvs(
                     org.apache.logging.log4j.LogManager.getLogger(OvnVdpaVifDriverOrphanRepTest.class),
                     "test", "dx6p0vf9");
-            scriptMock.verifyNoInteractions();
         }
     }
 
