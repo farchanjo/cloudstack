@@ -257,6 +257,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         command.setExpectedRepresentorsByPciBdf(Map.of(BDF, "zzz-correct-pf1vf24", "0000:03:07.2", "rep-second"));
         command.setExpectedInterfaceIdsByPciBdf(Map.of(BDF, EXPECTED_IFACE_ID,
                 "0000:03:07.2", EXPECTED_IFACE_ID));
+        command.setExpectedRepresentorsByPciBdf(Map.of(BDF, "zzz-correct-pf1vf24", "0000:03:07.2", "rep-second"));
+        command.setExpectedInterfaceIdsByPciBdf(Map.of(BDF, EXPECTED_IFACE_ID,
+                "0000:03:07.2", EXPECTED_IFACE_ID));
 
         final HostVfPurgeOrphansAnswer answer = execute(host, command);
 
