@@ -8,7 +8,9 @@
 > spawning a parallel tracker.
 >
 > **Phase A (Architecture / tracker) — COMPLETED** at commit `1975addd90`
-> (local + Aragog `main` aligned). Phases B–E pending.
+> (local + Aragog `main` aligned). **Slice 0 — COMPLETED** at the code-phase
+> commit recorded below. Runtime slices remain pending until Slice 0's Aragog
+> gate is independently validated.
 
 **Architecture review status:** **COMPLETE — PASS with mandatory corrections.**
 The consolidated review below is docs-only and does not authorize runtime changes,
@@ -540,7 +542,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
-| B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | pending | — | — | revert pom + setup.py |
+| B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
 | B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | pending | — | — | — |
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | pending | — | — | restore F3 fallback |
 | B4 | hostdev live rejection (§5.3) | pending | — | — | — |
@@ -585,6 +587,16 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | E2 | Migrate first workload vDPA VM (live) | pending | — | C7,D4,E1 | rollback to source |
 | E3 | Drain Fluffy / K8s node rotations | pending | — | E2 | per-node rollback |
 | E4 | Final invariant audit (§11) | pending | — | E* | — |
+
+### Phase B/C implementation gate record
+
+| Gate | Status | Evidence | Blocker / next action |
+|---|---|---|---|
+| Slice 0 P0.1 tracker corrections | completed | §15.4, §15.5, §15.6 contain the 15 corrections, UD1–UD5 resolutions, SP1–SP7, SP-COLD, and the storage-plus-vDPA scope decision | verify on Aragog before Slice 1 |
+| Slice 0 P0.2 version metadata | completed | root and child POM project versions target `4.24.1.33-SNAPSHOT`; Marvin stamp targets `4.24.1.33` | verify no unintended stale metadata on Aragog |
+| Slice 0 P0.3 schema registry | completed | `Upgrade42432to42433` and `DatabaseUpgradeChecker` registration | scoped schema/tool validation on Aragog |
+| Slice 0 P0.4 Aragog validation | pending | not run from this workstation by policy | Aragog build and clean-worktree verification |
+| Slice 0 P0.5 safety | completed | no runtime implementation, deployment, CMK, Foreman, or infrastructure operation performed | maintain boundary for later slices |
 
 ---
 
