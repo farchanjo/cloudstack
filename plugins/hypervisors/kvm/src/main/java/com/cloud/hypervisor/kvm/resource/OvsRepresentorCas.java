@@ -61,7 +61,12 @@ public final class OvsRepresentorCas {
         if (!NAME.matcher(name).matches() || executor == null || socket == null || socket.isBlank()) {
             return false;
         }
-        final Identity identity = discover(executor, socket, name);
+        final Identity identity;
+        try {
+            identity = discover(executor, socket, name);
+        } catch (RuntimeException e) {
+            return false;
+        }
         if (identity == null) {
             return true;
         }

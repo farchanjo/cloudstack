@@ -303,7 +303,8 @@ public class OvnVifDriver extends VifDriverBase {
         lock.lock();
         try {
         if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
-            throw new IllegalStateException(callerLabel + ": OVS representor CAS failed for " + repName);
+            log.warn("{}: OVS representor CAS failed; refusing mutation for {}", callerLabel, repName);
+            return;
         }
         log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
         } finally {
