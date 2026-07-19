@@ -128,6 +128,7 @@ public class SriovVfPoolBookkeepingTest {
     @Test
     public void exactReleasePredicateAcceptsSuspectAndRejectsReplayAfterFree() {
         SriovVfPoolVO row = staleVdpaRow();
+        row.setAllocatedToNicId(NIC_ID);
         row.setState(State.SUSPECT);
         assertTrue(SriovVfPoolDaoImpl.exactSuspectOwnershipMatches(row, NIC_ID));
         SriovVfPoolDaoImpl.applyFreeState(row);
