@@ -66,6 +66,7 @@ import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo.DiskType;
 import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo.DriverType;
 import com.cloud.agent.api.MigrateCommand.MigrateDiskInfo.Source;
 import com.cloud.agent.api.VgpuTypesInfo;
+import com.cloud.agent.api.to.DiskTO;
 import com.cloud.agent.api.to.DpdkTO;
 import com.cloud.agent.api.to.GPUDeviceTO;
 import com.cloud.agent.api.to.VirtualMachineTO;
@@ -977,6 +978,7 @@ public class LibvirtMigrateCommandWrapperTest {
         Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
         final VirtualMachineTO to = Mockito.mock(VirtualMachineTO.class);
         Mockito.when(to.getVncPassword()).thenReturn("");
+        Mockito.when(to.getDisks()).thenReturn(new DiskTO[0]);
         final MigrateCommand command = new MigrateCommand("vm-1", "10.0.0.2", false, to, false);
 
         final List<Map<String, String>> invalidMappings = new ArrayList<>();
@@ -1013,6 +1015,7 @@ public class LibvirtMigrateCommandWrapperTest {
         Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
         final VirtualMachineTO to = Mockito.mock(VirtualMachineTO.class);
         Mockito.when(to.getVncPassword()).thenReturn("");
+        Mockito.when(to.getDisks()).thenReturn(new DiskTO[0]);
         final MigrateCommand command = new MigrateCommand("vm-1", "10.0.0.2", false, to, false);
         command.setVdpaInterfaceMapping(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
 
