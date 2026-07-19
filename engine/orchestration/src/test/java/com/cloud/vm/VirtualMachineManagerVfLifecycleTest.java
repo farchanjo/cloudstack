@@ -29,6 +29,12 @@ import org.junit.Before;
 import org.junit.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.to.NicTO;
+import com.cloud.agent.api.to.VirtualMachineTO;
+import com.cloud.agent.manager.AgentManager;
+import com.cloud.host.Host;
+import com.cloud.host.dao.HostDao;
 import com.cloud.agent.api.StartAnswer;
 import com.cloud.network.router.VfPoolManager;
 
@@ -99,5 +105,56 @@ public class VirtualMachineManagerVfLifecycleTest {
 
         assertFalse(VirtualMachineManagerImpl.authorizeFailedStartHardwareCleanup(answer, false, true));
         assertTrue(VirtualMachineManagerImpl.authorizeFailedStartHardwareCleanup(answer, true, true));
+    }
+
+    @Test
+    public void destinationStampFailureIsFatalForVdpa() throws Exception {
+        final AgentManager agentManager = mock(AgentManager.class);
+        final Answer failedStamp = mock(Answer.class);
+        when(failedStamp.getResult()).thenReturn(false);
+        when(agentManager.send(org.mockito.ArgumentMatchers.eq(16L),
+                org.mockito.ArgumentMatchers.any())).thenReturn(failedStamp);
+        final MigrationVfPreflight preflight = mock(MigrationVfPreflight.class);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        when(vm.getHypervisorType()).thenReturn(com.cloud.hypervisor.Hypervisor.HypervisorType.KVM);
+        when(vm.getInstanceName()).thenReturn("i-1-VM");
+        final NicTO nic = new NicTO();
+        nic.setUseVdpa(true);
+        nic.setUuid("nic-1");
+        final VirtualMachineTO to = mock(VirtualMachineTO.class);
+        when(to.getNics()).thenReturn(new NicTO[]{nic});
+        ReflectionTestUtils.setField(manager, "_agentMgr", agentManager);
+        ReflectionTestUtils.setField(manager, "migrationVfPreflight", preflight);
+
+        assertFalse(manager.dispatchPostMigrateOvnStamp(vm, to, 16L));
+    }
+
+    @Test
+    public void reorderedStampVerifierFailureIsFatalAfterStampAnswer() throws Exception {
+        final AgentManager agentManager = mock(AgentManager.class);
+        final Answer stamp = mock(Answer.class);
+        final Answer verifier = mock(Answer.class);
+        when(stamp.getResult()).thenReturn(true);
+        when(verifier.getResult()).thenReturn(false);
+        when(agentManager.send(org.mockito.ArgumentMatchers.eq(16L),
+                org.mockito.ArgumentMatchers.any())).thenReturn(stamp, verifier);
+        final HostDao hostDao = mock(HostDao.class);
+        final Host host = mock(Host.class);
+        final MigrationVfPreflight preflight = mock(MigrationVfPreflight.class);
+        when(hostDao.findById(16L)).thenReturn(host);
+        when(preflight.expectedChassis(host)).thenReturn("chassis-1");
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        when(vm.getHypervisorType()).thenReturn(com.cloud.hypervisor.Hypervisor.HypervisorType.KVM);
+        when(vm.getInstanceName()).thenReturn("i-1-VM");
+        final NicTO nic = new NicTO();
+        nic.setUseVdpa(true);
+        nic.setUuid("nic-1");
+        final VirtualMachineTO to = mock(VirtualMachineTO.class);
+        when(to.getNics()).thenReturn(new NicTO[]{nic});
+        ReflectionTestUtils.setField(manager, "_agentMgr", agentManager);
+        ReflectionTestUtils.setField(manager, "_hostDao", hostDao);
+        ReflectionTestUtils.setField(manager, "migrationVfPreflight", preflight);
+
+        assertFalse(manager.dispatchPostMigrateOvnStamp(vm, to, 16L));
     }
 }

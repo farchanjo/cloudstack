@@ -22,6 +22,7 @@ import static org.junit.Assert.assertFalse;
 import org.junit.Test;
 
 import com.cloud.network.router.MigrationPreflightResult;
+import com.cloud.network.router.MigrationNicPreflightStatus;
 import com.cloud.network.router.VfPoolStatus;
 
 public class MigrationPreflightResponseTest {
@@ -29,13 +30,16 @@ public class MigrationPreflightResponseTest {
     @Test
     public void mapsStructuredDenialWithoutLosingCapacityEvidence() {
         final MigrationPreflightResponse response = MigrationPreflightResponse.from(
-                new MigrationPreflightResult(false, 11L, 22L, 2, 1, "fencing unavailable"));
+                new MigrationPreflightResult(false, 11L, 22L, 2, 1, "fencing unavailable",
+                        java.util.List.of(new MigrationNicPreflightStatus("nic-1", false, 2, 1,
+                                "fencing unavailable"))));
 
         assertFalse(response.isAllowed());
         assertEquals(11L, response.getVmId());
         assertEquals(2, response.getRequiredVdpaVfs());
         assertEquals(1, response.getFreeVdpaVfs());
         assertEquals("fencing unavailable", response.getDenialReason());
+        assertEquals("nic-1", response.getNicStatuses().get(0).nicId());
     }
 
     @Test

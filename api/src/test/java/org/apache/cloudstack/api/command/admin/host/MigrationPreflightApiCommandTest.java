@@ -14,23 +14,25 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-package com.cloud.network.ovn;
+package org.apache.cloudstack.api.command.admin.host;
 
-import java.util.Map;
+import static org.junit.Assert.assertTrue;
 
-/** Read-only management-side port for resolving a CloudStack host's OVN chassis. */
-public interface OvnChassisLookup {
+import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.api.APICommand;
+import org.junit.Test;
 
-    /** @return the registered chassis UUID, or {@code null} when unregistered. */
-    String findChassisUuid(long hostId);
+public class MigrationPreflightApiCommandTest {
 
-    /** Returns active SB Port_Binding claims for one LSP, or -1 when unavailable. */
-    default int countActiveClaims(final long dataCenterId, final String lspName) {
-        return -1;
+    @Test
+    public void listMigrationPreflightCmdIsAdminOnly() {
+        final APICommand command = ListMigrationPreflightCmd.class.getAnnotation(APICommand.class);
+        assertTrue(java.util.Arrays.asList(command.authorized()).contains(RoleType.Admin));
     }
 
-    /** Resolves the configured requested-chassis policy without writing OVN state. */
-    default String resolveRequestedChassis(final Map<String, String> vmDetails) {
-        return vmDetails == null ? null : vmDetails.get("ovn.requested_chassis");
+    @Test
+    public void listHostVfPoolStatusCmdIsAdminOnly() {
+        final APICommand command = ListHostVfPoolStatusCmd.class.getAnnotation(APICommand.class);
+        assertTrue(java.util.Arrays.asList(command.authorized()).contains(RoleType.Admin));
     }
 }

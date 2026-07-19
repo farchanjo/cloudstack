@@ -16,10 +16,14 @@
 // under the License.
 package org.apache.cloudstack.api.response;
 
+import java.util.List;
+
+import org.apache.cloudstack.api.BaseResponse;
+
+import com.cloud.network.router.MigrationNicPreflightStatus;
 import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.serializer.Param;
 import com.google.gson.annotations.SerializedName;
-import org.apache.cloudstack.api.BaseResponse;
 
 public class MigrationPreflightResponse extends BaseResponse {
     @SerializedName("allowed") @Param(description = "Whether migration admission passed") private boolean allowed;
@@ -28,6 +32,8 @@ public class MigrationPreflightResponse extends BaseResponse {
     @SerializedName("requiredvdpavfs") @Param(description = "Required vDPA VFs") private int requiredVdpaVfs;
     @SerializedName("freevdpavfs") @Param(description = "Free vDPA VFs") private int freeVdpaVfs;
     @SerializedName("denialreason") @Param(description = "Structured denial reason") private String denialReason;
+    @SerializedName("nicstatuses") @Param(description = "Per-NIC migration admission evidence")
+    private List<MigrationNicPreflightStatus> nicStatuses;
 
     public static MigrationPreflightResponse from(final MigrationPreflightResult result) {
         final MigrationPreflightResponse response = new MigrationPreflightResponse();
@@ -37,6 +43,7 @@ public class MigrationPreflightResponse extends BaseResponse {
         response.requiredVdpaVfs = result.requiredVdpaVfs();
         response.freeVdpaVfs = result.freeVdpaVfs();
         response.denialReason = result.denialReason();
+        response.nicStatuses = result.nicStatuses();
         return response;
     }
 
@@ -46,4 +53,5 @@ public class MigrationPreflightResponse extends BaseResponse {
     public int getRequiredVdpaVfs() { return requiredVdpaVfs; }
     public int getFreeVdpaVfs() { return freeVdpaVfs; }
     public String getDenialReason() { return denialReason; }
+    public List<MigrationNicPreflightStatus> getNicStatuses() { return nicStatuses; }
 }

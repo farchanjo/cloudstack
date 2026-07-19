@@ -30,36 +30,8 @@ import org.mockito.MockedStatic;
 
 import com.cloud.utils.script.Script;
 
-/**
- * Unit tests for the orphan-representor free path in
- * {@link OvnVdpaVifDriver#unplug} (FIX D + Chaos B).
- *
- * <p>libvirt zeroes the VF MAC during managed hostdev detach / domain destroy
- * BEFORE {@code unplug} runs, so the VF-PCI reverse lookup by guest MAC
- * ({@code lookupVfPciByMac}) routinely comes back null on the VM-expunge path.
- * Without a fallback the representor stays on the integration bridge with
- * stale {@code external_ids} ({@code iface-id=lsp-...},
- * {@code iface-status=active}).
- *
- * <p>Chaos B additionally requires that free always clears
- * {@code external_ids} and uses a bridge-agnostic {@code del-port &lt;rep&gt;}
- * so a wrong configured bridge name cannot leave the OVN binding live.
- *
- * <p>All tests intercept {@link Script#runSimpleBashScript} via Mockito
- * {@link MockedStatic} so no actual OVS, vdpa or shell process is invoked.
- * The test environment has no real sysfs PF/VF topology, so both
- * {@code VdpaVifDriver.lookupVdpaNameByVhostDev} and the reflective
- * {@code VfPassthroughVifDriver.lookupVfPciByMac} naturally resolve to null
- * without any additional stubbing — exercising the exact failure branch
- * this fix addresses.
- */
 public class OvnVdpaVifDriverOrphanRepTest {
 
-    /**
-     * The stop-path fan-out (getAllVifDrivers) hands every InterfaceDef to
-     * every driver; a non-vDPA iface (e.g. an OVN kernel tap or a hostdev
-     * VF) must be ignored entirely — zero Script activity (Bug 30 type gate).
-     */
     @Test
     public void unplug_foreignNetType_isNoOp() {
         final OvnVdpaVifDriver driver = new OvnVdpaVifDriver();
@@ -72,11 +44,6 @@ public class OvnVdpaVifDriverOrphanRepTest {
         }
     }
 
-    /**
-     * With the PCI reverse lookup failing, unplug() must fall back to the
-     * OVSDB {@code attached-mac} lookup and free every representor it finds:
-     * clear {@code external_ids} then bridge-agnostic {@code del-port}.
-     */
     @Test
     public void unplug_failedPciLookup_attachedMacHit_removesOrphanRep() {
         final OvnVdpaVifDriver driver = new OvnVdpaVifDriver();
@@ -84,7 +51,6 @@ public class OvnVdpaVifDriverOrphanRepTest {
         iface.defVdpaNet("/dev/vhost-vdpa-3", "fa:16:3e:00:02:10", 4);
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            // FullResult: multi-rep attached-mac find must not use OneLineParser.
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
@@ -97,16 +63,10 @@ public class OvnVdpaVifDriverOrphanRepTest {
 
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("clear Interface dx6p1vf6 external_ids")),
                     times(1));
-            // Bridge-agnostic: "del-port <rep>" with no bridge name argument.
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p1vf6")), times(1));
         }
     }
 
-    /**
-     * When the attached-mac fallback also finds nothing (no orphan exists),
-     * unplug() must be a clean no-op with respect to representor teardown:
-     * no del-port / clear call is issued.
-     */
     @Test
     public void unplug_failedPciLookup_noAttachedMacHit_isNoOp() {
         final OvnVdpaVifDriver driver = new OvnVdpaVifDriver();
@@ -125,11 +85,6 @@ public class OvnVdpaVifDriverOrphanRepTest {
         }
     }
 
-    /**
-     * Chaos B helper contract: freeRepresentorOnOvs always clears OVN
-     * external_ids before bridge-agnostic del-port, so a FREE VF never keeps
-     * iface-id=lsp-... / iface-status=active after deallocate.
-     */
     @Test
     public void freeRepresentorOnOvs_clearsExternalIdsThenDelPort() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
@@ -142,11 +97,29 @@ public class OvnVdpaVifDriverOrphanRepTest {
 
             scriptMock.verify(() -> Script.runSimpleBashScript(
                     contains("clear Interface dx6p0vf9 external_ids")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("del-port dx6p0vf9")), times(1));
-            // Must NOT require a bridge name (Chaos B: wrong bridge silent no-op).
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("del-port br-")), never());
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf9")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port br-")), never());
+        }
+    }
+
+    @Test
+    public void activeDuplicateIsNotDeleted() throws Exception {
+        final OvnVdpaVifDriver driver = new OvnVdpaVifDriver();
+        final var method = OvnVdpaVifDriver.class.getDeclaredMethod(
+                "clearOrphanRepsForLspName", String.class, String.class);
+        method.setAccessible(true);
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface")))
+                    .thenReturn("source-rep");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
+                    .thenReturn("{iface-status=active}");
+            try {
+                method.invoke(driver, "lsp-1", "destination-rep");
+                org.junit.Assert.fail("active duplicate must fail closed");
+            } catch (java.lang.reflect.InvocationTargetException expected) {
+                // expected fail-closed CloudRuntimeException
+            }
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), never());
         }
     }
 }

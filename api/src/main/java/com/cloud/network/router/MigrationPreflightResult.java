@@ -16,7 +16,15 @@
 // under the License.
 package com.cloud.network.router;
 
+import java.util.List;
+
 /** Structured, read-only migration admission result. */
 public record MigrationPreflightResult(boolean allowed, long vmId, long destinationHostId,
-        int requiredVdpaVfs, int freeVdpaVfs, String denialReason) {
+        int requiredVdpaVfs, int freeVdpaVfs, String denialReason,
+        List<MigrationNicPreflightStatus> nicStatuses) {
+
+    public MigrationPreflightResult(final boolean allowed, final long vmId, final long destinationHostId,
+            final int requiredVdpaVfs, final int freeVdpaVfs, final String denialReason) {
+        this(allowed, vmId, destinationHostId, requiredVdpaVfs, freeVdpaVfs, denialReason, List.of());
+    }
 }

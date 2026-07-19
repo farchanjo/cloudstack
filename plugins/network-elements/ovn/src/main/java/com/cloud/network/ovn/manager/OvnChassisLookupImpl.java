@@ -21,6 +21,7 @@ import javax.inject.Inject;
 import org.springframework.stereotype.Component;
 
 import com.cloud.network.ovn.OvnChassisLookup;
+import com.cloud.network.ovn.client.OvnSbClient;
 import com.cloud.network.ovn.config.OvnNicConfig;
 import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
@@ -30,10 +31,13 @@ import com.cloud.network.ovn.dao.OvnChassisMapDao;
 public class OvnChassisLookupImpl implements OvnChassisLookup {
 
     private final OvnChassisMapDao chassisMapDao;
+    private final OvnPluginManager pluginManager;
 
     @Inject
-    public OvnChassisLookupImpl(final OvnChassisMapDao chassisMapDao) {
+    public OvnChassisLookupImpl(final OvnChassisMapDao chassisMapDao,
+            final OvnPluginManager pluginManager) {
         this.chassisMapDao = chassisMapDao;
+        this.pluginManager = pluginManager;
     }
 
     @Override
@@ -46,5 +50,11 @@ public class OvnChassisLookupImpl implements OvnChassisLookup {
     public String resolveRequestedChassis(final java.util.Map<String, String> vmDetails) {
         return OvnNicTunables.resolve(OvnNicTunables.OVN_REQUESTED_CHASSIS,
                 vmDetails, null, null, OvnNicConfig.RequestedChassis.value(), String.class);
+    }
+
+    @Override
+    public int countActiveClaims(final long dataCenterId, final String lspName) {
+        final OvnSbClient sb = pluginManager.sbClient(dataCenterId);
+        return sb == null ? -1 : sb.countActivePortBindingClaims(lspName);
     }
 }

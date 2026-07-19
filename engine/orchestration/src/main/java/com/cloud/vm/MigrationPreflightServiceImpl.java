@@ -16,17 +16,20 @@
 // under the License.
 package com.cloud.vm;
 
+import java.util.List;
+
 import javax.inject.Inject;
 
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.HostVO;
+import com.cloud.host.dao.HostDao;
+import com.cloud.network.NetworkModel;
+import com.cloud.network.router.MigrationNicPreflightStatus;
 import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationPreflightService;
 import com.cloud.service.dao.ServiceOfferingDao;
 import com.cloud.vm.dao.VMInstanceDao;
-import com.cloud.network.NetworkModel;
-import com.cloud.host.dao.HostDao;
 
 @Component
 public class MigrationPreflightServiceImpl implements MigrationPreflightService {
@@ -65,10 +68,22 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
         final int free = preflight.freeVdpaVfs(destinationHostId);
         try {
             preflight.verify(profile, destination);
-            return new MigrationPreflightResult(true, vmId, destinationHostId, required, free, null);
+            return new MigrationPreflightResult(true, vmId, destinationHostId, required, free, null,
+                    nicStatuses(profile, true, null, free));
         } catch (RuntimeException e) {
             return new MigrationPreflightResult(false, vmId, destinationHostId, required, free,
-                    e.getMessage());
+                    e.getMessage(), nicStatuses(profile, false, e.getMessage(), free));
         }
+    }
+
+    private List<MigrationNicPreflightStatus> nicStatuses(final VirtualMachineProfile profile,
+            final boolean allowed, final String denialReason, final int free) {
+        if (profile.getNics() == null) {
+            return List.of();
+        }
+        return profile.getNics().stream()
+                .map(nic -> new MigrationNicPreflightStatus(nic.getUuid(), allowed,
+                        preflight.requiredVdpaVfs(profile), free, denialReason))
+                .toList();
     }
 }

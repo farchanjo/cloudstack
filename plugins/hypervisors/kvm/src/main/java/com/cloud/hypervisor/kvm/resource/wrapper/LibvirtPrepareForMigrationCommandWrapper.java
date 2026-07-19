@@ -135,18 +135,43 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             skipDisconnect = true;
 
             if (!storagePoolMgr.connectPhysicalDisksViaVmSpec(vm, true)) {
-                releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
-                return new PrepareForMigrationAnswer(command, "failed to connect physical disks to host");
+                skipDisconnect = false;
+                RuntimeException cleanupFailure = null;
+                try {
+                    releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
+                } catch (RuntimeException cleanupError) {
+                    cleanupFailure = cleanupError;
+                }
+                final String detail = cleanupFailure == null
+                        ? "failed to connect physical disks to host"
+                        : "failed to connect physical disks; cleanup failed: " + cleanupFailure;
+                return new PrepareForMigrationAnswer(command, detail);
             }
 
             logger.info("Successfully prepared destination host for migration of VM {}", vm.getName());
             return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, vdpaInterfaceMapping, libvirtComputingResource, vm);
         } catch (final LibvirtException | CloudRuntimeException | InternalErrorException | URISyntaxException e) {
-            releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
+            RuntimeException cleanupFailure = null;
+            try {
+                releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
+            } catch (RuntimeException cleanupError) {
+                cleanupFailure = cleanupError;
+            }
             if (MapUtils.isNotEmpty(dpdkInterfaceMapping)) {
                 for (DpdkTO to : dpdkInterfaceMapping.values()) {
-                    removeDpdkPort(to.getPort());
+                    try {
+                        removeDpdkPort(to.getPort());
+                    } catch (RuntimeException cleanupError) {
+                        if (cleanupFailure == null) {
+                            cleanupFailure = cleanupError;
+                        } else {
+                            cleanupFailure.addSuppressed(cleanupError);
+                        }
+                    }
                 }
+            }
+            if (cleanupFailure != null) {
+                e.addSuppressed(cleanupFailure);
             }
             return new PrepareForMigrationAnswer(command, e.toString());
         } finally {
@@ -182,11 +207,20 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         KVMStoragePoolManager storagePoolMgr = libvirtComputingResource.getStoragePoolMgr();
         VirtualMachineTO vmTO = command.getVirtualMachine();
 
-        releaseVdpaVfsOnRollback(vmTO, libvirtComputingResource);
+        RuntimeException cleanupFailure = null;
+        try {
+            releaseVdpaVfsOnRollback(vmTO, libvirtComputingResource);
+        } catch (RuntimeException e) {
+            cleanupFailure = e;
+        }
 
         logger.info("Rolling back PrepareForMigration for VM {}: disconnecting physical disks", vmTO.getName());
         if (!storagePoolMgr.disconnectPhysicalDisksViaVmSpec(vmTO)) {
             return new PrepareForMigrationAnswer(command, "failed to disconnect physical disks from host");
+        }
+
+        if (cleanupFailure != null) {
+            return new PrepareForMigrationAnswer(command, cleanupFailure.toString());
         }
 
         return new PrepareForMigrationAnswer(command);
@@ -210,12 +244,24 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         if (vdpaDriver == null) {
             return;
         }
+        RuntimeException cleanupFailure = null;
         for (final NicTO nic : nics) {
             if (!nic.isUseVdpa()) {
                 continue;
             }
             logger.info("PrepareForMigration rollback: releasing vDPA VF for mac={} vm={}", nic.getMac(), vm.getName());
-            vdpaDriver.releaseVdpaOnRollback(nic);
+            try {
+                vdpaDriver.releaseVdpaOnRollback(nic);
+            } catch (RuntimeException cleanupError) {
+                if (cleanupFailure == null) {
+                    cleanupFailure = cleanupError;
+                } else {
+                    cleanupFailure.addSuppressed(cleanupError);
+                }
+            }
+        }
+        if (cleanupFailure != null) {
+            throw cleanupFailure;
         }
     }
 }

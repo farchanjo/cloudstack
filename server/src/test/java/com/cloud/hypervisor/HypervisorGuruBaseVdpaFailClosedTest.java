@@ -14,23 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-package com.cloud.network.ovn;
+package com.cloud.hypervisor;
 
-import java.util.Map;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertEquals;
 
-/** Read-only management-side port for resolving a CloudStack host's OVN chassis. */
-public interface OvnChassisLookup {
+import org.junit.Test;
 
-    /** @return the registered chassis UUID, or {@code null} when unregistered. */
-    String findChassisUuid(long hostId);
+import com.cloud.utils.exception.CloudRuntimeException;
 
-    /** Returns active SB Port_Binding claims for one LSP, or -1 when unavailable. */
-    default int countActiveClaims(final long dataCenterId, final String lspName) {
-        return -1;
-    }
+public class HypervisorGuruBaseVdpaFailClosedTest {
 
-    /** Resolves the configured requested-chassis policy without writing OVN state. */
-    default String resolveRequestedChassis(final Map<String, String> vmDetails) {
-        return vmDetails == null ? null : vmDetails.get("ovn.requested_chassis");
+    @Test
+    public void nullAllocationMessageRejectsTapFallback() {
+        final CloudRuntimeException failure = HypervisorGuruBase.vdpaCapacityFailure(7L, 11L, null);
+
+        assertEquals("Insufficient vDPA VF capacity on host 7 for NIC 11; refusing TAP fallback",
+                failure.getMessage());
+        assertThrows(CloudRuntimeException.class, () -> { throw failure; });
     }
 }

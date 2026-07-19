@@ -344,7 +344,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
                                            final Boolean hairpin) {
-        rejectDuplicateRepsForLspName(lspName, repName);
+        clearOrphanRepsForLspName(lspName, repName);
         // DEF-1: a representor can retain an iface-id from a previous VM even
         // when that stale value does not match the current LSP. Clear the
         // complete external_ids map before stamping the new identity.
@@ -353,7 +353,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
-            "ovs-vsctl set Interface %s external_ids:iface-id=%s", repName, lspName));
+                "ovs-vsctl set Interface %s external_ids:iface-id=%s", repName, lspName));
+        Script.runSimpleBashScript(String.format(
+                "ovs-vsctl set Interface %s external_ids:migration-owner=destination", repName));
         if (StringUtils.isNotBlank(mac)) {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set Interface %s external_ids:attached-mac=%s", repName, mac));
@@ -369,7 +371,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
     }
 
-    private void rejectDuplicateRepsForLspName(final String lspName, final String keepRepName) {
+    private void clearOrphanRepsForLspName(final String lspName, final String keepRepName) {
         if (StringUtils.isBlank(lspName)) {
             return;
         }
@@ -384,9 +386,20 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(name) || name.equals(keepRepName)) {
                 continue;
             }
-            throw new CloudRuntimeException(String.format(
-                    "duplicate active destination/source representor claim: rep=%s iface-id=%s target=%s",
-                    name, lspName, keepRepName);
+            final String ids = Script.runSimpleBashScript(String.format(
+                    "ovs-vsctl get Interface %s external_ids 2>/dev/null", name));
+            final boolean destinationOwned = ids.contains("migration-owner=destination")
+                    || ids.contains("migration-owner=\"destination\"");
+            final boolean inactive = ids.contains("iface-status=inactive")
+                    || ids.contains("iface-status=\"inactive\"");
+            if (!destinationOwned || !inactive) {
+                throw new CloudRuntimeException(String.format(
+                        "duplicate active/source representor claim cannot be proven orphaned: rep=%s iface-id=%s target=%s",
+                        name, lspName, keepRepName));
+            }
+            Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port %s %s",
+                    integrationBridge, name));
+            logger.warn("Removed provably orphaned inactive destination representor {} for LSP {}", name, lspName);
         }
     }
 
@@ -408,16 +421,66 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         if (nic == null || !nic.isUseVdpa()) {
             return;
         }
+        RuntimeException cleanupFailure = null;
         final String vdpaName = VdpaVifDriver.buildVdpaName(nic);
         logger.info("OvnVdpaVifDriver.releaseVdpaOnRollback: releasing vdpa={} mac={}", vdpaName, nic.getMac());
-        Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+        try {
+            Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+        } catch (RuntimeException e) {
+            cleanupFailure = e;
+        }
 
         final String pciAddress = nic.getVfPciAddress();
         if (StringUtils.isNotBlank(pciAddress)) {
-            removeRepresentorAndClearVf(pciAddress);
+            try {
+                removeRepresentorAndClearVf(pciAddress);
+            } catch (RuntimeException e) {
+                cleanupFailure = appendCleanupFailure(cleanupFailure, e);
+            }
         } else {
-            logger.warn("OvnVdpaVifDriver.releaseVdpaOnRollback: no vfPciAddress on NicTO mac={}; rep not removed", nic.getMac());
+            try {
+                removeDestinationOwnedRepresentor(nic);
+            } catch (RuntimeException e) {
+                cleanupFailure = appendCleanupFailure(cleanupFailure, e);
+            }
         }
+        if (cleanupFailure != null) {
+            throw cleanupFailure;
+        }
+    }
+
+    private void removeDestinationOwnedRepresentor(final NicTO nic) {
+        if (StringUtils.isBlank(nic.getUuid())) {
+            throw new CloudRuntimeException("cannot identify destination representor during vDPA rollback");
+        }
+        final String lsp = "lsp-" + nic.getUuid();
+        final String found = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --no-headings --columns=name find Interface external_ids:iface-id=%s 2>/dev/null", lsp));
+        for (final String raw : found.split("\\R")) {
+            final String rep = raw.trim().replaceAll("^\"|\"$", "");
+            if (StringUtils.isBlank(rep)) {
+                continue;
+            }
+            final String ids = Script.runSimpleBashScript(String.format(
+                    "ovs-vsctl get Interface %s external_ids 2>/dev/null", rep));
+            final boolean owned = ids.contains("migration-owner=destination")
+                    || ids.contains("migration-owner=\"destination\"");
+            final boolean inactive = ids.contains("iface-status=inactive")
+                    || ids.contains("iface-status=\"inactive\"");
+            if (!owned || !inactive) {
+                throw new CloudRuntimeException("refusing to remove non-destination-owned representor " + rep);
+            }
+            Script.runSimpleBashScript(String.format("ovs-vsctl --if-exists del-port %s %s",
+                    integrationBridge, rep));
+        }
+    }
+
+    private RuntimeException appendCleanupFailure(final RuntimeException primary, final RuntimeException next) {
+        if (primary == null) {
+            return next;
+        }
+        primary.addSuppressed(next);
+        return primary;
     }
 
     private void removeRepresentorAndClearVf(final String pciAddress) {

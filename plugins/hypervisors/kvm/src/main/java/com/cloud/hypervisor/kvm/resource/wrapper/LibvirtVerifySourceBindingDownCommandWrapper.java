@@ -49,12 +49,6 @@ public final class LibvirtVerifySourceBindingDownCommandWrapper
             if (StringUtils.isNotBlank(interfaces)) {
                 return failure(command, "source still carries iface-id " + lsp);
             }
-            final String chassis = Script.runSimpleBashScript(String.format(
-                    "ovn-sbctl --bare --no-heading --columns=chassis find Port_Binding logical_port=%s 2>/dev/null",
-                    lsp));
-            if (StringUtils.isNotBlank(chassis) && !"[]".equals(chassis.trim())) {
-                return failure(command, "source Port_Binding remains claimed for " + lsp);
-            }
         }
         return new VerifySourceBindingDownAnswer(command, true, "source vDPA bindings are down");
     }

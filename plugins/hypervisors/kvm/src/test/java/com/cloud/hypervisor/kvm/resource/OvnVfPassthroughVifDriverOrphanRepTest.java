@@ -87,6 +87,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             // All other Script calls (del-port) should succeed with empty output.
             scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
                     .thenReturn("");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
+                    .thenReturn("{migration-owner=destination, iface-status=inactive}");
 
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
@@ -154,6 +156,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
                     .thenReturn("");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
+                    .thenReturn("{migration-owner=destination, iface-status=inactive}");
 
             driver.cleanupStaleRepsByLspName("lsp-b3f77bd2");
 

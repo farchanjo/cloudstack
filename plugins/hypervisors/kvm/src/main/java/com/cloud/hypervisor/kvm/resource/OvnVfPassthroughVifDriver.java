@@ -239,10 +239,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      * <p>Before adding the port, two guards are applied to prevent duplicate
      * {@code iface-id} conflicts in ovn-controller:
      * <ol>
-     *   <li><b>Cross-rep guard</b> ({@link #clearOrphanRepsForLspName}): any
-     *       OVS Interface on a <em>different</em> representor that already
-     *       carries {@code external_ids:iface-id=lspName} is removed from
-     *       the integration bridge.</li>
+     *   <li><b>Cross-rep guard</b> ({@link #clearOrphanRepsForLspName}): a
+     *       different representor is removed only when it is explicitly
+     *       destination-owned and inactive; active or unproven ownership
+     *       fails closed.</li>
      *   <li><b>Same-rep guard (DEF-1)</b>: {@code external_ids} on the target
      *       representor itself are cleared before stamping the new iface-id.
      *       This handles the case where the same representor was previously used
@@ -273,6 +273,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl set Interface %s external_ids:iface-id=%s", repName, lspName));
+        Script.runSimpleBashScript(String.format(
+            "ovs-vsctl set Interface %s external_ids:migration-owner=destination", repName));
         if (StringUtils.isNotBlank(mac)) {
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl set Interface %s external_ids:attached-mac=%s", repName, mac));
@@ -325,6 +327,15 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             final String name = raw.trim().replaceAll("^\"|\"$", "");
             if (StringUtils.isBlank(name) || name.equals(keepRepName)) {
                 continue;
+            }
+            final String ids = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl get Interface %s external_ids 2>/dev/null", name));
+            final boolean destinationOwned = ids.contains("migration-owner=destination")
+                    || ids.contains("migration-owner=\"destination\"");
+            final boolean inactive = ids.contains("iface-status=inactive")
+                    || ids.contains("iface-status=\"inactive\"");
+            if (!destinationOwned || !inactive) {
+                throw new CloudRuntimeException("refusing to remove representor with unproven ownership: " + name);
             }
             Script.runSimpleBashScript(String.format(
                 "ovs-vsctl --if-exists del-port %s %s", integrationBridge, name));

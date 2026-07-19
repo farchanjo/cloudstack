@@ -64,6 +64,11 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
                     || !hasExternalId(externalIds, "ovn-installed", "true")) {
                 return failure(command, "destination representor is not active and OVN-installed: " + claims[0]);
             }
+            final String bridge = Script.runSimpleBashScript(
+                    "ovs-vsctl port-to-br " + claims[0] + " 2>/dev/null").trim();
+            if (!"br-int".equals(bridge)) {
+                return failure(command, "destination representor is not attached to br-int: " + claims[0]);
+            }
             if (StringUtils.isNotBlank(nic.getVfRepName()) && Script.runSimpleBashScript(
                     "ip link show dev " + nic.getVfRepName() + " 2>/dev/null").isBlank()) {
                 return failure(command, "destination representor is absent: " + nic.getVfRepName());
@@ -73,6 +78,10 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
                     lsp));
             if (nonBlankLines(chassis).length != 1 || chassis.contains("[]")) {
                 return failure(command, "expected exactly one destination Port_Binding chassis claim for " + lsp);
+            }
+            if (StringUtils.isNotBlank(command.getExpectedChassis())
+                    && !chassis.contains(command.getExpectedChassis())) {
+                return failure(command, "destination Port_Binding chassis does not match expected chassis for " + lsp);
             }
         }
         return new VerifyDestinationDataplaneAnswer(command, true, "destination vDPA dataplane verified");

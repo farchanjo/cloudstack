@@ -64,6 +64,19 @@ public class LibvirtPrepareForMigrationCommandWrapperTest {
     }
 
     @Test
+    public void createPrepareForMigrationAnswerCarriesEveryVdpaMapping() {
+        Map<String, String> vdpaMapping = Map.of(
+                "02:00:00:00:00:01", "/dev/vhost-vdpa-new1",
+                "02:00:00:00:00:02", "/dev/vhost-vdpa-new2");
+
+        PrepareForMigrationAnswer answer = libvirtPrepareForMigrationCommandWrapperSpy
+                .createPrepareForMigrationAnswer(prepareForMigrationCommandMock, new HashMap<>(),
+                        vdpaMapping, libvirtComputingResourceMock, virtualMachineTOMock);
+
+        Assert.assertEquals(vdpaMapping, answer.getVdpaInterfaceMapping());
+    }
+
+    @Test
     public void createPrepareForMigrationAnswerTestVerifyThatCpuSharesIsSet() {
         int cpuShares = 1000;
         Mockito.doReturn(cpuShares).when(libvirtComputingResourceMock).calculateCpuShares(virtualMachineTOMock);

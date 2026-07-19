@@ -23,13 +23,16 @@ public class VerifyDestinationDataplaneCommand extends Command {
 
     private String vmName;
     private NicTO[] nics;
+    private String expectedChassis;
 
     protected VerifyDestinationDataplaneCommand() {
     }
 
-    public VerifyDestinationDataplaneCommand(final String vmName, final NicTO[] nics) {
+    public VerifyDestinationDataplaneCommand(final String vmName, final NicTO[] nics,
+            final String expectedChassis) {
         this.vmName = vmName;
         this.nics = nics == null ? new NicTO[0] : nics.clone();
+        this.expectedChassis = expectedChassis;
         setWait(10);
     }
 
@@ -40,6 +43,8 @@ public class VerifyDestinationDataplaneCommand extends Command {
     public NicTO[] getNics() {
         return nics.clone();
     }
+
+    public String getExpectedChassis() { return expectedChassis; }
 
     @Override
     public boolean executeInSequence() {

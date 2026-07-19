@@ -14,23 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-package com.cloud.network.ovn;
+package com.cloud.network.router;
 
-import java.util.Map;
-
-/** Read-only management-side port for resolving a CloudStack host's OVN chassis. */
-public interface OvnChassisLookup {
-
-    /** @return the registered chassis UUID, or {@code null} when unregistered. */
-    String findChassisUuid(long hostId);
-
-    /** Returns active SB Port_Binding claims for one LSP, or -1 when unavailable. */
-    default int countActiveClaims(final long dataCenterId, final String lspName) {
-        return -1;
-    }
-
-    /** Resolves the configured requested-chassis policy without writing OVN state. */
-    default String resolveRequestedChassis(final Map<String, String> vmDetails) {
-        return vmDetails == null ? null : vmDetails.get("ovn.requested_chassis");
-    }
+/** Per-NIC migration admission evidence. */
+public record MigrationNicPreflightStatus(String nicId, boolean allowed, int requiredVdpaVfs,
+        int freeVdpaVfs, String denialReason) {
 }

@@ -74,6 +74,37 @@ public class OvnSbClient implements AutoCloseable {
         return null;
     }
 
+    /** Counts Port_Binding rows for an LSP that have a non-empty chassis. */
+    public int countActivePortBindingClaims(final String logicalPort) {
+        final ArrayNode params = JsonNodeFactory.instance.arrayNode();
+        params.add(DB_SB);
+        params.add(OvnOpFactory.select("Port_Binding", OvnOpFactory.whereAll(),
+                stringArray("logical_port", "chassis")));
+        final JsonNode reply = pool.call("transact", params);
+        if (!(reply instanceof ArrayNode) || reply.size() == 0 || !reply.get(0).has("rows")) {
+            return -1;
+        }
+        int count = 0;
+        for (final JsonNode row : reply.get(0).get("rows")) {
+            if (!logicalPort.equals(row.path("logical_port").asText())) {
+                continue;
+            }
+            final JsonNode chassis = row.get("chassis");
+            if (hasChassis(chassis)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private boolean hasChassis(final JsonNode chassis) {
+        if (chassis == null || !chassis.isArray() || chassis.size() == 0) {
+            return false;
+        }
+        return !(chassis.size() == 2 && "set".equals(chassis.get(0).asText())
+                && chassis.get(1).isArray() && chassis.get(1).size() == 0);
+    }
+
     private List<ChassisRow> decodeChassisRows(final JsonNode reply) {
         final List<ChassisRow> out = new ArrayList<>();
         if (!(reply instanceof ArrayNode) || reply.size() == 0) {

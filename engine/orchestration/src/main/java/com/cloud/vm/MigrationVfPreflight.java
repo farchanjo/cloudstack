@@ -32,6 +32,7 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
+import com.cloud.resource.ResourceState;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 /**
@@ -53,6 +54,7 @@ public class MigrationVfPreflight {
     private final NetworkDao networkDao;
     private final NetworkOfferingDao networkOfferingDao;
     private final ConcurrentMap<String, ReentrantLock> admissionLocks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, ReentrantLock> clusterLocks = new ConcurrentHashMap<>();
     private OvnChassisLookup chassisLookup;
 
     @Inject
@@ -76,26 +78,53 @@ public class MigrationVfPreflight {
         return countVdpaNics(profile) > 0;
     }
 
+    public boolean requiresColdVfMigration(final VirtualMachineProfile profile) {
+        return requiresVdpa(profile) || (profile.getNics() != null
+                && profile.getNics().stream().anyMatch(NicProfile::isUseHwOffload));
+    }
+
     public int requiredVdpaVfs(final VirtualMachineProfile profile) {
         return countVdpaNics(profile);
     }
 
     public int freeVdpaVfs(final long hostId) {
+        if (vfPoolManager == null) {
+            throw new CloudRuntimeException("vDPA VF pool manager is unavailable");
+        }
         return vfPoolManager.countFreeForVdpa(hostId);
+    }
+
+    public String expectedChassis(final Host destination) {
+        return chassisLookup == null ? null : chassisLookup.findChassisUuid(destination.getId());
     }
 
     public void verify(final VirtualMachineProfile profile, final Host destination,
             final MigrationMode mode) {
-        final String key = profile.getVirtualMachine().getUuid();
-        final ReentrantLock lock = admissionLocks.computeIfAbsent(key, ignored -> new ReentrantLock());
-        if (!lock.tryLock()) {
+        final String key = profile.getVirtualMachine().getUuid() == null
+                ? "identity-" + System.identityHashCode(profile.getVirtualMachine())
+                : profile.getVirtualMachine().getUuid();
+        final ReentrantLock vmLock = admissionLocks.computeIfAbsent(key, ignored -> new ReentrantLock());
+        if (!vmLock.tryLock()) {
             throw new CloudRuntimeException("another migration admission is already in progress for VM " + key);
+        }
+        if (destination.getClusterId() == null) {
+            vmLock.unlock();
+            throw new CloudRuntimeException("destination cluster is unresolved; refusing vDPA migration");
+        }
+        final ReentrantLock clusterLock = clusterLocks.computeIfAbsent(destination.getClusterId(),
+                ignored -> new ReentrantLock());
+        if (!clusterLock.tryLock()) {
+            vmLock.unlock();
+            throw new CloudRuntimeException("another vDPA migration admission is active in destination cluster "
+                    + destination.getClusterId());
         }
         try {
             verifyInternal(profile, destination, mode);
         } finally {
-            lock.unlock();
-            admissionLocks.remove(key, lock);
+            clusterLock.unlock();
+            vmLock.unlock();
+            admissionLocks.remove(key, vmLock);
+            clusterLocks.remove(destination.getClusterId(), clusterLock);
         }
     }
 
@@ -103,17 +132,26 @@ public class MigrationVfPreflight {
             final MigrationMode mode) {
         validateHostdev(profile, mode);
         final int required = countVdpaNics(profile);
-        if (required == 0) {
+        final int requiredHostdev = mode == MigrationMode.COLD ? countColdHostdevNics(profile) : 0;
+        if (required == 0 && requiredHostdev == 0) {
             return;
         }
-        validateRequestedChassis(profile, destination);
-        validateHaAndPlacement(profile, mode);
-        final int free = vfPoolManager.countFreeForVdpa(destination.getId());
+        if (required > 0) {
+            validateRequestedChassis(profile, destination);
+            validateGlobalClaims(profile, destination);
+        }
+        validateHaAndPlacement(profile, destination, mode);
+        final int free = required == 0 ? Integer.MAX_VALUE : vfPoolManager.countFreeForVdpa(destination.getId());
         if (free < required) {
             final String message = String.format(
                     "VM %s requires %d vDPA VF(s) on host %s, but only %d are free",
                     profile.getVirtualMachine().getUuid(), required, destination.getId(), free);
             throw new CloudRuntimeException(message);
+        }
+        if (vfPoolManager.countFree(destination.getId()) < requiredHostdev) {
+            throw new CloudRuntimeException(String.format(
+                    "VM requires %d cold SR-IOV hostdev VF(s) on host %s, but capacity is unavailable",
+                    requiredHostdev, destination.getId()));
         }
     }
 
@@ -133,6 +171,21 @@ public class MigrationVfPreflight {
             }
         }
         return required;
+    }
+
+    private int countColdHostdevNics(final VirtualMachineProfile profile) {
+        if (profile.getNics() == null) {
+            return 0;
+        }
+        return (int) profile.getNics().stream()
+                .filter(NicProfile::isUseHwOffload)
+                .filter(nic -> {
+                    final NetworkVO network = networkDao.findById(nic.getNetworkId());
+                    final NetworkOfferingVO offering = network == null ? null
+                            : networkOfferingDao.findById(network.getNetworkOfferingId());
+                    return offering == null || !offering.isVdpaEnabled();
+                })
+                .count();
     }
 
     private void validateHostdev(final VirtualMachineProfile profile, final MigrationMode mode) {
@@ -173,21 +226,42 @@ public class MigrationVfPreflight {
         }
     }
 
-    private void validateHaAndPlacement(final VirtualMachineProfile profile, final MigrationMode mode) {
-        final VirtualMachine vm = profile.getVirtualMachine();
-        final java.util.Map<String, String> details = vm.getDetails();
-        if (mode == MigrationMode.LIVE && vm.isHaEnabled()
-                && !Boolean.parseBoolean(details == null ? null : details.get("fencing.configured"))) {
-            throw new CloudRuntimeException("live vDPA migration requires fencing for HA restart safety");
+    private void validateGlobalClaims(final VirtualMachineProfile profile, final Host destination) {
+        if (chassisLookup == null) {
+            throw new CloudRuntimeException("OVN global claim validation is unavailable; refusing vDPA migration");
         }
-        if (details == null || !Boolean.parseBoolean(details.get("k8s.control_plane_member"))) {
-            return;
+        for (final NicProfile nic : profile.getNics()) {
+            if (!isVdpaNic(nic)) {
+                continue;
+            }
+            final int claims = chassisLookup.countActiveClaims(destination.getDataCenterId(), "lsp-" + nic.getUuid());
+            if (claims != 1) {
+                throw new CloudRuntimeException(String.format(
+                        "expected exactly one pre-cutover source Port_Binding claim for NIC %s, found %d",
+                        nic.getUuid(), claims));
+            }
         }
-        if (!Boolean.parseBoolean(details.get("k8s.quorum.safe"))) {
-            throw new CloudRuntimeException("vDPA migration would violate Kubernetes control-plane quorum");
+    }
+
+    private boolean isVdpaNic(final NicProfile nic) {
+        final NetworkVO network = networkDao.findById(nic.getNetworkId());
+        final NetworkOfferingVO offering = network == null ? null
+                : networkOfferingDao.findById(network.getNetworkOfferingId());
+        return offering != null && offering.isVdpaEnabled();
+    }
+
+    private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination,
+            final MigrationMode mode) {
+        if (destination.getState() != Host.State.Up) {
+            throw new CloudRuntimeException("destination host is not Up; refusing vDPA migration");
         }
-        if (Boolean.parseBoolean(details.get("k8s.anti_affinity_violation"))) {
-            throw new CloudRuntimeException("vDPA migration would violate Kubernetes control-plane anti-affinity");
+        if (mode == MigrationMode.LIVE && profile.getVirtualMachine().isHaEnabled()
+                && destination.getResourceState() != ResourceState.Enabled) {
+            throw new CloudRuntimeException("HA vDPA migration requires an Enabled destination resource");
         }
+        // Affinity, anti-affinity, quorum, and fencing are authoritative
+        // placement/HA decisions. They are evaluated by the deployment planner
+        // and HighAvailabilityManager before this narrow hardware admission
+        // gate; VM details are deliberately not treated as policy truth here.
     }
 }

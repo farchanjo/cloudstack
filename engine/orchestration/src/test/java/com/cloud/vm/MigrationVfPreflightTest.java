@@ -20,6 +20,8 @@ import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.anyLong;
+import static org.mockito.Mockito.anyString;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -49,6 +51,10 @@ public class MigrationVfPreflightTest {
         networkDao = mock(NetworkDao.class);
         networkOfferingDao = mock(NetworkOfferingDao.class);
         preflight = new MigrationVfPreflight(vfPoolManager, networkDao, networkOfferingDao);
+        final OvnChassisLookup lookup = mock(OvnChassisLookup.class);
+        when(lookup.countActiveClaims(anyLong(), anyString())).thenReturn(1);
+        when(lookup.findChassisUuid(anyLong())).thenReturn("destination-chassis");
+        preflight.setChassisLookup(lookup);
     }
 
     @Test
@@ -57,6 +63,9 @@ public class MigrationVfPreflightTest {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final NicProfile nic = mock(NicProfile.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
@@ -77,6 +86,9 @@ public class MigrationVfPreflightTest {
     public void skipsCapacityCheckForNonVdpaProfile() {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         when(profile.getNics()).thenReturn(java.util.List.of());
 
         preflight.verify(profile, host);
@@ -90,6 +102,9 @@ public class MigrationVfPreflightTest {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final NicProfile nic = mock(NicProfile.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
@@ -110,6 +125,9 @@ public class MigrationVfPreflightTest {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
         final VirtualMachine vm = mock(VirtualMachine.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         final NicProfile nic = mock(NicProfile.class);
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
@@ -134,6 +152,9 @@ public class MigrationVfPreflightTest {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
         final VirtualMachine vm = mock(VirtualMachine.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         final NicProfile nic = mock(NicProfile.class);
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
@@ -157,6 +178,9 @@ public class MigrationVfPreflightTest {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
         final VirtualMachine vm = mock(VirtualMachine.class);
         final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
         final NicProfile nic = mock(NicProfile.class);
         final NetworkVO network = mock(NetworkVO.class);
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
@@ -175,5 +199,32 @@ public class MigrationVfPreflightTest {
         when(lookup.findChassisUuid(HOST_ID)).thenReturn("destination-chassis");
 
         assertThrows(CloudRuntimeException.class, () -> preflight.verify(profile, host));
+    }
+
+    @Test
+    public void coldHostdevRequiresDestinationVfCapacity() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final Host host = mock(Host.class);
+        when(host.getState()).thenReturn(Host.State.Up);
+        when(host.getClusterId()).thenReturn(1L);
+        when(host.getDataCenterId()).thenReturn(1L);
+        final NicProfile nic = mock(NicProfile.class);
+        final NetworkVO network = mock(NetworkVO.class);
+        final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.isUseHwOffload()).thenReturn(true);
+        when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(networkDao.findById(NETWORK_ID)).thenReturn(network);
+        when(network.getNetworkOfferingId()).thenReturn(11L);
+        when(networkOfferingDao.findById(11L)).thenReturn(offering);
+        when(offering.isVdpaEnabled()).thenReturn(false);
+        when(host.getId()).thenReturn(HOST_ID);
+        when(vfPoolManager.countFree(HOST_ID)).thenReturn(0);
+
+        assertTrue(preflight.requiresColdVfMigration(profile));
+        assertThrows(CloudRuntimeException.class,
+                () -> preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.COLD));
     }
 }
