@@ -1011,7 +1011,7 @@ public class LibvirtMigrateCommandWrapperTest {
         Mockito.when(libvirtComputingResourceMock.getInterfaces(conn, "vm-1")).thenReturn(List.of());
         Mockito.when(libvirtComputingResourceMock.getDisks(conn, "vm-1")).thenReturn(List.of());
         Mockito.when(conn.getLibVirVersion()).thenReturn(1000000L);
-        Mockito.when(dconn.getLibVirVersion()).thenThrow(new LibvirtException("destination connection unavailable"));
+        Mockito.when(dconn.getLibVirVersion()).thenThrow(LibvirtException.class);
         Mockito.when(conn.domainLookupByName("vm-1")).thenReturn(domain);
         Mockito.when(domain.getXMLDesc(Mockito.anyInt())).thenReturn("<domain><devices>"
                 + "<interface type='vdpa'><mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
