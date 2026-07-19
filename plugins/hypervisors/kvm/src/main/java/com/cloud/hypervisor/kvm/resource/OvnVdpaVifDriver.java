@@ -261,6 +261,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         if (StringUtils.isNotBlank(vdpaName)) {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("OvnVdpaVifDriver.unplug: deleted vdpa dev {}", vdpaName);
+            if (!OvnVifDriver.isVdpaDeviceAbsentStrict(vdpaName, pciAddress)) {
+                throw new CloudRuntimeException("vDPA inventory still contains " + vdpaName + " on " + pciAddress);
+            }
         } else {
             logger.warn("OvnVdpaVifDriver.unplug: could not resolve vdpa name from vhost={}; skipping vdpa dev del", vhostDev);
         }

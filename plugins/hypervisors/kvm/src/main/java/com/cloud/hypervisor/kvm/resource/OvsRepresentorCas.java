@@ -230,8 +230,9 @@ public final class OvsRepresentorCas {
             }
             for (int index = 0; index < 3; index++) {
                 final JsonObject wait = response.get(index).getAsJsonObject();
-                if (wait.has("error") || wait.entrySet().size() != 1
-                        || !wait.has("rows") || wait.getAsJsonArray("rows").size() != 1) {
+                // OVS 3.3 returns an empty object for a satisfied wait when
+                // columns=[] and until=!=; it does not return rows here.
+                if (!wait.entrySet().isEmpty()) {
                     return false;
                 }
             }

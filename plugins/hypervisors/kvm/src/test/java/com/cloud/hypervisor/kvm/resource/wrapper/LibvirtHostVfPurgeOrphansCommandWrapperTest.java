@@ -636,11 +636,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 assertEquals(0, wait.get("timeout").getAsInt());
             }
             for (int index = 1; index <= 3; index++) {
-                final JsonObject result = new JsonObject();
-                final JsonArray rows = new JsonArray();
-                rows.add(new JsonObject());
-                result.add("rows", rows);
-                response.add(result);
+                response.add(new JsonObject());
             }
             final JsonObject mutate = new JsonObject();
             mutate.addProperty("count", 1);

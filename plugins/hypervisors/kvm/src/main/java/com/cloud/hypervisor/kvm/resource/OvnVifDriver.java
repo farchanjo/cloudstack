@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -485,8 +486,13 @@ public class OvnVifDriver extends VifDriverBase {
                     continue;
                 }
                 try {
-                    freeRepresentorOnOvs(log, callerLabel, iface);
-                    clearVfIdentityForRepBestEffort(log, callerLabel, iface);
+                    final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                            "unix:/var/run/openvswitch/db.sock", iface);
+                    if (StringUtils.isBlank(ifaceId)) {
+                        log.warn("{}: orphan rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
+                        continue;
+                    }
+                    freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci);
                     if (hasVdpa) {
                         deleteVdpaDevsForPciBestEffort(log, callerLabel, vfPci);
                     }
@@ -850,23 +856,26 @@ public class OvnVifDriver extends VifDriverBase {
      */
     static Set<String> listVdpaMgmtPciFromCli(final Logger log) {
         final Set<String> out = new HashSet<>();
-        for (final String bin : new String[] {"/usr/sbin/vdpa", "/sbin/vdpa", "/usr/local/sbin/vdpa", "vdpa"}) {
-            try {
-                 final String raw = Script.runSimpleBashScriptWithFullResult(bin + " dev show -j 2>/dev/null", 5);
-                 for (final VdpaPoolReconciler.VdpaSf device
-                         : VdpaPoolReconciler.parseHostSfs(raw).values()) {
-                     out.add(device.getMgmtdevPci().toLowerCase());
-                 }
-                if (!out.isEmpty()) {
-                    return out;
-                }
-            } catch (RuntimeException re) {
-                if (log != null) {
-                    log.debug("listVdpaMgmtPciFromCli: {} failed: {}", bin, re.getMessage());
-                }
-            }
+        final String raw = Script.runSimpleBashScriptWithFullResult(
+                "/usr/sbin/vdpa dev show -j 2>/dev/null", 5);
+        for (final VdpaPoolReconciler.VdpaSf device : VdpaPoolReconciler.parseHostSfs(raw).values()) {
+            out.add(device.getMgmtdevPci().toLowerCase());
         }
         return out;
+    }
+
+    /** Strictly prove that a vDPA name and its BDF mapping are absent. */
+    static boolean isVdpaDeviceAbsentStrict(final String vdpaName, final String expectedBdf) {
+        final String raw = Script.runSimpleBashScriptWithFullResult(
+                "/usr/sbin/vdpa dev show -j 2>/dev/null", 5);
+        final Map<String, VdpaPoolReconciler.VdpaSf> devices = new HashMap<>();
+        for (final VdpaPoolReconciler.VdpaSf device : VdpaPoolReconciler.parseHostSfs(raw).values()) {
+            devices.put(device.getName(), device);
+        }
+        if (devices.containsKey(vdpaName)) {
+            return false;
+        }
+        return devices.values().stream().noneMatch(device -> expectedBdf.equalsIgnoreCase(device.getMgmtdevPci()));
     }
 
     /**
@@ -964,6 +973,12 @@ public class OvnVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(repName)) {
                 continue;
             }
+            final String vfPci = resolveVfPciFromRepresentor(repName);
+            if (StringUtils.isBlank(vfPci)) {
+                log.warn("{}: attached-mac fallback found rep={} without authoritative BDF; refusing cleanup",
+                        callerLabel, repName);
+                continue;
+            }
             final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
                     "unix:/var/run/openvswitch/db.sock", repName);
             if (StringUtils.isBlank(ifaceId)) {
@@ -971,10 +986,9 @@ public class OvnVifDriver extends VifDriverBase {
                         callerLabel, repName);
                 continue;
             }
-            freeRepresentorOnOvs(log, callerLabel, repName, ifaceId);
+            freeRepresentorAndClearVfIdentity(log, callerLabel, repName, ifaceId, vfPci);
             log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
                     callerLabel, repName, integrationBridge, mac);
-            clearVfIdentityForRepBestEffort(log, callerLabel, repName);
         }
     }
 
@@ -988,15 +1002,29 @@ public class OvnVifDriver extends VifDriverBase {
      * removal already performed by the caller is the load-bearing half of
      * this cleanup and must not be undone by a failure here.
      */
-    private static void clearVfIdentityForRepBestEffort(final Logger log, final String callerLabel, final String repName) {
-        final String physPort = VfPassthroughVifDriver.readPhysPortName(repName);
-        final Matcher matcher = physPort == null ? null : REP_PHYS_PORT_PATTERN.matcher(physPort);
-        if (matcher == null || !matcher.matches()) {
-            log.debug("{}: cannot derive VF identity for rep={} (phys_port_name={}); skipping PF-side clear",
-                    callerLabel, repName, physPort);
+    private static void freeRepresentorAndClearVfIdentity(final Logger log, final String callerLabel,
+                                                           final String repName, final String ifaceId,
+                                                           final String vfPci) {
+        if (StringUtils.isBlank(vfPci)) {
+            log.warn("{}: VF BDF is unknown; refusing attached-MAC cleanup for {}", callerLabel, repName);
             return;
         }
-        final String vfPci = resolveVfPciFromRepresentor(repName);
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+        lock.lock();
+        try {
+            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
+                    repName, ifaceId)) {
+                log.warn("{}: OVS representor CAS failed; refusing VF identity clear for {}", callerLabel, repName);
+                return;
+            }
+            clearVfIdentityForBdfBestEffort(log, callerLabel, vfPci, repName);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static void clearVfIdentityForBdfBestEffort(final Logger log, final String callerLabel,
+                                                        final String vfPci, final String repName) {
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
         if (pfName == null || vfId == null) {

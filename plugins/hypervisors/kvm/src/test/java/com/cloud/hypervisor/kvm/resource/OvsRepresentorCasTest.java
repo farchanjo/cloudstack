@@ -29,6 +29,7 @@ import java.util.Deque;
 import org.junit.Test;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -63,7 +64,7 @@ public class OvsRepresentorCasTest {
     @Test
     public void removeRejectsMalformedOrPartialMutationResponse() {
         final Deque<String> responses = discoveryResponses("lsp-1");
-        responses.add("[{\"rows\":[{}]},{\"rows\":[{}]},{\"rows\":[{}]},{\"count\":1}]");
+        responses.add("[{},{},{},{\"count\":1}]");
         assertFalse(OvsRepresentorCas.remove(executor(responses), "unix:/var/run/openvswitch/db.sock",
                 "rep0", "lsp-1"));
     }
@@ -71,10 +72,10 @@ public class OvsRepresentorCasTest {
     @Test
     public void removeRejectsZeroCountAndOperationError() {
         for (String mutationResponse : Arrays.asList(
-                "[{\"rows\":[{}]},{\"rows\":[{}]},{\"rows\":[{}]},{\"count\":0},{\"count\":1},{\"count\":1}]",
+                "[{},{},{},{\"count\":0},{\"count\":1},{\"count\":1}]",
                 "[{\"rows\":[{}]},{\"rows\":[{}]},{\"rows\":[{}]},{\"error\":\"constraint\"},{\"count\":1},{\"count\":1}]")) {
             final Deque<String> responses = discoveryResponses("lsp-1");
-            responses.add(mutationResponse);
+            responses.add(mutationResponse.replace("{\"rows\":[{}]}", "{}"));
             assertFalse(OvsRepresentorCas.remove(executor(responses), "unix:/var/run/openvswitch/db.sock",
                     "rep0", "lsp-1"));
         }
@@ -98,8 +99,8 @@ public class OvsRepresentorCasTest {
     @Test
     public void removeRejectsRecreatedInterfaceAtFinalPostcondition() {
         final Deque<String> responses = discoveryResponses("lsp-1");
-        responses.add("[{\"rows\":[]}]\n");
         responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"new-iface\"],\"name\":\"rep0\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-1\"]]]}]}]");
+        responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"rep0\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]");
         assertFalse(OvsRepresentorCas.remove(executorWithValidMutation(responses),
                 "unix:/var/run/openvswitch/db.sock", "rep0", "lsp-1"));
     }
@@ -119,9 +120,19 @@ public class OvsRepresentorCasTest {
 
     private static OvsRepresentorCas.Executor executorWithValidMutation(final Deque<String> responses) {
         return args -> {
-            if (args.length > 1 && "transact".equals(args[1])) {
+            boolean mutation = false;
+            if (args.length > 3 && "transact".equals(args[1])) {
+                for (JsonElement element : JsonParser.parseString(args[3]).getAsJsonArray()) {
+                    if (element.getAsJsonObject().has("op")
+                            && "mutate".equals(element.getAsJsonObject().get("op").getAsString())) {
+                        mutation = true;
+                        break;
+                    }
+                }
+            }
+            if (mutation) {
                 return new OvsRepresentorCas.Result(true,
-                        "[{\"rows\":[{}]},{\"rows\":[{}]},{\"rows\":[{}]},{\"count\":1},{\"count\":1},{\"count\":1}]", "");
+                        "[{},{},{},{\"count\":1},{\"count\":1},{\"count\":1}]", "");
             }
             return new OvsRepresentorCas.Result(true, responses.removeFirst(), "");
         };

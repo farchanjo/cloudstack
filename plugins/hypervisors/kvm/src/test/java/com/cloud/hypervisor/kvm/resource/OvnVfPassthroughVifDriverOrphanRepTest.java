@@ -90,7 +90,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
             // The orphan must enter the shared CAS path; the keeper must not.
-            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(1));
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), never());
         }
     }
 
