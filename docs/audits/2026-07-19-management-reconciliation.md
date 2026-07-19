@@ -58,3 +58,57 @@ current `.33` state must not be redeployed or declared pass while the payload
 identity is mixed and Salazar has 2 OutOfSync/3 Progressing applications.
 No canary, Kubernetes/GitOps mutation, direct Ansible, or further production
 mutation was performed during this reconciliation.
+
+## Follow-up plugin alignment
+
+The management owner resumed after the reconciliation and corrected only the
+external plugin mismatch. Aragog was fast-forwarded cleanly to
+`83b950f4c192c5bf0c8136727565fe782bd9a1a6`; no local Maven build was run.
+
+### Build and staging
+
+- Linstor focused tests: 4 run, 0 failures/errors; checkstyle clean.
+- StorPool focused tests: 6 run, 0 failures/errors; checkstyle clean.
+- Both plugin package builds completed successfully; both descriptors report
+  `4.24.1.33-SNAPSHOT`.
+- Linstor artifact: 112074 bytes, SHA256
+  `d29a5cab8be71819d75a5909404fab3c42a47bc24c190c5cc004d9c6e24d97b0`, MD5
+  `e4b5f44da2fe9aada3a8ecf351356680`.
+- StorPool artifact: 208132 bytes, SHA256
+  `25d404d2f3bf2a5edc0bd0da9c6e6976c17f408cd0fc8e3d8b99c44841db4f24`, MD5
+  `7d803a8d25f2cff0894d80694888f3b6`.
+- Direct foreground SCP and immediate hash verification passed 3/3 managers.
+
+### One-node activation
+
+- Bellatrix backup: `/usr/share/cloudstack-management/rollback/plugin-alignment-20260719T192256Z`; old plugins were root:root mode 0644, with SHA256 values
+  `a04f802abbee55e6bdfe97cf627de97243f6b5d8b920c1010840189e01b52d3a` and
+  `0c139ea27e666260beac1d402dcd97009cb651523583b55bd9bedff74e03dc06`.
+- Barty backup: `/usr/share/cloudstack-management/rollback/plugin-alignment-20260719T192402Z`; same owner/mode and old hashes.
+- Voldemort backup: `/usr/share/cloudstack-management/rollback/plugin-alignment-20260719T192507Z`; same owner/mode and old hashes.
+- Each node was stopped, both old `.30` paths were moved outside the classpath,
+  both `.33` files were atomically renamed into place, and the node was started
+  before continuing.
+- All three nodes now have the exact new hashes, no old `.30` plugin paths, HTTP
+  401 from the local unauthenticated API endpoint, and Spring logs loading both
+  `.33` plugin module contexts plus Linstor/StorPool registries.
+
+### Final classification
+
+- Management/plugin verdict: **PASS** — identical management SHA256
+  `f830e31ee1ff748d39cbc42d8b719630eb74b581cab16e294a512a57bbf1d315`, Linstor
+  SHA256 `d29a5cab8be71819d75a5909404fab3c42a47bc24c190c5cc004d9c6e24d97b0`,
+  and StorPool SHA256 `25d404d2f3bf2a5edc0bd0da9c6e6976c17f408cd0fc8e3d8b99c44841db4f24`
+  on Bellatrix, Barty, and Voldemort.
+- DB/PXC: `4.24.1.33 Complete`, Primary, size 3, Synced, wsrep_ready ON.
+- CloudStack: 3/3 managements Up, 6/6 KVM agents Up and `.33`, 19/19 VMs
+  Running with UUIDs, 12 DSR plus 2 CT_LB Active.
+- OVN/OVS: OVN SB reported 6 chassis; all six data nodes had active
+  `ovn-controller`, active OVS, and `br-int`.
+- Physical read-only gate: Nagini and Scabbers `dx6p0`/`dx6p1` Up; firmware
+  `22.47.2682`.
+- Kubernetes classification: Snape API ready, 6/6 Ready, no pending/failed/
+  CrashLoopBackOff, 0 OutOfSync; Salazar API ready, 13/13 Ready, no
+  pending/failed/CrashLoopBackOff, but 2 OutOfSync and 3 Progressing Argo
+  applications. This remains a separately reported known platform exception,
+  not a plugin-alignment failure.
