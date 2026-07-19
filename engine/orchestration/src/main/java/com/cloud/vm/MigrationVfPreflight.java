@@ -45,6 +45,10 @@ import com.cloud.utils.exception.CloudRuntimeException;
 @Component
 public class MigrationVfPreflight {
 
+    public record NicPreflightDecision(boolean allowed, String denialReason, String macAddress,
+            String ifaceId, String requestedChassis, String sourceChassis, String destinationChassis) {
+    }
+
     public enum MigrationMode {
         LIVE,
         COLD
@@ -294,6 +298,36 @@ public class MigrationVfPreflight {
 
     public int requiredVdpaVfs(final NicProfile nic) {
         return isVdpaNic(nic) ? 1 : 0;
+    }
+
+    public NicPreflightDecision evaluateNic(final VirtualMachineProfile profile, final NicProfile nic,
+            final Host destination) {
+        final String mac = nic.getMacAddress();
+        final String ifaceId = "lsp-" + nic.getUuid();
+        if (!isVdpaNic(nic)) {
+            return new NicPreflightDecision(true, null, mac, ifaceId, null, null, null);
+        }
+        if (chassisLookup == null) {
+            return new NicPreflightDecision(false,
+                    "OVN chassis lookup is unavailable for NIC " + nic.getUuid(), mac, ifaceId,
+                    null, null, null);
+        }
+        final String requested = chassisLookup.resolveRequestedChassis(profile.getVirtualMachine().getDetails());
+        final String destinationChassis = chassisLookup.findChassisUuid(destination.getId());
+        final Long sourceHostId = profile.getVirtualMachine().getHostId();
+        final String sourceChassis = sourceHostId == null ? null : chassisLookup.findChassisUuid(sourceHostId);
+        if (requested != null && !requested.isBlank() && !requested.equals(destinationChassis)) {
+            return new NicPreflightDecision(false,
+                    "requested OVN chassis mismatch for NIC " + nic.getUuid(), mac, ifaceId,
+                    requested, sourceChassis, destinationChassis);
+        }
+        final int claims = chassisLookup.countActiveClaims(destination.getDataCenterId(), ifaceId);
+        if (claims != 1 || !chassisLookup.hasExactActiveClaim(destination.getDataCenterId(), ifaceId, sourceChassis)) {
+            return new NicPreflightDecision(false,
+                    String.format("expected exactly one source Port_Binding claim for NIC %s, found %d",
+                            nic.getUuid(), claims), mac, ifaceId, requested, sourceChassis, destinationChassis);
+        }
+        return new NicPreflightDecision(true, null, mac, ifaceId, requested, sourceChassis, destinationChassis);
     }
 
     private void validateHaAndPlacement(final VirtualMachineProfile profile, final Host destination) {

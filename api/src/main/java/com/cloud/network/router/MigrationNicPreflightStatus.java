@@ -18,5 +18,12 @@ package com.cloud.network.router;
 
 /** Per-NIC migration admission evidence. */
 public record MigrationNicPreflightStatus(String nicId, boolean allowed, int requiredVdpaVfs,
-        int freeVdpaVfs, String denialReason) {
+        int freeVdpaVfs, String denialReason, String macAddress, String ifaceId,
+        String requestedChassis, String sourceChassis, String destinationChassis) {
+
+    public MigrationNicPreflightStatus(final String nicId, final boolean allowed,
+            final int requiredVdpaVfs, final int freeVdpaVfs, final String denialReason) {
+        this(nicId, allowed, requiredVdpaVfs, freeVdpaVfs, denialReason,
+                null, null, null, null, null);
+    }
 }

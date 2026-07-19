@@ -972,6 +972,7 @@ public class LibvirtMigrateCommandWrapperTest {
         Mockito.when(conn.domainLookupByName("vm-1")).thenReturn(domain);
         final String vdpaXml = "<domain><devices><interface type='vdpa'>"
                 + "<mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "<interface type='vdpa'><mac address='02:bb:00:00:00:02'/><source dev='/dev/vhost-vdpa-old2'/></interface>"
                 + "</devices></domain>";
         Mockito.when(domain.getXMLDesc(Mockito.anyInt())).thenReturn(vdpaXml);
         Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
@@ -994,6 +995,34 @@ public class LibvirtMigrateCommandWrapperTest {
             assertTrue(String.valueOf(answer.getDetails()).contains("vDPA"));
         }
         Mockito.verify(domain, Mockito.times(invalidMappings.size())).getXMLDesc(Mockito.anyInt());
+    }
+
+    @Test
+    public void executeAcceptsExactVdpaMappingPastDispatchGuard() throws Exception {
+        final LibvirtUtilitiesHelper helper = Mockito.mock(LibvirtUtilitiesHelper.class);
+        final Connect conn = Mockito.mock(Connect.class);
+        final Domain domain = Mockito.mock(Domain.class);
+        Mockito.when(libvirtComputingResourceMock.getLibvirtUtilitiesHelper()).thenReturn(helper);
+        Mockito.when(helper.getConnectionByVmName("vm-1")).thenReturn(conn);
+        Mockito.when(libvirtComputingResourceMock.getInterfaces(conn, "vm-1")).thenReturn(List.of());
+        Mockito.when(libvirtComputingResourceMock.getDisks(conn, "vm-1")).thenReturn(List.of());
+        Mockito.when(conn.getLibVirVersion()).thenReturn(1000000L);
+        Mockito.when(conn.domainLookupByName("vm-1")).thenReturn(domain);
+        Mockito.when(domain.getXMLDesc(Mockito.anyInt())).thenReturn("<domain><devices>"
+                + "<interface type='vdpa'><mac address='02:aa:00:00:00:01'/><source dev='/dev/vhost-vdpa-old'/></interface>"
+                + "</devices></domain>");
+        Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
+        final VirtualMachineTO to = Mockito.mock(VirtualMachineTO.class);
+        Mockito.when(to.getVncPassword()).thenReturn("");
+        final MigrateCommand command = new MigrateCommand("vm-1", "10.0.0.2", false, to, false);
+        command.setVdpaInterfaceMapping(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
+
+        final Answer answer = libvirtMigrateCmdWrapper.execute(command, libvirtComputingResourceMock);
+
+        assertFalse(answer.getResult());
+        assertFalse(String.valueOf(answer.getDetails()).contains("bijective"));
+        assertFalse(String.valueOf(answer.getDetails()).contains("destination mapping is absent"));
+        Mockito.verify(domain).getXMLDesc(Mockito.anyInt());
     }
 
     @Test

@@ -97,6 +97,12 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
         if (profile.getNics() == null) {
             return List.of();
         }
+        final int totalRequired = profile.getNics().stream().mapToInt(preflight::requiredVdpaVfs).sum();
+        final int totalFree = totalRequired == 0 ? 0 : preflight.freeVdpaVfs(destinationHostId);
+        final boolean capacityAdmissionFailure = totalRequired > totalFree;
+        final boolean perNicDenial = profile.getNics().stream()
+                .map(nic -> preflight.evaluateNic(profile, nic, hostDao.findById(destinationHostId)))
+                .anyMatch(decision -> decision != null && !decision.allowed());
         return profile.getNics().stream()
                 .map(nic -> {
                     final int required = preflight.requiredVdpaVfs(nic);
@@ -108,17 +114,16 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
                     final boolean capacityDenied = required > availableForNic;
                     final boolean hostdevDenied = nic.isUseHwOffload() && required == 0
                             && denialReason != null && denialReason.contains("SR-IOV hostdev");
-                    final boolean chassisDenied = required > 0 && denialReason != null
-                            && ((nic.getUuid() != null && denialReason.contains(nic.getUuid()))
-                            || (nic.getMacAddress() != null && denialReason.contains(nic.getMacAddress())));
-                    final boolean scopedDenial = denialReason != null && (denialReason.contains("requires")
-                            || profile.getNics().stream().anyMatch(candidate ->
-                            (candidate.getUuid() != null && denialReason.contains(candidate.getUuid()))
-                            || (candidate.getMacAddress() != null && denialReason.contains(candidate.getMacAddress()))));
+                    final MigrationVfPreflight.NicPreflightDecision decision = preflight.evaluateNic(profile, nic,
+                            hostDao.findById(destinationHostId));
                     final String nicReason = capacityDenied ? String.format("NIC %s requires %d vDPA VF(s), but only %d are free",
-                            nic.getUuid(), required, availableForNic) : hostdevDenied || chassisDenied ? denialReason : null;
-                    return new MigrationNicPreflightStatus(nic.getUuid(), nicReason == null && (globallyAllowed || scopedDenial),
-                            required, availableForNic, nicReason);
+                            nic.getUuid(), required, availableForNic) : hostdevDenied ? denialReason
+                            : decision != null && !decision.allowed() ? decision.denialReason() : null;
+                    final boolean decisionAllowed = decision == null || decision.allowed();
+                    return new MigrationNicPreflightStatus(nic.getUuid(), decisionAllowed
+                            && nicReason == null && (globallyAllowed || perNicDenial || capacityAdmissionFailure),
+                            required, availableForNic, nicReason, decision.macAddress(), decision.ifaceId(),
+                            decision.requestedChassis(), decision.sourceChassis(), decision.destinationChassis());
                 })
                 .toList();
     }
