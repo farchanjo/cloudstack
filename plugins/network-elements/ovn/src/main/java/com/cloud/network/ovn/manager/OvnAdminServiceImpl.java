@@ -220,8 +220,18 @@ public class OvnAdminServiceImpl implements OvnAdminService {
             case "OVS_POLICY":
                 // OVS_POLICY is keyed by host id (carried on resourceId); the
                 // internal Kind.NIC token is the dispatch hook in
-                // OvnReconcilerService.reconcileResource.
+                // OvnReconcilerService.reconcileResource. It is an alias — NOT
+                // a NIC-mapping reconcile.
                 return new ScopedKind(Kind.NIC);
+            case "NIC":
+            case "":
+                // Explicitly reject raw NIC and blank. Kind.NIC is an
+                // internal alias for OVS_POLICY only; exposing it as an API
+                // token would create a type-safety hazard (a NIC mapping
+                // scope is a different concept). Blank is rejected so a
+                // caller cannot accidentally fall through to a default scope.
+                throw new CloudRuntimeException("scoped OVN reconciliation supports only resourcekind="
+                        + "LOAD_BALANCER | VPC | OVS_POLICY (NIC is not a valid scoped resourcekind)");
             default:
                 throw new CloudRuntimeException("scoped OVN reconciliation supports only resourcekind="
                         + "LOAD_BALANCER | VPC | OVS_POLICY");

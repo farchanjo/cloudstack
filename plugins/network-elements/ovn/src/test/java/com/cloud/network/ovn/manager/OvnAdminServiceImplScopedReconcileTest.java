@@ -138,6 +138,106 @@ public class OvnAdminServiceImplScopedReconcileTest {
                 org.mockito.ArgumentMatchers.anyBoolean());
     }
 
+    // Blocker #6: raw NIC token must be rejected so Kind.NIC alias is not
+    // exposed through the API.
+    @Test
+    public void resourcekindNicRejectedAtApiLayer() throws Exception {
+        final Fixture f = fixture();
+        try {
+            f.impl.runReconciler(4L, true, false, "NIC", 1L);
+            fail("expected CloudRuntimeException for raw NIC resourcekind");
+        } catch (CloudRuntimeException expected) {
+            assertTrue(expected.getMessage().contains("NIC is not a valid scoped resourcekind"));
+        }
+        verify(f.reconciler, never()).reconcileZone(
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.anyBoolean(),
+                org.mockito.ArgumentMatchers.anyBoolean());
+        verify(f.reconciler, never()).reconcileResource(
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.any(Kind.class),
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.anyBoolean());
+    }
+
+    @Test
+    public void resourcekindNicLowercaseRejected() throws Exception {
+        final Fixture f = fixture();
+        try {
+            f.impl.runReconciler(4L, true, false, "nic", 1L);
+            fail("expected CloudRuntimeException for lowercase nic");
+        } catch (CloudRuntimeException expected) {
+            assertTrue(expected.getMessage().contains("NIC is not a valid"));
+        }
+    }
+
+    @Test
+    public void resourcekindBlankRejected() throws Exception {
+        final Fixture f = fixture();
+        try {
+            f.impl.runReconciler(4L, true, false, "   ", 1L);
+            fail("expected CloudRuntimeException for blank resourcekind");
+        } catch (CloudRuntimeException expected) {
+            assertTrue(expected.getMessage().contains("NIC is not a valid"));
+        }
+    }
+
+    // Blocker #6: lowercase + whitespace handling for valid tokens.
+    @Test
+    public void resourcekindVpcLowercaseWithWhitespaceDispatches() throws Exception {
+        final Fixture f = fixture();
+        f.impl.runReconciler(4L, true, false, "  vpc  ", 924L);
+
+        verify(f.reconciler).reconcileResource(eq(4L), eq(Kind.VPC), eq(924L), eq(true));
+        verify(f.reconciler, never()).reconcileZone(
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.anyBoolean(),
+                org.mockito.ArgumentMatchers.anyBoolean());
+    }
+
+    @Test
+    public void resourcekindOvsPolicyLowercaseWithWhitespaceDispatches() throws Exception {
+        final Fixture f = fixture();
+        f.impl.runReconciler(4L, true, false, "  ovs_policy  ", 1L);
+
+        verify(f.reconciler).reconcileResource(eq(4L), eq(Kind.NIC), eq(1L), eq(true));
+    }
+
+    @Test
+    public void resourcekindLoadBalancerLowercaseDispatches() throws Exception {
+        final Fixture f = fixture();
+        f.impl.runReconciler(4L, false, false, "load_balancer", 1473L);
+
+        verify(f.reconciler).reconcileResource(eq(4L), eq(Kind.LOAD_BALANCER), eq(1473L), eq(false));
+    }
+
+    // Blocker #6: zone-wide + purgeUntagged dispatches reconcileZone (not scoped).
+    @Test
+    public void zoneWideWithPurgeUntaggedDispatchesReconcileZone() throws Exception {
+        final Fixture f = fixture();
+        f.impl.runReconciler(4L, true, true, null, null);
+
+        verify(f.reconciler).reconcileZone(eq(4L), eq(true), eq(true));
+        verify(f.reconciler, never()).reconcileResource(
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.any(Kind.class),
+                org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.anyBoolean());
+    }
+
+    // Blocker #6: scoped + purgeUntagged rejected (already covered but
+    // add explicit lowercase variant).
+    @Test
+    public void scopedWithPurgeUntaggedRejectedEvenLowercase() throws Exception {
+        final Fixture f = fixture();
+        try {
+            f.impl.runReconciler(4L, true, true, "  vpc  ", 924L);
+            fail("expected CloudRuntimeException for scoped + purge");
+        } catch (CloudRuntimeException expected) {
+            assertTrue(expected.getMessage().contains("purgeuntagged is not valid for scoped"));
+        }
+    }
+
     @Test
     public void responseContainsAcksByTableField() throws Exception {
         final Fixture f = fixture();

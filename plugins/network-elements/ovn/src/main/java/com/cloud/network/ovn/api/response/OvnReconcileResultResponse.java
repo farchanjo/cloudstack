@@ -50,12 +50,20 @@ public class OvnReconcileResultResponse extends BaseResponse {
     @Param(description = "Per-table count of stale mapping rows")
     private Map<String, Integer> staleMappingsByTable;
 
-    /** Per-zone sweep ACK / status counters (hairpin-swept, tc-policy-swept).
-     *  Surfaced for operator visibility but do NOT contribute to
-     *  {totalorphans}. */
+    /** Per-zone sweep ACK / status counters (hairpin-swept, tc-policy-swept,
+     *  scoped force-SNAT action, scoped OVS_POLICY host sweep). Surfaced
+     *  for operator visibility but do NOT contribute to {totalorphans}.
+     *
+     *  <p><b>Zero-value contract:</b> entries are inserted ONLY for
+     *  true/1 values. Absent keys mean false/zero/distributed:
+     *  <ul>
+     *    <li>Absent {@code Logical_Router_ForceSnat:topology} = distributed</li>
+     *    <li>Absent {@code Logical_Router_ForceSnat:applied} = no write performed</li>
+     *    <li>Absent {@code Logical_Router_ForceSnat:applied} = no write performed (dry-run or no-change)</li>
+     *  </ul> */
     @SerializedName("acksbytable")
-    @Param(description = "Per-zone sweep ACK/status counters (hairpin/tc-policy sweep ran); "
-            + "do not contribute to totalorphans")
+    @Param(description = "Per-zone sweep ACK/status counters (hairpin/tc-policy/force-SNAT); "
+            + "do not contribute to totalorphans. Zero-value contract: absent means false/zero/distributed.")
     private Map<String, Integer> acksByTable;
 
     public boolean isDryRun() {
