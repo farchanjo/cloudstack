@@ -36,6 +36,10 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
 import com.cloud.agent.api.HostVfPurgeOrphansCommand;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
@@ -464,6 +468,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         public CommandResult run(final String... command) {
             final String value = String.join(" ", command);
             commands.add(value);
+            if (value.contains("/usr/bin/ovsdb-client") && value.contains(" transact ")) {
+                return ovsdbTransaction(command[command.length - 1]);
+            }
             if (value.endsWith("vdpa dev show")) {
                 if (vdpaInventoryFails) {
                     return CommandResult.failure("vdpa unavailable");
@@ -523,6 +530,114 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 return CommandResult.success(value.contains(" get Interface ") ? "{}" : "");
             }
             return CommandResult.success("");
+        }
+
+        private CommandResult ovsdbTransaction(final String request) {
+            final JsonArray operations;
+            try {
+                operations = new JsonParser().parse(request).getAsJsonArray();
+            } catch (RuntimeException e) {
+                return CommandResult.failure("malformed request");
+            }
+            final JsonArray response = new JsonArray();
+            if (operations.size() == 2) {
+                final JsonObject select = operations.get(1).getAsJsonObject();
+                final String table = select.get("table").getAsString();
+                final JsonObject result = new JsonObject();
+                final JsonArray rows = new JsonArray();
+                final String name = selectName(select);
+                if ("Interface".equals(table) && ovsIfaceId != null) {
+                    rows.add(interfaceRow(name));
+                } else if ("Port".equals(table) && ovsIfaceId != null) {
+                    rows.add(portRow(name));
+                } else if ("Bridge".equals(table) && ovsIfaceId != null) {
+                    rows.add(bridgeRow());
+                }
+                result.add("rows", rows);
+                response.add(result);
+                return CommandResult.success(response.toString());
+            }
+            if (changeIfaceBeforeDelete) {
+                final JsonObject error = new JsonObject();
+                error.addProperty("error", "wait failed");
+                response.add(error);
+                for (int index = 1; index < operations.size(); index++) {
+                    response.add(new JsonObject());
+                }
+                return CommandResult.success(response.toString());
+            }
+            for (int index = 1; index <= 3; index++) {
+                final JsonObject result = new JsonObject();
+                final JsonArray rows = new JsonArray();
+                rows.add(new JsonObject());
+                result.add("rows", rows);
+                response.add(result);
+            }
+            final JsonObject mutate = new JsonObject();
+            mutate.addProperty("count", 1);
+            response.add(mutate);
+            final JsonObject delete = new JsonObject();
+            delete.addProperty("count", 1);
+            response.add(delete);
+            removedRepresentors.add("zzz-correct-pf1vf24");
+            ovsIfaceId = null;
+            return CommandResult.success(response.toString());
+        }
+
+        private String selectName(final JsonObject select) {
+            final JsonArray where = select.getAsJsonArray("where");
+            for (int index = 0; index < where.size(); index++) {
+                final JsonArray clause = where.get(index).getAsJsonArray();
+                if ("name".equals(clause.get(0).getAsString())) {
+                    return clause.get(2).getAsJsonArray().get(1).getAsString();
+                }
+            }
+            return "zzz-correct-pf1vf24";
+        }
+
+        private JsonObject interfaceRow(final String name) {
+            final JsonObject row = new JsonObject();
+            row.add("_uuid", uuid("iface-uuid"));
+            row.add("name", typed("string", name));
+            return row;
+        }
+
+        private JsonObject portRow(final String name) {
+            final JsonObject row = new JsonObject();
+            row.add("_uuid", uuid("port-uuid"));
+            row.add("name", typed("string", name));
+            final JsonArray interfaces = new JsonArray();
+            interfaces.add(uuid("iface-uuid"));
+            row.add("interfaces", set(interfaces));
+            return row;
+        }
+
+        private JsonObject bridgeRow() {
+            final JsonObject row = new JsonObject();
+            row.add("_uuid", uuid("bridge-uuid"));
+            row.add("name", typed("string", "br-bond"));
+            final JsonArray ports = new JsonArray();
+            ports.add(uuid("port-uuid"));
+            row.add("ports", set(ports));
+            return row;
+        }
+
+        private JsonArray uuid(final String value) {
+            return typed("uuid", value);
+        }
+
+        private JsonArray typed(final String type, final String value) {
+            final JsonArray typed = new JsonArray();
+            typed.add(type);
+            typed.add(value);
+            return typed;
+        }
+
+        private JsonArray set(final JsonArray values) {
+            final JsonArray set = new JsonArray();
+            set.add("set");
+            set.add(values);
+            return set;
         }
     }
 }

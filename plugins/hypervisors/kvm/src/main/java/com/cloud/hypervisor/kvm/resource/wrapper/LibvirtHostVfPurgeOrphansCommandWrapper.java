@@ -350,10 +350,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 "unix:/var/run/openvswitch/db.sock", new Gson().toJson(request));
         requireSuccess(result, "read OVS " + table);
         final JsonArray response = parseArray(result.output, "OVS " + table + " discovery");
-        if (response.size() != 2 || !response.get(1).isJsonObject()) {
+        if (response.size() != 1 || !response.get(0).isJsonObject()) {
             throw new IllegalStateException("malformed OVS " + table + " discovery response");
         }
-        final JsonObject resultObject = response.get(1).getAsJsonObject();
+        final JsonObject resultObject = response.get(0).getAsJsonObject();
         if (resultObject.has("error") || !resultObject.has("rows") || !resultObject.get("rows").isJsonArray()) {
             throw new IllegalStateException("OVS " + table + " discovery failed");
         }
@@ -526,19 +526,19 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
 
     private void validateOvsTransaction(final String output, final OvsIdentity identity) {
         final JsonArray response = parseArray(output, "atomic OVS deletion");
-        if (response.size() != 6) {
+        if (response.size() != 5) {
             throw new IllegalStateException("atomic OVS deletion returned an unexpected operation count");
         }
-        for (int index = 1; index < response.size(); index++) {
+        for (int index = 0; index < response.size(); index++) {
             final JsonElement element = response.get(index);
             if (!element.isJsonObject() || element.getAsJsonObject().has("error")) {
                 throw new IllegalStateException("atomic OVS deletion operation failed");
             }
             final JsonObject result = element.getAsJsonObject();
-            if (index <= 3 && (!result.has("rows") || result.getAsJsonArray("rows").size() != 1)) {
+            if (index <= 2 && (!result.has("rows") || result.getAsJsonArray("rows").size() != 1)) {
                 throw new IllegalStateException("atomic OVS wait did not prove ownership");
             }
-            if (index >= 4 && (!result.has("count") || result.get("count").getAsInt() != 1)) {
+            if (index >= 3 && (!result.has("count") || result.get("count").getAsInt() != 1)) {
                 throw new IllegalStateException("atomic OVS mutation did not affect exactly one row");
             }
         }

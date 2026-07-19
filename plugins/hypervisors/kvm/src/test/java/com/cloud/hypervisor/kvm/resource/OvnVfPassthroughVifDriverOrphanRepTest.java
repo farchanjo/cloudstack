@@ -94,7 +94,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             // del-port must have been called exactly once — for the orphan, not the keeper.
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p0vf4")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p0vf4.*")), times(1));
             scriptMock.verify(() -> Script.runSimpleBashScript(
                     matches(".*del-port.*dx6p1vf6.*")), never());
         }
@@ -163,8 +163,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             // Both reps must have been removed — keepRepName=null means keep nothing.
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port")), times(2));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p1vf6")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("dx6p0vf4")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p1vf6.*")), times(1));
+            scriptMock.verify(() -> Script.runSimpleBashScript(matches(".*del-port.*dx6p0vf4.*")), times(1));
         }
     }
 
