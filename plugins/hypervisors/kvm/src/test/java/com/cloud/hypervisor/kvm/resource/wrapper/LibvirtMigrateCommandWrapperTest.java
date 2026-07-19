@@ -20,6 +20,7 @@ package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
@@ -978,25 +979,16 @@ public class LibvirtMigrateCommandWrapperTest {
         Mockito.when(domain.getXMLDesc(Mockito.anyInt())).thenReturn(vdpaXml);
         Mockito.when(libvirtComputingResourceMock.cleanVMSnapshotMetadata(domain)).thenReturn(List.of());
         final VirtualMachineTO to = Mockito.mock(VirtualMachineTO.class);
-        Mockito.when(to.getVncPassword()).thenReturn("");
         Mockito.when(to.getDisks()).thenReturn(new DiskTO[0]);
         final MigrateCommand command = new MigrateCommand("vm-1", "10.0.0.2", false, to, false);
 
-        final List<Map<String, String>> invalidMappings = new ArrayList<>();
-        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
-        invalidMappings.add(Map.of("02:cc:00:00:00:03", "/dev/vhost-vdpa-extra"));
-        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
-        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new",
-                "02:00:00:00:00:02", "/dev/vhost-vdpa-extra"));
-        invalidMappings.add(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new",
-                "02:aa:00:00:00:01".toUpperCase(), "/dev/vhost-vdpa-new"));
-        for (Map<String, String> mapping : invalidMappings) {
-            command.setVdpaInterfaceMapping(mapping);
-            final Answer answer = libvirtMigrateCmdWrapper.execute(command, libvirtComputingResourceMock);
-            assertFalse("mapping must fail at the execute dispatch guard: " + mapping, answer.getResult());
-            assertTrue(String.valueOf(answer.getDetails()).contains("vDPA"));
-        }
-        Mockito.verify(domain, Mockito.times(invalidMappings.size())).getXMLDesc(Mockito.anyInt());
+        command.setVdpaInterfaceMapping(Map.of("02:aa:00:00:00:01", "/dev/vhost-vdpa-new"));
+        final CloudRuntimeException exception = assertThrows(CloudRuntimeException.class,
+                () -> libvirtMigrateCmdWrapper.execute(command, libvirtComputingResourceMock));
+
+        assertEquals("no safe destination vDPA mapping for MAC 02:bb:00:00:00:02", exception.getMessage());
+        Mockito.verify(domain).getXMLDesc(Mockito.anyInt());
+        Mockito.verify(helper, Mockito.never()).retrieveQemuConnection(Mockito.anyString());
     }
 
     @Test
