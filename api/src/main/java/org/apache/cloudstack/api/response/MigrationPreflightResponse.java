@@ -39,4 +39,11 @@ public class MigrationPreflightResponse extends BaseResponse {
         response.denialReason = result.denialReason();
         return response;
     }
+
+    public boolean isAllowed() { return allowed; }
+    public long getVmId() { return vmId; }
+    public long getDestinationHostId() { return destinationHostId; }
+    public int getRequiredVdpaVfs() { return requiredVdpaVfs; }
+    public int getFreeVdpaVfs() { return freeVdpaVfs; }
+    public String getDenialReason() { return denialReason; }
 }

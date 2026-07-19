@@ -52,4 +52,11 @@ public class VfPoolStatusResponse extends BaseResponse {
         response.suspect = status.suspect();
         return response;
     }
+
+    public String getHostId() { return hostId; }
+    public int getFree() { return free; }
+    public int getVdpaFree() { return vdpaFree; }
+    public int getReserved() { return reserved; }
+    public int getAllocated() { return allocated; }
+    public int getSuspect() { return suspect; }
 }
