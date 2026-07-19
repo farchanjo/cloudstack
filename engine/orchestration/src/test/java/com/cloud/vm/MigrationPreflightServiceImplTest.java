@@ -119,6 +119,7 @@ public class MigrationPreflightServiceImplTest {
         when(vm.getServiceOfferingId()).thenReturn(1L);
         when(vm.getHostId()).thenReturn(10L);
         when(host.getId()).thenReturn(44L);
+        when(hostDao.findById(44L)).thenReturn(host);
         when(host.getStatus()).thenReturn(Status.Up);
         when(host.getClusterId()).thenReturn(1L);
         when(host.getDataCenterId()).thenReturn(1L);

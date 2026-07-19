@@ -47,6 +47,7 @@ public class MigrationVfPreflightTest {
     private NetworkOfferingDao networkOfferingDao;
     private MigrationVfPreflight preflight;
     private MigrationAuthoritativeGuard authoritativeGuard;
+    private OvnChassisLookup chassisLookup;
 
     @Before
     public void setUp() {
@@ -54,10 +55,10 @@ public class MigrationVfPreflightTest {
         networkDao = mock(NetworkDao.class);
         networkOfferingDao = mock(NetworkOfferingDao.class);
         preflight = new MigrationVfPreflight(vfPoolManager, networkDao, networkOfferingDao);
-        final OvnChassisLookup lookup = mock(OvnChassisLookup.class);
-        when(lookup.countActiveClaims(anyLong(), anyString())).thenReturn(1);
-        when(lookup.findChassisUuid(anyLong())).thenReturn("destination-chassis");
-        preflight.setChassisLookup(lookup);
+        chassisLookup = mock(OvnChassisLookup.class);
+        when(chassisLookup.countActiveClaims(anyLong(), anyString())).thenReturn(1);
+        when(chassisLookup.findChassisUuid(anyLong())).thenReturn("destination-chassis");
+        preflight.setChassisLookup(chassisLookup);
         authoritativeGuard = mock(MigrationAuthoritativeGuard.class);
         when(authoritativeGuard.fencingReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
         when(authoritativeGuard.placementReady(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(true);
@@ -79,14 +80,18 @@ public class MigrationVfPreflightTest {
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
         when(vm.getHostId()).thenReturn(19L);
+        when(vm.getUuid()).thenReturn("vm-1");
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(nic.getUuid()).thenReturn("nic-1");
         when(networkDao.findById(NETWORK_ID)).thenReturn(network);
         when(network.getNetworkOfferingId()).thenReturn(11L);
         when(networkOfferingDao.findById(11L)).thenReturn(offering);
         when(offering.isVdpaEnabled()).thenReturn(true);
         when(host.getId()).thenReturn(HOST_ID);
         when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(0);
+        when(chassisLookup.findChassisUuid(19L)).thenReturn("source-chassis");
+        when(chassisLookup.hasExactActiveClaim(1L, "lsp-nic-1", "source-chassis")).thenReturn(true);
 
         assertThrows(CloudRuntimeException.class, () -> preflight.verify(profile, host));
         verify(vfPoolManager).countFreeForVdpa(HOST_ID);
@@ -95,10 +100,13 @@ public class MigrationVfPreflightTest {
     @Test
     public void skipsCapacityCheckForNonVdpaProfile() {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
         final Host host = mock(Host.class);
         when(host.getStatus()).thenReturn(Status.Up);
         when(host.getClusterId()).thenReturn(1L);
         when(host.getDataCenterId()).thenReturn(1L);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getUuid()).thenReturn("vm-1");
         when(profile.getNics()).thenReturn(java.util.List.of());
 
         preflight.verify(profile, host);
@@ -144,6 +152,7 @@ public class MigrationVfPreflightTest {
         final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
         when(profile.getVirtualMachine()).thenReturn(vm);
         when(vm.getHostId()).thenReturn(19L);
+        when(vm.getUuid()).thenReturn("vm-1");
         when(vm.isHaEnabled()).thenReturn(true);
         when(vm.getDetails()).thenReturn(java.util.Map.of());
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
@@ -177,12 +186,16 @@ public class MigrationVfPreflightTest {
         when(vm.getDetails()).thenReturn(java.util.Map.of("fencing.configured", "false"));
         when(profile.getNics()).thenReturn(java.util.List.of(nic));
         when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(nic.getUuid()).thenReturn("nic-1");
         when(networkDao.findById(NETWORK_ID)).thenReturn(network);
         when(network.getNetworkOfferingId()).thenReturn(11L);
         when(networkOfferingDao.findById(11L)).thenReturn(offering);
         when(offering.isVdpaEnabled()).thenReturn(true);
         when(host.getId()).thenReturn(HOST_ID);
         when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(1);
+        when(chassisLookup.findChassisUuid(19L)).thenReturn("source-chassis");
+        when(chassisLookup.findChassisUuid(HOST_ID)).thenReturn("destination-chassis");
+        when(chassisLookup.hasExactActiveClaim(1L, "lsp-nic-1", "source-chassis")).thenReturn(true);
 
         preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.COLD);
     }
