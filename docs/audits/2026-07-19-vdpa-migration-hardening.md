@@ -1235,4 +1235,29 @@ suspended pending operator-controlled resolution of the stale Argo comparison;
 the prior policy was not re-enabled because the required `Synced` gate was not
 earned. All CloudStack rollout phases remain locked.
 
+### 16.7 Source-resolution rollback failure
+
+Read-only source checks proved `origin/main` contained `7b10a69` and the live
+repo URL/path were correct. Argo's repo-server eventually resolved `7b10a69`,
+but the Application-level suspension was not durable: the normal Application
+owner reasserted automated sync, and Argo performed a child server-side apply.
+The CloneSet image changed to `7b10a69f`, revision `socket-79d6cff88b`, and
+restart counters increased from `3,3,5` to `4,4,6` while pod UIDs remained the
+same. This violated the no-workload-change requirement.
+
+The metadata commit was reverted as `6ad21bf`, and the Application was
+temporarily pinned to the exact rollback commit with the prior automated policy
+restored so the normal owner could roll back. The rollback operation succeeded,
+but the live state is not stable: Application `OutOfSync/Degraded`, CloneSet
+current `socket-79d6cff88b`, update `socket-68d9f8479c`, `3` replicas/`2` ready,
+one pod still on `7b10a69f`, and restart counters `4,5,9`. The operation also
+produced liveness/readiness failures during the in-place rollback. No direct pod
+restart/delete or CloudStack host mutation was used.
+
+This is a genuine unsafe `NO_GO`; KVM, management, canary, cold, and live
+migration phases remain locked until the accounting owner completes a separately
+controlled recovery and proves stable identities, revisions, restarts, and
+readiness. The temporary exact source pin and automated policy state require
+operator cleanup after recovery; no further mutation was attempted in this run.
+
 **End of tracker.**
