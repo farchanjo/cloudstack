@@ -492,12 +492,13 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             if (value.contains("/usr/bin/ovsdb-client") && value.contains(" transact ")) {
                 return ovsdbTransaction(command[command.length - 1]);
             }
-            if (value.endsWith("vdpa dev show")) {
+            if (value.endsWith("vdpa dev show -j")) {
                 if (vdpaInventoryFails) {
                     return CommandResult.failure("vdpa unavailable");
                 }
                 return CommandResult.success(vdpaPresent
-                        ? "vdpa-target: type network mgmtdev pci/" + BDF : "");
+                        ? "{\"dev\":{\"vdpa-target\":{\"mgmtdev\":\"pci/" + BDF + "\"}}}"
+                        : "{\"dev\":{}}");
             }
             if (value.endsWith("vdpa dev del vdpa-target")) {
                 vdpaPresent = false;

@@ -55,16 +55,14 @@ public class OvnVdpaVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("clear Interface")))
-                    .thenReturn("");
-            scriptMock.when(() -> Script.runSimpleBashScript(contains("del-port")))
-                    .thenReturn("");
+            scriptMock.when(() -> Script.executeCommandForExitValue(any(String[].class))).thenReturn(0);
 
             driver.unplug(iface, true);
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("clear Interface dx6p1vf6 external_ids")),
-                    times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p1vf6")), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p1vf6", "external_ids"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "del-port", "dx6p1vf6"), times(1));
         }
     }
 

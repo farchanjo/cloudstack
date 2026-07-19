@@ -200,12 +200,14 @@ public class OvnVifDriverFreeStaleRepTest {
 
             OvnVifDriver.clearOrphanRepsByAttachedMac(LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff");
 
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("clear Interface dx6p0vf4 external_ids")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(
-                    contains("clear Interface dx6p1vf6 external_ids")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p0vf4")), times(1));
-            scriptMock.verify(() -> Script.runSimpleBashScript(contains("del-port dx6p1vf6")), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p0vf4", "external_ids"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p1vf6", "external_ids"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "del-port", "dx6p0vf4"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(
+                    "ovs-vsctl", "--if-exists", "del-port", "dx6p1vf6"), times(1));
         }
     }
 }
