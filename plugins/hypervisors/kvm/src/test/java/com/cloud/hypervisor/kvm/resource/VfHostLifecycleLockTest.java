@@ -23,6 +23,8 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.junit.Test;
@@ -36,7 +38,19 @@ public class VfHostLifecycleLockTest {
         assertSame(first, second);
         first.lock();
         try {
-            assertFalse(second.tryLock(50, TimeUnit.MILLISECONDS));
+            final CountDownLatch started = new CountDownLatch(1);
+            final AtomicBoolean acquired = new AtomicBoolean();
+            final Thread contender = new Thread(() -> {
+                started.countDown();
+                if (second.tryLock()) {
+                    acquired.set(true);
+                    second.unlock();
+                }
+            });
+            contender.start();
+            assertTrue(started.await(1, TimeUnit.SECONDS));
+            contender.join(1_000);
+            assertFalse(acquired.get());
         } finally {
             first.unlock();
         }
