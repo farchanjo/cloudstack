@@ -26,7 +26,6 @@ import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationNicPreflightStatus;
 import com.cloud.network.router.VfDeviceStatus;
 import com.cloud.network.router.VfPoolStatus;
-import com.cloud.network.router.VfPoolStatus;
 
 public class MigrationPreflightResponseTest {
 
