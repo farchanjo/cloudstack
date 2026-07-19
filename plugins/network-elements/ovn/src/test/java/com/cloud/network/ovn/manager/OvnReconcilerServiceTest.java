@@ -751,10 +751,28 @@ public class OvnReconcilerServiceTest {
         return new NatSweepFixture(service, nb, controller, mappingDao, out);
     }
 
+    /**
+     * Invoke a private method by name with the given args. Maps wrapper types
+     * (Boolean, Integer, Long) to their primitive equivalents so
+     * {getDeclaredMethod} resolves methods declared with primitive
+     * parameters (e.g. {boolean} in
+     * {sweepLegacyPortForwardingNat(OvnNbClient, OvnControllerVO, boolean, Result)}).
+     * Without this mapping, {args[i].getClass()} returns {Boolean.class} for
+     * {true}/{false} and the lookup fails because {Boolean.class != boolean.class}.
+     */
     private static void invokePrivate(final Object target, final String method, final Object... args) throws Exception {
         final Class<?>[] types = new Class<?>[args.length];
         for (int i = 0; i < args.length; i++) {
-            types[i] = args[i].getClass();
+            final Class<?> cls = args[i].getClass();
+            if (cls == Boolean.class) {
+                types[i] = boolean.class;
+            } else if (cls == Integer.class) {
+                types[i] = int.class;
+            } else if (cls == Long.class) {
+                types[i] = long.class;
+            } else {
+                types[i] = cls;
+            }
         }
         final Method m = target.getClass().getDeclaredMethod(method, types);
         m.setAccessible(true);

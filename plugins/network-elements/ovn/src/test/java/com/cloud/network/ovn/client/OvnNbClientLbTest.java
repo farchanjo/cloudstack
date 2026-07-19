@@ -536,6 +536,100 @@ public class OvnNbClientLbTest {
         client.updateLoadBalancerBackends("lb-uuid", null);
     }
 
+    // ------------------------------------------------------------------
+    // readLogicalRouterOptionsPublic — transport/decode contract for the
+    // scoped VPC force-SNAT dry-run path. These tests exercise the REAL
+    // OvnNbClient JSON decode (not a mock) so a wire-format regression is
+    // caught here rather than silently degrading to null at the service
+    // layer.
+    // ------------------------------------------------------------------
+
+    @Test
+    public void readLogicalRouterOptionsReturnsDecodedMapWhenRowPresent() throws Exception {
+        when(pool.call(anyString(), any())).thenReturn(
+                selectOptionsReply("chassis", "gw1",
+                        OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP));
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-uuid-1");
+
+        assertNotNull(options);
+        assertEquals(2, options.size());
+        assertEquals("gw1", options.get("chassis"));
+        assertEquals(OvnNbClient.LB_FORCE_SNAT_ROUTER_IP,
+                options.get(OvnNbClient.LR_OPT_LB_FORCE_SNAT));
+    }
+
+    @Test
+    public void readLogicalRouterOptionsReturnsDecodedMapWhenDistributedWithLegacyToken() throws Exception {
+        // Distributed router (no chassis key) carrying the stale router_ip
+        // magic value — the exact live state of the two Slytherin VPC LRs.
+        when(pool.call(anyString(), any())).thenReturn(
+                selectOptionsReply(OvnNbClient.LR_OPT_LB_FORCE_SNAT, OvnNbClient.LB_FORCE_SNAT_ROUTER_IP));
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-distributed");
+
+        assertNotNull(options);
+        assertEquals(1, options.size());
+        assertFalse("distributed LR must not have chassis key", options.containsKey("chassis"));
+        assertEquals(OvnNbClient.LB_FORCE_SNAT_ROUTER_IP,
+                options.get(OvnNbClient.LR_OPT_LB_FORCE_SNAT));
+    }
+
+    @Test
+    public void readLogicalRouterOptionsReturnsEmptyMapWhenNoOptions() throws Exception {
+        // Row exists but options map is empty (no keys).
+        when(pool.call(anyString(), any())).thenReturn(selectOptionsReply());
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-empty");
+
+        assertNotNull("empty options map must decode to non-null empty map, not null",
+                options);
+        assertTrue(options.isEmpty());
+    }
+
+    @Test
+    public void readLogicalRouterOptionsReturnsNullWhenRowsEmpty() throws Exception {
+        // Row does not exist — select returns empty rows array.
+        final ObjectNode result = mapper.createObjectNode();
+        result.set("rows", mapper.createArrayNode());
+        final ArrayNode reply = mapper.createArrayNode();
+        reply.add(result);
+        when(pool.call(anyString(), any())).thenReturn(reply);
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-missing");
+
+        assertNull("missing LR row must return null, not empty map", options);
+    }
+
+    @Test
+    public void readLogicalRouterOptionsReturnsNullWhenReplyNull() throws Exception {
+        when(pool.call(anyString(), any())).thenReturn(null);
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-null");
+
+        assertNull("null reply must return null", options);
+    }
+
+    @Test
+    public void readLogicalRouterOptionsReturnsNullWhenReplyEmptyArray() throws Exception {
+        when(pool.call(anyString(), any())).thenReturn(mapper.createArrayNode());
+
+        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-empty-reply");
+
+        assertNull("empty array reply must return null", options);
+    }
+
+    @Test(expected = OvnException.class)
+    public void readLogicalRouterOptionsPropagatesTransportException() throws Exception {
+        // Transport failure (OVSDB connection lost) — must propagate as
+        // OvnException, NOT be swallowed into null. The scoped VPC
+        // reconciler relies on this to fail closed instead of silently
+        // treating a transport error as "no options".
+        when(pool.call(anyString(), any())).thenThrow(new OvnException("transport error"));
+
+        client.readLogicalRouterOptionsPublic("lr-transport-fail");
+    }
+
     private ArrayNode captureTransactCall() {
         final ArgumentCaptor<JsonNode> captor = ArgumentCaptor.forClass(JsonNode.class);
         verify(pool).call(anyString(), captor.capture());

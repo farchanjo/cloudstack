@@ -58,7 +58,6 @@ public class OvnReconcileResultResponse extends BaseResponse {
      *  true/1 values. Absent keys mean false/zero/distributed:
      *  <ul>
      *    <li>Absent {@code Logical_Router_ForceSnat:topology} = distributed</li>
-     *    <li>Absent {@code Logical_Router_ForceSnat:applied} = no write performed</li>
      *    <li>Absent {@code Logical_Router_ForceSnat:applied} = no write performed (dry-run or no-change)</li>
      *  </ul> */
     @SerializedName("acksbytable")
