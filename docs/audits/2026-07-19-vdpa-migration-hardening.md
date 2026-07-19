@@ -543,29 +543,29 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
 | B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
-| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | `e77119c3e5` adds serialized per-VM admission checks; the workstream includes a vDPA-kind-specific DAO count, chassis read port/adapter, requested-chassis validation, HA/fencing gate, and K8s quorum/anti-affinity checks | duplicate-claim proof and full cold wiring remain | continue Slice 2 before marking complete |
+| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | completed | `34571acf75`: vDPA-specific count, global SB claim count, requested-chassis adapter, authoritative host/placement gate, VM + destination-cluster admission locks, live hostdev denial, and cold hostdev capacity gate | Aragog validation pending | preserve planner/HA ownership |
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `1b4e244850` extends `982672fe9f`: null manager, null allocation, checked allocation failure, and runtime failure all reject vDPA without TAP fallback; focused message test added | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | completed | `MigrationVfPreflight` rejects non-vDPA `useHwOffload` NICs for LIVE mode with an explicit unsupported-operation message; COLD mode remains available for later destination-device gates | cold hostdev capacity gate remains in Slice 5.5/6 | preserve live rejection |
 | B5 | `requested-chassis` validation (§5.4) | completed | `d37c03e0f0`: read-only `OvnChassisLookup` port/OVN adapter resolves the configured policy and rejects non-matching destination chassis without NB writes | Aragog integration validation pending | no auto-pin; preserve operator policy |
-| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | in_progress | `ab5126839d`, `b6e92008ba`: shared destination proof checks iface-id, unique MAC, active/installed state, representor presence, and exactly one SB chassis claim; live/storage/scale paths gate commit | cold-restart proof and Aragog verifier tests remain | do not claim migration canary readiness |
-| B7 | VF commit/rollback gated on dataplane (§5.6) | in_progress | `1b4e244850` propagates ownership commit failures and performs destination stop/cleanup before failed migration cleanup on live/storage/scale paths | source cold-restart semantics and failure integration tests remain | fail closed; no ownership commit on failed proof |
+| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | completed | `34571acf75`: destination proof now checks br-int membership, expected chassis, unique iface-id/MAC, active/installed state, representor presence, and one global SB claim; source proof runs after cutover | Aragog validation pending | no canary before C5 |
+| B7 | VF commit/rollback gated on dataplane (§5.6) | completed | `34571acf75`: ownership manager is mandatory for VF paths; commit occurs only after stamp, destination proof, source-down proof, and destination cleanup is authoritative | Aragog failure-path tests pending | fail closed |
 | B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | completed | Current worktree adds admin-only read-only command/response contracts and `VfPoolService` status façade; no force-release or repair operation exposed | Aragog API authorization/response tests pending | preserve read-only boundary |
-| B9 | Cold relocate preflight (§5.8) | in_progress | `ab5126839d` adds shared source-binding-down command/wrapper; `1b4e244850` wires a bounded proof into the vDPA migrate-away stop path | dedicated cold destination start transaction remains | leave VM stopped on failed proof |
+| B9 | Cold relocate preflight (§5.8) | completed | `34571acf75`: cold vDPA/SR-IOV transaction uses `orchestrateStart` with destination plan, source binding-down proof, destination stamp/verify, ownership commit, destination stop/rollback, and HA-manager restart scheduling | Aragog validation pending | leave stopped if restart policy declines |
 | B10 | Error/reporting semantics (§5.9) | pending | — | — | — |
 
 ### Phase C — Tests (PENDING)
 
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
-| C1 | Unit tests §7.1 | in_progress | Focused fail-closed allocation, preflight capacity/hostdev/HA/chassis, ownership, and vDPA pool tests are present | destination/source verifier and rollback tests remain | — |
-| C2 | Wrapper/XML tests §7.2 | pending | — | B6 | — |
-| C3 | Orchestration failure tests §7.3 | pending | — | B2,B3,B6 | — |
-| C4 | API tests §7.4 | in_progress | `e95f8607d7` adds structured migration-admission and VF-status response tests; command authorization tests remain | Aragog API module validation | — |
+| C1 | Unit tests §7.1 | completed | `34571acf75`: fail-closed allocation, vDPA-specific capacity, preflight gates, cold hostdev capacity, ownership failure, and per-NIC API evidence tests | Aragog execution pending | — |
+| C2 | Wrapper/XML tests §7.2 | completed | `34571acf75`: vDPA XML mapping, prepare mapping, post-stamp failure/idempotence contract, and orphan ownership tests | Aragog execution pending | — |
+| C3 | Orchestration failure tests §7.3 | completed | `34571acf75`: stamp failure and reordered verifier failure are fatal before ownership commit; cold path has authoritative rollback code | Aragog execution pending | — |
+| C4 | API tests §7.4 | completed | `34571acf75`: admin authorization annotation tests and structured per-NIC/status response tests | Aragog execution pending | — |
 | C5 | Aragog full build + checkstyle + unit §7.5 | pending | — | B*, C1–C4 | — |
 | C6 | Marvin cold canary §7.6 | pending | — | C5, §8 | no prod VM |
 | C7 | Marvin live canary §7.6 | pending | — | C6 | no prod VM |
 | C8 | Bounded continuity probe §7.7 | pending | — | C7 | canary only |
-| C9 | Cleanup/failure tests §7.8 | pending | — | B6,B7 | — |
+| C9 | Cleanup/failure tests §7.8 | in_progress | `34571acf75` adds representor ownership and source/destination cleanup coverage | add Aragog orphan sweep execution | — |
 | C10 | Network invariant snapshots §7.9 | pending | — | C6 | — |
 
 ### Phase D — Deploy (PENDING)
