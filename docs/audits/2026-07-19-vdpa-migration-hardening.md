@@ -1455,4 +1455,73 @@ the management failure is an upgrade-order/cluster-state gate.
 quiesce Barty and Voldemort; until then `BELLATRIX_MANAGEMENT_PASS` cannot be
 earned without violating the no-other-management-mutation constraint.
 
+### 16.10 Management packaging fix/build evidence (read-only production, 2026-07-19)
+
+The `.33` management blocker was a missing normalized schema resource, not a
+DDL or Spring regression. `DbUpgrade.getPrepareScripts()` constructs
+`META-INF/db/schema-424132to424133.sql` by removing dots from the version
+range; `getCleanupScripts()` similarly requires
+`META-INF/db/schema-424132to424133-cleanup.sql`. The initial fix used the
+non-normalized names and the focused test caught that exact failure. The names
+were corrected in commit `ffc90ee26e`.
+
+Commits pushed to Aragog `main`:
+
+* `0da21adc99` — add the explicit comment-only prepare and cleanup resources
+* `ffc90ee26e` — use the exact normalized resource names
+
+The resources contain only Apache headers and comments: 4.24.1.32→4.24.1.33
+has no DDL, data migration, or cleanup operation. No database was touched.
+
+#### Validation
+
+On Aragog only:
+
+* `mvn -Pdeveloper -pl engine/schema -am -Dtest=Upgrade42432to42433Test -Dsurefire.failIfNoSpecifiedTests=false clean test` — **SUCCESS**, 2 tests, 0 failures/errors; reactor checkstyle reported 0 violations.
+* `mvn -Pdeveloper,systemvm -pl client -am -DskipTests clean package` — **SUCCESS**; the systemvm profile is required for the complete management shaded runtime and console-proxy classes.
+* Final JAR contains exactly:
+  `META-INF/db/schema-424132to424133.sql` and
+  `META-INF/db/schema-424132to424133-cleanup.sql`; the obsolete
+  `schema-42432to42433*` source files were removed from the Aragog build tree.
+
+Final artifact:
+
+```text
+/root/cloudstack/client/target/cloud-client-ui-4.24.1.33-SNAPSHOT.jar
+size:   144892516
+sha256: 216977f3552bab27a25164697437ecf5936420948848d74656ddd4a269fc913a
+md5:    029a1e732a87cbbc0a3c2ed45e07ac4e
+```
+
+Manifest confirms `Main-Class: org.apache.cloudstack.ServerDaemon`,
+`Implementation-Version: 4.24.1.33-SNAPSHOT`, and revision
+`ffc90ee26ed03024956bf9ea749dc6a4739f788f`. The two embedded resource hashes
+are `97cb91be6a16b16bccb42c05eae52d7e4bd85df51a92c8ab94ec3bfa9fc9cc84` and
+`0b1a7c3f293ee9a0b8c9199b4f20e6f268a9174bd3d477158b0d61d7dfe9a014`.
+
+#### Agent impact
+
+The source change is resource-only. Raw JAR hashes differ from the earlier
+agent artifacts only because the build manifest revision changed from `6e1d...`
+to `ffc90...`; canonical ZIP content excluding `META-INF/MANIFEST.MF` is
+identical for all four agent payloads (same entry counts and canonical SHA-256):
+
+```text
+cloud-api:                 d7b168778f965d92df12a662b264650151ed66e6e323f2c6e115072a4bb158de
+cloud-core:                35c28a558f21cb26284ca24908d3b836254b0a54bb59ccc7cfdfb2e962308e30
+cloud-agent:               e41730cbf0f6d4887f82358f7f0191fe85a02969557089443938b3a3d03bfc28
+cloud-plugin-hypervisor-kvm: d3d62c94a89d43855c50452dee9a3b5b7bacde1de7f20fee31504dd61881c0bf
+```
+
+Therefore the six verified `.33` agent payloads do not require rerolling.
+Matching external management artifacts were built in the same package:
+Linstor SHA256 `be5003256684f4d418435d833ccc5042515b39e2cc3f62fac1617e313fa4a804`,
+StorPool `4ec46bf1fe24b7ac879efce66b5b166af780d974ff2b9483a121da3faa9add00`,
+with unchanged Java-Linstor, MySQL, and Bouncy Castle hashes from the validated
+set.
+
+**Decision: `MANAGEMENT_ARTIFACT_READY`.** This is build readiness only. No
+production service, DB, management node, KVM host, canary, migration, or
+Kubernetes/OVN/OVS state was mutated in this generation.
+
 **End of tracker.**
