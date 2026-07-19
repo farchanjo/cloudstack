@@ -29,6 +29,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.junit.Rule;
@@ -253,6 +254,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         host.vdpaInventoryFails = true;
         final HostVfPurgeOrphansCommand command = command(false);
         command.setTargetPciBdfs(new LinkedHashSet<>(java.util.Arrays.asList(BDF, "0000:03:07.2")));
+        command.setExpectedRepresentorsByPciBdf(Map.of(BDF, "zzz-correct-pf1vf24", "0000:03:07.2", "rep-second"));
+        command.setExpectedInterfaceIdsByPciBdf(Map.of(BDF, EXPECTED_IFACE_ID,
+                "0000:03:07.2", "lsp-12345678-1234-1234-1234-123456789012"));
 
         final HostVfPurgeOrphansAnswer answer = execute(host, command);
 

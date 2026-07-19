@@ -176,7 +176,9 @@ public class VfPoolOwnershipLifecycleTest {
     }
 
     private static NicVO nic() {
-        return org.mockito.Mockito.mock(NicVO.class);
+        final NicVO nic = org.mockito.Mockito.mock(NicVO.class);
+        when(nic.getUuid()).thenReturn("db91cde8-e9ab-4f0a-a6f1-37f562be2536");
+        return nic;
     }
 
     private static SriovVfPoolVO row(final long id, final long hostId, final String bdf,
