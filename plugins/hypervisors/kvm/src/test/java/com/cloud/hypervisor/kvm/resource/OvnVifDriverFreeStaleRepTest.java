@@ -133,7 +133,7 @@ public class OvnVifDriverFreeStaleRepTest {
                              .thenReturn("vnet101\nunit-test-vf4\n");
             // empty CLI + empty sysfs (no /sys in unit env) → no vDPA set
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
-                    .thenReturn("");
+                    .thenReturn("{\"dev\":{}}");
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
 
             final OvnVifDriver.FreeStaleOvsResult r =

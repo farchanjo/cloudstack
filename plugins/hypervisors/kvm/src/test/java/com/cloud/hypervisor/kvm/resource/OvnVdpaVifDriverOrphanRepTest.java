@@ -55,6 +55,8 @@ public class OvnVdpaVifDriverOrphanRepTest {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
+                    .thenReturn("{\"dev\":{}}");
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
 
             driver.unplug(iface, true);
