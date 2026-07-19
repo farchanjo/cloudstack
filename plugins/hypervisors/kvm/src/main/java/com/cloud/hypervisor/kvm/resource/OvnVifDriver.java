@@ -294,10 +294,20 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return;
         }
+        final String bdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(bdf)) {
+            throw new IllegalStateException(callerLabel + ": representor BDF is unknown; refusing unfenced CAS");
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        lock.lock();
+        try {
         if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
             throw new IllegalStateException(callerLabel + ": OVS representor CAS failed for " + repName);
         }
         log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
+        } finally {
+            lock.unlock();
+        }
     }
 
     /** Checked variant used when management requires positive cleanup evidence. */
@@ -305,12 +315,23 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(repName)) {
             return true;
         }
+        final String bdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(bdf)) {
+            log.warn("{}: representor BDF is unknown; refusing unfenced CAS for {}", callerLabel, repName);
+            return false;
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        lock.lock();
+        try {
         if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName, null)) {
             log.warn("{}: failed to free OVS representor {} by CAS", callerLabel, repName);
             return false;
         }
         log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
         return true;
+        } finally {
+            lock.unlock();
+        }
     }
 
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
