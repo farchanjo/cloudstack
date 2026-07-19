@@ -50,6 +50,14 @@ public final class LibvirtVerifyDestinationDataplaneCommandWrapper
                 return failure(command, String.format("expected exactly one destination iface-id claim for %s, found %d",
                         lsp, claims.length));
             }
+            if (StringUtils.isNotBlank(nic.getMac())) {
+                final String macClaims = Script.runSimpleBashScript(String.format(
+                        "ovs-vsctl --no-headings --columns=name find Interface external_ids:attached-mac=%s 2>/dev/null",
+                        nic.getMac()));
+                if (nonBlankLines(macClaims).length != 1) {
+                    return failure(command, "expected exactly one destination MAC claim for " + nic.getMac());
+                }
+            }
             final String externalIds = Script.runSimpleBashScript(String.format(
                     "ovs-vsctl get Interface %s external_ids 2>/dev/null", claims[0]));
             if (!hasExternalId(externalIds, "iface-status", "active")
