@@ -551,7 +551,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | B7 | VF commit/rollback gated on dataplane (§5.6) | completed | `34571acf75`: ownership manager is mandatory for VF paths; commit occurs only after stamp, destination proof, source-down proof, and destination cleanup is authoritative | Aragog failure-path tests pending | fail closed |
 | B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | completed | Current worktree adds admin-only read-only command/response contracts and `VfPoolService` status façade; no force-release or repair operation exposed | Aragog API authorization/response tests pending | preserve read-only boundary |
 | B9 | Cold relocate preflight (§5.8) | completed | `34571acf75`: cold vDPA/SR-IOV transaction uses `orchestrateStart` with destination plan, source binding-down proof, destination stamp/verify, ownership commit, destination stop/rollback, and HA-manager restart scheduling | Aragog validation pending | leave stopped if restart policy declines |
-| B10 | Error/reporting semantics (§5.9) | pending | — | — | — |
+| B10 | Error/reporting semantics (§5.9) | completed | `34571acf75`: per-NIC API denials, explicit ownership failures, source/destination proof failures, and aggregated agent cleanup failures retain recovery evidence | Aragog validation pending | no silent downgrade |
 
 ### Phase C — Tests (PENDING)
 
@@ -565,7 +565,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | C6 | Marvin cold canary §7.6 | pending | — | C5, §8 | no prod VM |
 | C7 | Marvin live canary §7.6 | pending | — | C6 | no prod VM |
 | C8 | Bounded continuity probe §7.7 | pending | — | C7 | canary only |
-| C9 | Cleanup/failure tests §7.8 | in_progress | `34571acf75` adds representor ownership and source/destination cleanup coverage | add Aragog orphan sweep execution | — |
+| C9 | Cleanup/failure tests §7.8 | completed | `34571acf75`: destination-owned orphan tests, active duplicate refusal, source binding proof, wrapper cleanup aggregation, and destination-stop rollback coverage | Aragog execution pending | — |
 | C10 | Network invariant snapshots §7.9 | pending | — | C6 | — |
 
 ### Phase D — Deploy (PENDING)
