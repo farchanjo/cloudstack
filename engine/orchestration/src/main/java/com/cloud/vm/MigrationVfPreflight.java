@@ -24,7 +24,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import javax.inject.Inject;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import com.cloud.host.Host;
 import com.cloud.host.Status;
@@ -44,7 +43,6 @@ import com.cloud.utils.exception.CloudRuntimeException;
  * allocation is still authoritative and must fail closed if capacity changes
  * between this check and agent preparation.</p>
  */
-@Component
 public class MigrationVfPreflight {
 
     public static final class NicPreflightDecision {

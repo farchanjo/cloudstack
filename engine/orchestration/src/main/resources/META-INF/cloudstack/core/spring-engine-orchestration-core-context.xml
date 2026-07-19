@@ -66,6 +66,8 @@
     <bean id="clusteredAgentManagerImpl" class="com.cloud.agent.manager.ClusteredAgentManagerImpl" />
     <bean id="managementServiceConfigurationImpl" class="com.cloud.configuration.ManagementServiceConfigurationImpl" />
 
+    <bean id="migrationVfPreflight" class="com.cloud.vm.MigrationVfPreflight" />
+
     <bean id="cloudOrchestrator"
         class="org.apache.cloudstack.engine.orchestration.CloudOrchestrator" />
     <bean id="dataCenterResourceManagerImpl"
