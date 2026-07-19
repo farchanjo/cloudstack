@@ -131,7 +131,7 @@ public class OvnVifDriverFreeStaleRepTest {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface"), anyInt()))
-                    .thenReturn("vnet101\ndx6p0vf4\n");
+                             .thenReturn("vnet101\nunit-test-vf4\n");
             // empty CLI + empty sysfs (no /sys in unit env) → no vDPA set
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
                     .thenReturn("");
