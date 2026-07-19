@@ -37,7 +37,20 @@ public final class OvsRepresentorCas {
         Result run(String... argv);
     }
 
-    public record Result(boolean success, String output, String error) {
+    public static final class Result {
+        private final boolean success;
+        private final String output;
+        private final String error;
+
+        public Result(final boolean success, final String output, final String error) {
+            this.success = success;
+            this.output = output;
+            this.error = error;
+        }
+
+        public boolean success() { return success; }
+        public String output() { return output; }
+        public String error() { return error; }
     }
 
     public static boolean remove(final Executor executor, final String socket, final String name,
@@ -160,5 +173,18 @@ public final class OvsRepresentorCas {
     private static String uuid(final JsonElement value) { return value.getAsJsonArray().get(1).getAsString(); }
     private static JsonArray unwrap(final JsonElement value) { return "set".equals(value.getAsJsonArray().get(0).getAsString()) ? value.getAsJsonArray().get(1).getAsJsonArray() : value.getAsJsonArray(); }
     private static boolean validResponse(final String output) { try { final JsonArray r = JsonParser.parseString(output).getAsJsonArray(); return r.size() >= 5 && !r.get(1).getAsJsonObject().has("error"); } catch (RuntimeException e) { return false; } }
-    private record Identity(String interfaceUuid, String portUuid, String bridgeUuid, String name) { }
+    private static final class Identity {
+        private final String interfaceUuid;
+        private final String portUuid;
+        private final String bridgeUuid;
+        private final String name;
+
+        private Identity(final String interfaceUuid, final String portUuid, final String bridgeUuid,
+                         final String name) {
+            this.interfaceUuid = interfaceUuid;
+            this.portUuid = portUuid;
+            this.bridgeUuid = bridgeUuid;
+            this.name = name;
+        }
+    }
 }
