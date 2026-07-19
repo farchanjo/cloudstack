@@ -16,6 +16,10 @@
 // under the License.
 package com.cloud.vm;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
+
 import javax.inject.Inject;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -48,6 +52,7 @@ public class MigrationVfPreflight {
     private final VfPoolManager vfPoolManager;
     private final NetworkDao networkDao;
     private final NetworkOfferingDao networkOfferingDao;
+    private final ConcurrentMap<String, ReentrantLock> admissionLocks = new ConcurrentHashMap<>();
     private OvnChassisLookup chassisLookup;
 
     @Inject
@@ -80,6 +85,21 @@ public class MigrationVfPreflight {
     }
 
     public void verify(final VirtualMachineProfile profile, final Host destination,
+            final MigrationMode mode) {
+        final String key = profile.getVirtualMachine().getUuid();
+        final ReentrantLock lock = admissionLocks.computeIfAbsent(key, ignored -> new ReentrantLock());
+        if (!lock.tryLock()) {
+            throw new CloudRuntimeException("another migration admission is already in progress for VM " + key);
+        }
+        try {
+            verifyInternal(profile, destination, mode);
+        } finally {
+            lock.unlock();
+            admissionLocks.remove(key, lock);
+        }
+    }
+
+    private void verifyInternal(final VirtualMachineProfile profile, final Host destination,
             final MigrationMode mode) {
         validateHostdev(profile, mode);
         final int required = countVdpaNics(profile);
