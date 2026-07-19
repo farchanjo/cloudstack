@@ -544,7 +544,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 |---|---|---|---|---|---|
 | B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
 | B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | pending | — | — | — |
-| B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | Slice 1 commit: `HypervisorGuruBase` rejects null/failed vDPA VF allocation with a fail-closed runtime error and preserves non-vDPA HW-offload fallback | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
+| B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `982672fe9f`: `HypervisorGuruBase` rejects null/failed vDPA VF allocation with a fail-closed runtime error and preserves non-vDPA HW-offload fallback | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | pending | — | — | — |
 | B5 | `requested-chassis` validation (§5.4) | pending | — | UD1 | — |
 | B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | pending | — | — | restore easySend best-effort |
