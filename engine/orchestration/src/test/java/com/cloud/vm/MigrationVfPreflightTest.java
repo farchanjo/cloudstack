@@ -82,4 +82,25 @@ public class MigrationVfPreflightTest {
 
         verify(vfPoolManager, org.mockito.Mockito.never()).countFreeForVdpa(HOST_ID);
     }
+
+    @Test
+    public void rejectsHostdevForLiveMigration() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final NicProfile nic = mock(NicProfile.class);
+        final Host host = mock(Host.class);
+        final NetworkVO network = mock(NetworkVO.class);
+        final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(nic.isUseHwOffload()).thenReturn(true);
+        when(networkDao.findById(NETWORK_ID)).thenReturn(network);
+        when(network.getNetworkOfferingId()).thenReturn(11L);
+        when(networkOfferingDao.findById(11L)).thenReturn(offering);
+        when(offering.isVdpaEnabled()).thenReturn(false);
+
+        assertThrows(CloudRuntimeException.class,
+                () -> preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.LIVE));
+    }
 }

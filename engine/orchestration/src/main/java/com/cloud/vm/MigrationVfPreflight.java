@@ -38,6 +38,11 @@ import com.cloud.utils.exception.CloudRuntimeException;
 @Component
 public class MigrationVfPreflight {
 
+    public enum MigrationMode {
+        LIVE,
+        COLD
+    }
+
     private final VfPoolManager vfPoolManager;
     private final NetworkDao networkDao;
     private final NetworkOfferingDao networkOfferingDao;
@@ -51,6 +56,12 @@ public class MigrationVfPreflight {
     }
 
     public void verify(final VirtualMachineProfile profile, final Host destination) {
+        verify(profile, destination, MigrationMode.LIVE);
+    }
+
+    public void verify(final VirtualMachineProfile profile, final Host destination,
+            final MigrationMode mode) {
+        validateHostdev(profile, mode);
         final int required = countVdpaNics(profile);
         if (required == 0) {
             return;
@@ -80,5 +91,24 @@ public class MigrationVfPreflight {
             }
         }
         return required;
+    }
+
+    private void validateHostdev(final VirtualMachineProfile profile, final MigrationMode mode) {
+        if (mode != MigrationMode.LIVE || profile.getNics() == null) {
+            return;
+        }
+        for (final NicProfile nic : profile.getNics()) {
+            if (!nic.isUseHwOffload()) {
+                continue;
+            }
+            final NetworkVO network = networkDao.findById(nic.getNetworkId());
+            final NetworkOfferingVO offering = network == null ? null
+                    : networkOfferingDao.findById(network.getNetworkOfferingId());
+            if (offering == null || !offering.isVdpaEnabled()) {
+                throw new CloudRuntimeException(String.format(
+                        "VM %s NIC %s uses SR-IOV hostdev passthrough; live migration is not supported",
+                        profile.getVirtualMachine().getUuid(), nic.getUuid()));
+            }
+        }
     }
 }
