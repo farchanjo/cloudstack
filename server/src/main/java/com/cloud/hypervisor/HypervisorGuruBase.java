@@ -722,6 +722,7 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
             return;
         }
         final boolean isVr = vmProfile.getType() == com.cloud.vm.VirtualMachine.Type.DomainRouter;
+        boolean shouldVdpa = false;
         try {
             NetworkVO network = networkDao.findById(nicProfile.getNetworkId());
             if (network == null) {
@@ -745,7 +746,6 @@ public abstract class HypervisorGuruBase extends AdapterBase implements Hypervis
                 }
             }
             boolean shouldOffload = false;
-            boolean shouldVdpa = false;
             com.cloud.offerings.NetworkOfferingVO offering = networkOfferingDao.findById(network.getNetworkOfferingId());
             if (offering != null && offering.isVdpaEnabled()) {
                 // vDPA path: highest priority. Mutually exclusive with hostdev
