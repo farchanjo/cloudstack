@@ -1203,4 +1203,36 @@ CT_LB is therefore not proven green. No `accouting` auto-sync suspension or
 tracking-metadata Git change was attempted because both cluster gates were not
 clean. KVM, management, canary, cold, and live phases remain locked.
 
+### 16.6 Suspended accounting comparison attempt
+
+Canonical probes subsequently passed: CT_LB API `.35:6443/readyz` and
+`.33:6443/readyz` returned HTTP 200; Snape public DSR v4/v6 returned 301 with
+the canonical Host header; Salazar public and accounting v4/v6 returned the
+expected 301/404 Istio responses. CloudStack inventory showed the expected two
+Active `ct_lb` API rules and six Active `dsr_software` rules (14 raw dual-stack
+rows). OVN ECMP configuration contained the Snape and Salazar dual-stack
+worker next-hops. The raw reconciler command was not applied; it requires an
+explicit zone id, so no mutation was attempted. These results classify the
+Snape ingress `Synced/Progressing` status as the accepted externalIPs/CCM-
+disabled Service-status limitation, with workloads/endpoints healthy.
+
+After that dataplane PASS, accounting automated sync was suspended by removing
+only `spec.syncPolicy.automated`; the prior policy was `prune=true,
+selfHeal=true`. The pre-suspend operation was already completed at 13:24:47 UTC.
+The exact live tracking ID was read as
+`accouting:apps.kruise.io/CloneSet:accouting/socket`. Git commit `7b10a69`
+added only that value to CloneSet object metadata (not the pod template,
+image, or spec) and was pushed. One hard refresh was issued while automated sync
+was suspended. No new Argo operation, child apply, pod event, UID change,
+restart, or revision change followed; the old operation timestamp remained
+13:24:47 UTC and the CloneSet remained `socket-68d9f8479c`, 3/3 ready, UIDs
+unchanged, restarts `3,3,5`.
+
+Argo nevertheless remained `OutOfSync/Healthy` with only `CloneSet/socket`, and
+the observed source revision remained `9cf84b6` rather than the pushed `7b10a69`.
+No further Application/workload mutation was made. Automated sync is currently
+suspended pending operator-controlled resolution of the stale Argo comparison;
+the prior policy was not re-enabled because the required `Synced` gate was not
+earned. All CloudStack rollout phases remain locked.
+
 **End of tracker.**
