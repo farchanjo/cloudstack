@@ -514,6 +514,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 if (value.contains(" del-port ")) {
                     final String representor = command[command.length - 1];
                     removedRepresentors.add(representor);
+                    ovsIfaceId = null;
                     return CommandResult.success("");
                 }
                 return CommandResult.success(value.contains(" get Interface ") ? "{}" : "");
