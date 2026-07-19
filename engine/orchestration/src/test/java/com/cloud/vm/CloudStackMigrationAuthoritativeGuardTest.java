@@ -42,7 +42,7 @@ public class CloudStackMigrationAuthoritativeGuardTest {
     public void requiresOobAndFenceBuilderForMigration() {
         final OutOfBandManagementService oob = mock(OutOfBandManagementService.class);
         final HostDao hostDao = mock(HostDao.class);
-        final Host source = readyHost(1L);
+        final HostVO source = readyHost(1L);
         final Host destination = readyHost(2L);
         final VirtualMachine vm = mock(VirtualMachine.class);
         when(vm.getHostId()).thenReturn(1L);
