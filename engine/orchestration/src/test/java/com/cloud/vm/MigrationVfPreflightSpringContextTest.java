@@ -22,6 +22,8 @@ import static org.mockito.Mockito.mock;
 
 import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import org.junit.Test;
+import org.springframework.beans.factory.support.AbstractBeanDefinition;
+import org.springframework.beans.factory.support.BeanDefinitionBuilder;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
 import org.springframework.core.io.ClassPathResource;
@@ -49,7 +51,12 @@ public class MigrationVfPreflightSpringContextTest {
                 factory.getBeanDefinition(PREFLIGHT_BEAN_NAME).getBeanClassName());
 
         registerDependencies(factory);
-        final MigrationPreflightServiceImpl consumer = factory.createBean(MigrationPreflightServiceImpl.class);
+        factory.registerBeanDefinition("migrationPreflightServiceImpl", BeanDefinitionBuilder
+                .genericBeanDefinition(MigrationPreflightServiceImpl.class)
+                .setAutowireMode(AbstractBeanDefinition.AUTOWIRE_CONSTRUCTOR)
+                .getBeanDefinition());
+        final MigrationPreflightServiceImpl consumer = factory.getBean("migrationPreflightServiceImpl",
+                MigrationPreflightServiceImpl.class);
 
         assertSame(factory.getBean(PREFLIGHT_BEAN_NAME),
                 ReflectionTestUtils.getField(consumer, "preflight"));
