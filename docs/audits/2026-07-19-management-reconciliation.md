@@ -112,3 +112,19 @@ external plugin mismatch. Aragog was fast-forwarded cleanly to
   pending/failed/CrashLoopBackOff, but 2 OutOfSync and 3 Progressing Argo
   applications. This remains a separately reported known platform exception,
   not a plugin-alignment failure.
+
+### Terminal Kubernetes classification
+
+The independent fresh Kubernetes gate subsequently reached terminal
+`KUBERNETES_GATE_PASS_WITH_ACCEPTED_EXCEPTIONS`. The accepted exceptions are:
+
+- `accouting` at `6ad21bf7...`: Healthy, tracking-id metadata-only drift.
+- `flink-operator` 1.15.0: Healthy, CRD normalization-only drift.
+- Three Istio ingressgateway Applications: Progressing only while their
+  deployments are 3/3, 6/6, and 3/3 with CCM-disabled external-IP semantics
+  and no unhealthy children.
+
+The same gate confirmed Salazar 13/13 and Snape 6/6 Ready, API/etcd 3/3,
+Accounting 3/3, StarRocks 3/3, Flink healthy, CT_LB/DSR dual-stack probes,
+and 19/19 UUID correlation. No Kubernetes or Argo synchronization or mutation
+was performed.
