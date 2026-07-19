@@ -150,16 +150,10 @@ public class OvnVifDriverFreeStaleRepTest {
     }
 
     @Test
-    public void freeRepresentorOnOvs_passesArgumentsWithoutShellInterpolation() {
+    public void freeRepresentorOnOvs_unknownBdfFailsClosed() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
-            scriptMock.when(() -> Script.executeCommandForExitValue(any(String[].class))).thenReturn(0);
-
             OvnVifDriver.freeRepresentorOnOvs(LOG, "test", "dx6p0vf9");
-
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p0vf9", "external_ids"), times(1));
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "del-port", "dx6p0vf9"), times(1));
+            scriptMock.verifyNoInteractions();
         }
     }
 
@@ -200,14 +194,7 @@ public class OvnVifDriverFreeStaleRepTest {
 
             OvnVifDriver.clearOrphanRepsByAttachedMac(LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff");
 
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p0vf4", "external_ids"), times(1));
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "clear", "Interface", "dx6p1vf6", "external_ids"), times(1));
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "del-port", "dx6p0vf4"), times(1));
-            scriptMock.verify(() -> Script.executeCommandForExitValue(
-                    "ovs-vsctl", "--if-exists", "del-port", "dx6p1vf6"), times(1));
+            scriptMock.verify(() -> Script.executeCommandForExitValue(any(String[].class)), never());
         }
     }
 }

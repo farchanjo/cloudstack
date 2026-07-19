@@ -296,7 +296,8 @@ public class OvnVifDriver extends VifDriverBase {
         }
         final String bdf = resolveVfPciFromRepresentor(repName);
         if (StringUtils.isBlank(bdf)) {
-            throw new IllegalStateException(callerLabel + ": representor BDF is unknown; refusing unfenced CAS");
+            log.warn("{}: representor BDF is unknown; refusing unfenced CAS for {}", callerLabel, repName);
+            return;
         }
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
