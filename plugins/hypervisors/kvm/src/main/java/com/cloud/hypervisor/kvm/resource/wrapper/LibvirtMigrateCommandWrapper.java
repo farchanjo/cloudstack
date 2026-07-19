@@ -230,8 +230,9 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
             }
 
             Map<String, String> vdpaMapping = command.getVdpaInterfaceMapping();
-            if (MapUtils.isNotEmpty(vdpaMapping)) {
-                logger.debug("Rewriting vDPA source dev paths in domain XML for VM {} ({} NIC(s))", vmName, vdpaMapping.size());
+            if (containsVdpaInterface(xmlDesc) || MapUtils.isNotEmpty(vdpaMapping)) {
+                logger.debug("Rewriting vDPA source dev paths in domain XML for VM {} ({} NIC(s))", vmName,
+                        vdpaMapping == null ? 0 : vdpaMapping.size());
                 xmlDesc = replaceVdpaInterfaces(xmlDesc, vdpaMapping);
                 if (logger.isDebugEnabled()) {
                     logger.debug("Changed VM {} vDPA source paths. New XML: {}", vmName, maskSensitiveInfoInXML(xmlDesc));
@@ -712,23 +713,26 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
 
         Node domainNode = doc.getFirstChild();
         java.util.Set<String> xmlMacs = new java.util.HashSet<>();
+        java.util.Set<String> xmlDevices = new java.util.HashSet<>();
         NodeList domainChildren = domainNode.getChildNodes();
         for (int i = 0; i < domainChildren.getLength(); i++) {
             Node child = domainChildren.item(i);
             if (!"devices".equals(child.getNodeName())) {
                 continue;
             }
-            xmlMacs.addAll(rewriteVdpaDevicesNode(child, vdpaMapping));
+            xmlMacs.addAll(rewriteVdpaDevicesNode(child, vdpaMapping, xmlDevices));
         }
         java.util.Set<String> mappingMacs = vdpaMapping.keySet().stream()
                 .map(mac -> mac.toLowerCase(java.util.Locale.ROOT)).collect(java.util.stream.Collectors.toSet());
-        if (!mappingMacs.equals(xmlMacs) || vdpaMapping.values().stream().distinct().count() != vdpaMapping.size()) {
+        if (!mappingMacs.equals(xmlMacs) || vdpaMapping.values().stream().distinct().count() != vdpaMapping.size()
+                || xmlDevices.size() != xmlMacs.size()) {
             throw new CloudRuntimeException("vDPA destination mapping is not bijective with migration XML");
         }
         return LibvirtXMLParser.getXml(doc);
     }
 
-    private java.util.Set<String> rewriteVdpaDevicesNode(final Node devicesNode, final Map<String, String> vdpaMapping) {
+    private java.util.Set<String> rewriteVdpaDevicesNode(final Node devicesNode, final Map<String, String> vdpaMapping,
+            final java.util.Set<String> xmlDevices) {
         final java.util.Set<String> xmlMacs = new java.util.HashSet<>();
         NodeList devChildren = devicesNode.getChildNodes();
         for (int x = 0; x < devChildren.getLength(); x++) {
@@ -745,9 +749,38 @@ public final class LibvirtMigrateCommandWrapper extends CommandWrapper<MigrateCo
             if (mac != null) {
                 xmlMacs.add(mac.toLowerCase(java.util.Locale.ROOT));
             }
+            final Node source = findChild(devChild, "source");
+            final Node dev = source == null ? null : source.getAttributes().getNamedItem("dev");
+            if (dev == null || !xmlDevices.add(dev.getNodeValue())) {
+                throw new CloudRuntimeException("vDPA XML contains a missing or duplicate source device");
+            }
             rewriteSingleVdpaInterface(devChild, vdpaMapping);
         }
         return xmlMacs;
+    }
+
+    private boolean containsVdpaInterface(final String xmlDesc) throws TransformerException, ParserConfigurationException,
+            IOException, SAXException {
+        final Document doc = ParserUtils.getSaferDocumentBuilderFactory().newDocumentBuilder()
+                .parse(IOUtils.toInputStream(xmlDesc));
+        final NodeList interfaces = doc.getElementsByTagName("interface");
+        for (int i = 0; i < interfaces.getLength(); i++) {
+            final Node type = interfaces.item(i).getAttributes().getNamedItem("type");
+            if (type != null && "vdpa".equals(type.getNodeValue())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Node findChild(final Node node, final String name) {
+        final NodeList children = node.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            if (name.equals(children.item(i).getNodeName())) {
+                return children.item(i);
+            }
+        }
+        return null;
     }
 
     private void rewriteSingleVdpaInterface(final Node ifaceNode, final Map<String, String> vdpaMapping) {

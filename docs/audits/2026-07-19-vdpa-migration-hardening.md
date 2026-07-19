@@ -568,18 +568,18 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | C2 | Wrapper/XML tests §7.2 | completed | `34571acf75`: vDPA XML mapping, prepare mapping, post-stamp failure/idempotence contract, and orphan ownership tests | Aragog execution pending | — |
 | C3 | Orchestration failure tests §7.3 | completed | `34571acf75`: stamp failure and reordered verifier failure are fatal before ownership commit; cold path has authoritative rollback code | Aragog execution pending | — |
 | C4 | API tests §7.4 | completed | `34571acf75`: admin authorization annotation tests and structured per-NIC/status response tests | Aragog execution pending | — |
-| C5 | Aragog full build + checkstyle + unit §7.5 | pending | — | B*, C1–C4 | — |
-| C6 | Marvin cold canary §7.6 | pending | — | C5, §8 | no prod VM |
-| C7 | Marvin live canary §7.6 | pending | — | C6 | no prod VM |
-| C8 | Bounded continuity probe §7.7 | pending | — | C7 | canary only |
-| C9 | Cleanup/failure tests §7.8 | completed | `34571acf75`: destination-owned orphan tests, active duplicate refusal, source binding proof, wrapper cleanup aggregation, and destination-stop rollback coverage | Aragog execution pending | — |
-| C10 | Network invariant snapshots §7.9 | pending | — | C6 | — |
+| C5 | Aragog full build + checkstyle + unit §7.5 | pending | Runtime/profile, rollback, wrapper, and per-NIC preflight fixes are landed locally; build execution remains outstanding | B*, C1–C4 | — |
+| C6 | Marvin cold canary §7.6 | pending | Live/canary evidence not collected | C5, §8 | no prod VM |
+| C7 | Marvin live canary §7.6 | pending | Live/canary evidence not collected | C6 | no prod VM |
+| C8 | Bounded continuity probe §7.7 | pending | Live/canary evidence not collected | C7 | canary only |
+| C9 | Cleanup/failure tests §7.8 | completed | Local negative coverage now includes NIC omission, null/empty vDPA mapping, and fail-closed cold rollback restart gating; execution remains part of C5 | Aragog execution pending | — |
+| C10 | Network invariant snapshots §7.9 | pending | Live/canary evidence not collected | C6 | — |
 
 ### Phase D — Deploy (PENDING)
 
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
-| D1 | Determine if KVM agent plugin jar changed (§8.4) | pending | — | C5 | — |
+| D1 | Determine if KVM agent plugin jar changed (§8.4) | pending | Build execution required before artifact comparison | C5 | — |
 | D2 | Rolling mgmt redeploy + rollback JAR | pending | — | D1 | prev JAR |
 | D3 | Rolling agent redeploy if D1 says changed | pending | — | D1 | prev agent JAR |
 | D4 | CMK catalog gates green | pending | — | D2,D3 | — |

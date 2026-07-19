@@ -76,6 +76,28 @@ public class MigrationVfPreflightInventoryTest {
                 () -> preflight.verify(profile, destination, MigrationVfPreflight.MigrationMode.COLD));
     }
 
+    @Test
+    public void rejectsProfileThatOmitsOneAuthoritativeNic() {
+        final NicDao nicDao = mock(NicDao.class);
+        final MigrationVfPreflight preflight = new MigrationVfPreflight(mock(VfPoolManager.class),
+                mock(NetworkDao.class), mock(NetworkOfferingDao.class), nicDao);
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final NicProfile one = mock(NicProfile.class);
+        final NicProfile two = mock(NicProfile.class);
+        final NicVO inventoryOne = mock(NicVO.class);
+        final NicVO inventoryTwo = mock(NicVO.class);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(profile.getId()).thenReturn(99L);
+        when(profile.getNics()).thenReturn(List.of(one));
+        when(one.getId()).thenReturn(7L);
+        when(inventoryOne.getId()).thenReturn(7L);
+        when(inventoryTwo.getId()).thenReturn(8L);
+        when(nicDao.listByVmId(99L)).thenReturn(List.of(inventoryOne, inventoryTwo));
+
+        assertThrows(CloudRuntimeException.class, () -> preflight.verify(profile, readyHost()));
+    }
+
     private Host readyHost() {
         final Host host = mock(Host.class);
         when(host.getState()).thenReturn(Host.State.Up);

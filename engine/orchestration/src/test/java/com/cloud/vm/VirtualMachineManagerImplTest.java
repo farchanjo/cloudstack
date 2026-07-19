@@ -173,6 +173,15 @@ import com.cloud.vm.dao.VMInstanceDao;
 @RunWith(MockitoJUnitRunner.class)
 public class VirtualMachineManagerImplTest {
 
+    @Test
+    public void coldRollbackNeverSchedulesRestartWhenAnyProofOrCleanupFails() {
+        assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(false, true, true, true));
+        assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, false, true, true));
+        assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, false, true));
+        assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, true, false));
+        assertTrue(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, true, true));
+    }
+
     @Spy
     @InjectMocks
     private VirtualMachineManagerImpl virtualMachineManagerImpl = new VirtualMachineManagerImpl();

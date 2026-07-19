@@ -53,6 +53,21 @@ public class LibvirtMigrateCommandWrapperVdpaXmlTest {
     }
 
     @Test
+    public void rejectsNullMappingWhenSourceContainsVdpa() {
+        final String xml = "<domain><devices><interface type='vdpa'><mac address='02:00:00:00:00:03'/><source dev='/dev/vhost-vdpa-old3'/></interface></devices></domain>";
+        assertThrows(RuntimeException.class, () -> ReflectionTestUtils.invokeMethod(
+                new LibvirtMigrateCommandWrapper(), "replaceVdpaInterfaces", xml, null));
+    }
+
+    @Test
+    public void acceptsEmptyMappingWhenSourceHasNoVdpa() {
+        final String xml = "<domain><devices><interface type='bridge'><mac address='02:00:00:00:00:03'/></interface></devices></domain>";
+        final String rewritten = ReflectionTestUtils.invokeMethod(new LibvirtMigrateCommandWrapper(),
+                "replaceVdpaInterfaces", xml, Map.of());
+        assertTrue(rewritten.contains("type=\"bridge\"") || rewritten.contains("type='bridge'"));
+    }
+
+    @Test
     public void rejectsPartialMultiNicVdpaMapping() {
         final String xml = "<domain><devices>"
                 + "<interface type='vdpa'><mac address='02:00:00:00:00:01'/><source dev='/dev/vhost-vdpa-old1'/></interface>"

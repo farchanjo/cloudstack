@@ -3247,7 +3247,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             vmSrc.addNic(nic);
         }
 
-        final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null, _offeringDao.findById(vm.getId(), vm.getServiceOfferingId()), null, null);
+        final VirtualMachineProfile profile = migrationProfile(vm, dest.getHost());
         profile.setHost(dest.getHost());
 
         migrationVfPreflight.verify(profile, dest.getHost());
@@ -3893,7 +3893,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             vmSrc.addNic(nic);
         }
 
-        final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null, _offeringDao.findById(vm.getId(), vm.getServiceOfferingId()), null, null);
+        final VirtualMachineProfile profile = migrationProfile(vm, destHost);
         profile.setHost(destHost);
 
         final Map<Volume, StoragePool> volumeToPoolMap = createMappingVolumeAndStoragePool(profile, destHost, volumeToPool);
@@ -4259,6 +4259,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 .map(uuid -> "lsp-" + uuid)
                 .toArray(String[]::new);
         VirtualMachineProfile destinationProfile = null;
+        boolean sourceBindingProof = false;
+        boolean destinationStopped = true;
+        boolean ownershipRestored = false;
+        boolean cleanupSucceeded = false;
         try {
             migrationVfPreflight.verify(sourceProfile, destination.getHost(), MigrationVfPreflight.MigrationMode.COLD);
             advanceStop(vmUuid, true);
@@ -4269,6 +4273,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!(bindingDown instanceof VerifySourceBindingDownAnswer) || !bindingDown.getResult()) {
                 throw new CloudRuntimeException("source vDPA binding-down proof failed; refusing cold relocation");
             }
+            sourceBindingProof = true;
 
             final DataCenterDeployment startPlan = new DataCenterDeployment(
                     destination.getDataCenter().getId(), destination.getPod().getId(),
@@ -4292,34 +4297,73 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     true, true, "cold-migration", workId);
         } catch (Exception e) {
             logger.error("Cold vDPA relocation failed for VM {}; beginning authoritative rollback", vmUuid, e);
+            final List<Throwable> rollbackFailures = new ArrayList<>();
             try {
                 final VMInstanceVO currentVm = _vmDao.findByUuid(vmUuid);
                 if (currentVm != null && java.util.Objects.equals(destination.getHost().getId(), currentVm.getHostId())) {
                     advanceStop(vmUuid, true);
                 }
             } catch (Exception cleanupError) {
+                destinationStopped = false;
+                rollbackFailures.add(cleanupError);
                 logger.error("Cold vDPA destination stop failed for VM {}; recovery evidence retained", vmUuid, cleanupError);
             }
             if (destinationProfile != null) {
-                _networkMgr.rollbackNicForMigration(sourceProfile, destinationProfile);
+                try {
+                    _networkMgr.rollbackNicForMigration(sourceProfile, destinationProfile);
+                } catch (RuntimeException rollbackError) {
+                    rollbackFailures.add(rollbackError);
+                }
             }
             try {
                 rollbackVfReservationsStrict(vm.getId(), destination.getHost().getId(), true,
                         "cold-migration", workId);
             } catch (RuntimeException rollbackError) {
-                e.addSuppressed(rollbackError);
+                rollbackFailures.add(rollbackError);
             }
             try {
                 stateTransitTo(vm, VirtualMachine.Event.OperationFailed, sourceHostId);
+                ownershipRestored = true;
             } catch (NoTransitionException stateError) {
+                rollbackFailures.add(stateError);
                 logger.error("Unable to restore source ownership state for VM {}; leaving stopped", vmUuid, stateError);
             }
             vm.setHostId(sourceHostId);
             vm.setLastHostId(sourceHostId);
-            _haMgr.scheduleRestart(vm, true);
+            cleanupSucceeded = rollbackFailures.isEmpty();
+            rollbackFailures.forEach(e::addSuppressed);
+            if (shouldScheduleColdRollbackRestart(destinationStopped, ownershipRestored,
+                    sourceBindingProof, cleanupSucceeded)) {
+                _haMgr.scheduleRestart(vm, true);
+            } else {
+                logger.error("Cold vDPA rollback for VM {} is recovery-required; restart is suppressed "
+                        + "(destinationStopped={}, ownershipRestored={}, sourceBindingProof={}, cleanupSucceeded={})",
+                        vmUuid, destinationStopped, ownershipRestored, sourceBindingProof, cleanupSucceeded);
+            }
             throw e instanceof CloudRuntimeException ? (CloudRuntimeException) e
                     : new CloudRuntimeException("Cold vDPA relocation failed for " + vmUuid, e);
         }
+    }
+
+    static boolean shouldScheduleColdRollbackRestart(final boolean destinationStopped,
+            final boolean ownershipRestored, final boolean sourceBindingProof, final boolean cleanupSucceeded) {
+        return destinationStopped && ownershipRestored && sourceBindingProof && cleanupSucceeded;
+    }
+
+    private VirtualMachineProfile migrationProfile(final VMInstanceVO vm, final Host host) {
+        final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null,
+                _offeringDao.findById(vm.getId(), vm.getServiceOfferingId()), null, null);
+        final List<NicProfile> nics = _networkMgr.getNicProfiles(vm);
+        final List<NicVO> inventory = _nicsDao.listByVmId(vm.getId());
+        final Set<Long> inventoryIds = inventory.stream().map(NicVO::getId).collect(Collectors.toSet());
+        final Set<Long> profileIds = nics.stream().map(NicProfile::getId).collect(Collectors.toSet());
+        if (inventory.size() != nics.size() || inventoryIds.size() != inventory.size()
+                || profileIds.size() != nics.size() || !inventoryIds.equals(profileIds)) {
+            throw new CloudRuntimeException("VM NIC inventory/profile bijection failed before migration for VM " + vm.getUuid());
+        }
+        nics.forEach(profile::addNic);
+        profile.setHost(host);
+        return profile;
     }
 
     /**

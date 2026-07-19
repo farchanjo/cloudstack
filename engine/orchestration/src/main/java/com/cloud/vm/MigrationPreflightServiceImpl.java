@@ -30,6 +30,8 @@ import com.cloud.network.router.MigrationPreflightResult;
 import com.cloud.network.router.MigrationPreflightService;
 import com.cloud.service.dao.ServiceOfferingDao;
 import com.cloud.vm.dao.VMInstanceDao;
+import com.cloud.vm.dao.NicDao;
+import com.cloud.vm.NicVO;
 
 @Component
 public class MigrationPreflightServiceImpl implements MigrationPreflightService {
@@ -39,16 +41,18 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
     private final ServiceOfferingDao offeringDao;
     private final NetworkModel networkModel;
     private final MigrationVfPreflight preflight;
+    private final NicDao nicDao;
 
     @Inject
     public MigrationPreflightServiceImpl(final VMInstanceDao vmDao, final HostDao hostDao,
             final ServiceOfferingDao offeringDao, final NetworkModel networkModel,
-            final MigrationVfPreflight preflight) {
+            final MigrationVfPreflight preflight, final NicDao nicDao) {
         this.vmDao = vmDao;
         this.hostDao = hostDao;
         this.offeringDao = offeringDao;
         this.networkModel = networkModel;
         this.preflight = preflight;
+        this.nicDao = nicDao;
     }
 
     @Override
@@ -64,31 +68,49 @@ public class MigrationPreflightServiceImpl implements MigrationPreflightService 
         for (final NicProfile nic : networkModel.getNicProfiles(vm)) {
             profile.addNic(nic);
         }
+        final List<NicVO> inventory = nicDao.listByVmId(vmId);
+        if (inventory.size() != profile.getNics().size()
+                || inventory.stream().map(NicVO::getId).collect(java.util.stream.Collectors.toSet()).size() != inventory.size()
+                || profile.getNics().stream().map(NicProfile::getId).collect(java.util.stream.Collectors.toSet()).size() != profile.getNics().size()
+                || !inventory.stream().map(NicVO::getId).collect(java.util.stream.Collectors.toSet()).equals(
+                        profile.getNics().stream().map(NicProfile::getId).collect(java.util.stream.Collectors.toSet()))) {
+            return new MigrationPreflightResult(false, vmId, destinationHostId, 0, 0,
+                    "VM NIC inventory/profile bijection failed", List.of(), true, false);
+        }
         final int required = preflight.requiredVdpaVfs(profile);
         final int free = preflight.freeVdpaVfs(destinationHostId);
         try {
             preflight.verify(profile, destination);
             return new MigrationPreflightResult(true, vmId, destinationHostId, required, free, null,
-                    nicStatuses(profile, true, null, free));
+                    nicStatuses(profile, destinationHostId, true, null));
         } catch (RuntimeException e) {
             final String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             return new MigrationPreflightResult(false, vmId, destinationHostId, required, free,
-                    reason, nicStatuses(profile, false, reason, free),
+                    reason, nicStatuses(profile, destinationHostId, false, reason),
                     !reason.contains("requested OVN chassis"),
                     reason.contains("SR-IOV hostdev"));
         }
     }
 
     private List<MigrationNicPreflightStatus> nicStatuses(final VirtualMachineProfile profile,
-            final boolean allowed, final String denialReason, final int free) {
+            final long destinationHostId, final boolean globallyAllowed, final String denialReason) {
         if (profile.getNics() == null) {
             return List.of();
         }
         return profile.getNics().stream()
-                .map(nic -> new MigrationNicPreflightStatus(nic.getUuid(), allowed,
-                        preflight.requiredVdpaVfs(nic), free,
-                        denialReason != null && denialReason.contains("SR-IOV hostdev")
-                                && !nic.isUseHwOffload() ? null : denialReason))
+                .map(nic -> {
+                    final int required = preflight.requiredVdpaVfs(nic);
+                    final int free = required == 0 ? 0 : preflight.freeVdpaVfs(destinationHostId);
+                    final boolean capacityDenied = required > free;
+                    final boolean hostdevDenied = nic.isUseHwOffload() && required == 0
+                            && denialReason != null && denialReason.contains("SR-IOV hostdev");
+                    final boolean chassisDenied = required > 0 && denialReason != null
+                            && (denialReason.contains("chassis") || denialReason.contains("Port_Binding"));
+                    final String nicReason = capacityDenied ? String.format("NIC %s requires %d vDPA VF(s), but only %d are free",
+                            nic.getUuid(), required, free) : hostdevDenied || chassisDenied ? denialReason : null;
+                    return new MigrationNicPreflightStatus(nic.getUuid(), globallyAllowed && nicReason == null,
+                            required, free, nicReason);
+                })
                 .toList();
     }
 }
