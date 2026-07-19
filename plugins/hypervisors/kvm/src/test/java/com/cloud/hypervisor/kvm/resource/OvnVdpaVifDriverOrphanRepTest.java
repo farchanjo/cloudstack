@@ -20,6 +20,7 @@
 package com.cloud.hypervisor.kvm.resource;
 
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
