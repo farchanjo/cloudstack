@@ -1260,4 +1260,92 @@ controlled recovery and proves stable identities, revisions, restarts, and
 readiness. The temporary exact source pin and automated policy state require
 operator cleanup after recovery; no further mutation was attempted in this run.
 
+### 16.8 Fluffy KVM `.33` canary RCA (read-only, 2026-07-19)
+
+The two Fluffy plugin-only canaries are **NO_GO** and were rolled back to the
+validated `.32` plugin. No Kubernetes-bearing host, management server, VM, or
+migration was mutated by this investigation. The authoritative host row is
+currently `id=22`, `status=Up`, `resource_state=Enabled`, `version=4.24.1.31-SNAPSHOT`,
+`mgmt_server_id=266600964325576` (Bellatrix), `last_mgmt_server_id=41854098319389`
+(Barty), `disconnected=2026-07-10 23:58:18`, and `last_ping=1742646478`
+(`2025-03-22 12:27:58`); the stale ping value is retained as evidence and was
+not repaired.
+
+#### Authoritative failure chain
+
+Bellatrix owned both observed connections. Its management log records:
+
+* `13:56:56.667` — `NetworkOrchestrator` received Fluffy's startup connection
+  and sent `CheckNetworkCommand`.
+* `13:56:56.674` — `ClassCastException`: `Answer` cannot be cast to
+  `CheckNetworkAnswer`, at `NetworkOrchestrator.processConnect:4388`, called
+  from `AgentManagerImpl.sendReadyAndGetAttache:1388`.
+* `13:56:56.675` — `AgentDisconnected`; `Unable to create attache for agent`.
+* `14:04:57.259–14:04:57.271` — the same sequence and same exception on the
+  second canary attempt. Retries at `14:06:02` reproduced it.
+
+Fluffy's agent log confirms SSL handshake, startup response receipt, and Ready
+processing before the management-side rejection. It also records the decisive
+ABI failure: `14:04:57.264` `NoClassDefFoundError` initializing
+`LibvirtRequestWrapper`, caused by `TypeNotPresentException` for
+`com.cloud.agent.api.VerifyDestinationDataplaneCommand`. Therefore the earlier
+absence of a visible NoClassDef report in the short canary summary was not a
+clean run; the full agent log contains it.
+
+The source state machine explains the apparently contradictory observations:
+`AgentManagerImpl.notifyMonitorsOfConnection` invokes
+`NetworkOrchestrator.processConnect` before the `Event.Ready` transition at
+`AgentManagerImpl.java:854`. Any monitor exception takes the generic disconnect
+path (`:784–787`), removes the attache, and never reaches the Ready-to-Up
+transition. A successful SSL/startup response and an agent-side Ready log can
+therefore coexist with an authoritative Alert/disconnected host. `Ping` cannot
+restore the host because the attache is removed before the periodic
+`PingRoutingCommand` path can run. The normal recovery path is
+`agentStatusTransitTo(host, Event.Ping, ...)` only after a valid attached agent
+is investigated as up (`:1157–1161`).
+
+#### ABI and classpath evidence
+
+Fluffy's runtime classpath is `/usr/share/cloudstack-agent/lib/*` followed by
+`/usr/share/cloudstack-agent/plugins/*`. The active `.32` plugin hash is
+`00052046894b1dc96848dbf6f2771dd0dd51f689617526c81e21fd99a9954798`.
+The plugins directory still contains an old `.26` plugin and `.26` cloud-api,
+but the lib directory precedes it. The active shared jars are
+`cloud-agent`, `cloud-api`, and `cloud-core` `4.24.1.31-SNAPSHOT`; this explains
+the agent implementation version and is an existing package/version skew, not
+evidence that the `.33` plugin was not loaded. The `.33` attempt was loaded: its
+new KVM wrapper's static Reflections initialization is the source of the
+`VerifyDestinationDataplaneCommand` type-resolution failure.
+
+The candidate artifact is internally consistent with the source, but is not a
+complete agent payload. It adds/uses the vDPA destination/source proof wrappers
+and shared command classes introduced by the migration hardening commits. The
+candidate's proven identity is: size `1,111,000`, SHA256
+`5f301d82774932b4c1e65f16c96ba7e466da4ec987a63deee32e67052f547811`, MD5
+`7093364b8aeb309945df1f91fba00158`. The matching Aragog build artifacts already
+available for a future, separately gated payload are:
+
+| Artifact | Size | SHA256 | MD5 |
+|---|---:|---|---|
+| `api/target/cloud-api-4.24.1.33-SNAPSHOT.jar` | 2,963,465 | `a107f9e48e29ac60aaeeca5ecd9528ec144eab73e5a43dbec4b565cda5c62b4b` | `fa8f4d45c15830cb2bf6723a65eca702` |
+| `core/target/cloud-core-4.24.1.33-SNAPSHOT.jar` | 723,332 | `aaa09c46dd54e4e3bc01e4197403b10ef730508745c7e3abded253d0091f5093` | `7766b44ee318686aa8944f1a289b26c0` |
+| `agent/target/cloud-agent-4.24.1.33-SNAPSHOT.jar` | 90,975 | `e7803ea5018aaac397c7ecf0053ce3c4c7877807f1ae87c8221224a2d75ac5ec` | `577d39557cf0b8c7fb7744a9b9939076` |
+| `plugins/hypervisors/kvm/target/cloud-plugin-hypervisor-kvm-4.24.1.33-SNAPSHOT.jar` | 1,111,000 | `5f301d82774932b4c1e65f16c96ba7e466da4ec987a63deee32e67052f547811` | `7093364b8aeb309945df1f91fba00158` |
+
+The matching `cloud-core` contains `VerifyDestinationDataplaneCommand`; the
+Fluffy `.31` core does not. This proves the failure was caused by an incomplete
+plugin-only replacement, not by management-first ordering or a defective
+`.33` KVM implementation. No source fix or regression test is warranted for
+this RCA. A future rollout must use the complete matching agent payload above,
+agent first, then the matching shaded management artifact, one host/control
+node at a time, with fresh Kubernetes and CloudStack gates at every step.
+
+#### Decision
+
+**Exact decision: NO_GO.** Do not retry Fluffy while the mandatory Snape/Salazar
+consistency gate remains blocked in §16.1–§16.7. No artifact was deployed by
+this RCA, no host/API/DB write was made, and no Kubernetes or migration action
+was attempted. Rollback evidence is the restored `.32` hash above and the
+authoritative host state `Up`.
+
 **End of tracker.**
