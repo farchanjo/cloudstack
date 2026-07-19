@@ -25,10 +25,8 @@ import java.util.List;
 import org.junit.Test;
 
 import com.cloud.host.Host;
-import com.cloud.network.NetworkVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
-import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.vm.dao.NicDao;

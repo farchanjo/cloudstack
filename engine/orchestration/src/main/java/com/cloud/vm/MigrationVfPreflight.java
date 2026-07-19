@@ -27,9 +27,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.Host;
-import com.cloud.network.NetworkVO;
 import com.cloud.network.ovn.OvnChassisLookup;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;

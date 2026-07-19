@@ -31,7 +31,6 @@ import com.cloud.network.router.MigrationPreflightService;
 import com.cloud.service.dao.ServiceOfferingDao;
 import com.cloud.vm.dao.VMInstanceDao;
 import com.cloud.vm.dao.NicDao;
-import com.cloud.vm.NicVO;
 
 @Component
 public class MigrationPreflightServiceImpl implements MigrationPreflightService {
