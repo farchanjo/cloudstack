@@ -62,6 +62,12 @@ public class HostVfPurgeOrphansCommand extends Command {
     /** Optional expected guest MAC per target BDF; mismatches fail closed. */
     private Map<String, String> expectedMacsByPciBdf = new HashMap<>();
 
+    /** Exact representor expected for each target; never delete a shared port. */
+    private Map<String, String> expectedRepresentorsByPciBdf = new HashMap<>();
+
+    /** Exact OVN iface-id expected for each target representor. */
+    private Map<String, String> expectedInterfaceIdsByPciBdf = new HashMap<>();
+
     /** Operation id used to bind explicit lifecycle authorization per BDF. */
     private Map<String, String> ownerOperationIdsByPciBdf = new HashMap<>();
 
@@ -134,6 +140,30 @@ public class HostVfPurgeOrphansCommand extends Command {
     public void setExpectedMacsByPciBdf(final Map<String, String> expectedMacsByPciBdf) {
         this.expectedMacsByPciBdf = expectedMacsByPciBdf == null
                 ? new HashMap<>() : new HashMap<>(expectedMacsByPciBdf);
+    }
+
+    public Map<String, String> getExpectedRepresentorsByPciBdf() {
+        return expectedRepresentorsByPciBdf == null ? Collections.emptyMap() : expectedRepresentorsByPciBdf;
+    }
+
+    public void setExpectedRepresentorsByPciBdf(final Map<String, String> values) {
+        expectedRepresentorsByPciBdf = values == null ? new HashMap<>() : new HashMap<>(values);
+    }
+
+    public Map<String, String> getExpectedInterfaceIdsByPciBdf() {
+        return expectedInterfaceIdsByPciBdf == null ? Collections.emptyMap() : expectedInterfaceIdsByPciBdf;
+    }
+
+    public void setExpectedInterfaceIdsByPciBdf(final Map<String, String> values) {
+        expectedInterfaceIdsByPciBdf = values == null ? new HashMap<>() : new HashMap<>(values);
+    }
+
+    public String getExpectedRepresentor(final String bdf) {
+        return valueForBdf(getExpectedRepresentorsByPciBdf(), bdf);
+    }
+
+    public String getExpectedInterfaceId(final String bdf) {
+        return valueForBdf(getExpectedInterfaceIdsByPciBdf(), bdf);
     }
 
     public Map<String, String> getOwnerOperationIdsByPciBdf() {

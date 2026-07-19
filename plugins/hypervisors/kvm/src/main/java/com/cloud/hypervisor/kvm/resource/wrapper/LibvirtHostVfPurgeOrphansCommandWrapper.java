@@ -174,12 +174,14 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                     "inactive persistent domain references target; STAGE_ROLLBACK authorization required");
         }
         observation.setLifecycleAuthorizationUsed(tokenValid);
-        return cleanupTarget(bdf, observation, vdpa.byBdf.get(bdf));
+        return cleanupTarget(bdf, observation, vdpa.byBdf.get(bdf),
+                cmd.getExpectedRepresentor(bdf), cmd.getExpectedInterfaceId(bdf));
     }
 
     /** Executes the real target mutation path; tests inject only the environment. */
     TargetResult cleanupTarget(final String bdf, final TargetResult observation,
-                               final List<String> vdpaNames) {
+                               final List<String> vdpaNames, final String expectedRepresentor,
+                               final String expectedInterfaceId) {
         boolean vdpaRemoved = false;
         boolean representorRemoved = false;
         boolean rebound = false;
@@ -196,13 +198,14 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 }
             }
 
+            final String representor = StringUtils.isNotBlank(expectedRepresentor)
+                    ? expectedRepresentor : VfPassthroughVifDriver.lookupRepresentor(
+                            bdf, environment.pciDevices, environment.netClass);
+            if (representor != null) {
+                removeRepresentorChecked(representor, expectedInterfaceId);
+                representorRemoved = true;
+            }
             if (observation.isDevicePresent()) {
-                final String representor = VfPassthroughVifDriver.lookupRepresentor(
-                        bdf, environment.pciDevices, environment.netClass);
-                if (representor != null) {
-                    removeRepresentorChecked(representor);
-                    representorRemoved = true;
-                }
                 final Path driver = environment.pciDevices.resolve(bdf).resolve("driver");
                 if (DRV_VFIO.equals(currentDriverOf(driver))) {
                     rebindOne(bdf);
@@ -248,13 +251,16 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 mac.mac, binding, driver, first(vdpaNames), references, complete, mac.status);
     }
 
-    private void removeRepresentorChecked(final String representor) {
-        requireSuccess(environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "clear",
-                "Interface", representor, "external_ids"), "clear OVS external_ids for " + representor);
+    private void removeRepresentorChecked(final String representor, final String expectedInterfaceId) {
         final CommandResult port = environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "get",
                 "Port", representor, "name");
         requireSuccess(port, "observe OVS port " + representor);
         if (StringUtils.isNotBlank(port.output)) {
+            if (StringUtils.isNotBlank(expectedInterfaceId) && !hasInterfaceId(representor, expectedInterfaceId)) {
+                throw new IllegalStateException("OVS representor ownership does not match expected iface-id for " + representor);
+            }
+            requireSuccess(environment.runner.run("/usr/bin/ovs-vsctl", "--if-exists", "clear",
+                    "Interface", representor, "external_ids"), "clear OVS external_ids for " + representor);
             final CommandResult bridge = environment.runner.run("/usr/bin/ovs-vsctl", "port-to-br", representor);
             if (!bridge.success || StringUtils.isBlank(bridge.output)) {
                 throw new IllegalStateException("cannot resolve exact OVS bridge for " + representor);
@@ -272,6 +278,21 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         if (!postPort.success || StringUtils.isNotBlank(postPort.output)) {
             throw new IllegalStateException("OVS port removal postcondition unavailable for " + representor);
         }
+    }
+
+    private boolean hasInterfaceId(final String representor, final String expectedInterfaceId) {
+        final CommandResult ids = environment.runner.run("/usr/bin/ovs-vsctl", "get", "Interface", representor,
+                "external_ids:iface-id");
+        return ids.success && expectedInterfaceId.equals(unquote(ids.output));
+    }
+
+    private String unquote(final String value) {
+        if (value == null) {
+            return null;
+        }
+        final String trimmed = value.trim();
+        return trimmed.length() >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")
+                ? trimmed.substring(1, trimmed.length() - 1) : trimmed;
     }
 
     private void clearVfIdentityExact(final String bdf) {

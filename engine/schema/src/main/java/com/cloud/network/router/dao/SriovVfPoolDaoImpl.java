@@ -504,19 +504,24 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
 
     @Override
     public int quarantineByVmId(final long vmId) {
-        return Transaction.execute(new TransactionCallback<Integer>() {
+        return quarantineAndListByVmId(vmId).size();
+    }
+
+    @Override
+    public List<SriovVfPoolVO> quarantineAndListByVmId(final long vmId) {
+        return Transaction.execute(new TransactionCallback<List<SriovVfPoolVO>>() {
             @Override
-            public Integer doInTransaction(TransactionStatus status) {
+            public List<SriovVfPoolVO> doInTransaction(TransactionStatus status) {
                 lockVm(vmId);
                 final Map<Long, Long> nics = lockVmNics(vmId);
                 final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(nics);
-                int affected = 0;
+                final List<SriovVfPoolVO> affected = new ArrayList<>();
                 for (final List<SriovVfPoolVO> rows : rowsByNic.values()) {
                     for (final SriovVfPoolVO row : rows) {
                         if (State.ALLOCATED.name().equals(row.getState())
                                 || State.RESERVED.name().equals(row.getState())) {
                             markSuspectLocked(row);
-                            affected++;
+                            affected.add(row);
                         }
                     }
                 }

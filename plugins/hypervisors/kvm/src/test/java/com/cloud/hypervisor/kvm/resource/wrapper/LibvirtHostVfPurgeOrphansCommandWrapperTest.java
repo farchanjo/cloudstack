@@ -277,6 +277,36 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
     }
 
     @Test
+    public void staleRepresentorIsRemovedOnlyWhenExactIfaceIdMatches() throws Exception {
+        final FakeHost host = preparedHost("stale-representor");
+        host.ovsIfaceId = "lsp-nic-980";
+        final HostVfPurgeOrphansCommand command = command(false);
+        authorize(command, "op-stale", "LIFECYCLE_RELEASE");
+        command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, "lsp-nic-980"));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command);
+
+        assertTrue(answer.getResult());
+        assertTrue(host.removedRepresentors.contains("dx6p1vf24"));
+    }
+
+    @Test
+    public void sharedRepresentorIsNotRemovedWhenIfaceIdDoesNotMatch() throws Exception {
+        final FakeHost host = preparedHost("shared-representor");
+        host.ovsIfaceId = "lsp-other-nic";
+        final HostVfPurgeOrphansCommand command = command(false);
+        authorize(command, "op-shared", "LIFECYCLE_RELEASE");
+        command.setExpectedRepresentorsByPciBdf(Collections.singletonMap(BDF, "dx6p1vf24"));
+        command.setExpectedInterfaceIdsByPciBdf(Collections.singletonMap(BDF, "lsp-nic-980"));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command);
+
+        assertFalse(answer.getResult());
+        assertTrue(host.removedRepresentors.isEmpty());
+    }
+
+    @Test
     public void parsersSelectExactVfAndHostdev() {
         final String output = "vf 5 link/ether 02:00:00:00:00:05 spoof checking off\n"
                 + "vf 24 link/ether 02:00:00:00:00:24 spoof checking off\n";
@@ -352,6 +382,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         private boolean identityClearFails;
         private boolean macReadFails;
         private boolean macOutputMissing;
+        private String ovsIfaceId;
 
         private FakeHost(final Path root) throws Exception {
             pciDevices = Files.createDirectories(root.resolve("bus/pci/devices"));
@@ -428,6 +459,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 if (value.contains(" get Port ")) {
                     final String representor = command[command.length - 2];
                     return CommandResult.success(removedRepresentors.contains(representor) ? "" : representor);
+                }
+                if (value.contains(" get Interface ") && value.contains("external_ids:iface-id")) {
+                    return CommandResult.success(ovsIfaceId == null ? "" : "\"" + ovsIfaceId + "\"");
                 }
                 if (value.contains(" port-to-br ")) {
                     return CommandResult.success("br-bond");

@@ -17,6 +17,7 @@
 package com.cloud.network.router;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -117,6 +118,36 @@ public class VfPoolOwnershipLifecycleTest {
 
         verify(vfPoolDao).releaseExact(833L, NIC_ID);
         verify(vfPoolDao, never()).releaseByNicId(NIC_ID);
+    }
+
+    @Test
+    public void expungeCleansRowWhenNicVfMappingIsAlreadyNull() throws Exception {
+        final NicVO nic = nic();
+        final SriovVfPoolVO row = row(980L, SOURCE_HOST, "0000:01:04.1", State.ALLOCATED, NIC_ID);
+        when(nic.getMacAddress()).thenReturn("02:04:02:a6:00:01");
+        when(nic.getUuid()).thenReturn("db91cde8-e9ab-4f0a-a6f1-37f562be2536");
+        when(nicDao.findByIdIncludingRemoved(NIC_ID)).thenReturn(nic);
+        when(vfPoolDao.quarantineAndListByVmId(VM_ID)).thenReturn(Collections.singletonList(row));
+        when(agentManager.send(eq(SOURCE_HOST), any(HostVfPurgeOrphansCommand.class)))
+                .thenReturn(successAnswer("0000:01:04.1", "ABSENT", null, null,
+                        "vm-release-" + VM_ID, "LIFECYCLE_RELEASE", NIC_ID));
+        when(vfPoolDao.releaseExact(980L, NIC_ID)).thenReturn(true);
+
+        assertEquals(1, manager.quarantineByVmId(VM_ID));
+
+        verify(vfPoolDao).releaseExact(980L, NIC_ID);
+        verify(vfPoolDao, never()).releaseByNicId(NIC_ID);
+    }
+
+    @Test
+    public void repeatedVmCleanupIsIdempotentAndDoesNotReleaseUnknownRows() {
+        when(vfPoolDao.quarantineAndListByVmId(VM_ID))
+                .thenReturn(Collections.emptyList(), Collections.emptyList());
+
+        assertEquals(0, manager.quarantineByVmId(VM_ID));
+        assertEquals(0, manager.quarantineByVmId(VM_ID));
+
+        verify(vfPoolDao, never()).releaseExact(anyLong(), anyLong());
     }
 
     private static NicVO nic() {

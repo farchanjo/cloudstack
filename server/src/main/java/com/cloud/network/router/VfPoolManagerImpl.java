@@ -237,7 +237,7 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
     private boolean cleanupAndRelease(final SriovVfPoolVO row, final long nicId,
                                       final String operationId, final String purpose) {
         if (row.getPciAddress() == null || !targetedCleanupSucceeded(
-                row.getHostId(), row.getPciAddress(), nicId, operationId, purpose)) {
+                row.getHostId(), row.getPciAddress(), row.getRepresentorName(), nicId, operationId, purpose)) {
             vfPoolDao.markSuspect(row.getId(), nicId);
             LOGGER.warn("VF pool row {} host={} pci={} remains SUSPECT: exact agent cleanup was not confirmed",
                     row.getId(), row.getHostId(), row.getPciAddress());
@@ -250,7 +250,8 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         return true;
     }
 
-    private boolean targetedCleanupSucceeded(final long hostId, final String pciBdf, final long nicId,
+    private boolean targetedCleanupSucceeded(final long hostId, final String pciBdf, final String representorName,
+                                             final long nicId,
                                              final String operationId, final String purpose) {
         final NicVO nic = nicDao.findByIdIncludingRemoved(nicId);
         if (nic == null || nic.getMacAddress() == null) {
@@ -259,6 +260,10 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
         final HostVfPurgeOrphansCommand cmd = new HostVfPurgeOrphansCommand();
         cmd.setTargetPciBdfs(java.util.Collections.singleton(pciBdf));
         cmd.setExpectedMacsByPciBdf(java.util.Collections.singletonMap(pciBdf, nic.getMacAddress()));
+        cmd.setExpectedRepresentorsByPciBdf(java.util.Collections.singletonMap(pciBdf, representorName));
+        if (nic.getUuid() != null) {
+            cmd.setExpectedInterfaceIdsByPciBdf(java.util.Collections.singletonMap(pciBdf, "lsp-" + nic.getUuid()));
+        }
         final String safeOperationId = operationId == null ? "vf-operation-" + nicId : operationId;
         cmd.setOwnerOperationIdsByPciBdf(java.util.Collections.singletonMap(pciBdf, safeOperationId));
         cmd.setOwnerPurposesByPciBdf(java.util.Collections.singletonMap(pciBdf, purpose));
@@ -320,12 +325,19 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     @Override
     public int quarantineByVmId(long vmId) {
-        int affected = vfPoolDao.quarantineByVmId(vmId);
-        if (affected > 0) {
-            LOGGER.warn("Quarantined {} VF row(s) for VM {}; exact cleanup evidence is required before FREE",
-                    affected, vmId);
+        final List<SriovVfPoolVO> rows = vfPoolDao.quarantineAndListByVmId(vmId);
+        int released = 0;
+        for (final SriovVfPoolVO row : rows) {
+            if (row.getAllocatedToNicId() != null && cleanupAndRelease(
+                    row, row.getAllocatedToNicId(), "vm-release-" + vmId, "LIFECYCLE_RELEASE")) {
+                released++;
+            }
         }
-        return affected;
+        if (rows.size() > released) {
+            LOGGER.warn("VM {} VF cleanup completed {}/{} rows; unresolved rows remain SUSPECT",
+                    vmId, released, rows.size());
+        }
+        return released;
     }
 
     @Override
@@ -631,7 +643,7 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
     private void applyApprovedCandidate(final VfOwnershipRepairPlan plan,
                                         final VfOwnershipRepairPlan.Candidate candidate) {
         if (!targetedCleanupSucceeded(candidate.getStaleHostId(), candidate.getStaleBdf(),
-                candidate.getNicId(), plan.getHash(), "RECONCILE")) {
+                null, candidate.getNicId(), plan.getHash(), "RECONCILE")) {
             LOGGER.error("Approved VF repair candidate {} remains SUSPECT after unconfirmed cleanup", candidate.getId());
             return;
         }

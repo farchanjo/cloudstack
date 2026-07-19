@@ -113,6 +113,14 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     int quarantineByVmId(long vmId);
 
     /**
+     * Atomically marks VM-owned allocated/reserved rows SUSPECT and returns
+     * the locked rows so the caller can perform exact host cleanup. Includes
+     * NICs already soft-removed from the database and rows whose reverse
+     * {@code nics.vf_pool_id} mapping is null.
+     */
+    List<SriovVfPoolVO> quarantineAndListByVmId(long vmId);
+
+    /**
      * Mark ALLOCATED VFs SUSPECT when their NIC or VM has been removed. Exact
      * agent cleanup must be confirmed before a row becomes FREE.
      */
