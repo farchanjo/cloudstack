@@ -16,9 +16,16 @@
 // under the License.
 package com.cloud.network.ovn;
 
+import java.util.Map;
+
 /** Read-only management-side port for resolving a CloudStack host's OVN chassis. */
 public interface OvnChassisLookup {
 
     /** @return the registered chassis UUID, or {@code null} when unregistered. */
     String findChassisUuid(long hostId);
+
+    /** Resolves the configured requested-chassis policy without writing OVN state. */
+    default String resolveRequestedChassis(final Map<String, String> vmDetails) {
+        return vmDetails == null ? null : vmDetails.get("ovn.requested_chassis");
+    }
 }

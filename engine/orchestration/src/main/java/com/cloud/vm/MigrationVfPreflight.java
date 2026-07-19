@@ -135,8 +135,10 @@ public class MigrationVfPreflight {
     }
 
     private void validateRequestedChassis(final VirtualMachineProfile profile, final Host destination) {
-        final String requested = profile.getVirtualMachine().getDetails() == null ? null
-                : profile.getVirtualMachine().getDetails().get("ovn.requested_chassis");
+        final String requested = chassisLookup == null
+                ? (profile.getVirtualMachine().getDetails() == null ? null
+                : profile.getVirtualMachine().getDetails().get("ovn.requested_chassis"))
+                : chassisLookup.resolveRequestedChassis(profile.getVirtualMachine().getDetails());
         if (requested == null || requested.isBlank()) {
             return;
         }

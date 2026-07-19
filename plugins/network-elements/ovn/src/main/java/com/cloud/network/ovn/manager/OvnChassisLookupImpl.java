@@ -21,6 +21,8 @@ import javax.inject.Inject;
 import org.springframework.stereotype.Component;
 
 import com.cloud.network.ovn.OvnChassisLookup;
+import com.cloud.network.ovn.config.OvnNicConfig;
+import com.cloud.network.ovn.config.OvnNicTunables;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
 
 /** Database-backed read adapter; it performs no OVN writes. */
@@ -38,5 +40,11 @@ public class OvnChassisLookupImpl implements OvnChassisLookup {
     public String findChassisUuid(final long hostId) {
         final var row = chassisMapDao.findByHostId(hostId);
         return row == null ? null : row.getChassisUuid();
+    }
+
+    @Override
+    public String resolveRequestedChassis(final java.util.Map<String, String> vmDetails) {
+        return OvnNicTunables.resolve(OvnNicTunables.OVN_REQUESTED_CHASSIS,
+                vmDetails, null, null, OvnNicConfig.RequestedChassis.value(), String.class);
     }
 }

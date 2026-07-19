@@ -27,6 +27,7 @@ import org.junit.Test;
 import com.cloud.host.Host;
 import com.cloud.network.NetworkVO;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.ovn.OvnChassisLookup;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
@@ -149,5 +150,30 @@ public class MigrationVfPreflightTest {
         when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(1);
 
         preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.COLD);
+    }
+
+    @Test
+    public void rejectsRequestedChassisMismatch() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final Host host = mock(Host.class);
+        final NicProfile nic = mock(NicProfile.class);
+        final NetworkVO network = mock(NetworkVO.class);
+        final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
+        final OvnChassisLookup lookup = mock(OvnChassisLookup.class);
+        preflight.setChassisLookup(lookup);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.getDetails()).thenReturn(java.util.Map.of("ovn.requested_chassis", "source-chassis"));
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(networkDao.findById(NETWORK_ID)).thenReturn(network);
+        when(network.getNetworkOfferingId()).thenReturn(11L);
+        when(networkOfferingDao.findById(11L)).thenReturn(offering);
+        when(offering.isVdpaEnabled()).thenReturn(true);
+        when(host.getId()).thenReturn(HOST_ID);
+        when(lookup.resolveRequestedChassis(vm.getDetails())).thenReturn("source-chassis");
+        when(lookup.findChassisUuid(HOST_ID)).thenReturn("destination-chassis");
+
+        assertThrows(CloudRuntimeException.class, () -> preflight.verify(profile, host));
     }
 }
