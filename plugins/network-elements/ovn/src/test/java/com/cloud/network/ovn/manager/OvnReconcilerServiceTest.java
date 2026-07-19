@@ -148,7 +148,7 @@ public class OvnReconcilerServiceTest {
         final NatSweepFixture f = natSweepFixture();
         // Return an empty list for NAT (no legacy rows) — LB rows are never
         // queried.
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of());
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of());
         invokePrivate(f.service, "sweepLegacyPortForwardingNat", f.nb, f.controller, false, f.out);
 
         assertEquals(0, f.out.totalOrphans());
@@ -161,7 +161,7 @@ public class OvnReconcilerServiceTest {
         // Even if a PF mapping is transiently absent, the sweep queries NAT
         // only — it cannot discover or delete the LB row.
         final NatSweepFixture f = natSweepFixture();
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of());
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of());
         when(f.mappingDao.findByOvnUuid(any())).thenReturn(null);
         invokePrivate(f.service, "sweepLegacyPortForwardingNat", f.nb, f.controller, false, f.out);
 
@@ -176,7 +176,7 @@ public class OvnReconcilerServiceTest {
         final NatSweepFixture f = natSweepFixture();
         final String natUuid = "nat-legacy-pf-1431";
         final String lbUuid = "lb-current-pf-1431";
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of(natUuid));
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of(natUuid));
         final OvnLogicalIdMapVO migratedMapping = new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, 1431L, 1L,
                 lbUuid, "cs-pf-1431");
         when(f.mappingDao.findByOvnUuid(natUuid)).thenReturn(migratedMapping);
@@ -193,7 +193,7 @@ public class OvnReconcilerServiceTest {
         // will migrate it. Leave it.
         final NatSweepFixture f = natSweepFixture();
         final String natUuid = "nat-legacy-pf-1431";
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of(natUuid));
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of(natUuid));
         final OvnLogicalIdMapVO natMapping = new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, 1431L, 1L,
                 natUuid, "cs-pf-1431");
         when(f.mappingDao.findByOvnUuid(natUuid)).thenReturn(natMapping);
@@ -210,7 +210,7 @@ public class OvnReconcilerServiceTest {
         // inert NAT row.
         final NatSweepFixture f = natSweepFixture();
         final String natUuid = "nat-legacy-pf-9999";
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of(natUuid));
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of(natUuid));
         when(f.mappingDao.findByOvnUuid(natUuid)).thenReturn(null);
         invokePrivate(f.service, "sweepLegacyPortForwardingNat", f.nb, f.controller, false, f.out);
 
@@ -223,7 +223,7 @@ public class OvnReconcilerServiceTest {
         final NatSweepFixture f = natSweepFixture();
         final String natUuid = "nat-legacy-pf-1431";
         final String lbUuid = "lb-current-pf-1431";
-        when(f.nb.findUuidsByExternalIds("NAT", any(), any())).thenReturn(List.of(natUuid));
+        when(f.nb.findUuidsByExternalIds(eq("NAT"), any(), any())).thenReturn(List.of(natUuid));
         final OvnLogicalIdMapVO migratedMapping = new OvnLogicalIdMapVO(Kind.PORT_FORWARDING, 1431L, 1L,
                 lbUuid, "cs-pf-1431");
         when(f.mappingDao.findByOvnUuid(natUuid)).thenReturn(migratedMapping);

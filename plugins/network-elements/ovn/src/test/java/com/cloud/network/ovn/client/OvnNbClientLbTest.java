@@ -601,13 +601,15 @@ public class OvnNbClientLbTest {
         assertNull("missing LR row must return null, not empty map", options);
     }
 
-    @Test
-    public void readLogicalRouterOptionsReturnsNullWhenReplyNull() throws Exception {
+    @Test(expected = OvnException.class)
+    public void readLogicalRouterOptionsPropagatesOvnExceptionWhenReplyNull() throws Exception {
+        // OvnTransaction.commit() rejects a null reply before the reader can
+        // return null — the fail-closed transport semantics the scoped VPC
+        // reconciler relies on. A null pool.call result propagates as
+        // OvnException, NOT a silent null return.
         when(pool.call(anyString(), any())).thenReturn(null);
 
-        final Map<String, String> options = client.readLogicalRouterOptionsPublic("lr-null");
-
-        assertNull("null reply must return null", options);
+        client.readLogicalRouterOptionsPublic("lr-null");
     }
 
     @Test
