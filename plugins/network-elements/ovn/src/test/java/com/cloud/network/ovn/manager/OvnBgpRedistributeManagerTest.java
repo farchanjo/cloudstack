@@ -43,6 +43,9 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
 import com.cloud.agent.api.OvnBgpAnnounceAnswer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.host.HostVO;
+import com.cloud.host.Status;
+import com.cloud.host.dao.HostDao;
 import com.cloud.network.IpAddress;
 import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
@@ -82,6 +85,7 @@ public class OvnBgpRedistributeManagerTest {
     private OvnPublicNetworkManager publicNetworkManager;
     private IPAddressDao ipAddressDao;
     private FirewallRulesDao firewallRulesDao;
+    private HostDao hostDao;
     private OvnNbClient nbClient;
     private OvnBgpRedistributeManager manager;
 
@@ -94,6 +98,7 @@ public class OvnBgpRedistributeManagerTest {
         publicNetworkManager = mock(OvnPublicNetworkManager.class);
         ipAddressDao = mock(IPAddressDao.class);
         firewallRulesDao = mock(FirewallRulesDao.class);
+        hostDao = mock(HostDao.class);
         nbClient = mock(OvnNbClient.class);
 
         final OvnControllerVO controller = mock(OvnControllerVO.class);
@@ -113,6 +118,7 @@ public class OvnBgpRedistributeManagerTest {
         final OvnChassisMapVO chassisRow = mock(OvnChassisMapVO.class);
         when(chassisRow.getHostId()).thenReturn(HOST_ID);
         when(chassisMapDao.findByChassisUuid(CHASSIS_NAME)).thenReturn(chassisRow);
+        registerUpHost(HOST_ID);
 
         // Default: no remaining SNAT/StaticNat/LB/PF users so withdraw is free.
         when(ipAddressDao.findById(anyLong())).thenReturn(null);
@@ -126,6 +132,7 @@ public class OvnBgpRedistributeManagerTest {
         injectField(manager, "publicNetworkManager", publicNetworkManager);
         injectField(manager, "ipAddressDao", ipAddressDao);
         injectField(manager, "firewallRulesDao", firewallRulesDao);
+        injectField(manager, "hostDao", hostDao);
     }
 
     @Test
@@ -357,6 +364,9 @@ public class OvnBgpRedistributeManagerTest {
     @Test
     public void announceLbOnlyAnycastsOnBackendHypervisors() {
         when(publicNetworkManager.isBgpRedistributeEnabled(VPC_ID)).thenReturn(true);
+        registerUpHost(31L);
+        registerUpHost(32L);
+        registerUpHost(33L);
         manager = spy(manager);
         doReturn(true).when(manager).isLbOnlyPublicIp(IP_ADDR_ID);
         doReturn(List.of(31L, 32L, 33L)).when(manager).resolveLbBackendHostIds(IP_ADDR_ID);
@@ -440,5 +450,11 @@ public class OvnBgpRedistributeManagerTest {
         final Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    private void registerUpHost(final long hostId) {
+        final HostVO host = mock(HostVO.class);
+        when(host.getStatus()).thenReturn(Status.Up);
+        when(hostDao.findById(hostId)).thenReturn(host);
     }
 }

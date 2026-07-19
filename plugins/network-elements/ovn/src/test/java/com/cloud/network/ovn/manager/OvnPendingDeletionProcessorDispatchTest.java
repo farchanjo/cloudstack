@@ -53,6 +53,7 @@ public class OvnPendingDeletionProcessorDispatchTest {
     private OvnPendingDeletionDao pendingDeletionDao;
     private OvnLogicalIdMapDao logicalIdMapDao;
     private OvnPluginManager pluginManager;
+    private OvnReconcileLeader reconcileLeader;
     private AlertManager alertManager;
     private OvnNbClient nbClient;
     private OvnControllerVO controller;
@@ -64,6 +65,7 @@ public class OvnPendingDeletionProcessorDispatchTest {
         pendingDeletionDao = mock(OvnPendingDeletionDao.class);
         logicalIdMapDao = mock(OvnLogicalIdMapDao.class);
         pluginManager = mock(OvnPluginManager.class);
+        reconcileLeader = mock(OvnReconcileLeader.class);
         alertManager = mock(AlertManager.class);
         nbClient = mock(OvnNbClient.class);
         controller = mock(OvnControllerVO.class);
@@ -72,6 +74,7 @@ public class OvnPendingDeletionProcessorDispatchTest {
         when(controller.getZoneId()).thenReturn(ZONE_ID);
         when(controllerDao.listAll()).thenReturn(List.of(controller));
         when(pluginManager.nbClient(ZONE_ID)).thenReturn(nbClient);
+        when(reconcileLeader.isLeader()).thenReturn(true);
         when(pendingDeletionDao.findAllSentinels(anyInt())).thenReturn(List.of());
 
         processor = new OvnPendingDeletionProcessor();
@@ -79,6 +82,7 @@ public class OvnPendingDeletionProcessorDispatchTest {
         inject(processor, "pendingDeletionDao", pendingDeletionDao);
         inject(processor, "logicalIdMapDao", logicalIdMapDao);
         inject(processor, "pluginManager", pluginManager);
+        inject(processor, "reconcileLeader", reconcileLeader);
         inject(processor, "alertManager", alertManager);
     }
 

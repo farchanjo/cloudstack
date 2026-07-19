@@ -37,6 +37,7 @@ import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO.Kind;
+import com.cloud.network.ovn.dao.OvnPendingDeletionDao;
 import com.cloud.network.ovn.manager.OvnPluginManager;
 import com.cloud.network.vpc.Vpc;
 
@@ -44,6 +45,7 @@ public class OvnVpcElementTest {
 
     private OvnPluginManager pluginManager;
     private OvnLogicalIdMapDao logicalIdMapDao;
+    private OvnPendingDeletionDao pendingDeletionDao;
     private OvnNbClient nbClient;
     private OvnControllerVO controller;
     private OvnVpcElement element;
@@ -52,6 +54,7 @@ public class OvnVpcElementTest {
     public void setUp() throws Exception {
         pluginManager = mock(OvnPluginManager.class);
         logicalIdMapDao = mock(OvnLogicalIdMapDao.class);
+        pendingDeletionDao = mock(OvnPendingDeletionDao.class);
         nbClient = mock(OvnNbClient.class);
         controller = mock(OvnControllerVO.class);
         when(controller.getId()).thenReturn(1L);
@@ -61,6 +64,7 @@ public class OvnVpcElementTest {
         element = new OvnVpcElement();
         injectField(element, "pluginManager", pluginManager);
         injectField(element, "logicalIdMapDao", logicalIdMapDao);
+        injectField(element, "pendingDeletionDao", pendingDeletionDao);
     }
 
     @Test
@@ -85,6 +89,7 @@ public class OvnVpcElementTest {
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
         when(existing.getOvnUuid()).thenReturn("existing-uuid");
         when(logicalIdMapDao.findByCsId(any(Kind.class), anyLong(), anyLong())).thenReturn(existing);
+        when(nbClient.rowExistsByUuid("Logical_Router", "existing-uuid")).thenReturn(true);
 
         final Vpc vpc = mock(Vpc.class);
         when(vpc.getId()).thenReturn(42L);
@@ -103,7 +108,7 @@ public class OvnVpcElementTest {
         final OvnLogicalIdMapVO existing = mock(OvnLogicalIdMapVO.class);
         when(existing.getId()).thenReturn(99L);
         when(existing.getOvnUuid()).thenReturn("delete-me-uuid");
-        when(logicalIdMapDao.findByCsId(any(Kind.class), anyLong(), anyLong())).thenReturn(existing);
+        when(logicalIdMapDao.findByCsId(Kind.VPC, 42L, 1L)).thenReturn(existing);
 
         final Vpc vpc = mock(Vpc.class);
         when(vpc.getId()).thenReturn(42L);

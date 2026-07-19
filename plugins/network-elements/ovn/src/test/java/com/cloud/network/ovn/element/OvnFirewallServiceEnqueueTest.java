@@ -102,7 +102,7 @@ public class OvnFirewallServiceEnqueueTest {
     @Test
     public void revokeOne_enqueuesAclUuid_thenMarksSucceeded_onSyncSuccess() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID), eq(NETWORK_ID)))
                 .thenReturn(aclMapping);
         when(pendingDeletionDao.isPendingByOvnUuid(ACL_UUID, "NETWORK_ACL")).thenReturn(false);
 
@@ -119,7 +119,7 @@ public class OvnFirewallServiceEnqueueTest {
     @Test
     public void revokeOne_leavesQueueRow_onSyncFailure() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID), eq(NETWORK_ID)))
                 .thenReturn(aclMapping);
         when(pendingDeletionDao.isPendingByOvnUuid(ACL_UUID, "NETWORK_ACL")).thenReturn(false);
         doThrow(new OvnException("ovsdb timeout"))
@@ -141,7 +141,7 @@ public class OvnFirewallServiceEnqueueTest {
     @Test
     public void revokeOne_skipsEnqueue_whenAlreadyPending() throws ResourceUnavailableException {
         final OvnLogicalIdMapVO aclMapping = aclMappingFor(ACL_UUID);
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID), eq(NETWORK_ID)))
                 .thenReturn(aclMapping);
         when(pendingDeletionDao.isPendingByOvnUuid(ACL_UUID, "NETWORK_ACL")).thenReturn(true);
 
@@ -157,7 +157,7 @@ public class OvnFirewallServiceEnqueueTest {
      */
     @Test
     public void revokeOne_isNoOp_whenNoMapping() throws ResourceUnavailableException {
-        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID)))
+        when(logicalIdMapDao.findByCsId(eq(Kind.NETWORK_ACL), eq(RULE_ID), eq(CONTROLLER_ID), eq(NETWORK_ID)))
                 .thenReturn(null);
 
         service.applyNetworkACLs(network, List.of(revokeRule(RULE_ID)));

@@ -40,6 +40,7 @@ import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.ovn.client.OvnException;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
+import com.cloud.network.ovn.dao.OvnChassisMapVO;
 import com.cloud.network.ovn.dao.OvnControllerVO;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapDao;
 import com.cloud.network.ovn.dao.OvnLogicalIdMapVO;
@@ -64,6 +65,7 @@ public class OvnPublicNetworkManagerRspTest {
     private static final String LR_UUID = "lr-uuid";
     private static final String LRP_UUID = "lrp-uuid";
     private static final String RSP_UUID = "rsp-uuid";
+    private static final String CHASSIS_UUID = "chassis-uuid-21";
 
     private OvnPluginManager pluginManager;
     private OvnLogicalIdMapDao logicalIdMapDao;
@@ -87,6 +89,8 @@ public class OvnPublicNetworkManagerRspTest {
         when(controller.getId()).thenReturn(CONTROLLER_ID);
         when(pluginManager.findControllerForZone(ZONE_ID)).thenReturn(controller);
         when(pluginManager.nbClient(ZONE_ID)).thenReturn(nbClient);
+        when(chassisMapDao.listByController(CONTROLLER_ID))
+                .thenReturn(List.of(new OvnChassisMapVO(21L, CONTROLLER_ID, CHASSIS_UUID)));
         // Auto-detect VLAN chain (ovn.public.vlan.auto defaults to true) must
         // not NPE — no Public networks in this zone -> auto-detect no-ops.
         when(networkDao.listByZoneAndTrafficType(ZONE_ID, TrafficType.Public)).thenReturn(List.of());

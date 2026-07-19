@@ -36,6 +36,9 @@ import org.mockito.ArgumentCaptor;
 import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.OvnBgpAnnounceAnswer;
 import com.cloud.agent.api.OvnBgpAnnounceCommand;
+import com.cloud.host.HostVO;
+import com.cloud.host.Status;
+import com.cloud.host.dao.HostDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.ovn.client.OvnNbClient;
 import com.cloud.network.ovn.dao.OvnChassisMapDao;
@@ -76,6 +79,7 @@ public class OvnBgpRedistributeManagerV6Test {
     private OvnLogicalIdMapDao logicalIdMapDao;
     private OvnChassisMapDao chassisMapDao;
     private OvnPublicNetworkManager publicNetworkManager;
+    private HostDao hostDao;
     private OvnNbClient nbClient;
     private OvnBgpRedistributeManager manager;
 
@@ -86,6 +90,7 @@ public class OvnBgpRedistributeManagerV6Test {
         logicalIdMapDao = mock(OvnLogicalIdMapDao.class);
         chassisMapDao = mock(OvnChassisMapDao.class);
         publicNetworkManager = mock(OvnPublicNetworkManager.class);
+        hostDao = mock(HostDao.class);
         nbClient = mock(OvnNbClient.class);
 
         final OvnControllerVO controller = mock(OvnControllerVO.class);
@@ -101,6 +106,9 @@ public class OvnBgpRedistributeManagerV6Test {
         final OvnChassisMapVO chassisRow = mock(OvnChassisMapVO.class);
         when(chassisRow.getHostId()).thenReturn(HOST_ID);
         when(chassisMapDao.findByChassisUuid(CHASSIS_NAME)).thenReturn(chassisRow);
+        final HostVO host = mock(HostVO.class);
+        when(host.getStatus()).thenReturn(Status.Up);
+        when(hostDao.findById(HOST_ID)).thenReturn(host);
 
         manager = spy(new OvnBgpRedistributeManager());
         injectField(manager, "agentManager", agentManager);
@@ -109,6 +117,7 @@ public class OvnBgpRedistributeManagerV6Test {
         injectField(manager, "chassisMapDao", chassisMapDao);
         injectField(manager, "publicNetworkManager", publicNetworkManager);
         injectField(manager, "ipAddressDao", mock(IPAddressDao.class));
+        injectField(manager, "hostDao", hostDao);
     }
 
     @Test
