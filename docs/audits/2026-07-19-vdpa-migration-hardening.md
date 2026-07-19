@@ -331,12 +331,15 @@ tracker records **HA crash-restart = NO-GO**.
 ### 7.2 Wrapper / XML tests
 
 - `LibvirtMigrateCommandWrapperTest`: `replaceVdpaInterfaces` rewrites dest
-  `/dev/vhost-vdpa-N` for every vDPA interface; missing mapping leaves XML
-  unchanged + warns (current behavior preserved).
+  `/dev/vhost-vdpa-N` for every vDPA interface; missing or partial mappings
+  throw and never retain a source vDPA path.
 - `LibvirtPrepareForMigrationCommandWrapperTest`: dest vDPA device captured
   into `vdpaInterfaceMapping` for each vDPA NIC.
 - `LibvirtPostMigrateOvnStampCommandWrapperTest`: stamps `iface-id=lsp-<uuid>`
   on every dest tap; idempotent on retry.
+- `LibvirtVerifySourceBindingDownCommandWrapperTest` and
+  `DestinationDataplaneVerifierTest`: execute agent wrappers against exact
+  local Interface, br-int, chassis, and SB Port_Binding identities.
 
 ### 7.3 Orchestration failure tests
 
@@ -349,9 +352,10 @@ tracker records **HA crash-restart = NO-GO**.
 
 ### 7.4 API tests
 
-- `listMigrationPreflightCmdTest`: returns structured denial for each failing
-  NIC.
-- `listHostVfPoolStatusCmdTest`: returns per-NIC free/used/reserved counts.
+- `listMigrationPreflightCmdTest`: behavioral admin authorization plus
+  structured per-NIC denial, requested-chassis, and hostdev-live fields.
+- `listHostVfPoolStatusCmdTest`: behavioral admin authorization plus per-device
+  PCI/NIC/state/kind status and host totals.
 
 ### 7.5 Real Aragog build / test
 
