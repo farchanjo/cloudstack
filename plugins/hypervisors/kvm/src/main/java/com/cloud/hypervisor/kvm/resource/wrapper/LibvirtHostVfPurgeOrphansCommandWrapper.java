@@ -318,7 +318,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         if (!representor.equals(text(port.get("name"))) || !representor.equals(text(iface.get("name")))) {
             throw new IllegalStateException("OVS discovery name changed for " + representor);
         }
-        final JsonArray interfaces = port.getAsJsonArray("interfaces");
+        final JsonArray interfaces = unwrapSet(port.getAsJsonArray("interfaces"));
         if (interfaces == null || interfaces.size() != 1 || !ifaceUuid.equals(uuid(interfaces.get(0)))) {
             throw new IllegalStateException("OVS Port interface set changed for " + representor);
         }
@@ -469,6 +469,16 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         values.add(uuidAtom(uuid));
         set.add(values);
         return set;
+    }
+
+    private JsonArray unwrapSet(final JsonArray value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.size() == 2 && "set".equals(value.get(0).getAsString())) {
+            return value.get(1).getAsJsonArray();
+        }
+        return value;
     }
 
     private JsonArray includesUuid(final String uuid) {

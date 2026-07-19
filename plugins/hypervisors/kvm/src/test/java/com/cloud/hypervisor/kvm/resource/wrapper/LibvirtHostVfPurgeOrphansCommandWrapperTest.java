@@ -431,6 +431,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         private boolean macReadFails;
         private boolean macOutputMissing;
         private String ovsIfaceId = EXPECTED_IFACE_ID;
+        private String ovsName = "zzz-correct-pf1vf24";
         private boolean changeIfaceBeforeDelete;
 
         private FakeHost(final Path root) throws Exception {
@@ -546,6 +547,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 final JsonObject result = new JsonObject();
                 final JsonArray rows = new JsonArray();
                 final String name = selectName(select);
+                if ("Interface".equals(table) || "Port".equals(table)) {
+                    ovsName = name;
+                }
                 if ("Interface".equals(table) && ovsIfaceId != null) {
                     rows.add(interfaceRow(name));
                 } else if ("Port".equals(table) && ovsIfaceId != null) {
@@ -579,7 +583,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
             final JsonObject delete = new JsonObject();
             delete.addProperty("count", 1);
             response.add(delete);
-            removedRepresentors.add("zzz-correct-pf1vf24");
+            removedRepresentors.add(ovsName);
             ovsIfaceId = null;
             return CommandResult.success(response.toString());
         }
@@ -592,7 +596,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                     return clause.get(2).getAsJsonArray().get(1).getAsString();
                 }
             }
-            return "zzz-correct-pf1vf24";
+            return ovsName;
         }
 
         private JsonObject interfaceRow(final String name) {
