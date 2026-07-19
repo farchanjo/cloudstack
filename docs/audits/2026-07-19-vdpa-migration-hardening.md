@@ -547,7 +547,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `982672fe9f`: `HypervisorGuruBase` rejects null/failed vDPA VF allocation with a fail-closed runtime error and preserves non-vDPA HW-offload fallback | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | completed | `MigrationVfPreflight` rejects non-vDPA `useHwOffload` NICs for LIVE mode with an explicit unsupported-operation message; COLD mode remains available for later destination-device gates | cold hostdev capacity gate remains in Slice 5.5/6 | preserve live rejection |
 | B5 | `requested-chassis` validation (§5.4) | pending | — | UD1 | — |
-| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | pending | — | — | restore easySend best-effort |
+| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | in_progress | Current worktree reorders the vDPA stamp before NIC/VF ownership commit and uses synchronous agent send; destination dataplane command/verification is still pending | add `VerifyDestinationDataplaneCommand` and rollback/cold-restart coverage | do not claim migration canary readiness |
 | B7 | VF commit/rollback gated on dataplane (§5.6) | pending | — | — | — |
 | B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | pending | — | — | — |
 | B9 | Cold relocate preflight (§5.8) | pending | — | — | — |

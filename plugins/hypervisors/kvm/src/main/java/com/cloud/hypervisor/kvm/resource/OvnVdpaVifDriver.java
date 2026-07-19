@@ -342,7 +342,13 @@ public class OvnVdpaVifDriver extends VifDriverBase {
      * the caller so the post-start hook can retrieve it without a PCI scan.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
-                                          final Boolean hairpin) {
+                                           final Boolean hairpin) {
+        clearOrphanRepsForLspName(lspName, repName);
+        // DEF-1: a representor can retain an iface-id from a previous VM even
+        // when that stale value does not match the current LSP. Clear the
+        // complete external_ids map before stamping the new identity.
+        Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --if-exists clear Interface %s external_ids", repName));
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -360,6 +366,28 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 + " (deferred-active: post-start hook will cycle to active after vDPA queue negotiation)",
                 repName, lspName);
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
+    }
+
+    private void clearOrphanRepsForLspName(final String lspName, final String keepRepName) {
+        if (StringUtils.isBlank(lspName)) {
+            return;
+        }
+        final String found = Script.runSimpleBashScript(String.format(
+                "ovs-vsctl --no-headings --columns=name find Interface external_ids:iface-id=%s 2>/dev/null",
+                lspName));
+        if (StringUtils.isBlank(found)) {
+            return;
+        }
+        for (final String raw : found.split("\\R")) {
+            final String name = raw.trim().replaceAll("^\"|\"$", "");
+            if (StringUtils.isBlank(name) || name.equals(keepRepName)) {
+                continue;
+            }
+            Script.runSimpleBashScript(String.format(
+                    "ovs-vsctl --if-exists del-port %s %s", integrationBridge, name));
+            logger.info("OvnVdpaVifDriver: cleared orphan rep={} carrying stale iface-id={} (kept rep={})",
+                    name, lspName, keepRepName);
+        }
     }
 
     /**
