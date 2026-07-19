@@ -131,7 +131,8 @@ public class VfPoolOwnershipLifecycleTest {
         when(vfPoolDao.quarantineAndListByVmId(VM_ID)).thenReturn(Collections.singletonList(row));
         when(agentManager.send(eq(SOURCE_HOST), any(HostVfPurgeOrphansCommand.class)))
                 .thenReturn(successAnswer("0000:01:04.1", "ABSENT", null, null,
-                        "vm-release-" + VM_ID, "LIFECYCLE_RELEASE", NIC_ID));
+                        "vm-release-" + VM_ID, "LIFECYCLE_RELEASE", NIC_ID,
+                        "02:04:02:a6:00:01"));
         when(vfPoolDao.releaseExact(980L, NIC_ID)).thenReturn(true);
 
         assertEquals(1, manager.quarantineByVmId(VM_ID));
@@ -170,6 +171,14 @@ public class VfPoolOwnershipLifecycleTest {
                                                            final String mac, final String vdpaName,
                                                            final String operation, final String purpose,
                                                            final long nicId) {
+        return successAnswer(bdf, state, mac, vdpaName, operation, purpose, nicId,
+                "02:04:02:9b:00:07");
+    }
+
+    private static HostVfPurgeOrphansAnswer successAnswer(final String bdf, final String state,
+                                                           final String mac, final String vdpaName,
+                                                           final String operation, final String purpose,
+                                                           final long nicId, final String expectedMac) {
         final HostVfPurgeOrphansCommand command = new HostVfPurgeOrphansCommand();
         final HostVfPurgeOrphansAnswer answer = new HostVfPurgeOrphansAnswer(command, true, "ok");
         final TargetResult result = new TargetResult(bdf, true, true, false, false, false, "ok");
@@ -178,7 +187,7 @@ public class VfPoolOwnershipLifecycleTest {
         result.setVdpaName(vdpaName);
         result.setObservationComplete(true);
         result.setMacObservation("UNASSIGNED_ZERO");
-        result.setExpectedMac("02:04:02:9b:00:07");
+        result.setExpectedMac(expectedMac);
         result.setOwnerOperationId(operation);
         result.setOwnerPurpose(purpose);
         result.setOwnerToken(HostVfPurgeOrphansCommand.createOwnerToken(
