@@ -1169,4 +1169,38 @@ CloneSet FailedUpdate condition, and Snape Argo drift are not clean, the exact
 tracking annotation was **not** added to Git and no further live
 Application/workload mutation was attempted. This remains `NO_GO`.
 
+### 16.5 Subsequent comparative recovery check
+
+Salazar recovery is currently stable at 3/3 ready with unchanged pod UIDs,
+revision `socket-68d9f8479c`, image digest
+`sha256:977fc0e74f17f45a91a23674ca2cffe66d19d499c82037888633ad3f6893d266`,
+and restart counters `3,3,5`; no post-incident update event occurred after
+13:04 UTC. The `FailedUpdate` condition is stale historical state: generation
+and observedGeneration are both `110`, while the condition last transitioned
+on 2026-07-13. However, Argo continues automated auto-heal operations against
+`CloneSet/socket` and reports `OutOfSync/Healthy`, so the gate is not clean.
+
+Snape's actual Istio control plane and ingress are healthy: istiod is 2/2,
+both ingress Deployments are 3/3, all eight relevant pods are Ready with zero
+restarts, and all Istio/DSR EndpointSlice addresses are Ready for both families.
+The exact Argo drift was controller-owned webhook mutation: both validating
+webhooks changed chart-desired `failurePolicy: Ignore` to live `Fail`, added the
+istiod CA bundle, defaulted service port `443`, and defaulted rule scope `*`.
+The minimal GitOps correction was pushed to `infra/cks-snape` as `838acea`,
+scoping jq ignores to those exact webhook objects/fields. Argo then reported
+`istio-base` and `istiod` `Synced/Healthy`; no Istio pod UID, revision, or restart
+changed. Ingress Applications remain `Synced/Progressing` because their
+LoadBalancer Service status is empty while the design intentionally uses
+`externalIPs` with CCM disabled. This is a known cosmetic dataplane contract,
+but it fails the explicit `Healthy` hard gate and was not weakened.
+
+The comparative check retained all 19 Kubernetes VMs `Running` with the
+recorded placement, all six cluster nodes Ready, and 3/3 etcd pods per cluster.
+The attempted four VIP probes from the LAX control path did not establish
+(`000`/timeout or reset), and CloudStack load-balancer enumeration did not
+produce a complete authoritative result in the bounded read-only query; DSR/
+CT_LB is therefore not proven green. No `accouting` auto-sync suspension or
+tracking-metadata Git change was attempted because both cluster gates were not
+clean. KVM, management, canary, cold, and live phases remain locked.
+
 **End of tracker.**
