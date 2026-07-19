@@ -10,6 +10,11 @@
 > **Phase A (Architecture / tracker) — COMPLETED** at commit `1975addd90`
 > (local + Aragog `main` aligned). Phases B–E pending.
 
+**Architecture review status:** **COMPLETE — PASS with mandatory corrections.**
+The consolidated review below is docs-only and does not authorize runtime changes,
+deployment, or production migration. Implementation must satisfy the 15 mandatory
+corrections and the exact Slice 0 gate before Phase B begins.
+
 Target release line: **`4.24.1.33-SNAPSHOT`** (confirmed).
 Baseline pom at audit time: `pom.xml` line 32 = `4.24.1.32-SNAPSHOT`.
 Baseline Marvin stamp at audit time: `tools/marvin/setup.py` `VERSION = "4.24.1.22"` (stale; see Version bump checklist).
@@ -623,5 +628,320 @@ task does **not** perform the bump; the bump is the first code-phase commit.
   arch-advisor skill, not here).
 
 ---
+
+---
+
+## 15. Consolidated architecture-review closeout
+
+> This section materializes the independent source review completed against CloudStack
+> commit `8c6a81221ebb4eff9d460999bd80edac486ddfba` (`8c6a81221e`). It preserves the
+> Phase-A history and checklist above. No runtime code is changed by this section.
+
+### 15.1 Verified findings F1–F10
+
+All ten findings are substantiated against the source at the reviewed commit.
+
+| ID | Finding | Source anchor | Severity |
+|---|---|---|---|
+| F1 | vDPA live migration exists end-to-end, but has no E2E continuity proof. | `engine/orchestration/src/main/java/com/cloud/vm/VirtualMachineManagerImpl.java:3234-3425`; `plugins/hypervisors/kvm/src/main/java/com/cloud/hypervisor/kvm/resource/wrapper/LibvirtMigrateCommandWrapper.java:232-239` | HIGH |
+| F2 | No destination VF capacity preflight; `countFree` is not called by migration orchestration. | `server/src/main/java/com/cloud/network/router/VfPoolManagerImpl.java:752-755`; `VirtualMachineManagerImpl.java:3229,3817` | HIGH |
+| F3 | vDPA allocation can silently fall back to TAP when `allocateForVdpa` returns null. | `server/src/main/java/com/cloud/hypervisor/HypervisorGuruBase.java:763-779` | HIGH |
+| F4 | `PostMigrateOvnStamp` is best-effort: `easySend` swallows errors and only warns. | `engine/orchestration/src/main/java/com/cloud/vm/VirtualMachineManagerImpl.java:3427-3459`; `engine/components-api/src/main/java/com/cloud/agent/AgentManager.java:67-88` | MEDIUM |
+| F5 | `requested-chassis` is emitted only when configured; migration has no validation gate. | `plugins/network-elements/ovn/src/main/java/com/cloud/network/ovn/element/OvnNetworkElement.java:1367-1387` | MEDIUM |
+| F6 | Existing vDPA tests are unit/lifecycle coverage; no cold/live migration E2E canary exists. | `server/src/test/java/com/cloud/network/router/VfPoolManagerVdpaTest.java`; `engine/orchestration/src/test/java/com/cloud/vm/VirtualMachineManagerVfLifecycleTest.java` | HIGH |
+| F7 | Hostdev/VF passthrough live migration is unsupported; vDPA hot attach/detach throws. | `plugins/hypervisors/kvm/src/main/java/com/cloud/hypervisor/kvm/resource/OvnVdpaVifDriver.java:277-285`; `LibvirtPlugNicCommandWrapper.java:63-65` | HIGH |
+| F8 | HA restart requires successful fencing; current LAX conditions do not provide that guarantee. | `server/src/main/java/com/cloud/ha/HighAvailabilityManagerImpl.java:662-693,729-734`; migration timeout path `VirtualMachineManagerImpl.java:3348-3355` | HIGH |
+| F9 | vDPA representor attach lacks the HW-offload DEF-1/cross-representor duplicate-iface-id guard. | `plugins/hypervisors/kvm/src/main/java/com/cloud/hypervisor/kvm/resource/OvnVdpaVifDriver.java:344-363`; compare `OvnVfPassthroughVifDriver.java:242-275` | HIGH; storm vector |
+| F10 | Partial `PrepareForMigration` failure does not call vDPA rollback from its catch block; inactive destination artifacts can remain. | `plugins/hypervisors/kvm/src/main/java/com/cloud/hypervisor/kvm/resource/wrapper/LibvirtPrepareForMigrationCommandWrapper.java:143-154,202-218` | MEDIUM |
+
+### 15.2 Resolved architecture decisions UD1–UD5
+
+#### UD1 — `requested-chassis`
+
+**Decision: reject auto-pinning.** Use read-only preflight validation only. If a
+VM/NIC or global setting supplies a non-blank `requested-chassis`, resolve it via
+the same `OvnNicTunables.resolve` path used by `OvnNetworkElement.applyLspOptions`
+and require it to match the destination OVN chassis. A blank value is valid and
+remains blank. Do not write or temporarily restore OVN NB state during migration.
+
+#### UD2 — synchronous `PostMigrateOvnStamp` failure
+
+**Decision: pre-verify, do not promise rollback after libvirt commit.** The current
+order commits NIC/VF ownership at `VirtualMachineManagerImpl.java:3409-3410` and
+then stamps at `:3417`; this must be reversed for vDPA. Use synchronous `send`
+for vDPA, run the stamp and destination verification before ownership commit, and
+fail closed. If stamping or verification fails after libvirt has moved the domain,
+stop the destination and use a **cold restart** on source as the recovery path;
+packet loss is expected. Do not claim an atomic live rollback or restoration of a
+committed source VF. For virtio/TAP, preserve the existing best-effort behavior.
+
+#### UD3 — artifact and deploy boundary
+
+**Decision: both shaded management and KVM agent artifacts change; no separate OVN
+plugin artifact.** Management-side changes include orchestration, server, API,
+OVN management adapter, and schema versioning. Agent-side changes include the new
+verification command wrappers, vDPA DEF-1 guard, and prepare-failure cleanup.
+Shared command classes in `core` affect both. An older agent must reject an unknown
+command and cause management verification to fail closed. Therefore deploy
+**agent first, management second**, one host/node at a time, with previous JARs
+retained for rollback.
+
+#### UD4 — cold relocation
+
+**Decision: conditional GO only after proof and canary.** The transaction is:
+preflight → source stop → authoritative source-down proof → destination prepare /
+start with destination representor inactive → post-start stamp and verify → VF
+commit. Preflight failure leaves the VM running on source. A destination-start
+failure can leave the VM Stopped and require deterministic operator restart if
+source VF reallocation is unavailable. Cold migration has downtime; it is not a
+zero-loss operation. It is NO-GO until the cold canary and SP-COLD pass.
+
+#### UD5 — HA/fencing
+
+**Decision: hard-fail live vDPA when HA is enabled and fencing is unavailable;
+cold vDPA is fencing-agnostic.** The admission gate is:
+
+```text
+if (mode == LIVE && vm.isHaEnabled()
+        && !fencingConfiguredForCluster(vm.getClusterId())) {
+    deny("live vDPA migration requires fencing for HA restart safety");
+}
+```
+
+Planned relocation and crash-restart remain separate paths. This workstream does
+not add or claim crash-restart safety; `HighAvailabilityManagerImpl` remains
+NO-GO for unfenced crash recovery.
+
+### 15.3 Storm-prevention gates SP1–SP7 and SP-COLD
+
+The following gates are mandatory. Observations are read-only; **never clear
+counters** or alter OVS/OVN state as part of observation.
+
+#### SP1 — Destination inactive until authoritative cutover
+
+`OvnVdpaVifDriver.attachRepresentorToBrInt` must leave the destination
+representor `external_ids:iface-status=inactive` (`OvnVdpaVifDriver.java:354-358`).
+Only the authoritative post-start/post-migration path
+(`LibvirtComputingResource.applyVdpaPostPlugTunables`, `:5144-5169`) may set
+`iface-status=active` and `ovn-installed=true`. Stamp and verify before VF/NIC
+commit. Any early active destination is a hard abort.
+
+#### SP2 — Never dual-active for one MAC/LSP
+
+At no point may source and destination both carry an active Interface with the
+same MAC or `iface-id=lsp-<uuid>`, and exactly one OVN chassis may claim the
+Port_Binding. Preflight rejects an existing multi-chassis claim; destination
+verification proves exactly one destination claim. Any two claims are a hard
+abort.
+
+#### SP3 — Remove inactive destination artifacts on cleanup
+
+Every failed prepare or pre-cutover failure must remove destination vDPA device,
+representor, OVS port, PF identity, and VF reservation. Wire the existing
+`OvnVdpaVifDriver.releaseVdpaOnRollback` (`:379-398`) through
+`LibvirtPrepareForMigrationCommandWrapper`'s catch path, not only its explicit
+rollback-command path. Any stale inactive artifact is a hard abort/blocker.
+
+#### SP4 — No fail-open TAP duplicate
+
+A vDPA NIC with no destination VF must throw and fail closed. It must never become
+a TAP NIC with the same MAC/LSP while source remains active. The vDPA null result
+at `HypervisorGuruBase.java:767-770` must throw; preserve the existing fallback
+for legitimate non-vDPA HW-offload behavior. A destination TAP duplicate is a
+hard abort.
+
+#### SP5 — Bounded canary traffic only
+
+Use only a dedicated canary VM. The continuity probe is one unicast TCP iperf
+plus one ICMP pair, maximum five minutes, with no broadcast/multicast target, ARP
+sweep, or traffic from workload VMs. Probe scope or duration violation is a hard
+abort.
+
+#### SP6 — Read-only pre/during/post observations
+
+Capture pre-migration baseline, during-cutover, and post-steady-state observations
+of BUM/broadcast/multicast/unknown-unicast counters, TC/OVS flow state, and OVN
+Port_Binding claims. Use read-only OVS/OVN/switch observations; **do not clear
+counters**. Record source/destination Interface state, `iface-id`,
+`iface-status`, Port_Binding chassis, and any `actions=FLOOD` path.
+
+#### SP7 — Hard-abort triggers
+
+Any one of the following stops the migration/canary and blocks further rollout:
+
+1. Unexpected duplicate MAC on two OVS Interfaces.
+2. Two Port_Binding chassis claims for one LSP.
+3. Broadcast increase above the approved baseline threshold (initial canary gate:
+   >2x baseline sustained for 10 seconds).
+4. Any switch storm-control event or equivalent switch alert.
+5. An OVS flood path for a migrated learned MAC after destination activation.
+
+Preserve observations for RCA; do not clear counters. Recovery is fail closed:
+stop destination, do not commit ownership, and use the UD2 cold-restart path.
+
+#### SP-COLD — Prove source binding down before destination start
+
+After `advanceStop` (`VirtualMachineManagerImpl.java:2549-2608+`) and before
+destination `StartCommand`, a new `VerifySourceBindingDownCommand` must prove:
+
+1. The source libvirt domain is shut off/not found.
+2. No source `br-int` Interface carries the VM's `iface-id=lsp-<uuid>`.
+3. The source Port_Binding is absent or has no chassis claim.
+
+Use one bounded synchronous command, not a polling loop. If the source agent is
+unreachable or the proof is negative, deny/abort and leave the VM Stopped; do not
+start the destination.
+
+### 15.4 Mandatory corrections before Phase B
+
+1. Reorder vDPA stamp/verify before `commitNicForMigration` and
+   `finalizeVfOwnershipAfterMigration`; replace impossible live rollback wording
+   with destination stop + source cold-restart semantics.
+2. Correct deployment order to agent JAR first, management JAR second; document
+   both artifacts and no separate OVN plugin.
+3. Add the exact UD5 live/HA/fencing hard gate; keep cold fencing-agnostic.
+4. Change vDPA null allocation to throw before the HW-offload fallback catch;
+   preserve legitimate HW-offload fallback.
+5. Add/register no-op `Upgrade42432to42433.java` for the version-row bump.
+6. Add tests for process-level vDPA XML mapping, reordered-stamp failure,
+   expected cold downtime, fencing admission, agent cleanup, destination verify,
+   and source-binding-down verify.
+7. Use minimal `countFreeForVdpa(long hostId)`; document preflight as advisory and
+   allocation as the hard gate.
+8. Confirm UD1 no auto-pin and read-only requested-chassis validation.
+9. Either add stamp/verification to `orchestrateMigrateWithStorage` or mark
+   storage-plus-vDPA host migration NO-GO.
+10. Add DSR LB VIP/router chassis-affinity preservation to the invariant table.
+11. Apply K8s anti-affinity/quorum checks to live and cold preflight.
+12. Port DEF-1 and `clearOrphanRepsForLspName` into
+   `OvnVdpaVifDriver.attachRepresentorToBrInt`.
+13. Wire `releaseVdpaOnRollback` into the prepare catch block for partial failures.
+14. Add `VerifySourceBindingDownCommand` between source stop and destination start.
+15. Add SP6's three read-only observation windows and SP7's five hard-abort
+   triggers; explicitly forbid counter clears.
+
+### 15.5 Ordered implementation slices
+
+#### Slice 0 — Tracker corrections and version bump
+
+Docs/status plus version metadata only: update this tracker with corrections
+1–15; bump all project versions to `4.24.1.33-SNAPSHOT`; bump
+`tools/marvin/setup.py` to `4.24.1.33`; add/register
+`engine/schema/.../Upgrade42432to42433.java`; build only the scoped schema/tool
+reactor on Aragog; require clean worktree. No runtime deployment.
+
+#### Slice 1 — Fail-closed vDPA allocation
+
+Change `server/src/main/java/com/cloud/hypervisor/HypervisorGuruBase.java:763-779`
+to throw on null vDPA allocation without swallowing it in the HW-offload catch.
+Add `HypervisorGuruBaseVdpaFailClosedTest`. This closes SP4.
+
+#### Slice 2 — Capacity-aware migration preflight
+
+Add `countFreeForVdpa(long hostId)` to `VfPoolManager`/
+`VfPoolManagerImpl`; add `MigrationVfPreflight` in orchestration; add the
+`OvnChassisLookup` read port and OVN adapter; add fencing inspector, hostdev-live
+rejection, requested-chassis validation, live/cold K8s anti-affinity, and SP2
+single-claim preflight. Wire before `prepareNicForMigration` at
+`VirtualMachineManagerImpl.java:3229,3817` and into cold relocation. Add unit
+tests.
+
+#### Slice 3 — Synchronous stamp and destination verification
+
+In `VirtualMachineManagerImpl.java:3407-3420`, stamp/verify before NIC/VF commit;
+use synchronous `send` for vDPA only. Add shared
+`VerifyDestinationDataplaneCommand`/Answer and the KVM wrapper. Verify iface-id,
+inactive-to-active cutover, representor state, `ovn-installed=true`, and exactly
+one destination Port_Binding claim. Gate `finalizeVfOwnershipAfterMigration`.
+Add orchestration, verifier, XML mapping, and reordered-failure tests.
+
+#### Slice 4 — Agent cleanup and vDPA duplicate guard
+
+In `LibvirtPrepareForMigrationCommandWrapper.java:143-154`, call
+`releaseVdpaVfsOnRollback` on partial prepare failure. In
+`OvnVdpaVifDriver.java:344-363`, port the DEF-1 and cross-representor guard from
+`OvnVfPassthroughVifDriver`. Add cleanup and duplicate-iface-id tests. This closes
+F9, F10, SP2, and SP3.
+
+#### Slice 5 — CMK-visible read-only APIs
+
+Add `listMigrationPreflight` and `listHostVfPoolStatus` under
+`api/src/main/java/org/apache/cloudstack/api/command/admin/host/`; extend the
+read façade `VfPoolService`; add structured denial/status responses and API tests.
+Expose no force-release or unsafe repair operation.
+
+#### Slice 5.5 — Cold source-binding-down proof
+
+Add shared `VerifySourceBindingDownCommand`/Answer and
+`LibvirtVerifySourceBindingDownCommandWrapper`; wire after source
+`advanceStop` and before destination `StartCommand`. Use one bounded synchronous
+send, hard-deny unreachable/claimed source, and leave VM Stopped. Add wrapper and
+orchestration tests. This closes SP-COLD and R11.
+
+#### Slice 6 — Build, cold/live canaries, and storm observations
+
+Run the full Aragog build and tests. Execute only a dedicated canary: cold first,
+then live. Require bounded cold downtime, zero-loss live continuity, XML/VF/
+Port_Binding invariants, SP1–SP2 state transitions, SP5 traffic bounds, SP6
+pre/during/post read-only observations, and no SP7 hard-abort trigger. No workload
+VM is a canary target until cold passes.
+
+#### Slice 7 — Deployment
+
+Because `core` commands and KVM wrappers changed, roll the agent plugin JAR first,
+one LAX KVM host at a time, then roll the shaded management JAR one control node
+at a time. Keep previous JARs and verify agent/management compatibility before
+any migration. No NYC/gryffindor activity.
+
+#### Slice 8 — Production migration
+
+E1: first vDPA cold migration; E2: first vDPA live migration; E3: Fluffy/K8s
+rotations; E4: final invariants and storm-observation audit. Apply SP6 for every
+canary/production migration and abort on any SP7 trigger.
+
+### 15.6 Exact Slice 0 PASS/FAIL criteria
+
+Slice 0 is **PASS only if every P0 criterion holds**. Any F0 criterion is an
+immediate **FAIL** and blocks Slice 1.
+
+#### PASS criteria
+
+- **P0.1 Tracker:** this file contains all 15 mandatory corrections, including
+  UD2 truthful failure semantics, UD3 agent-first deployment, UD5 exact gate,
+  F9/F10 cleanup/duplicate guards, SP1–SP7, SP-COLD, and the storage-plus-vDPA
+  scope decision.
+- **P0.2 Versions:** `pom.xml` is `4.24.1.33-SNAPSHOT`; all intended child POM
+  parent references are updated; `tools/marvin/setup.py` is `4.24.1.33`; no
+  unintended old version metadata remains.
+- **P0.3 Schema registry:** `engine/schema/src/main/java/com/cloud/upgrade/dao/Upgrade42432to42433.java`
+  exists, is a no-op schema/version-row bump mirroring the existing upgrade
+  pattern, and is registered in the upgrade order/registry.
+- **P0.4 Aragog validation:** the scoped Aragog build returns `BUILD SUCCESS`;
+  Aragog `git status --porcelain` is empty after the version-stamp build; local
+  `main` and Aragog `main` point to the same commit; one `main` worktree remains.
+- **P0.5 Safety:** no runtime code changed; no JAR deployed; no CMK write,
+  Foreman REX job, forbidden-repository/environment access, or production action
+  occurred.
+
+#### FAIL criteria
+
+- **F0.1:** any of the 15 corrections or storm gates is absent, ambiguous, or
+  contradicts the verified source.
+- **F0.2:** any unintended `4.24.1.32-SNAPSHOT` project version remains.
+- **F0.3:** Marvin remains at `4.24.1.22` or does not match `4.24.1.33`.
+- **F0.4:** `Upgrade42432to42433` is missing, malformed, or unregistered.
+- **F0.5:** scoped Aragog build/checkstyle/compile fails.
+- **F0.6:** Aragog worktree remains dirty after the version-stamp build.
+- **F0.7:** local and Aragog `main` HEADs diverge or extra worktrees remain.
+- **F0.8:** any runtime code, live infrastructure, JAR deployment, CMK write,
+  Foreman REX job, forbidden environment access, sleep/watch/polling/retry loop,
+  background/detached process, or other production action occurs.
+
+**Slice 0 exit rule:** all P0.1–P0.5 true means **PASS — Slice 1 may begin**.
+Any F0.1–F0.8 means **FAIL — stop, correct, and re-evaluate before Slice 1**.
+
+**Architecture review conclusion:** **PASS with mandatory corrections; no runtime
+implementation or production migration is authorized until Slice 0 and all later
+slice gates pass.**
 
 **End of tracker.**
