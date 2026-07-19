@@ -279,7 +279,9 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         assertFalse(answer.getResult());
         assertEquals(2, answer.getTargetResults().size());
         assertTrue(answer.getTargetResults().stream().anyMatch(result -> !result.isSuccess()));
-        assertTrue(answer.getTargetResults().stream().anyMatch(HostVfPurgeOrphansAnswer.TargetResult::isSuccess));
+        assertTrue("target details=" + answer.getTargetResults().stream()
+                        .map(HostVfPurgeOrphansAnswer.TargetResult::getDetails).toList(),
+                answer.getTargetResults().stream().anyMatch(HostVfPurgeOrphansAnswer.TargetResult::isSuccess));
     }
 
     @Test
