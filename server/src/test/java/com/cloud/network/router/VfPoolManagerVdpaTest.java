@@ -119,6 +119,7 @@ public class VfPoolManagerVdpaTest {
         row.setAllocatedToNicId(NIC_ID);
         final NicVO nic = org.mockito.Mockito.mock(NicVO.class);
         when(nic.getMacAddress()).thenReturn(MAC);
+        when(nic.getUuid()).thenReturn("nic-uuid-7");
         when(vfPoolDao.findById(7L)).thenReturn(row);
         when(nicDao.findByIdIncludingRemoved(NIC_ID)).thenReturn(nic);
         when(agentManager.send(eq(HOST_ID), any(HostVfPurgeOrphansCommand.class)))

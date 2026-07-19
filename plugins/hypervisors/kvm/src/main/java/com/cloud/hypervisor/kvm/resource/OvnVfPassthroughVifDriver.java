@@ -183,7 +183,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                 lifecycleLock.unlock();
             }
         } else {
-            logger.warn("OvnVfPassthroughVifDriver.unplug: no explicit VF PCI for mac={}; fail-closed skip", mac);
+            logger.warn("OvnVfPassthroughVifDriver.unplug: no explicit VF PCI for mac={}; attempting exact attached-mac stale-representor cleanup",
+                    mac);
+            OvnVifDriver.clearOrphanRepsByAttachedMac(logger, "OvnVfPassthroughVifDriver.unplug",
+                    integrationBridge, mac);
         }
     }
 
