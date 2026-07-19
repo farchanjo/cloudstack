@@ -16,7 +16,54 @@
 // under the License.
 package com.cloud.network.router;
 
+import java.util.Objects;
+
 /** Per-device and per-NIC VF ownership evidence. */
-public record VfDeviceStatus(long vfPoolId, String pciAddress, Long nicId,
-        String state, String vdpaKind) {
+public final class VfDeviceStatus {
+
+    private final long vfPoolId;
+    private final String pciAddress;
+    private final Long nicId;
+    private final String state;
+    private final String vdpaKind;
+
+    public VfDeviceStatus(final long vfPoolId, final String pciAddress, final Long nicId,
+            final String state, final String vdpaKind) {
+        this.vfPoolId = vfPoolId;
+        this.pciAddress = pciAddress;
+        this.nicId = nicId;
+        this.state = state;
+        this.vdpaKind = vdpaKind;
+    }
+
+    public long vfPoolId() { return vfPoolId; }
+    public String pciAddress() { return pciAddress; }
+    public Long nicId() { return nicId; }
+    public String state() { return state; }
+    public String vdpaKind() { return vdpaKind; }
+
+    @Override
+    public boolean equals(final Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof VfDeviceStatus)) {
+            return false;
+        }
+        final VfDeviceStatus that = (VfDeviceStatus) other;
+        return vfPoolId == that.vfPoolId && Objects.equals(pciAddress, that.pciAddress)
+                && Objects.equals(nicId, that.nicId) && Objects.equals(state, that.state)
+                && Objects.equals(vdpaKind, that.vdpaKind);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(vfPoolId, pciAddress, nicId, state, vdpaKind);
+    }
+
+    @Override
+    public String toString() {
+        return "VfDeviceStatus[vfPoolId=" + vfPoolId + ", pciAddress=" + pciAddress + ", nicId=" + nicId
+                + ", state=" + state + ", vdpaKind=" + vdpaKind + "]";
+    }
 }

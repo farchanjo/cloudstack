@@ -192,7 +192,18 @@ public class MigrationPreflightServiceImplTest {
                 networkModel, preflight, nicDao), preflight, first, second);
     }
 
-    private record Fixture(MigrationPreflightServiceImpl service, MigrationVfPreflight preflight,
-            NicProfile first, NicProfile second) {
+    private static final class Fixture {
+        private final MigrationPreflightServiceImpl service;
+        private final MigrationVfPreflight preflight;
+        private final NicProfile first;
+        private final NicProfile second;
+
+        private Fixture(final MigrationPreflightServiceImpl service, final MigrationVfPreflight preflight,
+                final NicProfile first, final NicProfile second) {
+            this.service = service;
+            this.preflight = preflight;
+            this.first = first;
+            this.second = second;
+        }
     }
 }

@@ -16,6 +16,7 @@
 // under the License.
 package com.cloud.vm;
 
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -45,8 +46,64 @@ import com.cloud.utils.exception.CloudRuntimeException;
 @Component
 public class MigrationVfPreflight {
 
-    public record NicPreflightDecision(boolean allowed, String denialReason, String macAddress,
-            String ifaceId, String requestedChassis, String sourceChassis, String destinationChassis) {
+    public static final class NicPreflightDecision {
+        private final boolean allowed;
+        private final String denialReason;
+        private final String macAddress;
+        private final String ifaceId;
+        private final String requestedChassis;
+        private final String sourceChassis;
+        private final String destinationChassis;
+
+        public NicPreflightDecision(final boolean allowed, final String denialReason, final String macAddress,
+                final String ifaceId, final String requestedChassis, final String sourceChassis,
+                final String destinationChassis) {
+            this.allowed = allowed;
+            this.denialReason = denialReason;
+            this.macAddress = macAddress;
+            this.ifaceId = ifaceId;
+            this.requestedChassis = requestedChassis;
+            this.sourceChassis = sourceChassis;
+            this.destinationChassis = destinationChassis;
+        }
+
+        public boolean allowed() { return allowed; }
+        public String denialReason() { return denialReason; }
+        public String macAddress() { return macAddress; }
+        public String ifaceId() { return ifaceId; }
+        public String requestedChassis() { return requestedChassis; }
+        public String sourceChassis() { return sourceChassis; }
+        public String destinationChassis() { return destinationChassis; }
+
+        @Override
+        public boolean equals(final Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof NicPreflightDecision)) {
+                return false;
+            }
+            final NicPreflightDecision that = (NicPreflightDecision) other;
+            return allowed == that.allowed && Objects.equals(denialReason, that.denialReason)
+                    && Objects.equals(macAddress, that.macAddress) && Objects.equals(ifaceId, that.ifaceId)
+                    && Objects.equals(requestedChassis, that.requestedChassis)
+                    && Objects.equals(sourceChassis, that.sourceChassis)
+                    && Objects.equals(destinationChassis, that.destinationChassis);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(allowed, denialReason, macAddress, ifaceId, requestedChassis,
+                    sourceChassis, destinationChassis);
+        }
+
+        @Override
+        public String toString() {
+            return "NicPreflightDecision[allowed=" + allowed + ", denialReason=" + denialReason
+                    + ", macAddress=" + macAddress + ", ifaceId=" + ifaceId + ", requestedChassis="
+                    + requestedChassis + ", sourceChassis=" + sourceChassis + ", destinationChassis="
+                    + destinationChassis + "]";
+        }
     }
 
     public enum MigrationMode {
