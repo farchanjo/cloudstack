@@ -270,6 +270,7 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
     public void targetMutationFailurePreservesIndependentLaterTargetResult() throws Exception {
         final FakeHost host = preparedHost("partial-targets");
         host.identityClearFails = true;
+        host.removedRepresentors.add("rep-second");
         final HostVfPurgeOrphansCommand command = command(false);
         command.setTargetPciBdfs(new LinkedHashSet<>(java.util.Arrays.asList(BDF, "0000:03:07.2")));
 
