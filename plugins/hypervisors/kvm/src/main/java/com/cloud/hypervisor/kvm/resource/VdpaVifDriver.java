@@ -218,7 +218,7 @@ public class VdpaVifDriver extends VifDriverBase {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             if (VdpaPoolReconciler.parseHostSfs(
                     Script.runSimpleBashScript("vdpa dev show -j 2>/dev/null", 5000)).containsKey(vdpaName)) {
-                throw new InternalErrorException("vDPA device remained after deletion: " + vdpaName);
+                throw new IllegalStateException("vDPA device remained after deletion: " + vdpaName);
             }
             logger.info("vDPA unplug: deleted {} (vhost={} mac={})", vdpaName, vhostDev, mac);
 
