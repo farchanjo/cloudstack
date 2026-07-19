@@ -1112,4 +1112,30 @@ placement evidence justifies a documented serial change.
 creation, cold migration, live migration, physical remediation, or production
 CloudStack mutation has been performed.
 
+### 16.3 Follow-up comparison attempt
+
+The next-generation correction removed the live name-scoped tracking-id
+`jsonPointer` and retained only the exact name-scoped jq expression in commit
+`9c7b8d8`. Because the Application manifest is not rendered by the workload
+`kustomization.yaml`, the committed Application spec was applied through its
+normal committed manifest path, then hard-refreshed once. The live Application
+confirmed the jq expression, but remained `OutOfSync`; the CloneSet was the only
+reported resource.
+
+The required no-rollout comparison was not achieved. The BEFORE snapshot had
+`socket-84b7778f58`, update revision `socket-68d9f8479c`, 3 replicas/2 ready,
+and pod UIDs `313746ec…`, `df65a9e7…`, `ed95d565…`. After the hard refresh the
+CloneSet returned to `socket-68d9f8479c` with the same pod UIDs, but restart
+counts increased (`2,2,5` → `3,3,5`) and one pod was not Ready; the application
+was `OutOfSync/Degraded`. This is an immediate consistency failure even though
+the pods remained Running. Container termination was exit `143`, so no rollout
+phase was authorized.
+
+The Application-spec correction was rolled back for safety via backend commits
+`9cf84b6` (revert of `9c7b8d8`) and the prior committed Application spec was
+restored live. Final observed state was `accouting` `OutOfSync/Healthy`; no
+child-workload patch, force sync, prune, replace, or restart was issued. The
+remaining GitOps comparison blocker and unexpected restart delta are unresolved
+and keep every operational phase locked.
+
 **End of tracker.**
