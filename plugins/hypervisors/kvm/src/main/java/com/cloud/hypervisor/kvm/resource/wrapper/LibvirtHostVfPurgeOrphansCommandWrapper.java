@@ -301,8 +301,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                                           final boolean allowUnassignedMac) {
         revalidateBeforeDestructiveAction(bdf, expectedMac, representor, expectedInterfaceId,
                 "OVS deletion", false, allowUnassignedMac);
-        if (!OvsRepresentorCas.remove(environment.runner::run, "unix:/var/run/openvswitch/db.sock",
-                representor, expectedInterfaceId)) {
+        if (!OvsRepresentorCas.remove(command -> {
+            final CommandResult result = environment.runner.run(command);
+            return new OvsRepresentorCas.Result(result.success, result.output, result.error);
+        }, "unix:/var/run/openvswitch/db.sock", representor, expectedInterfaceId)) {
             throw new IllegalStateException("atomic OVS representor deletion failed or postcondition was not proven: "
                     + representor);
         }
