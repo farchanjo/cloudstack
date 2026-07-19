@@ -39,6 +39,7 @@ import org.libvirt.LibvirtException;
 
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.exception.InternalErrorException;
+import com.cloud.hypervisor.kvm.resource.hwoffload.VdpaPoolReconciler;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef.NicModel;
 import com.cloud.utils.script.Script;
@@ -778,8 +779,11 @@ public class OvnVifDriver extends VifDriverBase {
         final Set<String> out = new HashSet<>();
         for (final String bin : new String[] {"/usr/sbin/vdpa", "/sbin/vdpa", "/usr/local/sbin/vdpa", "vdpa"}) {
             try {
-                final String raw = Script.runSimpleBashScriptWithFullResult(bin + " dev show 2>/dev/null", 5);
-                out.addAll(parseVdpaDevShowPci(raw));
+                 final String raw = Script.runSimpleBashScriptWithFullResult(bin + " dev show -j 2>/dev/null", 5);
+                 for (final VdpaPoolReconciler.VdpaSf device
+                         : VdpaPoolReconciler.parseHostSfs(raw).values()) {
+                     out.add(device.getMgmtdevPci().toLowerCase());
+                 }
                 if (!out.isEmpty()) {
                     return out;
                 }

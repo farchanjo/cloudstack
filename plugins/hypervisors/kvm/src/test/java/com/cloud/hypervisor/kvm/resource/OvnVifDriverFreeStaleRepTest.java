@@ -109,8 +109,8 @@ public class OvnVifDriverFreeStaleRepTest {
     public void listVdpaMgmtPciFromCli_usesFullResult_notOneLine() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
-                    .thenReturn("vdpa-r1: type network mgmtdev pci/0000:01:00.3 max_vqs 33\n"
-                            + "vdpa-r2: type network mgmtdev pci/0000:01:04.2\n");
+                    .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"},"
+                            + "\"vdpa-r2\":{\"mgmtdev\":\"pci/0000:01:04.2\"}}}");
 
             final Set<String> pci = OvnVifDriver.listVdpaMgmtPciFromCli(LOG);
             assertEquals(2, pci.size());
