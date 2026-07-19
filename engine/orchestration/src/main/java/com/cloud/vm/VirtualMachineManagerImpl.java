@@ -134,6 +134,10 @@ import com.cloud.agent.api.PlugNicCommand;
 import com.cloud.agent.api.PrepareExternalProvisioningAnswer;
 import com.cloud.agent.api.PrepareExternalProvisioningCommand;
 import com.cloud.agent.api.PostMigrateOvnStampCommand;
+import com.cloud.agent.api.VerifyDestinationDataplaneAnswer;
+import com.cloud.agent.api.VerifyDestinationDataplaneCommand;
+import com.cloud.agent.api.VerifySourceBindingDownAnswer;
+import com.cloud.agent.api.VerifySourceBindingDownCommand;
 import com.cloud.agent.api.PrepareForMigrationAnswer;
 import com.cloud.agent.api.PrepareForMigrationCommand;
 import com.cloud.agent.api.RebootAnswer;
@@ -1600,7 +1604,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                             }
 
                             startedVm = vm;
-                            commitVfOwnershipBestEffort(vm.getId(), null, destHostId, "start", work.getId());
+                            commitVfOwnership(vm.getId(), null, destHostId, "start", work.getId());
                             logger.debug("Start completed for VM {}", vm);
                             final Host vmHost = _hostDao.findById(destHostId);
                             if (vmHost != null && (VirtualMachine.Type.ConsoleProxy.equals(vm.getType()) ||
@@ -1747,7 +1751,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
     }
 
-    void commitVfOwnershipBestEffort(final long vmId, final Long sourceHostId,
+    void commitVfOwnership(final long vmId, final Long sourceHostId,
                                      final long destinationHostId, final String operation,
                                      final String workId) {
         if (vfPoolManager == null) {
@@ -1758,6 +1762,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         } catch (RuntimeException e) {
             logger.error("VF ownership commit failed closed for operation={} vm={} source={} destination={}: {}",
                     operation, vmId, sourceHostId, destinationHostId, e.getMessage(), e);
+            throw new CloudRuntimeException(String.format(
+                    "VF ownership commit failed for %s VM %s from host %s to host %s",
+                    operation, vmId, sourceHostId, destinationHostId), e);
         }
     }
 
@@ -1767,7 +1774,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                                            final boolean destinationAuthoritativelyVerified,
                                            final String operation, final String workId) {
         if (commandConclusive && destinationAuthoritativelyVerified) {
-            commitVfOwnershipBestEffort(vmId, sourceHostId, destinationHostId, operation, workId);
+            commitVfOwnership(vmId, sourceHostId, destinationHostId, operation, workId);
             return;
         }
         rollbackVfReservationsBestEffort(vmId, destinationHostId, false,
@@ -3385,10 +3392,29 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
                 throw new CloudRuntimeException("Destination OVN post-migration stamp failed for " + vm.getInstanceName());
             }
+            try {
+                _networkMgr.commitNicForMigration(vmSrc, profile);
+                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
+                        !migrationCommandTimedOut, destinationAuthoritativelyVerified, "migration", work.getId());
+            } catch (RuntimeException e) {
+                throw new CloudRuntimeException("Migration ownership commit failed for " + vm.getInstanceName(), e);
+            }
             migrated = true;
         } finally {
             if (!migrated) {
                 logger.info("Migration was unsuccessful. Cleaning up: {}", vm);
+                if (hasVdpaNic(to)) {
+                    try {
+                        final Answer stopAnswer = _agentMgr.send(dstHostId,
+                                new StopCommand(vm.getInstanceName(), false, true));
+                        if (stopAnswer == null || !stopAnswer.getResult()) {
+                            logger.error("Unable to stop failed vDPA destination {}: {}",
+                                    dstHostId, stopAnswer == null ? "null answer" : stopAnswer.getDetails());
+                        }
+                    } catch (Exception e) {
+                        logger.error("Unable to stop failed vDPA destination {}; leaving VM stopped", dstHostId, e);
+                    }
+                }
                 _networkMgr.rollbackNicForMigration(vmSrc, profile);
                 rollbackVfReservationsBestEffort(vm.getId(), dstHostId, migrationCleanupAuthorized,
                         "migration", work.getId());
@@ -3412,9 +3438,6 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 }
             } else {
                 logger.info("Migration completed successfully for VM %s" + vm);
-                _networkMgr.commitNicForMigration(vmSrc, profile);
-                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
-                        !migrationCommandTimedOut, destinationAuthoritativelyVerified, "migration", work.getId());
                 volumeMgr.release(vm.getId(), srcHostId);
                 // deallocate GPU devices for the VM on the src host after migration is complete
                 gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), srcHostId);
@@ -3456,6 +3479,18 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 return !vdpa;
             } else {
                 logger.debug("PostMigrateOvnStamp succeeded for VM {} on dest host {}.", vm.getInstanceName(), destHostId);
+                if (!vdpa) {
+                    return true;
+                }
+                final Answer verification = _agentMgr.send(destHostId,
+                        new VerifyDestinationDataplaneCommand(vm.getInstanceName(), to.getNics()));
+                if (!(verification instanceof VerifyDestinationDataplaneAnswer)
+                        || !verification.getResult()) {
+                    logger.error("Destination vDPA dataplane verification failed for VM {} on host {}: {}",
+                            vm.getInstanceName(), destHostId,
+                            verification == null ? "null answer" : verification.getDetails());
+                    return false;
+                }
                 return true;
             }
         } catch (final Exception e) {
@@ -3463,6 +3498,11 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     vm.getInstanceName(), destHostId, e.getMessage(), e);
             return !vdpa;
         }
+    }
+
+    private boolean hasVdpaNic(final VirtualMachineTO to) {
+        return to != null && to.getNics() != null
+                && java.util.Arrays.stream(to.getNics()).anyMatch(NicTO::isUseVdpa);
     }
 
     /**
@@ -3895,6 +3935,12 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 storageDestinationVerified = false;
                 logger.error("Error while checking the vm {} is on host {}", vm, destHost, e);
             }
+            if (!dispatchPostMigrateOvnStamp(vm, to, destHostId)) {
+                throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
+            }
+            _networkMgr.commitNicForMigration(vmSrc, profile);
+            finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, destHostId,
+                    true, storageDestinationVerified, "storage-migration", work.getId());
             migrated = true;
         } finally {
             if (!migrated) {
@@ -3919,9 +3965,6 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                         "storage-migration", work.getId());
                 _networkMgr.setHypervisorHostname(profile, destination, false);
             } else {
-                _networkMgr.commitNicForMigration(vmSrc, profile);
-                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, destHostId,
-                        true, storageDestinationVerified, "storage-migration", work.getId());
                 volumeMgr.release(vm.getId(), srcHostId);
                 _networkMgr.setHypervisorHostname(profile, destination, true);
                 endSnapshotChainForVolumes(volumeToPoolMap, vm.getHypervisorType());
@@ -4081,6 +4124,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
         ServiceOfferingVO offeringVO = _offeringDao.findById(vm.getId(), vm.getServiceOfferingId());
         final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null, offeringVO, null, null);
+        for (final NicProfile nic : _networkMgr.getNicProfiles(vm)) {
+            profile.addNic(nic);
+        }
 
         final Long hostId = vm.getHostId();
         if (hostId == null) {
@@ -4130,6 +4176,18 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
             try {
                 advanceStop(vmUuid, true);
+                if (migrationVfPreflight.requiresVdpa(profile)) {
+                    final String[] lsps = profile.getNics().stream()
+                            .map(NicProfile::getUuid)
+                            .filter(java.util.Objects::nonNull)
+                            .map(uuid -> "lsp-" + uuid)
+                            .toArray(String[]::new);
+                    final Answer bindingDown = _agentMgr.send(srcHostId,
+                            new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps));
+                    if (!(bindingDown instanceof VerifySourceBindingDownAnswer) || !bindingDown.getResult()) {
+                        throw new CloudRuntimeException("source vDPA binding-down proof failed; VM remains stopped");
+                    }
+                }
                 throw new CloudRuntimeException("Unable to migrate " + vm);
             } catch (final ResourceUnavailableException | ConcurrentOperationException | OperationTimedoutException e) {
                 logger.error("Unable to stop {} due to [{}].", vm.toString(), e.getMessage(), e);
@@ -5104,6 +5162,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
         final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm);
         profile.setHost(dest.getHost());
+        for (final NicProfile nic : _networkMgr.getNicProfiles(vm)) {
+            profile.addNic(nic);
+        }
+        migrationVfPreflight.verify(profile, dest.getHost());
         _networkMgr.prepareNicForMigration(profile, dest);
 
         volumeMgr.prepareForMigration(profile, dest);
@@ -5209,6 +5271,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 logger.debug("Error while checking the {} on {}", vm, dstHost, e);
             }
 
+            if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
+                throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
+            }
+            _networkMgr.commitNicForMigration(vmSrc, profile);
+            finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
+                    true, scaleDestinationVerified, "scale-migration", work.getId());
+
             migrated = true;
         } finally {
             if (!migrated) {
@@ -5234,21 +5303,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     logger.warn(e.getMessage(), e);
                 }
             } else {
-                _networkMgr.commitNicForMigration(vmSrc, profile);
-                finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
-                        true, scaleDestinationVerified, "scale-migration", work.getId());
                 _networkMgr.setHypervisorHostname(profile, dest, true);
 
                 updateVmPod(vm, dstHostId);
 
-                // Bug 14b coverage on the scale-migrate path. orchestrateMigrate
-                // already dispatches PostMigrateOvnStampCommand on its own
-                // success branch (commit d34f9fe190); this mirrors the behavior
-                // for orchestrateMigrateForScale so OVN tap NICs on the
-                // destination receive the lsp- prefixed iface-id stamp on
-                // every successful live-migration, including vertical-scale
-                // migrations triggered by orchestrateScaleVm.
-                dispatchPostMigrateOvnStamp(vm, to, dstHostId);
             }
 
             work.setStep(Step.Done);

@@ -18,10 +18,12 @@ package com.cloud.vm;
 
 import javax.inject.Inject;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import com.cloud.host.Host;
 import com.cloud.network.NetworkVO;
+import com.cloud.network.ovn.OvnChassisLookup;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.router.VfPoolManager;
 import com.cloud.offerings.NetworkOfferingVO;
@@ -46,6 +48,7 @@ public class MigrationVfPreflight {
     private final VfPoolManager vfPoolManager;
     private final NetworkDao networkDao;
     private final NetworkOfferingDao networkOfferingDao;
+    private OvnChassisLookup chassisLookup;
 
     @Inject
     public MigrationVfPreflight(final VfPoolManager vfPoolManager,
@@ -55,8 +58,25 @@ public class MigrationVfPreflight {
         this.networkOfferingDao = networkOfferingDao;
     }
 
+    @Autowired(required = false)
+    public void setChassisLookup(final OvnChassisLookup chassisLookup) {
+        this.chassisLookup = chassisLookup;
+    }
+
     public void verify(final VirtualMachineProfile profile, final Host destination) {
         verify(profile, destination, MigrationMode.LIVE);
+    }
+
+    public boolean requiresVdpa(final VirtualMachineProfile profile) {
+        return countVdpaNics(profile) > 0;
+    }
+
+    public int requiredVdpaVfs(final VirtualMachineProfile profile) {
+        return countVdpaNics(profile);
+    }
+
+    public int freeVdpaVfs(final long hostId) {
+        return vfPoolManager.countFreeForVdpa(hostId);
     }
 
     public void verify(final VirtualMachineProfile profile, final Host destination,
@@ -66,6 +86,8 @@ public class MigrationVfPreflight {
         if (required == 0) {
             return;
         }
+        validateRequestedChassis(profile, destination);
+        validateHaAndPlacement(profile, mode);
         final int free = vfPoolManager.countFreeForVdpa(destination.getId());
         if (free < required) {
             final String message = String.format(
@@ -109,6 +131,41 @@ public class MigrationVfPreflight {
                         "VM %s NIC %s uses SR-IOV hostdev passthrough; live migration is not supported",
                         profile.getVirtualMachine().getUuid(), nic.getUuid()));
             }
+        }
+    }
+
+    private void validateRequestedChassis(final VirtualMachineProfile profile, final Host destination) {
+        final String requested = profile.getVirtualMachine().getDetails() == null ? null
+                : profile.getVirtualMachine().getDetails().get("ovn.requested_chassis");
+        if (requested == null || requested.isBlank()) {
+            return;
+        }
+        if (chassisLookup == null) {
+            throw new CloudRuntimeException("requested-chassis validation is unavailable; refusing vDPA migration");
+        }
+        final String destinationChassis = chassisLookup.findChassisUuid(destination.getId());
+        if (destinationChassis == null || !requested.equals(destinationChassis)) {
+            throw new CloudRuntimeException(String.format(
+                    "requested OVN chassis %s does not match destination chassis %s",
+                    requested, destinationChassis));
+        }
+    }
+
+    private void validateHaAndPlacement(final VirtualMachineProfile profile, final MigrationMode mode) {
+        final VirtualMachine vm = profile.getVirtualMachine();
+        final java.util.Map<String, String> details = vm.getDetails();
+        if (mode == MigrationMode.LIVE && vm.isHaEnabled()
+                && !Boolean.parseBoolean(details == null ? null : details.get("fencing.configured"))) {
+            throw new CloudRuntimeException("live vDPA migration requires fencing for HA restart safety");
+        }
+        if (details == null || !Boolean.parseBoolean(details.get("k8s.control_plane_member"))) {
+            return;
+        }
+        if (!Boolean.parseBoolean(details.get("k8s.quorum.safe"))) {
+            throw new CloudRuntimeException("vDPA migration would violate Kubernetes control-plane quorum");
+        }
+        if (Boolean.parseBoolean(details.get("k8s.anti_affinity_violation"))) {
+            throw new CloudRuntimeException("vDPA migration would violate Kubernetes control-plane anti-affinity");
         }
     }
 }

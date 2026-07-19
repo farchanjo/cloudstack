@@ -103,4 +103,51 @@ public class MigrationVfPreflightTest {
         assertThrows(CloudRuntimeException.class,
                 () -> preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.LIVE));
     }
+
+    @Test
+    public void rejectsUnfencedHaLiveMigration() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final Host host = mock(Host.class);
+        final NicProfile nic = mock(NicProfile.class);
+        final NetworkVO network = mock(NetworkVO.class);
+        final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.isHaEnabled()).thenReturn(true);
+        when(vm.getDetails()).thenReturn(java.util.Map.of());
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(networkDao.findById(NETWORK_ID)).thenReturn(network);
+        when(network.getNetworkOfferingId()).thenReturn(11L);
+        when(networkOfferingDao.findById(11L)).thenReturn(offering);
+        when(offering.isVdpaEnabled()).thenReturn(true);
+        when(host.getId()).thenReturn(HOST_ID);
+        when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(1);
+
+        assertThrows(CloudRuntimeException.class,
+                () -> preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.LIVE));
+    }
+
+    @Test
+    public void acceptsFencedHaColdMigrationWithoutChassisPin() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final Host host = mock(Host.class);
+        final NicProfile nic = mock(NicProfile.class);
+        final NetworkVO network = mock(NetworkVO.class);
+        final NetworkOfferingVO offering = mock(NetworkOfferingVO.class);
+        when(profile.getVirtualMachine()).thenReturn(vm);
+        when(vm.isHaEnabled()).thenReturn(true);
+        when(vm.getDetails()).thenReturn(java.util.Map.of("fencing.configured", "false"));
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.getNetworkId()).thenReturn(NETWORK_ID);
+        when(networkDao.findById(NETWORK_ID)).thenReturn(network);
+        when(network.getNetworkOfferingId()).thenReturn(11L);
+        when(networkOfferingDao.findById(11L)).thenReturn(offering);
+        when(offering.isVdpaEnabled()).thenReturn(true);
+        when(host.getId()).thenReturn(HOST_ID);
+        when(vfPoolManager.countFreeForVdpa(HOST_ID)).thenReturn(1);
+
+        preflight.verify(profile, host, MigrationVfPreflight.MigrationMode.COLD);
+    }
 }

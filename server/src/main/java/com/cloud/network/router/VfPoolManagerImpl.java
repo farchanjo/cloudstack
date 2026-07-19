@@ -756,7 +756,17 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     @Override
     public int countFreeForVdpa(long hostId) {
-        return countFree(hostId);
+        return vfPoolDao.countFreeVdpaCapable(hostId);
+    }
+
+    @Override
+    public VfPoolStatus getHostVfPoolStatus(final long hostId) {
+        return new VfPoolStatus(hostId,
+                vfPoolDao.countByHostAndState(hostId, State.FREE),
+                vfPoolDao.countFreeVdpaCapable(hostId),
+                vfPoolDao.countByHostAndState(hostId, State.RESERVED),
+                vfPoolDao.countByHostAndState(hostId, State.ALLOCATED),
+                vfPoolDao.countByHostAndState(hostId, State.SUSPECT));
     }
 
     @Override

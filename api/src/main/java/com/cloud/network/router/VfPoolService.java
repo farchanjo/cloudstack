@@ -39,4 +39,7 @@ public interface VfPoolService {
      * use the leader/GlobalLock/exact-plan approval path.
      */
     int recoverByHostId(long hostId);
+
+    /** Read-only status; this method never changes pool ownership. */
+    VfPoolStatus getHostVfPoolStatus(long hostId);
 }

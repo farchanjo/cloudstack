@@ -543,14 +543,14 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
 | B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
-| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | Capacity advisory and both migration entry-point hooks are implemented in the current worktree; remaining Slice 2 gates are not yet complete | requested-chassis, hostdev, HA/fencing, anti-affinity, and duplicate-claim admission checks remain | continue Slice 2 before marking complete |
+| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | Current worktree adds a vDPA-kind-specific DAO count, chassis read port/adapter, requested-chassis validation, HA/fencing gate, and K8s quorum/anti-affinity checks | duplicate-claim/concurrency admission and cold wiring remain | continue Slice 2 before marking complete |
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `982672fe9f`: `HypervisorGuruBase` rejects null/failed vDPA VF allocation with a fail-closed runtime error and preserves non-vDPA HW-offload fallback | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | completed | `MigrationVfPreflight` rejects non-vDPA `useHwOffload` NICs for LIVE mode with an explicit unsupported-operation message; COLD mode remains available for later destination-device gates | cold hostdev capacity gate remains in Slice 5.5/6 | preserve live rejection |
 | B5 | `requested-chassis` validation (§5.4) | pending | — | UD1 | — |
-| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | in_progress | `240dc854c3`: reorders the vDPA stamp before NIC/VF ownership commit and uses synchronous agent send; destination dataplane command/verification is still pending | add `VerifyDestinationDataplaneCommand` and rollback/cold-restart coverage | do not claim migration canary readiness |
-| B7 | VF commit/rollback gated on dataplane (§5.6) | pending | — | — | — |
-| B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | pending | — | — | — |
-| B9 | Cold relocate preflight (§5.8) | pending | — | — | — |
+| B6 | Synchronous `PostMigrateOvnStamp` + dataplane verify (§5.5) | in_progress | Current worktree adds shared destination proof command/wrapper and gates synchronous vDPA stamp verification before commit | rollback/cold-restart and storage/scale wiring remain | do not claim migration canary readiness |
+| B7 | VF commit/rollback gated on dataplane (§5.6) | in_progress | Live migration now performs NIC/VF ownership commit before setting migration success and propagates commit failure into cleanup | destination stop/source cold-restart path and storage/scale wiring remain | fail closed; no ownership commit on failed proof |
+| B8 | `listMigrationPreflight` + `listHostVfPoolStatus` APIs (§5.7) | completed | Current worktree adds admin-only read-only command/response contracts and `VfPoolService` status façade; no force-release or repair operation exposed | Aragog API authorization/response tests pending | preserve read-only boundary |
+| B9 | Cold relocate preflight (§5.8) | in_progress | Shared source-binding-down command/wrapper added; orchestration wiring remains | wire after `advanceStop` and before destination start | leave VM stopped on failed proof |
 | B10 | Error/reporting semantics (§5.9) | pending | — | — | — |
 
 ### Phase C — Tests (PENDING)
@@ -560,7 +560,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | C1 | Unit tests §7.1 | pending | Slice 1 negative test remains to be added with the migration-preflight test group | B2–B10 | — |
 | C2 | Wrapper/XML tests §7.2 | pending | — | B6 | — |
 | C3 | Orchestration failure tests §7.3 | pending | — | B2,B3,B6 | — |
-| C4 | API tests §7.4 | pending | — | B8 | — |
+| C4 | API tests §7.4 | in_progress | API command/response slices added; authorization and structured response tests remain | Aragog API module validation | — |
 | C5 | Aragog full build + checkstyle + unit §7.5 | pending | — | B*, C1–C4 | — |
 | C6 | Marvin cold canary §7.6 | pending | — | C5, §8 | no prod VM |
 | C7 | Marvin live canary §7.6 | pending | — | C6 | no prod VM |

@@ -170,6 +170,7 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         hostStateKindSearch = createSearchBuilder();
         hostStateKindSearch.and("hostId", hostStateKindSearch.entity().getHostId(), SearchCriteria.Op.EQ);
         hostStateKindSearch.and("state", hostStateKindSearch.entity().getState(), SearchCriteria.Op.EQ);
+        hostStateKindSearch.and("vdpaKind", hostStateKindSearch.entity().getVdpaKind(), SearchCriteria.Op.EQ);
         hostStateKindSearch.done();
 
         hostVdpaNameSearch = createSearchBuilder();
@@ -206,6 +207,15 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
         sc.setParameters("hostId", hostId);
         sc.setParameters("state", state.name());
+        return getCount(sc);
+    }
+
+    @Override
+    public int countFreeVdpaCapable(final long hostId) {
+        final SearchCriteria<SriovVfPoolVO> sc = hostStateKindSearch.create();
+        sc.setParameters("hostId", hostId);
+        sc.setParameters("state", State.FREE.name());
+        sc.setParameters("vdpaKind", VdpaKind.PASSTHROUGH.name());
         return getCount(sc);
     }
 
@@ -531,9 +541,10 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
         // any mlx5 VF behind a switchdev PF can host a vDPA mgmtdev). Future
         // hardware-specific gating (e.g. ConnectX-7-only sub-set) belongs
         // here as an extra column or filter.
-        SearchCriteria<SriovVfPoolVO> sc = hostStateSearch.create();
+        SearchCriteria<SriovVfPoolVO> sc = hostStateKindSearch.create();
         sc.setParameters("hostId", hostId);
         sc.setParameters("state", State.FREE.name());
+        sc.setParameters("vdpaKind", VdpaKind.PASSTHROUGH.name());
         List<SriovVfPoolVO> free = listBy(sc);
         return (free == null || free.isEmpty()) ? null : free.get(0);
     }

@@ -343,7 +343,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
                                            final Boolean hairpin) {
-        clearOrphanRepsForLspName(lspName, repName);
+        rejectDuplicateRepsForLspName(lspName, repName);
         // DEF-1: a representor can retain an iface-id from a previous VM even
         // when that stale value does not match the current LSP. Clear the
         // complete external_ids map before stamping the new identity.
@@ -368,7 +368,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         OvnNicTunableApplier.applyHairpin(repName, hairpin);
     }
 
-    private void clearOrphanRepsForLspName(final String lspName, final String keepRepName) {
+    private void rejectDuplicateRepsForLspName(final String lspName, final String keepRepName) {
         if (StringUtils.isBlank(lspName)) {
             return;
         }
@@ -383,9 +383,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(name) || name.equals(keepRepName)) {
                 continue;
             }
-            Script.runSimpleBashScript(String.format(
-                    "ovs-vsctl --if-exists del-port %s %s", integrationBridge, name));
-            logger.info("OvnVdpaVifDriver: cleared orphan rep={} carrying stale iface-id={} (kept rep={})",
+            throw new CloudRuntimeException(String.format(
+                    "duplicate active destination/source representor claim: rep=%s iface-id=%s target=%s",
                     name, lspName, keepRepName);
         }
     }

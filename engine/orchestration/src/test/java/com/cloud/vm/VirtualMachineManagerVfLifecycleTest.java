@@ -44,7 +44,7 @@ public class VirtualMachineManagerVfLifecycleTest {
 
     @Test
     public void migrationSuccessDelegatesExactSourceAndDestinationCommit() {
-        manager.commitVfOwnershipBestEffort(1553L, 269L, 16L, "migration", "work-1");
+        manager.commitVfOwnership(1553L, 269L, 16L, "migration", "work-1");
 
         verify(vfPoolManager).commitOwnershipForVm(1553L, 269L, 16L, "work-1");
     }

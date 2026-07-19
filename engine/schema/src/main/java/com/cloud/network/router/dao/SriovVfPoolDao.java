@@ -121,6 +121,9 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
     /** Counts of FREE/ALLOCATED/RESERVED/UNAVAILABLE per host (for capacity reporting). */
     int countByHostAndState(long hostId, State state);
 
+    /** Counts FREE rows explicitly normalized as vDPA-capable passthrough VFs. */
+    int countFreeVdpaCapable(long hostId);
+
     /**
      * Atomically take a free VF on the host, mark it as
      * {@link com.cloud.network.router.SriovVfPoolVO.VdpaKind#VDPA VDPA}, and

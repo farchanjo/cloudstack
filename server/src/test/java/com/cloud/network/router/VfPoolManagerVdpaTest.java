@@ -107,10 +107,10 @@ public class VfPoolManagerVdpaTest {
 
     @Test
     public void countFreeForVdpaUsesFreePoolCount() {
-        when(vfPoolDao.countByHostAndState(eq(HOST_ID), eq(State.FREE))).thenReturn(3);
+        when(vfPoolDao.countFreeVdpaCapable(eq(HOST_ID))).thenReturn(3);
 
         assertEquals(3, manager.countFreeForVdpa(HOST_ID));
-        verify(vfPoolDao).countByHostAndState(HOST_ID, State.FREE);
+        verify(vfPoolDao).countFreeVdpaCapable(HOST_ID);
     }
 
     @Test
