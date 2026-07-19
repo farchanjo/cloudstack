@@ -755,6 +755,11 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
     }
 
     @Override
+    public int countFreeForVdpa(long hostId) {
+        return countFree(hostId);
+    }
+
+    @Override
     public SriovVfPoolVO allocateForVdpa(long hostId, long nicId, String mac, int maxVqs) {
         SriovVfPoolVO vf = vfPoolDao.allocateForVdpa(hostId, nicId, mac, maxVqs);
         if (vf == null) {

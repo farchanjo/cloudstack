@@ -130,6 +130,12 @@ public interface VfPoolManager extends Manager {
     int countFree(long hostId);
 
     /**
+     * Count FREE rows eligible for a vDPA allocation. This advisory value is
+     * checked before migration; the atomic allocation remains the hard gate.
+     */
+    int countFreeForVdpa(long hostId);
+
+    /**
      * Allocate one FREE VF on the given host and bind it to the NIC as a vDPA
      * mgmt-device. The row is flagged {@code vdpa_kind=VDPA} and a canonical
      * {@code vdpa_name} ({@code vdpa-<nicId>}) is stamped on it. The agent

@@ -326,6 +326,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Inject
     private VfPoolManager vfPoolManager;
     @Inject
+    private MigrationVfPreflight migrationVfPreflight;
+    @Inject
     private NetworkModel _networkModel;
     @Inject
     private AgentManager _agentMgr;
@@ -3226,6 +3228,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         final VirtualMachineProfile profile = new VirtualMachineProfileImpl(vm, null, _offeringDao.findById(vm.getId(), vm.getServiceOfferingId()), null, null);
         profile.setHost(dest.getHost());
 
+        migrationVfPreflight.verify(profile, dest.getHost());
         _networkMgr.prepareNicForMigration(profile, dest);
         volumeMgr.prepareForMigration(profile, dest);
         profile.setConfigDriveLabel(VmConfigDriveLabel.value());
@@ -3814,6 +3817,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             alertType = AlertManager.AlertType.ALERT_TYPE_CONSOLE_PROXY_MIGRATE;
         }
 
+        migrationVfPreflight.verify(profile, destination.getHost());
         _networkMgr.prepareNicForMigration(profile, destination);
         volumeMgr.prepareForMigration(profile, destination);
         final HypervisorGuru hvGuru = _hvGuruMgr.getGuru(vm.getHypervisorType());

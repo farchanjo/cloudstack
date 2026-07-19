@@ -543,7 +543,7 @@ task does **not** perform the bump; the bump is the first code-phase commit.
 | ID | Task | Status | Evidence | Blockers | Decision / rollback |
 |---|---|---|---|---|---|
 | B1 | Version bump to `4.24.1.33-SNAPSHOT` (§9) | completed | Slice 0 commit: all tracked POM project-version references and `tools/marvin/setup.py` now target `4.24.1.33` | Aragog scoped validation pending | revert version metadata |
-| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | pending | — | — | — |
+| B2 | `MigrationVfPreflight` use case + `countFreeForVdpa` (§5.1) | in_progress | Capacity advisory and both migration entry-point hooks are implemented in the current worktree; remaining Slice 2 gates are not yet complete | requested-chassis, hostdev, HA/fencing, anti-affinity, and duplicate-claim admission checks remain | continue Slice 2 before marking complete |
 | B3 | Fail-closed vDPA allocation in `HypervisorGuruBase` (§5.2) | completed | `982672fe9f`: `HypervisorGuruBase` rejects null/failed vDPA VF allocation with a fail-closed runtime error and preserves non-vDPA HW-offload fallback | Aragog scoped compile/unit validation pending | restore only with explicit tracker rollback |
 | B4 | hostdev live rejection (§5.3) | pending | — | — | — |
 | B5 | `requested-chassis` validation (§5.4) | pending | — | UD1 | — |

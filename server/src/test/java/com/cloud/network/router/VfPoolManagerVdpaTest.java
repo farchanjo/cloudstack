@@ -106,6 +106,14 @@ public class VfPoolManagerVdpaTest {
     }
 
     @Test
+    public void countFreeForVdpaUsesFreePoolCount() {
+        when(vfPoolDao.countByHostAndState(eq(HOST_ID), eq(State.FREE))).thenReturn(3);
+
+        assertEquals(3, manager.countFreeForVdpa(HOST_ID));
+        verify(vfPoolDao).countByHostAndState(HOST_ID, State.FREE);
+    }
+
+    @Test
     public void releaseVdpaUsesExactAgentEvidenceBeforeRelease() throws Exception {
         final SriovVfPoolVO row = rowWithId(7L, "0000:01:00.5", "dx6p1", "dx6p1vf1", State.ALLOCATED);
         row.setAllocatedToNicId(NIC_ID);
