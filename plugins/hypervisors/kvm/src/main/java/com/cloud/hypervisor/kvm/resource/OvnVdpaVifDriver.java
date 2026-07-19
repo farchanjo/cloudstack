@@ -101,6 +101,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final int maxVqs = nic.getVdpaMaxVqs() != null ? nic.getVdpaMaxVqs() : 33;
 
         final Deque<Runnable> rollback = new ArrayDeque<>();
+        final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
         try {
             // (1) PF-side VF identity: MAC + trust + spoofchk, NO VLAN.
             //     Switchdev mlx5 rejects PF-side VLAN; OVN owns segmentation.
@@ -176,6 +178,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         } catch (RuntimeException | InternalErrorException ex) {
             drainRollback(rollback);
             throw ex;
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 
@@ -246,6 +250,14 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         //     scan via VdpaVifDriver helpers.
         String vdpaName = VdpaVifDriver.lookupVdpaNameByVhostDev(vhostDev);
         final String pciAddress = VdpaVifDriver.lookupVdpaPciByName(vdpaName);
+        if (StringUtils.isBlank(pciAddress)) {
+            logger.warn("OvnVdpaVifDriver.unplug: vDPA name {} did not resolve to an exact VF BDF; fail-closed",
+                    vdpaName);
+            return;
+        }
+        final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
+        try {
         if (StringUtils.isNotBlank(vdpaName)) {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("OvnVdpaVifDriver.unplug: deleted vdpa dev {}", vdpaName);
@@ -258,8 +270,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         //     so a wrong integration-bridge name cannot leave a live OVN binding
         //     after destroy/expunge (Chaos B). Cleanup is fail-closed unless
         //     the vhost device resolves to one exact vDPA management BDF.
-        if (StringUtils.isNotBlank(pciAddress)) {
-            final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+        final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.unplug", repName);
             }
@@ -269,9 +280,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 Script.runSimpleBashScript(String.format(
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
-        } else {
-            logger.warn("OvnVdpaVifDriver.unplug: no exact VF PCI for vhost={} mac={}; fail-closed skip of representor/VF identity",
-                    vhostDev, mac);
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 

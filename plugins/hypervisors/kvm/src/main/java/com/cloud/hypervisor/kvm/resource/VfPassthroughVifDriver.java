@@ -71,6 +71,8 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             throw new InternalErrorException(
                 "VfPassthroughVifDriver invoked without vfPciAddress on NicTO; check VfPoolManager allocation");
         }
+        java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
 
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
@@ -134,6 +136,8 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         } catch (RuntimeException ex) {
             drainRollback(rollback, "VfPassthroughVifDriver.plug");
             throw ex;
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 
@@ -180,6 +184,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             notifyDvrUnregister(mac);
             return;
         }
+        java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
+        try {
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
             Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
@@ -206,6 +213,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             } catch (RuntimeException e) {
                 logger.warn("refreshAllLocalFlood on VF unplug failed: {}", e.getMessage());
             }
+        }
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 

@@ -54,6 +54,7 @@ import com.cloud.agent.api.HostVfPurgeOrphansAnswer.TargetResult;
 import com.cloud.agent.api.HostVfPurgeOrphansCommand;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.resource.VfPassthroughVifDriver;
+import com.cloud.hypervisor.kvm.resource.VfHostLifecycleLock;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
 import com.cloud.utils.script.OutputInterpreter;
@@ -113,7 +114,13 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 continue;
             }
             try {
-                results.add(processTarget(cmd, bdf, vdpa, domains));
+                final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(bdf);
+                lifecycleLock.lock();
+                try {
+                    results.add(processTarget(cmd, bdf, vdpa, domains));
+                } finally {
+                    lifecycleLock.unlock();
+                }
             } catch (RuntimeException e) {
                 LOGGER.warn("Exact VF target {} failed within its exception boundary: {}", bdf, e.getMessage(), e);
                 results.add(failure(bdf, "target exception: " + e.getMessage()));

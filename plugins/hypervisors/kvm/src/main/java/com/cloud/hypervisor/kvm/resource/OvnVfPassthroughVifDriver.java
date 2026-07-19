@@ -95,7 +95,6 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             throw new InternalErrorException(
                 "OvnVfPassthroughVifDriver invoked without vfPciAddress on NicTO; check VfPoolManager allocation");
         }
-
         final String pfName = StringUtils.isNotBlank(nic.getVfPfName())
                 ? nic.getVfPfName()
                 : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
@@ -108,6 +107,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         // the Geneve VNI in its pipeline instead. Pass null to skip the
         // PF-side VLAN config and avoid "Operation not supported".
         final Deque<Runnable> rollback = new ArrayDeque<>();
+        final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
         try {
             configureVfOnPfNoVlan(pfName, vfId, nic.getMac());
             // Apply operator-resolved VF tunables (trust / spoofchk /
@@ -147,6 +148,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         } catch (RuntimeException | InternalErrorException ex) {
             drainRollback(rollback);
             throw ex;
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 
@@ -160,6 +163,9 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         String pciAddress = iface.getPciAddress();
         final String mac = iface.getMacAddress();
         if (StringUtils.isNotBlank(pciAddress)) {
+            final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+            lifecycleLock.lock();
+            try {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.unplug", repName);
@@ -172,6 +178,9 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             if (pfName != null && vfId != null) {
                 Script.runSimpleBashScript(String.format(
                     "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
+            }
+            } finally {
+                lifecycleLock.unlock();
             }
         } else {
             logger.warn("OvnVfPassthroughVifDriver.unplug: no explicit VF PCI for mac={}; fail-closed skip", mac);

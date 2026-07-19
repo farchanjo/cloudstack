@@ -112,7 +112,8 @@ public interface VfPoolManager extends Manager {
      * failed-start and expunge paths that no longer have enough exact host
      * evidence to release hardware.
      *
-     * @return number of rows quarantined.
+     * @return number of rows released to FREE after exact cleanup. Rows that
+     * remain SUSPECT are unresolved and are not counted.
      */
     int quarantineByVmId(long vmId);
 

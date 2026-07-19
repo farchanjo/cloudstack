@@ -114,7 +114,8 @@ public interface SriovVfPoolDao extends GenericDao<SriovVfPoolVO, Long> {
 
     /**
      * Atomically marks VM-owned allocated/reserved rows SUSPECT and returns
-     * the locked rows so the caller can perform exact host cleanup. Includes
+     * the locked rows so the caller can perform exact host cleanup. Already
+     * SUSPECT rows are returned unchanged for retry. Includes
      * NICs already soft-removed from the database and rows whose reverse
      * {@code nics.vf_pool_id} mapping is null.
      */

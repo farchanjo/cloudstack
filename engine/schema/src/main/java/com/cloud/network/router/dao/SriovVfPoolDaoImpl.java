@@ -234,10 +234,14 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 final Long canonicalId = lockNicAndReadVfPoolId(nicId);
                 final List<SriovVfPoolVO> existing = lockRowsForNic(nicId);
                 for (final SriovVfPoolVO row : existing) {
+                    if (State.SUSPECT.name().equals(row.getState())) {
+                        throw new CloudRuntimeException(String.format(
+                                "VF pool row %d for nic=%d host=%d is SUSPECT; exact cleanup must release ownership before allocation",
+                                row.getId(), nicId, row.getHostId()));
+                    }
                     if (row.getHostId() == hostId) {
                         if (State.ALLOCATED.name().equals(row.getState())
-                                || State.RESERVED.name().equals(row.getState())
-                                || State.SUSPECT.name().equals(row.getState())) {
+                                || State.RESERVED.name().equals(row.getState())) {
                             return row;
                         }
                         throw new CloudRuntimeException(String.format(
@@ -517,11 +521,18 @@ public class SriovVfPoolDaoImpl extends GenericDaoBase<SriovVfPoolVO, Long> impl
                 final Map<Long, Long> nics = lockVmNics(vmId);
                 final Map<Long, List<SriovVfPoolVO>> rowsByNic = lockPoolRowsForNics(nics);
                 final List<SriovVfPoolVO> affected = new ArrayList<>();
-                for (final List<SriovVfPoolVO> rows : rowsByNic.values()) {
-                    for (final SriovVfPoolVO row : rows) {
+                for (final Map.Entry<Long, List<SriovVfPoolVO>> entry : rowsByNic.entrySet()) {
+                    final long nicId = entry.getKey();
+                    for (final SriovVfPoolVO row : entry.getValue()) {
+                        if (!Long.valueOf(nicId).equals(row.getAllocatedToNicId())) {
+                            continue;
+                        }
                         if (State.ALLOCATED.name().equals(row.getState())
-                                || State.RESERVED.name().equals(row.getState())) {
-                            markSuspectLocked(row);
+                                || State.RESERVED.name().equals(row.getState())
+                                || State.SUSPECT.name().equals(row.getState())) {
+                            if (!State.SUSPECT.name().equals(row.getState())) {
+                                markSuspectLocked(row);
+                            }
                             affected.add(row);
                         }
                     }

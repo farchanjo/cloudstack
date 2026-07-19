@@ -89,6 +89,8 @@ public class VdpaVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(mac)) {
             throw new InternalErrorException("VdpaVifDriver requires a MAC on the NicTO");
         }
+        java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
 
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
@@ -162,6 +164,8 @@ public class VdpaVifDriver extends VifDriverBase {
         } catch (RuntimeException | InternalErrorException ex) {
             drainRollback(rollback);
             throw ex;
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 
@@ -202,20 +206,21 @@ public class VdpaVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(vdpaName)) {
             vdpaName = lookupVdpaNameByMac(mac);
         }
-        if (StringUtils.isNotBlank(vdpaName)) {
+        final String pciAddress = StringUtils.isNotBlank(vdpaName) ? lookupVdpaPciByName(vdpaName) : null;
+        if (StringUtils.isBlank(vdpaName) || StringUtils.isBlank(pciAddress)) {
+            logger.warn("vDPA unplug: name={} did not resolve to an exact VF BDF; fail-closed", vdpaName);
+            return;
+        }
+        final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+        lifecycleLock.lock();
+        try {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("vDPA unplug: deleted {} (vhost={} mac={})", vdpaName, vhostDev, mac);
-        } else {
-            logger.warn("vDPA unplug: could not resolve vdpa dev name from vhost={} mac={}; skipping vdpa dev del",
-                    vhostDev, mac);
-        }
 
         // Drop the VF representor from br-bond and clear PF-side VF VLAN/MAC,
         // mirroring VfPassthroughVifDriver. The pciAddress is not stored on
         // the VDPA InterfaceDef — recover it through the same lookupVfPciByMac
         // path the passthrough driver uses, falling back to skip on miss.
-        String pciAddress = lookupVfPciByMac(mac);
-        if (StringUtils.isNotBlank(pciAddress)) {
             String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
@@ -227,6 +232,8 @@ public class VdpaVifDriver extends VifDriverBase {
             if (pfName != null && vfId != null) {
                 Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
             }
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 

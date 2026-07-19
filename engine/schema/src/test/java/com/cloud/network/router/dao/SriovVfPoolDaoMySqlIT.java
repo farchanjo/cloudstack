@@ -202,17 +202,41 @@ public class SriovVfPoolDaoMySqlIT {
         insertNic(8934L, 1591L, 980L);
         update("UPDATE nics SET removed=NOW(), vf_pool_id=NULL WHERE id=8934");
         insertPool(980L, 22L, "0000:01:04.1", "ALLOCATED", 8934L);
+        insertPool(981L, 22L, "0000:01:04.2", "RESERVED", 8934L);
+        insertPool(982L, 22L, "0000:01:04.3", "SUSPECT", 8934L);
 
-        assertEquals(1, dao.quarantineAndListByVmId(1591L).size());
+        assertEquals(3, dao.quarantineAndListByVmId(1591L).size());
         assertEquals("SUSPECT", poolState(980L));
-        assertEquals(1, dao.quarantineAndListByVmId(1591L).size());
+        assertEquals("SUSPECT", poolState(981L));
+        assertEquals("SUSPECT", poolState(982L));
+        assertEquals(3, dao.quarantineAndListByVmId(1591L).size());
         assertEquals("SUSPECT", poolState(980L));
 
         assertTrue(dao.releaseExact(980L, 8934L));
+        assertTrue(dao.releaseExact(981L, 8934L));
+        assertTrue(dao.releaseExact(982L, 8934L));
         assertEquals("FREE", poolState(980L));
         assertNull(longValueOrNull("SELECT vf_pool_id FROM nics WHERE id=8934"));
         assertTrue(dao.quarantineAndListByVmId(1591L).isEmpty());
         assertFalse(dao.releaseExact(980L, 8934L));
+    }
+
+    @Test
+    public void suspectOwnershipFailsClosedUntilExactReleaseAndReplayIsIdempotent() throws Exception {
+        insertHost(22L);
+        insertVm(1592L, 22L);
+        insertNic(8935L, 1592L, null);
+        update("UPDATE nics SET removed=NOW(), vf_pool_id=NULL WHERE id=8935");
+        insertPool(981L, 22L, "0000:01:04.2", "SUSPECT", 8935L);
+
+        assertEquals(1, dao.quarantineAndListByVmId(1592L).size());
+        assertEquals("SUSPECT", poolState(981L));
+        expectCloudRuntime(() -> assertNull(
+                dao.allocateOrReserve(22L, 8935L, VdpaKind.PASSTHROUGH, null)));
+        assertTrue(dao.releaseExact(981L, 8935L));
+        assertEquals("FREE", poolState(981L));
+        assertTrue(dao.quarantineAndListByVmId(1592L).isEmpty());
+        assertFalse(dao.releaseExact(981L, 8935L));
     }
 
     @Test
