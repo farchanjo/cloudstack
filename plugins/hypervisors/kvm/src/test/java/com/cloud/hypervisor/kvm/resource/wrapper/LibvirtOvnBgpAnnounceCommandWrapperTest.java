@@ -527,6 +527,184 @@ public class LibvirtOvnBgpAnnounceCommandWrapperTest {
         }
     }
 
+    @Test
+    public void fullyConvergedIpv4AnnounceDoesNotMutate() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(anyString(), org.mockito.ArgumentMatchers.anyInt()))
+                    .thenAnswer(invocation -> convergedIpv4Observation(invocation.getArgument(0)));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN,
+                    GATEWAY_IP, "217.179.89.2/24", "2988", "217.179.89.1");
+            cmd.setGatewayMac("02:02:02:b3:59:22");
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            Assert.assertEquals("already converged", answer.getDetails());
+            scriptMock.verify(() -> Script.executeCommand(anyString()), never());
+            scriptMock.verify(() -> Script.runSimpleBashScript(
+                    argThat(s -> s.contains("add-port") || s.contains("set port")
+                            || s.contains("ip link set") || s.contains("sysctl -w"))), never());
+        }
+    }
+
+    @Test
+    public void driftedRouteFallsThroughToRepair() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(anyString(), org.mockito.ArgumentMatchers.anyInt()))
+                    .thenAnswer(invocation -> convergedIpv4Observation(invocation.getArgument(0))
+                            .replace("via " + GATEWAY_IP, "via 217.179.89.35"));
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN,
+                    GATEWAY_IP);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            scriptMock.verify(() -> Script.executeCommand(argThat((String s) -> s.contains("network " + PUBLIC_IP))),
+                    atLeastOnce());
+        }
+    }
+
+    @Test
+    public void failedObservationFallsThroughToRepair() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(anyString(), org.mockito.ArgumentMatchers.anyInt()))
+                    .thenThrow(new IllegalStateException("observation failed"));
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            scriptMock.verify(() -> Script.executeCommand(argThat((String s) -> s.contains("network " + PUBLIC_IP))),
+                    atLeastOnce());
+        }
+    }
+
+    @Test
+    public void fullyConvergedIpv6AnnounceChecksIpv6Components() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(anyString(), org.mockito.ArgumentMatchers.anyInt()))
+                    .thenAnswer(invocation -> convergedIpv6Observation(invocation.getArgument(0)));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    V6_TIER, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN,
+                    V6_LRP_GUA, V6_ANCHOR, "2988", V6_GW);
+            cmd.setPrefixLength(64);
+            cmd.setGatewayMac(V6_LRP_MAC);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            Assert.assertEquals("already converged", answer.getDetails());
+            scriptMock.verify(() -> Script.executeCommand(anyString()), never());
+        }
+    }
+
+    @Test
+    public void invalidVtyshPathDoesNotInvokeScript() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh;bad", CONFIGURED_ASN);
+
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertFalse(answer.getResult());
+            Assert.assertEquals("invalid vtysh path", answer.getDetails());
+            scriptMock.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    public void malformedFullResultObservationFallsThroughToRepair() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(anyString(),
+                    org.mockito.ArgumentMatchers.anyInt())).thenReturn("not an FRR or kernel observation");
+            scriptMock.when(() -> Script.executeCommand(anyString())).thenReturn(new Pair<>("", ""));
+
+            final OvnBgpAnnounceCommand cmd = new OvnBgpAnnounceCommand(
+                    PUBLIC_IP, OvnBgpAnnounceCommand.OP_ANNOUNCE, "/usr/bin/vtysh", CONFIGURED_ASN);
+            final Answer answer = new LibvirtOvnBgpAnnounceCommandWrapper().execute(cmd, mockResource());
+
+            Assert.assertTrue(answer.getResult());
+            scriptMock.verify(() -> Script.executeCommand(argThat((String s) -> s.contains("network " + PUBLIC_IP))),
+                    atLeastOnce());
+        }
+    }
+
+    private static String convergedIpv4Observation(final String command) {
+        if (command.contains("show running-config")) {
+            return "router bgp " + CONFIGURED_ASN + "\n network " + PUBLIC_IP + "/32\n";
+        }
+        if (command.contains("route show")) {
+            return PUBLIC_IP + "/32 via " + GATEWAY_IP + " dev pub-anchor\n";
+        }
+        if (command.contains("neigh show")) {
+            return GATEWAY_IP + " dev pub-anchor lladdr 02:02:02:b3:59:22 PERMANENT\n";
+        }
+        if (command.contains("external_ids:ovn-bridge-mappings")) {
+            return "physnet1:br-cluster";
+        }
+        if (command.contains("port-to-br")) {
+            return "br-cluster";
+        }
+        if (command.contains("get interface")) {
+            return "internal";
+        }
+        if (command.contains("get port")) {
+            return "2988";
+        }
+        if (command.startsWith("ip link")) {
+            return "2: pub-anchor: <BROADCAST,UP,LOWER_UP> state UP";
+        }
+        if (command.contains("sysctl")) {
+            return "1";
+        }
+        if (command.contains("addr show")) {
+            return "inet 217.179.89.2/24 scope global pub-anchor\n"
+                    + "inet 217.179.89.1/32 scope global pub-anchor";
+        }
+        return "";
+    }
+
+    private static String convergedIpv6Observation(final String command) {
+        if (command.contains("show running-config")) {
+            return "router bgp " + CONFIGURED_ASN + "\n address-family ipv6 unicast\n network "
+                    + V6_TIER + "/64\n exit-address-family\n";
+        }
+        if (command.contains("route show")) {
+            return V6_TIER + "/64 via " + V6_LRP_GUA + " dev pub-anchor\n";
+        }
+        if (command.contains("neigh show")) {
+            return V6_LRP_GUA + " dev pub-anchor lladdr " + V6_LRP_MAC + " PERMANENT\n";
+        }
+        if (command.contains("external_ids:ovn-bridge-mappings")) {
+            return "physnet1:br-cluster";
+        }
+        if (command.contains("port-to-br")) {
+            return "br-cluster";
+        }
+        if (command.contains("get interface")) {
+            return "internal";
+        }
+        if (command.contains("get port")) {
+            return "2988";
+        }
+        if (command.startsWith("ip link")) {
+            return "2: pub-anchor: <BROADCAST,UP,LOWER_UP> state UP";
+        }
+        if (command.contains("sysctl")) {
+            return "1";
+        }
+        if (command.contains("addr show")) {
+            return "inet6 " + V6_ANCHOR + " scope global deprecated\n"
+                    + "inet6 " + V6_GW + "/128 scope global deprecated";
+        }
+        return "";
+    }
+
     private static LibvirtComputingResource mockResource() {
         return org.mockito.Mockito.mock(LibvirtComputingResource.class);
     }

@@ -72,12 +72,25 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         if (!withdraw && !OvnBgpAnnounceCommand.OP_ANNOUNCE.equalsIgnoreCase(operation)) {
             return new OvnBgpAnnounceAnswer(cmd, false, "unknown operation: " + operation);
         }
+        if (!isSafeToken(vtysh)) {
+            return new OvnBgpAnnounceAnswer(cmd, false, "invalid vtysh path");
+        }
         final Long asn = resolveAsn(vtysh, cmd.getAsn());
         if (asn == null) {
             LOGGER.warn("OvnBgpAnnounce: could not resolve FRR BGP ASN (vtysh={}); skipping {} {}",
                     vtysh, operation, publicIp);
             return new OvnBgpAnnounceAnswer(cmd, false,
                     "ASN auto-detect failed; configure ovn.bgp.frr.asn explicitly");
+        }
+        final boolean ipv6 = isIpv6(publicIp);
+        final int prefixLen = resolvePrefixLen(cmd.getPrefixLength(), ipv6);
+        if (!isSafeInput(cmd, publicIp, asn, prefixLen, ipv6)) {
+            return new OvnBgpAnnounceAnswer(cmd, false, "invalid announce value", asn);
+        }
+        if (!withdraw && isAlreadyConverged(cmd, vtysh, asn, prefixLen, ipv6)) {
+            LOGGER.debug("OvnBgpAnnounce {} {}/{}: already converged (asn={}, af={})",
+                    operation, publicIp, prefixLen, asn, ipv6 ? "ipv6" : "ipv4");
+            return new OvnBgpAnnounceAnswer(cmd, true, "already converged", asn);
         }
 
         // Datapath half: steer the /32 INTO OVN on the gateway chassis. The
@@ -97,12 +110,10 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
         // ':' can only appear in an IPv6 address). The v6 path uses `ip -6`,
         // holds the anchor with `ip -6 addr`, and writes the BGP `network` into
         // the `address-family ipv6 unicast` block instead of the default v4 AF.
-        final boolean ipv6 = isIpv6(publicIp);
         if (!withdraw) {
             ensureAnchor(cmd.getAnchorCidr(), cmd.getVlan(), cmd.getNetworkGatewayIp(), ipv6);
         }
 
-        final int prefixLen = resolvePrefixLen(cmd.getPrefixLength(), ipv6);
         final Answer routeErr = applyDatapathRoute(publicIp, cmd.getGatewayIp(), withdraw, cmd, asn, prefixLen, ipv6);
         if (routeErr != null) {
             return routeErr;
@@ -145,6 +156,240 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
      *  appear in an IPv6 address, never in a dotted-quad IPv4). */
     private static boolean isIpv6(final String addr) {
         return addr != null && addr.indexOf(':') >= 0;
+    }
+
+    private boolean isSafeInput(final OvnBgpAnnounceCommand cmd, final String publicIp, final long asn,
+                                final int prefixLen, final boolean ipv6) {
+        if (!isSafeIp(publicIp) || isIpv6(publicIp) != ipv6 || !isSafeAsn(asn)) {
+            return false;
+        }
+        if (cmd.getGatewayIp() != null
+                && (!isSafeIp(cmd.getGatewayIp()) || isIpv6(cmd.getGatewayIp()) != ipv6)) {
+            return false;
+        }
+        if (cmd.getGatewayMac() != null && !cmd.getGatewayMac().trim().isEmpty()
+                && !cmd.getGatewayMac().trim().matches("(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}")) {
+            return false;
+        }
+        if (cmd.getAnchorCidr() != null && !cmd.getAnchorCidr().trim().isEmpty()
+                && (!isSafeCidr(cmd.getAnchorCidr())
+                || isIpv6(cmd.getAnchorCidr().substring(0, cmd.getAnchorCidr().indexOf('/'))) != ipv6)) {
+            return false;
+        }
+        if (cmd.getNetworkGatewayIp() != null && !cmd.getNetworkGatewayIp().trim().isEmpty()
+                && (!isSafeIp(cmd.getNetworkGatewayIp()) || isIpv6(cmd.getNetworkGatewayIp()) != ipv6)) {
+            return false;
+        }
+        return prefixLen > 0 && prefixLen <= (ipv6 ? 128 : 32);
+    }
+
+    private static boolean isSafeToken(final String value) {
+        return value != null && value.matches("[A-Za-z0-9_./:-]+");
+    }
+
+    private static boolean isSafeIp(final String value) {
+        if (value == null || !value.matches("[0-9A-Fa-f:.]+")) {
+            return false;
+        }
+        return value.indexOf(':') >= 0 ? value.matches("[0-9A-Fa-f:]+") : value.matches("[0-9.]+");
+    }
+
+    private static boolean isSafeCidr(final String value) {
+        final String[] parts = value.trim().split("/", -1);
+        return parts.length == 2 && isSafeIp(parts[0]) && parts[1].matches("\\d{1,3}");
+    }
+
+    private static boolean isSafeAsn(final long asn) {
+        return asn > 0 && asn <= 4294967295L;
+    }
+
+    /** Read every desired component before changing anything. Unknown is never converged. */
+    private boolean isAlreadyConverged(final OvnBgpAnnounceCommand cmd, final String vtysh,
+                                       final long asn, final int prefixLen, final boolean ipv6) {
+        try {
+            final String prefix = cmd.getPublicIp() + "/" + prefixLen;
+            if (!hasFrrNetwork(read("%s -c \"show running-config\" 2>/dev/null", vtysh), asn, prefix, ipv6)) {
+                return false;
+            }
+            if (cmd.getGatewayIp() != null && !exactRoute(read("%s route show exact %s", ipv6 ? "ip -6" : "ip",
+                    prefix), prefix, cmd.getGatewayIp())) {
+                return false;
+            }
+            if (cmd.getGatewayIp() != null && cmd.getGatewayMac() != null
+                    && !cmd.getGatewayMac().trim().isEmpty()
+                    && !exactNeighbour(read("%s neigh show to exact %s dev %s", ipv6 ? "ip -6" : "ip",
+                    cmd.getGatewayIp(), ANCHOR_PORT), cmd.getGatewayIp(), cmd.getGatewayMac().trim())) {
+                return false;
+            }
+            if (cmd.getAnchorCidr() != null && !cmd.getAnchorCidr().trim().isEmpty()
+                    && !anchorConverged(cmd, ipv6)) {
+                return false;
+            }
+            return true;
+        } catch (RuntimeException e) {
+            LOGGER.debug("OvnBgpAnnounce: state observation failed; using repair path: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private String read(final String format, final Object... args) {
+        final String output = Script.runSimpleBashScriptWithFullResult(String.format(format, args), 30);
+        return output == null ? null : output.trim();
+    }
+
+    private boolean anchorConverged(final OvnBgpAnnounceCommand cmd, final boolean ipv6) {
+        final String bridge = observedLocalnetBridge();
+        if (bridge == null || !bridge.equals(read("ovs-vsctl --if-exists port-to-br %s", ANCHOR_PORT))
+                || !"internal".equals(read("ovs-vsctl --if-exists get interface %s type", ANCHOR_PORT))) {
+            return false;
+        }
+        final String vlan = cmd.getVlan() == null ? "" : cmd.getVlan().trim();
+        if (!vlan.isEmpty() && !vlan.equals(unquote(read("ovs-vsctl --if-exists get port %s tag", ANCHOR_PORT)))) {
+            return false;
+        }
+        final String link = read("ip link show dev %s", ANCHOR_PORT);
+        if (!linkIsUp(link)) {
+            return false;
+        }
+        final String addrTool = ipv6 ? "ip -6" : "ip";
+        final String addresses = read("%s addr show dev %s", addrTool, ANCHOR_PORT);
+        if (!exactAddress(addresses, cmd.getAnchorCidr().trim())) {
+            return false;
+        }
+        if (cmd.getNetworkGatewayIp() != null && !cmd.getNetworkGatewayIp().trim().isEmpty()) {
+            if (!exactAddress(addresses, cmd.getNetworkGatewayIp().trim() + (ipv6 ? "/128" : "/32"))) {
+                return false;
+            }
+            final String forwarding = ipv6 ? "net.ipv6.conf.all.forwarding" : "net.ipv4.ip_forward";
+            return "1".equals(read("sysctl -n %s", forwarding));
+        }
+        return true;
+    }
+
+    private String observedLocalnetBridge() {
+        final String raw = unquote(read("ovs-vsctl --if-exists get open_vswitch . external_ids:ovn-bridge-mappings"));
+        if (raw == null || raw.isEmpty() || raw.indexOf(',') >= 0) {
+            return null;
+        }
+        final String[] pair = raw.split(":", -1);
+        return pair.length == 2 && isSafeToken(pair[1].trim()) ? pair[1].trim() : null;
+    }
+
+    private static boolean hasFrrNetwork(final String config, final long asn, final String prefix, final boolean ipv6) {
+        if (config == null || config.isEmpty()) {
+            return false;
+        }
+        boolean router = false;
+        boolean v6 = false;
+        for (final String rawLine : config.split("\\R")) {
+            final String line = rawLine.trim();
+            if (line.startsWith("router bgp ")) {
+                router = line.equals("router bgp " + asn);
+                v6 = false;
+            } else if (!router) {
+                continue;
+            } else if (line.equals("address-family ipv6 unicast")) {
+                v6 = true;
+            } else if (line.equals("exit-address-family")) {
+                v6 = false;
+            } else if (line.equals("network " + prefix)) {
+                return v6 == ipv6;
+            }
+        }
+        return false;
+    }
+
+    private static boolean exactRoute(final String output, final String prefix, final String gateway) {
+        return oneLineContainingAll(output, prefix, "via", gateway);
+    }
+
+    private static boolean exactNeighbour(final String output, final String ip, final String mac) {
+        return oneLineContainingAllIgnoreCase(output, ip, "lladdr", mac, "permanent");
+    }
+
+    private static boolean exactAddress(final String output, final String address) {
+        return oneLineContainingAll(output, address);
+    }
+
+    private static boolean oneLineContainingAll(final String output, final String... values) {
+        if (output == null || output.isEmpty()) {
+            return false;
+        }
+        int matches = 0;
+        for (final String line : output.split("\\R")) {
+            final String[] words = line.trim().split("\\s+");
+            boolean all = true;
+            for (final String value : values) {
+                boolean found = false;
+                for (final String word : words) {
+                    if (word.equals(value)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) {
+                matches++;
+            }
+        }
+        return matches == 1;
+    }
+
+    private static boolean oneLineContainingAllIgnoreCase(final String output, final String... values) {
+        if (output == null) {
+            return false;
+        }
+        final String[] normalized = new String[values.length];
+        for (int i = 0; i < values.length; i++) {
+            normalized[i] = values[i].toLowerCase(java.util.Locale.ROOT);
+        }
+        return oneLineContainingAll(output.toLowerCase(java.util.Locale.ROOT), normalized);
+    }
+
+    private static boolean oneLineContaining(final String output, final String value) {
+        if (output == null || value == null || output.isEmpty()) {
+            return false;
+        }
+        final String[] lines = output.split("\\R");
+        int matches = 0;
+        for (final String line : lines) {
+            if (line.contains(value)) {
+                matches++;
+            }
+        }
+        return matches == 1;
+    }
+
+    private static boolean linkIsUp(final String output) {
+        if (output == null || output.isEmpty()) {
+            return false;
+        }
+        int matches = 0;
+        for (final String line : output.split("\\R")) {
+            final int flagsStart = line.indexOf('<');
+            final int flagsEnd = line.indexOf('>', flagsStart + 1);
+            if (flagsStart < 0 || flagsEnd < 0) {
+                continue;
+            }
+            for (final String flag : line.substring(flagsStart + 1, flagsEnd).split(",")) {
+                if ("UP".equals(flag.trim())) {
+                    matches++;
+                    break;
+                }
+            }
+        }
+        return matches == 1;
+    }
+
+    private static String unquote(final String value) {
+        if (value == null) {
+            return null;
+        }
+        return value.replaceAll("^\"|\"$", "");
     }
 
     /** Build the vtysh {@code -c} chain, injecting {@code address-family ipv6
@@ -373,7 +618,8 @@ public final class LibvirtOvnBgpAnnounceCommandWrapper extends
                     + "anchor port", raw);
         }
         final String[] pair = mappings[0].split(":");
-        return pair.length == 2 ? pair[1].trim() : null;
+        final String bridge = pair.length == 2 ? pair[1].trim() : null;
+        return isSafeToken(bridge) ? bridge : null;
     }
 
     /** Resolve the advertised prefix length: the command value when in the sane
