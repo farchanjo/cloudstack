@@ -419,7 +419,7 @@ public class OvnVifDriver extends VifDriverBase {
      * forever. Ownership is now decided by live domain MAC inventory:
      * <ul>
      *   <li>attached-mac present and <b>not</b> in any running domain → free
-     *       OVS rep + clear VF identity + best-effort {@code vdpa dev del}
+     *       strict vDPA deletion + OVS rep + clear VF identity
      *       (even if PCI still shows vfio/vDPA leftovers)</li>
      *   <li>attached-mac present and owned by a live domain → keep
      *       ({@code skippedAllocated})</li>
