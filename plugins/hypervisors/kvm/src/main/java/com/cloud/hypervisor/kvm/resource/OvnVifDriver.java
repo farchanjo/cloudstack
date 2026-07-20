@@ -448,31 +448,37 @@ public class OvnVifDriver extends VifDriverBase {
         }
 
         for (final String iface : candidates) {
-            if (!isVfRepresentor(iface)) {
-                result.skippedNonRep++;
-                continue;
-            }
-            final String vfPci = resolveVfPciFromRepresentor(iface);
-            if (StringUtils.isBlank(vfPci)) {
-                log.debug("{}: cannot resolve VF PCI for rep={}; skipping", callerLabel, iface);
-                result.skippedUnresolved++;
-                continue;
-            }
-            final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
-            lock.lock();
-            try {
-                processStaleRepresentorLocked(log, callerLabel, iface, vfPci, dryRun, result);
-            } catch (RuntimeException re) {
-                log.warn("{}: failed to free stale representor {}: {}", callerLabel, iface, re.getMessage());
-            } finally {
-                lock.unlock();
-            }
+            processStaleRepresentor(log, callerLabel, iface, dryRun, result);
         }
         log.info("{}: freeStaleFreeVfRepresentors scanned={} freed={} skippedNonRep={} "
                         + "skippedAllocated={} skippedUnresolved={} dryRun={}",
                 callerLabel, result.scanned, result.freed, result.skippedNonRep,
                 result.skippedAllocated, result.skippedUnresolved, dryRun);
         return result;
+    }
+
+    private static void processStaleRepresentor(final Logger log, final String callerLabel,
+                                                 final String iface, final boolean dryRun,
+                                                 final FreeStaleOvsResult result) {
+        if (!isVfRepresentor(iface)) {
+            result.skippedNonRep++;
+            return;
+        }
+        final String vfPci = resolveVfPciFromRepresentor(iface);
+        if (StringUtils.isBlank(vfPci)) {
+            log.debug("{}: cannot resolve VF PCI for rep={}; skipping", callerLabel, iface);
+            result.skippedUnresolved++;
+            return;
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+        lock.lock();
+        try {
+            processStaleRepresentorLocked(log, callerLabel, iface, vfPci, dryRun, result);
+        } catch (RuntimeException re) {
+            log.warn("{}: failed to free stale representor {}: {}", callerLabel, iface, re.getMessage());
+        } finally {
+            lock.unlock();
+        }
     }
 
     private static void processStaleRepresentorLocked(final Logger log, final String callerLabel,
