@@ -184,6 +184,7 @@ public class SriovVfPoolDaoMySqlIT {
     @Test
     public void exactReleaseConditionallyClearsOnlyItsOwnPointerAndReplayIsSafe() throws Exception {
         fixtureExactRelease();
+        assertTrue(dao.markSuspect(1001L, 100L));
         assertTrue(dao.releaseExact(1001L, 100L));
         assertEquals(1000L, longValue("SELECT vf_pool_id FROM nics WHERE id=100"));
         assertFalse(dao.releaseExact(1001L, 100L));
@@ -339,11 +340,12 @@ public class SriovVfPoolDaoMySqlIT {
     @Test
     public void forcedMidTransactionExceptionRollsBackPoolAndNicPointer() throws Exception {
         fixtureSingleNic();
+        assertTrue(dao.markSuspect(1000L, 100L));
         expectCloudRuntime(() -> Transaction.execute((TransactionCallback<Boolean>) status -> {
             assertTrue(dao.releaseExact(1000L, 100L));
             throw new CloudRuntimeException("forced rollback");
         }));
-        assertEquals("ALLOCATED", poolState(1000L));
+        assertEquals("SUSPECT", poolState(1000L));
         assertEquals(1000L, longValue("SELECT vf_pool_id FROM nics WHERE id=100"));
         assertEquals(100L, longValue("SELECT allocated_to_nic_id FROM sriov_vf_pool WHERE id=1000"));
     }
