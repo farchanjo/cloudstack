@@ -492,11 +492,11 @@ public class OvnVifDriver extends VifDriverBase {
                         log.warn("{}: orphan rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
                         continue;
                     }
-                    if (!freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci)) {
-                        continue;
-                    }
                     if (hasVdpa) {
                         deleteVdpaDevsForPciStrict(log, callerLabel, vfPci);
+                    }
+                    if (!freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci)) {
+                        continue;
                     }
                     result.freed++;
                     if (result.freedNames.size() < 64) {
