@@ -468,40 +468,11 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 lifecycleLock.unlock();
             }
         } else {
-            try {
-                Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
-                removeDestinationOwnedRepresentor(nic);
-            } catch (RuntimeException e) {
-                cleanupFailure = appendCleanupFailure(cleanupFailure, e);
-            }
+            cleanupFailure = new CloudRuntimeException(
+                    "cannot release vDPA rollback state without an exact VF BDF: " + vdpaName);
         }
         if (cleanupFailure != null) {
             throw cleanupFailure;
-        }
-    }
-
-    private void removeDestinationOwnedRepresentor(final NicTO nic) {
-        if (StringUtils.isBlank(nic.getUuid())) {
-            throw new CloudRuntimeException("cannot identify destination representor during vDPA rollback");
-        }
-        final String lsp = "lsp-" + nic.getUuid();
-        final String found = Script.runSimpleBashScript(String.format(
-                "ovs-vsctl --no-headings --columns=name find Interface external_ids:iface-id=%s 2>/dev/null", lsp));
-        for (final String raw : found.split("\\R")) {
-            final String rep = raw.trim().replaceAll("^\"|\"$", "");
-            if (StringUtils.isBlank(rep)) {
-                continue;
-            }
-            final String ids = Script.runSimpleBashScript(String.format(
-                    "ovs-vsctl get Interface %s external_ids 2>/dev/null", rep));
-            final boolean owned = ids.contains("migration-owner=destination")
-                    || ids.contains("migration-owner=\"destination\"");
-            final boolean inactive = ids.contains("iface-status=inactive")
-                    || ids.contains("iface-status=\"inactive\"");
-            if (!owned || !inactive) {
-                throw new CloudRuntimeException("refusing to remove non-destination-owned representor " + rep);
-            }
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.rollback", rep, lsp);
         }
     }
 
