@@ -268,6 +268,49 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
     }
 
     @Test
+    public void vDpaAppearingAfterInitialInventoryBlocksAllLaterMutations() throws Exception {
+        final FakeHost host = preparedHost("vdpa-appears-late");
+        host.vdpaInventorySequence = List.of(Collections.emptyList(), Collections.singletonList("vdpa-late"));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command(false));
+
+        assertFalse(answer.getResult());
+        assertFalse(host.hasMutation());
+        assertTrue(host.removedRepresentors.isEmpty());
+        assertEquals(0, answer.getVdpaDeleted());
+    }
+
+    @Test
+    public void changedPlannedVdpaNameFailsClosedBeforeDeletion() throws Exception {
+        final FakeHost host = preparedHost("vdpa-recreated");
+        host.vdpaInventorySequence = List.of(Collections.singletonList("vdpa-target"),
+                Collections.singletonList("vdpa-recreated"));
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command(false));
+
+        assertFalse(answer.getResult());
+        assertFalse(host.hasMutation());
+        assertTrue(host.removedRepresentors.isEmpty());
+        assertEquals(0, answer.getVdpaDeleted());
+    }
+
+    @Test
+    public void expectedPlannedVdpaNamesDeleteOnlyAfterMatchingPostconditions() throws Exception {
+        final FakeHost host = preparedHost("vdpa-authoritative-success");
+        host.vdpaPresent = true;
+        host.vdpaNames = new ArrayList<>(java.util.Arrays.asList("vdpa-first", "vdpa-second"));
+        host.vdpaInventorySequence = List.of(host.vdpaNames, host.vdpaNames);
+
+        final HostVfPurgeOrphansAnswer answer = execute(host, command(false));
+
+        assertTrue(answer.getResult());
+        assertEquals(2, answer.getVdpaDeleted());
+        assertEquals(java.util.Arrays.asList("vdpa-first", "vdpa-second"), answer.getVdpaDeletedNames());
+        assertTrue(host.removedRepresentors.contains("zzz-correct-pf1vf24"));
+        assertEquals("00:00:00:00:00:00", host.currentMac);
+    }
+
+    @Test
     public void countersReportEveryVdpaDeviceAndPreservePartialFailure() throws Exception {
         final FakeHost host = preparedHost("vdpa-multiple");
         host.vdpaPresent = true;
@@ -477,6 +520,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         private boolean vdpaInventoryFails;
         private boolean vdpaPresent;
         private List<String> vdpaNames = new ArrayList<>(Collections.singletonList("vdpa-target"));
+        private List<List<String>> vdpaInventorySequence;
+        private int vdpaInventoryCalls;
         private String vdpaDeleteFailsName;
         private boolean identityClearFails;
         private boolean macReadFails;
@@ -527,6 +572,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
                 if (vdpaInventoryFails) {
                     return CommandResult.failure("vdpa unavailable");
                 }
+                if (vdpaInventorySequence != null && vdpaInventoryCalls < vdpaInventorySequence.size()) {
+                    return CommandResult.success(vdpaJson(vdpaInventorySequence.get(vdpaInventoryCalls++)));
+                }
+                vdpaInventoryCalls++;
                 return CommandResult.success(vdpaPresent
                         ? vdpaJson()
                         : "{\"dev\":{}}");
@@ -653,12 +702,16 @@ public class LibvirtHostVfPurgeOrphansCommandWrapperTest {
         }
 
         private String vdpaJson() {
+            return vdpaJson(vdpaNames);
+        }
+
+        private String vdpaJson(final List<String> names) {
             final StringBuilder json = new StringBuilder("{\"dev\":{");
-            for (int index = 0; index < vdpaNames.size(); index++) {
+            for (int index = 0; index < names.size(); index++) {
                 if (index > 0) {
                     json.append(',');
                 }
-                json.append('\"').append(vdpaNames.get(index)).append("\":{\"mgmtdev\":\"pci/")
+                json.append('\"').append(names.get(index)).append("\":{\"mgmtdev\":\"pci/")
                         .append(BDF).append("\"}");
             }
             return json.append("}}").toString();

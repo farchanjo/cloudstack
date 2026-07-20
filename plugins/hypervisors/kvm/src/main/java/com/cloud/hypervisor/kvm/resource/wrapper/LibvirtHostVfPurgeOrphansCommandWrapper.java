@@ -218,19 +218,21 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         int representorsRemoved = 0;
         int rebound = 0;
         final List<String> vdpaRemovedNames = new ArrayList<>();
+        final Set<String> plannedVdpaNames = new LinkedHashSet<>(vdpaNames == null
+                ? Collections.emptyList() : vdpaNames);
         try {
-            if (vdpaNames != null) {
-                for (final String name : vdpaNames) {
+            if (!plannedVdpaNames.isEmpty()) {
+                final Set<String> remainingVdpaNames = new LinkedHashSet<>(plannedVdpaNames);
+                for (final String name : plannedVdpaNames) {
+                    requireVdpaPlan(bdf, remainingVdpaNames, "vDPA deletion");
                     revalidateBeforeDestructiveAction(bdf, observation.getExpectedMac(), expectedRepresentor,
                             expectedInterfaceId, "vDPA deletion", true, observation.isLifecycleAuthorizationUsed());
                     requireSuccess(environment.runner.run("/usr/sbin/vdpa", "dev", "del", name),
                             "vdpa dev del " + name);
                     vdpaRemoved++;
                     vdpaRemovedNames.add(name);
-                }
-                final VdpaInventory postVdpa = inventoryVdpa();
-                if (!postVdpa.success || postVdpa.byBdf.containsKey(bdf)) {
-                    throw new IllegalStateException("vDPA delete postcondition unavailable or target still present");
+                    remainingVdpaNames.remove(name);
+                    requireVdpaPlan(bdf, remainingVdpaNames, "vDPA deletion postcondition");
                 }
             }
 
@@ -274,6 +276,18 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             result.setRepresentorName(expectedRepresentor);
             setActions(result, representorsRemoved, vdpaRemoved, rebound);
             return result;
+        }
+    }
+
+    private void requireVdpaPlan(final String bdf, final Set<String> expectedNames, final String action) {
+        final VdpaInventory current = inventoryVdpa();
+        if (!current.success) {
+            throw new IllegalStateException(action + " inventory unavailable");
+        }
+        final Set<String> currentNames = new LinkedHashSet<>(current.byBdf.getOrDefault(bdf, Collections.emptyList()));
+        if (!currentNames.equals(expectedNames)) {
+            throw new IllegalStateException(action + " vDPA ownership changed: expected=" + expectedNames
+                    + " current=" + currentNames);
         }
     }
 
@@ -356,6 +370,10 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
         }
         if (action.startsWith("OVS") && !hasInterfaceId(expectedRepresentor, expectedInterfaceId)) {
             throw new IllegalStateException(action + " blocked: OVS iface-id ownership changed");
+        }
+        if (!action.startsWith("vDPA")
+                && !vdpa.byBdf.getOrDefault(bdf, Collections.emptyList()).isEmpty()) {
+            throw new IllegalStateException(action + " blocked: vDPA device owns target BDF");
         }
     }
 
