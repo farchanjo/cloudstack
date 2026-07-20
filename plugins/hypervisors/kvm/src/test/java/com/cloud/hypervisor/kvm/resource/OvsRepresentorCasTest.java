@@ -52,6 +52,17 @@ public class OvsRepresentorCasTest {
     }
 
     @Test
+    public void transactionRequiresTrueOvsUuidMembershipForInterfacePortAndBridge() {
+        final String transaction = OvsRepresentorCas.transactionForTest(
+                "iface-1", "port-1", "bridge-1", "rep0", "lsp-1");
+        assertTrue(transaction.contains("[\"uuid\",\"iface-1\"]"));
+        assertTrue(transaction.contains("[\"uuid\",\"port-1\"]"));
+        assertTrue(transaction.contains("[\"uuid\",\"bridge-1\"]"));
+        assertTrue(transaction.contains("\"interfaces\",\"includes\""));
+        assertTrue(transaction.contains("\"ports\",\"includes\""));
+    }
+
+    @Test
     public void removeRequiresIfaceIdBeforeAnyExecutorCall() {
         final int[] calls = {0};
         assertFalse(OvsRepresentorCas.remove(args -> {
@@ -104,6 +115,28 @@ public class OvsRepresentorCasTest {
         responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"name\":\"br-int\",\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]");
         assertFalse(OvsRepresentorCas.remove(executorWithValidMutation(responses),
                 "unix:/var/run/openvswitch/db.sock", "rep0", "lsp-1"));
+    }
+
+    @Test
+    public void restampRejectsStaleGenerationBeforeMutation() {
+        final Deque<String> responses = new ArrayDeque<>();
+        responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"iface-1\"],\"name\":\"rep0\","
+                + "\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-1\"],[\"migration-work-id\",\"old\"],"
+                + "[\"migration-generation\",\"9\"]]]}]}]");
+        responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"rep0\","
+                + "\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]");
+        responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"name\":\"br-int\","
+                + "\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]");
+        final int[] transactions = {0};
+        assertFalse(OvsRepresentorCas.restamp(args -> {
+            if (args.length > 3 && "transact".equals(args[1])
+                    && JsonParser.parseString(args[3]).toString().contains("mutate")) {
+                transactions[0]++;
+            }
+            return new OvsRepresentorCas.Result(true, responses.removeFirst(), "");
+        }, "unix:/var/run/openvswitch/db.sock", "rep0", "lsp-1", "new", 10L,
+                "nic-1", 7L, "0000:01:00.1"));
+        assertEquals(0, transactions[0]);
     }
 
     private static Deque<String> discoveryResponses(final String ifaceId) {

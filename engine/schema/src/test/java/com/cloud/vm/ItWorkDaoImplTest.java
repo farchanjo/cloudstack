@@ -53,7 +53,7 @@ public class ItWorkDaoImplTest {
             Long batchSize = (Long)invocationOnMock.getArguments()[1];
             return batchSize == null ? 0 : batchSize.intValue();
         }).when(itWorkDaoImplSpy).batchExpunge(Mockito.any(SearchCriteria.class), Mockito.anyLong());
-        Mockito.when(itWorkDaoImplSpy.createSearchBuilder()).thenReturn(sb);
+        Mockito.doReturn(sb).when(itWorkDaoImplSpy).createSearchBuilder();
         final ItWorkVO mockedVO = Mockito.mock(ItWorkVO.class);
         Mockito.when(sb.entity()).thenReturn(mockedVO);
         List<Long> vmIds = List.of(1L, 2L);
@@ -63,5 +63,17 @@ public class ItWorkDaoImplTest {
         Mockito.verify(sc).setParameters("vmIds", array);
         Mockito.verify(itWorkDaoImplSpy, Mockito.times(1))
                 .batchExpunge(sc, batchSize);
+    }
+
+    @Test
+    public void terminalizeMigrationAddsUnexpiredLeasePredicateToCas() {
+        final ItWorkVO work = Mockito.mock(ItWorkVO.class);
+        Mockito.doReturn(work).when(itWorkDaoImplSpy).findById("work");
+        Mockito.when(work.getMigrationGeneration()).thenReturn(4L);
+        Mockito.when(work.getMigrationPhase()).thenReturn(ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING);
+        Mockito.when(work.getMigrationRecoveryLeaseExpiresAt()).thenReturn(1L);
+
+        Assert.assertFalse(itWorkDaoImplSpy.terminalizeMigration("work", 4L, 9L, "token", 3L));
+        Mockito.verify(itWorkDaoImplSpy, Mockito.never()).update(Mockito.any(ItWorkVO.class), Mockito.any(SearchCriteria.class));
     }
 }

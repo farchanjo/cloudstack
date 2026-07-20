@@ -22,6 +22,7 @@ package com.cloud.hypervisor.kvm.resource.wrapper;
 import java.net.URISyntaxException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
 
 import org.apache.cloudstack.storage.configdrive.ConfigDrive;
 import org.apache.cloudstack.storage.to.VolumeObjectTO;
@@ -37,8 +38,11 @@ import com.cloud.agent.api.to.DiskTO;
 import com.cloud.agent.api.to.DpdkTO;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.agent.api.to.VirtualMachineTO;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationAnswer;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationCommand;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
+import com.cloud.hypervisor.kvm.resource.MigrationIdentityFenceStore;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.InterfaceDef.GuestNetType;
 import com.cloud.hypervisor.kvm.resource.OvnVdpaVifDriver;
@@ -55,17 +59,16 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
     @Override
     public Answer execute(final PrepareForMigrationCommand command, final LibvirtComputingResource libvirtComputingResource) {
         final VirtualMachineTO vm = command.getVirtualMachine();
+        final NicTO[] nics = vm.getNics();
 
         if (command.isRollback()) {
             logger.info("Handling rollback for PrepareForMigration of VM {}", vm.getName());
-            return handleRollback(command, libvirtComputingResource);
+            return handleRollback(command, libvirtComputingResource, nics);
         }
 
         if (logger.isDebugEnabled()) {
             logger.debug("Preparing host for migrating " + vm);
         }
-
-        final NicTO[] nics = vm.getNics();
 
         Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
         Map<String, String> vdpaInterfaceMapping = new HashMap<>();
@@ -138,7 +141,7 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
                 skipDisconnect = false;
                 RuntimeException cleanupFailure = null;
                 try {
-                    releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
+                    releaseVdpaVfsOnRollback(vm, nics, libvirtComputingResource);
                 } catch (RuntimeException cleanupError) {
                     cleanupFailure = cleanupError;
                 }
@@ -149,11 +152,11 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             }
 
             logger.info("Successfully prepared destination host for migration of VM {}", vm.getName());
-            return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, vdpaInterfaceMapping, libvirtComputingResource, vm);
+            return createPrepareForMigrationAnswer(command, dpdkInterfaceMapping, vdpaInterfaceMapping, libvirtComputingResource, vm, nics);
         } catch (final LibvirtException | CloudRuntimeException | InternalErrorException | URISyntaxException e) {
             RuntimeException cleanupFailure = null;
             try {
-                releaseVdpaVfsOnRollback(vm, libvirtComputingResource);
+                releaseVdpaVfsOnRollback(vm, nics, libvirtComputingResource);
             } catch (RuntimeException cleanupError) {
                 cleanupFailure = cleanupError;
             }
@@ -183,7 +186,7 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
 
     protected PrepareForMigrationAnswer createPrepareForMigrationAnswer(PrepareForMigrationCommand command,
             Map<String, DpdkTO> dpdkInterfaceMapping, Map<String, String> vdpaInterfaceMapping,
-            LibvirtComputingResource libvirtComputingResource, VirtualMachineTO vm) {
+            LibvirtComputingResource libvirtComputingResource, VirtualMachineTO vm, NicTO[] nics) {
         PrepareForMigrationAnswer answer = new PrepareForMigrationAnswer(command);
 
         if (MapUtils.isNotEmpty(dpdkInterfaceMapping)) {
@@ -196,6 +199,43 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
             answer.setVdpaInterfaceMapping(vdpaInterfaceMapping);
         }
 
+        if (command.getMigrationWorkId() == null || command.getMigrationGeneration() <= 0) {
+            throw new CloudRuntimeException("migration prepare is missing its persistent identity fence");
+        }
+        if (command.getMigrationIdentities().isEmpty()) {
+            throw new CloudRuntimeException("migration prepare lacks DB NIC identity reservations");
+        }
+        final MigrationIdentityFenceStore fences = new MigrationIdentityFenceStore(
+                MigrationIdentityFenceStore.migrationFenceDirectory());
+        final java.util.concurrent.locks.ReentrantLock manifestLock = MigrationIdentityFenceStore.lockFor(
+                command.getMigrationWorkId(), command.getMigrationGeneration(), fences.hostIdentity());
+        manifestLock.lock();
+        try {
+            final List<ObserveVdpaMigrationAnswer.NicObservation> observations =
+                    LibvirtObserveVdpaMigrationCommandWrapper.observeWithLocks(
+                            new ObserveVdpaMigrationCommand(vm.getName(), command.getMigrationWorkId(),
+                                    command.getMigrationGeneration(), command.getMigrationIdentities()));
+            if (observations.size() != nics.length
+                    || observations.stream().anyMatch(observation -> !observation.isExact())) {
+                throw new CloudRuntimeException("destination prepare did not produce exact local NIC identities");
+            }
+            fences.install(command.getMigrationWorkId(), command.getMigrationGeneration(),
+                    command.getMigrationIdentities().stream().map(identity -> MigrationIdentityFenceStore.Fence.fromIdentity(
+                            command.getMigrationWorkId(), command.getMigrationGeneration(), identity,
+                            command.getMigrationLeaseToken(), command.getMigrationLeaseVersion(),
+                            command.getMigrationLeaseExpiry())).toList());
+            final Map<Long, ObserveVdpaMigrationAnswer.NicObservation> byNic = new HashMap<>();
+            for (final ObserveVdpaMigrationAnswer.NicObservation observation : observations) {
+                if (observation.getNicId() <= 0 || observation.getNicUuid() == null
+                        || byNic.putIfAbsent(observation.getNicId(), observation) != null) {
+                    throw new CloudRuntimeException("destination prepare returned duplicate NIC identity");
+                }
+            }
+            answer.setNicObservations(byNic);
+        } finally {
+            manifestLock.unlock();
+        }
+
         int newCpuShares = libvirtComputingResource.calculateCpuShares(vm);
         logger.debug(String.format("Setting CPU shares to [%s] for the migration of VM [%s].", newCpuShares, vm));
         answer.setNewVmCpuShares(newCpuShares);
@@ -203,13 +243,14 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
         return answer;
     }
 
-    private Answer handleRollback(PrepareForMigrationCommand command, LibvirtComputingResource libvirtComputingResource) {
+    private Answer handleRollback(PrepareForMigrationCommand command, LibvirtComputingResource libvirtComputingResource,
+            NicTO[] nics) {
         KVMStoragePoolManager storagePoolMgr = libvirtComputingResource.getStoragePoolMgr();
         VirtualMachineTO vmTO = command.getVirtualMachine();
 
         RuntimeException cleanupFailure = null;
         try {
-            releaseVdpaVfsOnRollback(vmTO, libvirtComputingResource);
+            releaseVdpaVfsOnRollback(vmTO, nics, libvirtComputingResource);
         } catch (RuntimeException e) {
             cleanupFailure = e;
         }
@@ -235,8 +276,8 @@ public final class LibvirtPrepareForMigrationCommandWrapper extends CommandWrapp
      * <p>Called before physical-disk disconnect so that VF cleanup always runs
      * even if the disk path throws.
      */
-    private void releaseVdpaVfsOnRollback(VirtualMachineTO vm, LibvirtComputingResource libvirtComputingResource) {
-        final NicTO[] nics = vm.getNics();
+    private void releaseVdpaVfsOnRollback(VirtualMachineTO vm, NicTO[] nics,
+            LibvirtComputingResource libvirtComputingResource) {
         if (nics == null || nics.length == 0) {
             return;
         }

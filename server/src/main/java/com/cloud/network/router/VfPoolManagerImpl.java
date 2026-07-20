@@ -455,7 +455,7 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
                 free++;
             }
         }
-        int noncanonicalQuarantinedOrCompleted = 0;
+        int noncanonicalQuarantined = 0;
         int noncanonicalCompleted = 0;
         int wrongHostQuarantined = 0;
         for (final VfOwnershipRepairPlan.Candidate candidate : plan.getCandidates()) {
@@ -464,18 +464,34 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
                 return false;
             }
             if (candidate.getKind() == VfOwnershipRepairPlan.Kind.NONCANONICAL_STALE) {
-                if (state == VfOwnershipRepairPlan.CandidateState.QUARANTINED
-                        || state == VfOwnershipRepairPlan.CandidateState.COMPLETED) {
-                    noncanonicalQuarantinedOrCompleted++;
-                }
-                if (state == VfOwnershipRepairPlan.CandidateState.COMPLETED) {
+                if (state == VfOwnershipRepairPlan.CandidateState.QUARANTINED) {
+                    noncanonicalQuarantined++;
+                } else if (state == VfOwnershipRepairPlan.CandidateState.COMPLETED) {
                     noncanonicalCompleted++;
                 }
             } else if (state == VfOwnershipRepairPlan.CandidateState.QUARANTINED) {
                 wrongHostQuarantined++;
             }
         }
-        final int expectedAllocated = plan.getAllocatedBefore() - noncanonicalQuarantinedOrCompleted;
+        /*
+         * The incident plan's before counts describe the persisted boundary before
+         * any candidate was applied.  PENDING and QUARANTINED are both in-flight
+         * boundaries.  A noncanonical quarantine changes one stale row from
+         * ALLOCATED to SUSPECT; completion changes it from ALLOCATED to FREE.  A
+         * wrong-host quarantine consumes its previously FREE canonical row, while
+         * completion swaps the stale allocation for the canonical allocation and
+         * has no net count effect.
+         *
+         * Thus the persisted replay equations are:
+         *   ALLOCATED = allocatedBefore - noncanonicalQuarantined
+         *                            - noncanonicalCompleted
+         *   FREE      = freeBefore + noncanonicalCompleted - wrongHostQuarantined
+         * and the completed count is derived from the locked row states above.
+         * The per-candidate state predicates remain the state/pointer contract:
+         * only those exact boundaries can contribute to these equations.
+         */
+        final int expectedAllocated = plan.getAllocatedBefore() - noncanonicalQuarantined
+                - noncanonicalCompleted;
         final int expectedFree = plan.getFreeBefore() + noncanonicalCompleted - wrongHostQuarantined;
         return allocated == expectedAllocated && free == expectedFree;
     }
@@ -645,8 +661,17 @@ public class VfPoolManagerImpl extends ManagerBase implements VfPoolManager, VfP
 
     private void applyApprovedCandidate(final VfOwnershipRepairPlan plan,
                                         final VfOwnershipRepairPlan.Candidate candidate) {
+        final SriovVfPoolVO stale = vfPoolDao.findById(candidate.getStalePoolId());
+        if (!exactCandidateRow(stale, candidate.getStalePoolId(), candidate.getStaleHostId(),
+                candidate.getStaleBdf())
+                || !State.SUSPECT.name().equals(stale.getState())
+                || !Long.valueOf(candidate.getNicId()).equals(stale.getAllocatedToNicId())) {
+            LOGGER.error("Approved VF repair candidate {} remains SUSPECT after stale-row identity drift",
+                    candidate.getId());
+            return;
+        }
         if (!targetedCleanupSucceeded(candidate.getStaleHostId(), candidate.getStaleBdf(),
-                null, candidate.getNicId(), plan.getHash(), "RECONCILE")) {
+                stale.getRepresentorName(), candidate.getNicId(), plan.getHash(), "RECONCILE")) {
             LOGGER.error("Approved VF repair candidate {} remains SUSPECT after unconfirmed cleanup", candidate.getId());
             return;
         }

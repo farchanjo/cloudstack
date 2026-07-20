@@ -1624,20 +1624,10 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
     }
 
     /**
-     * Re-stamp {@code external_ids:ovn-installed=true} +
-     * {@code iface-status=active} on every local OVS Interface whose
-     * {@code external_ids:iface-id} matches the OVN logical-switch-port pattern
-     * ({@code ^lsp-[0-9a-f-]+$}). Closes the agent-restart reconciliation gap
-     * documented in Bug 25 (`2026-05-11-bug-25-old-vm-unreachable-after-agent-restart.md`).
-     *
-     * <p>Idempotent: setting external_ids to the same value via
-     * {@code ovs-vsctl set} is a no-op when the key is already present with
-     * the same value, so re-running the reconcile imposes no penalty on
-     * healthy interfaces.
-     *
-     * <p>Runs once per agent startup. Failures of individual {@code ovs-vsctl}
-     * invocations are logged at WARN and do not propagate — the reconciler
-     * is best-effort.
+     * Observe OVN-looking interfaces without changing ownership state.  An
+     * iface-id is not proof of a live libvirt attachment or an exact VF/vDPA
+     * owner; startup therefore fails closed and leaves unknown rows intact for
+     * the management-side, generation-fenced reconciliation path.
      */
     void reconcileOvnInstalledOnStartup() {
         try {
@@ -1661,24 +1651,9 @@ public class LibvirtComputingResource extends ServerResourceBase implements Serv
             final String raw = org.apache.commons.lang3.StringUtils.defaultString(
                     Script.runSimpleBashScriptWithFullResult(listCmd, 30));
             final java.util.List<String> ovnReps = parseOvnReps(raw);
-            int stamped = 0;
-            for (final String repName : ovnReps) {
-                final String stampCmd = String.format(
-                        "ovs-vsctl --if-exists set Interface %s "
-                                + "external_ids:ovn-installed=true "
-                                + "external_ids:iface-status=active",
-                        repName);
-                try {
-                    Script.runSimpleBashScript(stampCmd);
-                    stamped++;
-                    LOGGER.debug("reconcileOvnInstalledOnStartup: stamped iface={}", repName);
-                } catch (final RuntimeException stampErr) {
-                    LOGGER.warn("reconcileOvnInstalledOnStartup: stamp failed iface={}: {}",
-                            repName, stampErr.getMessage());
-                }
-            }
-            LOGGER.info("reconcileOvnInstalledOnStartup: discovered {} OVN-managed ports; re-stamped {}",
-                    ovnReps.size(), stamped);
+            LOGGER.info("reconcileOvnInstalledOnStartup: observed {} OVN-looking ports; "
+                    + "no ownership state changed without authoritative domain/VF/vDPA evidence",
+                    ovnReps.size());
         } catch (final Exception reconcileErr) {
             LOGGER.warn("reconcileOvnInstalledOnStartup: failed: {}", reconcileErr.getMessage());
         }

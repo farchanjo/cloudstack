@@ -34,6 +34,7 @@ import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.HostVfPurgeOrphansAnswer;
 import com.cloud.agent.api.HostVfPurgeOrphansAnswer.TargetResult;
 import com.cloud.agent.api.HostVfPurgeOrphansCommand;
+import com.cloud.network.router.SriovVfPoolVO.State;
 import com.cloud.network.router.dao.SriovVfPoolDao;
 import com.cloud.utils.db.GlobalLock;
 import com.cloud.vm.NicVO;
@@ -61,6 +62,7 @@ public class VfPoolReconciliationGateTest {
         final AgentManager agents = mock(AgentManager.class);
         final NicDao nics = mock(NicDao.class);
         final NicVO nic = mock(NicVO.class);
+        final SriovVfPoolVO stale = mock(SriovVfPoolVO.class);
         ReflectionTestUtils.setField(manager, "reconcileLeader", leader);
         ReflectionTestUtils.setField(manager, "vfPoolDao", dao);
         ReflectionTestUtils.setField(manager, "agentMgr", agents);
@@ -68,7 +70,15 @@ public class VfPoolReconciliationGateTest {
         when(leader.isLeader()).thenReturn(true);
         when(lock.lock(1)).thenReturn(true);
         when(dao.prepareReconciliationPlan(any())).thenReturn(true);
+        when(stale.getId()).thenReturn(2435L);
+        when(stale.getHostId()).thenReturn(staleHost);
+        when(stale.getPciAddress()).thenReturn(staleBdf);
+        when(stale.getState()).thenReturn(State.SUSPECT.name());
+        when(stale.getAllocatedToNicId()).thenReturn(nicId);
+        when(stale.getRepresentorName()).thenReturn("rep2435");
+        when(dao.findById(2435L)).thenReturn(stale);
         when(nic.getMacAddress()).thenReturn(mac);
+        when(nic.getUuid()).thenReturn("nic-uuid");
         when(nics.findByIdIncludingRemoved(nicId)).thenReturn(nic);
         when(agents.send(eq(staleHost), any(HostVfPurgeOrphansCommand.class)))
                 .thenReturn(successAnswer(staleBdf, plan.getHash(), mac));

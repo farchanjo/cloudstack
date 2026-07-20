@@ -25,18 +25,13 @@ import org.junit.Assert;
 import org.junit.Test;
 
 /**
- * Regression coverage for Bug 25 startup reconcile parser.
+ * Regression coverage for the startup OVN observation parser.
  *
  * <p>Bug 25 (`2026-05-11-bug-25-old-vm-unreachable-after-agent-restart.md`):
- * after a {@code cloudstack-agent} restart the post-plug stamp
- * ({@link LibvirtComputingResource#applyOvnPostPlugTunables}) only fires on
- * fresh NIC plug, so pre-existing running VMs lose
- * {@code external_ids:ovn-installed=true} after ovn-controller re-sync and
- * silently drop east-west traffic. The reconcile pass
- * ({@link LibvirtComputingResource#reconcileOvnInstalledOnStartup}) parses
- * {@code ovs-vsctl --no-headings --bare --columns=name,external_ids find Interface}
- * output and re-stamps every Interface whose {@code iface-id} starts with
- * {@code lsp-}.
+ * after a {@code cloudstack-agent} restart, an iface-id alone is not proof of
+ * a live libvirt attachment or exact VF/vDPA ownership. The startup pass
+ * ({@link LibvirtComputingResource#reconcileOvnInstalledOnStartup}) therefore
+ * observes matching interfaces but leaves ownership state unchanged.
  *
  * <p>This suite exercises the pure parser
  * ({@link LibvirtComputingResource#parseOvnReps}) against canonical

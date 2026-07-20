@@ -92,7 +92,10 @@ public class VdpaVifDriver extends VifDriverBase {
             throw new InternalErrorException("VdpaVifDriver requires a MAC on the NicTO");
         }
         java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
-        lifecycleLock.lock();
+        final boolean lockOwned = lifecycleLock.isHeldByCurrentThread();
+        if (!lockOwned) {
+            lifecycleLock.lock();
+        }
 
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
@@ -172,7 +175,9 @@ public class VdpaVifDriver extends VifDriverBase {
             drainRollback(rollback);
             throw ex;
         } finally {
-            lifecycleLock.unlock();
+            if (!lockOwned) {
+                lifecycleLock.unlock();
+            }
         }
     }
 

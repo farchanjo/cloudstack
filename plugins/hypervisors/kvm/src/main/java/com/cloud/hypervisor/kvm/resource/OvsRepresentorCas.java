@@ -83,6 +83,72 @@ public final class OvsRepresentorCas {
         }
     }
 
+    /** Set migration ownership metadata only after the exact Interface/Port/Bridge identity is proven. */
+    public static boolean restamp(final Executor executor, final String socket, final String name,
+            final String expectedIfaceId, final String workId, final long generation) {
+        return restamp(executor, socket, name, expectedIfaceId, workId, generation, null, null, null);
+    }
+
+    /** Exact migration restamp including the durable NIC/VF identity. */
+    public static boolean restamp(final Executor executor, final String socket, final String name,
+            final String expectedIfaceId, final String workId, final long generation,
+            final String nicUuid, final Long vfRowId, final String bdf) {
+        if (executor == null || socket == null || name == null || expectedIfaceId == null
+                || workId == null || workId.isBlank() || generation <= 0) {
+            return false;
+        }
+        final Identity identity;
+        try {
+            identity = discover(executor, socket, name);
+        } catch (RuntimeException e) {
+            return false;
+        }
+        if (identity == null || !expectedIfaceId.equals(identity.ifaceId)) {
+            return false;
+        }
+        if (identity.migrationGeneration != null
+                && (identity.migrationGeneration > generation
+                || !workId.equals(identity.migrationWorkId))) {
+            return false;
+        }
+        final JsonObject op = op("mutate", "Interface");
+        op.add("where", all(eqUuid("_uuid", identity.interfaceUuid), eq("name", name),
+                includesMap("external_ids", "iface-id", expectedIfaceId)));
+        final JsonArray mutations = new JsonArray();
+        addMapReplace(mutations, "migration-work-id", workId);
+        addMapReplace(mutations, "migration-generation", Long.toString(generation));
+        if (nicUuid != null) {
+            addMapReplace(mutations, "migration-nic-uuid", nicUuid);
+        }
+        if (vfRowId != null) {
+            addMapReplace(mutations, "migration-vf-row-id", Long.toString(vfRowId));
+        }
+        if (bdf != null) {
+            addMapReplace(mutations, "migration-vf-bdf", bdf);
+        }
+        addMapReplace(mutations, "iface-status", "active");
+        op.add("mutations", mutations);
+        final JsonArray request = new JsonArray();
+        request.add("Open_vSwitch");
+        request.add(wait("Interface", op.getAsJsonArray("where")));
+        request.add(op);
+        final Result result = executor.run("ovsdb-client", "transact", socket, request.toString());
+        if (!result.success() || !validSingleMutation(result.output())) {
+            return false;
+        }
+        try {
+            final Identity stamped = discover(executor, socket, name);
+            return stamped != null && expectedIfaceId.equals(stamped.ifaceId)
+                    && workId.equals(stamped.migrationWorkId)
+                    && Long.valueOf(generation).equals(stamped.migrationGeneration)
+                    && (nicUuid == null || nicUuid.equals(stamped.nicUuid))
+                    && (vfRowId == null || Long.valueOf(vfRowId).equals(stamped.vfRowId))
+                    && (bdf == null || bdf.equalsIgnoreCase(stamped.bdf));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     /** Return the authoritative iface-id for a representor, or null if absent/invalid. */
     public static String readIfaceId(final Executor executor, final String socket, final String name) {
         if (executor == null || socket == null || socket.isBlank() || name == null || name.isBlank()
@@ -105,6 +171,19 @@ public final class OvsRepresentorCas {
         }
         final Identity identity = discover(executor, socket, name);
         return identity == null ? null : identity.ifaceId;
+    }
+
+    /** True only when a strict OVSDB discovery proves that the representor is absent. */
+    public static boolean isAbsentExact(final Executor executor, final String socket, final String name) {
+        if (executor == null || socket == null || socket.isBlank() || name == null || name.isBlank()
+                || !NAME.matcher(name).matches()) {
+            return false;
+        }
+        try {
+            return discover(executor, socket, name) == null;
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     static String transactionForTest(final String ifaceUuid, final String portUuid, final String bridgeUuid,
@@ -141,7 +220,12 @@ public final class OvsRepresentorCas {
         if (bridge.size() != 1) {
             throw new IllegalStateException("OVS representor bridge identity is ambiguous");
         }
-        return new Identity(iu, pu, uuid(bridge.get(0).getAsJsonObject().get("_uuid")), name, ifaceId);
+        return new Identity(iu, pu, uuid(bridge.get(0).getAsJsonObject().get("_uuid")), name, ifaceId,
+                mapValue(i.get("external_ids"), "migration-work-id"),
+                longValue(mapValue(i.get("external_ids"), "migration-generation")),
+                mapValue(i.get("external_ids"), "migration-nic-uuid"),
+                longValue(mapValue(i.get("external_ids"), "migration-vf-row-id")),
+                mapValue(i.get("external_ids"), "migration-vf-bdf"));
     }
 
     private static JsonArray select(final Executor executor, final String socket, final String table,
@@ -208,6 +292,18 @@ public final class OvsRepresentorCas {
     private static JsonArray eqUuid(final String field, final String value) { final JsonArray c = new JsonArray(); c.add(field); c.add("=="); c.add(uuid(value)); return c; }
     private static JsonArray includesSet(final String field, final String value) { final JsonArray c = new JsonArray(); c.add(field); c.add("includes"); c.add(uuidSet(value)); return c; }
     private static JsonArray includesMap(final String field, final String key, final String value) { final JsonArray c = new JsonArray(); c.add(field); c.add("includes"); final JsonArray map = new JsonArray(); map.add("map"); final JsonArray pair = new JsonArray(); pair.add(key); pair.add(value); final JsonArray pairs = new JsonArray(); pairs.add(pair); map.add(pairs); c.add(map); return c; }
+    private static JsonArray mapInsert(final String field, final String key, final String value) {
+        final JsonArray mutation = new JsonArray(); mutation.add(field); mutation.add("insert");
+        final JsonArray map = new JsonArray(); map.add("map"); final JsonArray pair = new JsonArray();
+        pair.add(key); pair.add(value); final JsonArray pairs = new JsonArray(); pairs.add(pair);
+        map.add(pairs); mutation.add(map); return mutation;
+    }
+    private static void addMapReplace(final JsonArray mutations, final String key, final String value) {
+        final JsonArray delete = new JsonArray(); delete.add("external_ids"); delete.add("delete");
+        final JsonArray keySet = new JsonArray(); keySet.add("set"); final JsonArray keys = new JsonArray();
+        keys.add(key); keySet.add(keys); delete.add(keySet); mutations.add(delete);
+        mutations.add(mapInsert("external_ids", key, value));
+    }
     private static JsonArray uuidSet(final String value) { final JsonArray set = new JsonArray(); set.add("set"); final JsonArray values = new JsonArray(); values.add(uuid(value)); set.add(values); return set; }
     private static JsonArray uuid(final String value) { final JsonArray u = new JsonArray(); u.add("uuid"); u.add(value); return u; }
     private static String uuid(final JsonElement value) { return value.getAsJsonArray().get(1).getAsString(); }
@@ -249,6 +345,16 @@ public final class OvsRepresentorCas {
         }
     }
 
+    private static boolean validSingleMutation(final String output) {
+        try {
+            final JsonArray response = JsonParser.parseString(output).getAsJsonArray();
+            return response.size() == 2 && response.get(0).getAsJsonObject().isEmpty()
+                    && response.get(1).getAsJsonObject().get("count").getAsInt() == 1;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     private static String mapValue(final JsonElement value, final String wantedKey) {
         if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() != 2
                 || !"map".equals(value.getAsJsonArray().get(0).getAsString())) {
@@ -268,14 +374,39 @@ public final class OvsRepresentorCas {
         private final String bridgeUuid;
         private final String name;
         private final String ifaceId;
+        private final String migrationWorkId;
+        private final Long migrationGeneration;
+        private final String nicUuid;
+        private final Long vfRowId;
+        private final String bdf;
 
         private Identity(final String interfaceUuid, final String portUuid, final String bridgeUuid,
-                         final String name, final String ifaceId) {
+                          final String name, final String ifaceId) {
+            this(interfaceUuid, portUuid, bridgeUuid, name, ifaceId, null, null, null, null, null);
+        }
+
+        private Identity(final String interfaceUuid, final String portUuid, final String bridgeUuid,
+                          final String name, final String ifaceId, final String migrationWorkId,
+                          final Long migrationGeneration, final String nicUuid, final Long vfRowId,
+                          final String bdf) {
             this.interfaceUuid = interfaceUuid;
             this.portUuid = portUuid;
             this.bridgeUuid = bridgeUuid;
             this.name = name;
             this.ifaceId = ifaceId;
+            this.migrationWorkId = migrationWorkId;
+            this.migrationGeneration = migrationGeneration;
+            this.nicUuid = nicUuid;
+            this.vfRowId = vfRowId;
+            this.bdf = bdf;
+        }
+    }
+
+    private static Long longValue(final String value) {
+        try {
+            return value == null ? null : Long.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("OVS migration generation is malformed");
         }
     }
 }

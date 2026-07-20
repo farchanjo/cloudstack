@@ -108,7 +108,10 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             clearOrphanRepsForLspName(nic.getOvnLspName(), preLockRepName);
         }
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
-        lifecycleLock.lock();
+        final boolean lockOwned = lifecycleLock.isHeldByCurrentThread();
+        if (!lockOwned) {
+            lifecycleLock.lock();
+        }
         try {
             final VfPassthroughVifDriver.ExactVfTopology topology =
                     VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
@@ -191,7 +194,9 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             drainRollback(rollback);
             throw ex;
         } finally {
-            lifecycleLock.unlock();
+            if (!lockOwned) {
+                lifecycleLock.unlock();
+            }
         }
     }
 

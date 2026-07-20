@@ -46,8 +46,10 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -121,6 +123,8 @@ import com.cloud.agent.api.CheckRouterCommand;
 import com.cloud.agent.api.CheckVirtualMachineCommand;
 import com.cloud.agent.api.CleanupNetworkRulesCmd;
 import com.cloud.agent.api.Command;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationAnswer;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationCommand;
 import com.cloud.agent.api.CreatePrivateTemplateFromSnapshotCommand;
 import com.cloud.agent.api.CreatePrivateTemplateFromVolumeCommand;
 import com.cloud.agent.api.CreateStoragePoolCommand;
@@ -209,6 +213,7 @@ import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.SerialDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.TermPolicy;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.VideoDef;
 import com.cloud.hypervisor.kvm.resource.LibvirtVMDef.WatchDogDef;
+import com.cloud.hypervisor.kvm.resource.wrapper.LibvirtObserveVdpaMigrationCommandWrapper;
 import com.cloud.hypervisor.kvm.resource.wrapper.LibvirtRequestWrapper;
 import com.cloud.hypervisor.kvm.resource.wrapper.LibvirtUtilitiesHelper;
 import com.cloud.hypervisor.kvm.storage.KVMPhysicalDisk;
@@ -1446,7 +1451,7 @@ public class LibvirtComputingResourceTest {
     }
 
     @Test
-    public void testPrepareForMigrationCommand() {
+    public void testPrepareForMigrationCommand() throws InternalErrorException, IOException {
         final Connect conn = Mockito.mock(Connect.class);
         final LibvirtUtilitiesHelper libvirtUtilitiesHelper = Mockito.mock(LibvirtUtilitiesHelper.class);
 
@@ -1467,11 +1472,9 @@ public class LibvirtComputingResourceTest {
 
         when(vm.getNics()).thenReturn(new NicTO[]{nicTO});
         when(vm.getDisks()).thenReturn(new DiskTO[]{diskTO});
-
-        when(nicTO.getType()).thenReturn(TrafficType.Guest);
         when(diskTO.getType()).thenReturn(Volume.Type.ISO);
 
-        when(libvirtComputingResourceMock.getVifDriver(nicTO.getType(), nicTO.getName())).thenReturn(vifDriver);
+        when(libvirtComputingResourceMock.selectVifDriverForNic(nicTO)).thenReturn(vifDriver);
         when(libvirtComputingResourceMock.getStoragePoolMgr()).thenReturn(storagePoolManager);
 
         final LibvirtRequestWrapper wrapper = LibvirtRequestWrapper.getInstance();
@@ -1494,7 +1497,7 @@ public class LibvirtComputingResourceTest {
     }
 
     @Test
-    public void testPrepareForMigrationCommandMigration() {
+    public void testPrepareForMigrationCommandMigration() throws InternalErrorException, IOException {
         final Connect conn = Mockito.mock(Connect.class);
         final LibvirtUtilitiesHelper libvirtUtilitiesHelper = Mockito.mock(LibvirtUtilitiesHelper.class);
 
@@ -1507,6 +1510,7 @@ public class LibvirtComputingResourceTest {
         final PrepareForMigrationCommand command = new PrepareForMigrationCommand(vm);
 
         when(libvirtComputingResourceMock.getLibvirtUtilitiesHelper()).thenReturn(libvirtUtilitiesHelper);
+        when(vm.getName()).thenReturn("vm");
         try {
             when(libvirtUtilitiesHelper.getConnectionByVmName(vm.getName())).thenReturn(conn);
         } catch (final LibvirtException e) {
@@ -1515,18 +1519,49 @@ public class LibvirtComputingResourceTest {
 
         when(vm.getNics()).thenReturn(new NicTO[]{nicTO});
         when(vm.getDisks()).thenReturn(new DiskTO[]{diskTO});
+        final ObserveVdpaMigrationCommand.NicIdentity identity = migrationIdentityForPrepareTest();
+        command.setMigrationWorkId("work");
+        command.setMigrationGeneration(1L);
+        command.setMigrationLeaseToken("lease");
+        command.setMigrationLeaseVersion(1L);
+        command.setMigrationLeaseExpiry(Instant.now().plusSeconds(3600).getEpochSecond());
+        command.setMigrationIdentities(List.of(identity));
 
-        when(nicTO.getType()).thenReturn(TrafficType.Guest);
         when(diskTO.getType()).thenReturn(Volume.Type.ISO);
 
-        when(libvirtComputingResourceMock.getVifDriver(nicTO.getType(), nicTO.getName())).thenReturn(vifDriver);
+        when(libvirtComputingResourceMock.selectVifDriverForNic(nicTO)).thenReturn(vifDriver);
         when(libvirtComputingResourceMock.getStoragePoolMgr()).thenReturn(storagePoolManager);
         when(storagePoolManager.connectPhysicalDisksViaVmSpec(vm, true)).thenReturn(true);
 
         final LibvirtRequestWrapper wrapper = LibvirtRequestWrapper.getInstance();
         assertNotNull(wrapper);
 
-        final Answer answer = wrapper.execute(command, libvirtComputingResourceMock);
+        final Path fenceDirectory = Files.createTempDirectory("kvm-prepare-fence-");
+        System.setProperty("cloudstack.kvm.migration-fence-dir", fenceDirectory.toString());
+        final MigrationIdentityFenceStore fences = new MigrationIdentityFenceStore(fenceDirectory);
+        fences.install("work", 1L, List.of(MigrationIdentityFenceStore.Fence.fromIdentity(
+                "work", 1L, identity, "lease", 1L, command.getMigrationLeaseExpiry())));
+        final ObserveVdpaMigrationAnswer.NicObservation observation = new ObserveVdpaMigrationAnswer.NicObservation(
+                1L, "lsp-1", null, null, null, "ABSENT", null, null, null, null, null, true, true);
+        observation.setNicUuid("nic-1");
+        final Answer answer;
+        try (MockedStatic<LibvirtObserveVdpaMigrationCommandWrapper> observer =
+                Mockito.mockStatic(LibvirtObserveVdpaMigrationCommandWrapper.class)) {
+            observer.when(() -> LibvirtObserveVdpaMigrationCommandWrapper.observeWithLocks(
+                    Mockito.any(ObserveVdpaMigrationCommand.class))).thenReturn(List.of(observation));
+            answer = wrapper.execute(command, libvirtComputingResourceMock);
+        } finally {
+            System.clearProperty("cloudstack.kvm.migration-fence-dir");
+            try (var paths = Files.walk(fenceDirectory)) {
+                paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        }
         assertTrue(answer.getResult());
 
         verify(libvirtComputingResourceMock, times(1)).getLibvirtUtilitiesHelper();
@@ -1584,7 +1619,7 @@ public class LibvirtComputingResourceTest {
 
     @SuppressWarnings("unchecked")
     @Test
-    public void testPrepareForMigrationCommandURISyntaxException() {
+    public void testPrepareForMigrationCommandURISyntaxException() throws InternalErrorException {
         final Connect conn = Mockito.mock(Connect.class);
         final LibvirtUtilitiesHelper libvirtUtilitiesHelper = Mockito.mock(LibvirtUtilitiesHelper.class);
 
@@ -1606,10 +1641,9 @@ public class LibvirtComputingResourceTest {
         when(vm.getNics()).thenReturn(new NicTO[]{nicTO});
         when(vm.getDisks()).thenReturn(new DiskTO[]{volume});
 
-        when(nicTO.getType()).thenReturn(TrafficType.Guest);
         when(volume.getType()).thenReturn(Volume.Type.ISO);
 
-        when(libvirtComputingResourceMock.getVifDriver(nicTO.getType(), nicTO.getName())).thenReturn(vifDriver);
+        when(libvirtComputingResourceMock.selectVifDriverForNic(nicTO)).thenReturn(vifDriver);
         when(libvirtComputingResourceMock.getStoragePoolMgr()).thenReturn(storagePoolManager);
         try {
             when(libvirtComputingResourceMock.getVolumePath(conn, volume)).thenThrow(URISyntaxException.class);
@@ -1640,7 +1674,7 @@ public class LibvirtComputingResourceTest {
 
     @SuppressWarnings("unchecked")
     @Test
-    public void testPrepareForMigrationCommandInternalErrorException() {
+    public void testPrepareForMigrationCommandInternalErrorException() throws InternalErrorException {
         final Connect conn = Mockito.mock(Connect.class);
         final LibvirtUtilitiesHelper libvirtUtilitiesHelper = Mockito.mock(LibvirtUtilitiesHelper.class);
 
@@ -1659,9 +1693,7 @@ public class LibvirtComputingResourceTest {
         }
 
         when(vm.getNics()).thenReturn(new NicTO[]{nicTO});
-        when(nicTO.getType()).thenReturn(TrafficType.Guest);
-
-        BDDMockito.given(libvirtComputingResourceMock.getVifDriver(nicTO.getType(), nicTO.getName())).willAnswer(invocationOnMock -> {throw new InternalErrorException("Exception Occurred");});
+        BDDMockito.given(libvirtComputingResourceMock.selectVifDriverForNic(nicTO)).willAnswer(invocationOnMock -> {throw new InternalErrorException("Exception Occurred");});
         when(libvirtComputingResourceMock.getStoragePoolMgr()).thenReturn(storagePoolManager);
 
         final LibvirtRequestWrapper wrapper = LibvirtRequestWrapper.getInstance();
@@ -3577,6 +3609,8 @@ public class LibvirtComputingResourceTest {
             when(libvirtComputingResourceMock.getDomain(conn, instanceName)).thenReturn(vm);
 
             when(libvirtComputingResourceMock.getVifDriver(nic.getType(), nic.getName())).thenReturn(vifDriver);
+            when(libvirtComputingResourceMock.selectVifDriverForNic(nic)).thenAnswer(ignored ->
+                    libvirtComputingResourceMock.getVifDriver(nic.getType(), nic.getName()));
 
             when(vifDriver.plug(nic, "Other PV", "", null)).thenReturn(interfaceDef);
             when(interfaceDef.toString()).thenReturn("Interface");
@@ -3672,6 +3706,8 @@ public class LibvirtComputingResourceTest {
             when(libvirtComputingResourceMock.getDomain(conn, instanceName)).thenReturn(vm);
 
             when(libvirtComputingResourceMock.getVifDriver(nic.getType(), nic.getName())).thenReturn(vifDriver);
+            when(libvirtComputingResourceMock.selectVifDriverForNic(nic)).thenAnswer(ignored ->
+                    libvirtComputingResourceMock.getVifDriver(nic.getType(), nic.getName()));
 
             when(vifDriver.plug(nic, "Other PV", "", null)).thenThrow(InternalErrorException.class);
 
@@ -7328,5 +7364,14 @@ public class LibvirtComputingResourceTest {
         Mockito.doReturn(interfaces).when(libvirtComputingResourceSpy).getInterfaces(Mockito.any(), Mockito.anyString());
 
         libvirtComputingResourceSpy.getInterface(connMock, vmName, invalidMacAddress);
+    }
+
+    private static ObserveVdpaMigrationCommand.NicIdentity migrationIdentityForPrepareTest() {
+        final ObserveVdpaMigrationCommand.NicIdentity identity = new ObserveVdpaMigrationCommand.NicIdentity(
+                1L, "lsp-1", "VIRTIO_OVN", null, null, null,
+                "aa:bb:cc:dd:ee:ff", null, "virtio", null, "br-int", "port1", "tap0", null,
+                "lsp-1", "chassis1");
+        identity.setExpectedNicUuid("nic-1");
+        return identity;
     }
 }

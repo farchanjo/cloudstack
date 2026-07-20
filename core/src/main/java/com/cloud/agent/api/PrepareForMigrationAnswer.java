@@ -20,6 +20,7 @@
 package com.cloud.agent.api;
 
 import com.cloud.agent.api.to.DpdkTO;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationAnswer;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -41,6 +42,7 @@ public class PrepareForMigrationAnswer extends Answer {
     private Map<String, String> vdpaInterfaceMapping = new HashMap<>();
 
     private Integer newVmCpuShares = null;
+    private Map<Long, ObserveVdpaMigrationAnswer.NicObservation> nicObservations = new HashMap<>();
 
     protected PrepareForMigrationAnswer() {
     }
@@ -71,6 +73,14 @@ public class PrepareForMigrationAnswer extends Answer {
 
     public void setVdpaInterfaceMapping(final Map<String, String> vdpaInterfaceMapping) {
         this.vdpaInterfaceMapping = vdpaInterfaceMapping != null ? vdpaInterfaceMapping : new HashMap<>();
+    }
+
+    public Map<Long, ObserveVdpaMigrationAnswer.NicObservation> getNicObservations() {
+        return nicObservations;
+    }
+
+    public void setNicObservations(final Map<Long, ObserveVdpaMigrationAnswer.NicObservation> observations) {
+        nicObservations = observations == null ? new HashMap<>() : new HashMap<>(observations);
     }
 
     public Integer getNewVmCpuShares() {

@@ -37,6 +37,64 @@ public class ItWorkVO {
         Prepare, Starting, Started, Release, Done, Migrating, Reconfiguring
     }
 
+    /** Durable checkpoints for cold VF/vDPA relocation. */
+    public enum MigrationPhase {
+        PREPARING_DESTINATION,
+        DESTINATION_ALLOCATED,
+        SOURCE_MANIFEST_INSTALLED,
+        DESTINATION_DATAPLANE_PROVEN,
+        TRANSFERRING,
+        STARTING_DESTINATION,
+        GUEST_TRANSFERRED_OR_STARTED,
+        OWNERSHIP_COMMITTED,
+        SOURCE_CLEANUP,
+        POSTCONDITIONS_PROVEN,
+        FENCE_CLEANUP_PENDING,
+        ROLLING_BACK,
+        DONE,
+        MANUAL_INTERVENTION;
+
+        public boolean canTransitionTo(final MigrationPhase next) {
+            if (next == null) {
+                return false;
+            }
+            switch (this) {
+                case PREPARING_DESTINATION:
+                    return next == DESTINATION_ALLOCATED || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case DESTINATION_ALLOCATED:
+                    return next == SOURCE_MANIFEST_INSTALLED || next == DESTINATION_DATAPLANE_PROVEN
+                            || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case SOURCE_MANIFEST_INSTALLED:
+                    return next == DESTINATION_DATAPLANE_PROVEN || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case DESTINATION_DATAPLANE_PROVEN:
+                    return next == TRANSFERRING || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case TRANSFERRING:
+                    return next == STARTING_DESTINATION || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case STARTING_DESTINATION:
+                    return next == GUEST_TRANSFERRED_OR_STARTED || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case GUEST_TRANSFERRED_OR_STARTED:
+                    return next == OWNERSHIP_COMMITTED || next == ROLLING_BACK || next == MANUAL_INTERVENTION;
+                case OWNERSHIP_COMMITTED:
+                    return next == SOURCE_CLEANUP || next == MANUAL_INTERVENTION;
+                case SOURCE_CLEANUP:
+                    return next == POSTCONDITIONS_PROVEN || next == MANUAL_INTERVENTION;
+                case POSTCONDITIONS_PROVEN:
+                    return next == FENCE_CLEANUP_PENDING || next == MANUAL_INTERVENTION;
+                case FENCE_CLEANUP_PENDING:
+                    return next == DONE || next == MANUAL_INTERVENTION;
+                case ROLLING_BACK:
+                    return next == POSTCONDITIONS_PROVEN || next == MANUAL_INTERVENTION;
+                case DONE:
+                case MANUAL_INTERVENTION:
+                    return false;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    public enum MigrationMode { ORDINARY, ACCELERATED_COLD }
+
     @Id
     @Column(name = "id")
     String id;
@@ -76,9 +134,115 @@ public class ItWorkVO {
     @Enumerated(value = EnumType.STRING)
     VirtualMachine.Type vmType;
 
+    @Column(name = "migration_phase")
+    String migrationPhase;
+
+    @Column(name = "migration_mode")
+    String migrationMode;
+
+    @Column(name = "migration_generation")
+    long migrationGeneration;
+
+    @Column(name = "migration_vm_uuid")
+    String migrationVmUuid;
+
+    @Column(name = "migration_source_host_id")
+    Long migrationSourceHostId;
+
+    @Column(name = "migration_destination_host_id")
+    Long migrationDestinationHostId;
+
+    @Column(name = "migration_recovery_lease_token")
+    String migrationRecoveryLeaseToken;
+
+    @Column(name = "migration_recovery_lease_owner")
+    Long migrationRecoveryLeaseOwner;
+
+    @Column(name = "migration_recovery_lease_expires_at")
+    Long migrationRecoveryLeaseExpiresAt;
+
+    @Column(name = "migration_recovery_lease_version")
+    long migrationRecoveryLeaseVersion;
+
+    @Column(name = "migration_recovery_lease_heartbeat")
+    Long migrationRecoveryLeaseHeartbeat;
+
     public VirtualMachine.Type getVmType() {
         return vmType;
     }
+
+    public MigrationPhase getMigrationPhase() {
+        return migrationPhase == null ? null : MigrationPhase.valueOf(migrationPhase);
+    }
+
+    public String getMigrationPhaseValue() {
+        return migrationPhase;
+    }
+
+    public MigrationMode getMigrationMode() {
+        return migrationMode == null ? null : MigrationMode.valueOf(migrationMode);
+    }
+
+    public void setMigrationMode(final MigrationMode mode) {
+        migrationMode = mode == null ? null : mode.name();
+    }
+
+    public String getMigrationModeValue() {
+        return migrationMode;
+    }
+
+    public void setMigrationPhase(final MigrationPhase phase) {
+        migrationPhase = phase == null ? null : phase.name();
+    }
+
+    public long getMigrationGeneration() {
+        return migrationGeneration;
+    }
+
+    public void setMigrationGeneration(final long generation) {
+        migrationGeneration = generation;
+    }
+
+    public String getMigrationVmUuid() {
+        return migrationVmUuid;
+    }
+
+    public void setMigrationVmUuid(final String uuid) {
+        migrationVmUuid = uuid;
+    }
+
+    public Long getMigrationSourceHostId() {
+        return migrationSourceHostId;
+    }
+
+    public void setMigrationSourceHostId(final Long hostId) {
+        migrationSourceHostId = hostId;
+    }
+
+    public Long getMigrationDestinationHostId() {
+        return migrationDestinationHostId;
+    }
+
+    public void setMigrationDestinationHostId(final Long hostId) {
+        migrationDestinationHostId = hostId;
+    }
+
+    public String getMigrationRecoveryLeaseToken() {
+        return migrationRecoveryLeaseToken;
+    }
+
+    public void setMigrationRecoveryLeaseToken(final String token) {
+        migrationRecoveryLeaseToken = token;
+    }
+
+    public Long getMigrationRecoveryLeaseOwner() { return migrationRecoveryLeaseOwner; }
+    public void setMigrationRecoveryLeaseOwner(final Long owner) { migrationRecoveryLeaseOwner = owner; }
+    public Long getMigrationRecoveryLeaseExpiresAt() { return migrationRecoveryLeaseExpiresAt; }
+    public void setMigrationRecoveryLeaseExpiresAt(final Long expiresAt) { migrationRecoveryLeaseExpiresAt = expiresAt; }
+    public long getMigrationRecoveryLeaseVersion() { return migrationRecoveryLeaseVersion; }
+    public void setMigrationRecoveryLeaseVersion(final long version) { migrationRecoveryLeaseVersion = version; }
+    public Long getMigrationRecoveryLeaseHeartbeat() { return migrationRecoveryLeaseHeartbeat; }
+    public void setMigrationRecoveryLeaseHeartbeat(final Long heartbeat) { migrationRecoveryLeaseHeartbeat = heartbeat; }
 
     public long getResourceId() {
         return resourceId;

@@ -249,9 +249,16 @@ public class VfPoolIncidentResumeGateTest {
             });
             when(dao.completeReconciliation(anyLong(), anyLong(), anyLong(), anyLong(), anyLong()))
                     .thenAnswer(invocation -> fixture.complete(invocation.getArgument(4)));
-            when(nics.findByIdIncludingRemoved(anyLong())).thenAnswer(invocation -> fixture.nic(
-                    invocation.getArgument(0)));
-            when(vms.findById(anyLong())).thenAnswer(invocation -> fixture.vm(invocation.getArgument(0)));
+            // Keep the replay fixture deterministic: every approved candidate NIC is
+            // resolved by its immutable database id, and every VM by its exact id.
+            // Do not let an unstubbed lookup silently turn a replay into a cleanup
+            // rejection when the fixture is tightened with strict Mockito.
+            for (final Map.Entry<Long, NicVO> entry : fixture.nics.entrySet()) {
+                when(nics.findByIdIncludingRemoved(entry.getKey())).thenReturn(entry.getValue());
+            }
+            for (final Map.Entry<Long, VMInstanceVO> entry : fixture.vms.entrySet()) {
+                when(vms.findById(entry.getKey())).thenReturn(entry.getValue());
+            }
             when(agents.send(anyLong(), any(HostVfPurgeOrphansCommand.class))).thenAnswer(invocation ->
                     successfulAnswer(invocation.getArgument(1), fixture.plan));
         }
@@ -494,14 +501,6 @@ public class VfPoolIncidentResumeGateTest {
             return (int) allRows.stream().filter(row -> state.name().equals(row.getState())).count();
         }
 
-        private NicVO nic(final long nicId) {
-            return nics.get(nicId);
-        }
-
-        private VMInstanceVO vm(final long vmId) {
-            return vms.get(vmId);
-        }
-
         private SriovVfPoolVO row(final long id, final long hostId, final String bdf,
                                   final State state, final Long nicId) throws Exception {
             final SriovVfPoolVO row = new SriovVfPoolVO(hostId, bdf, "pf", "rep" + id);
@@ -521,6 +520,7 @@ public class VfPoolIncidentResumeGateTest {
             idField.setAccessible(true);
             idField.setLong(nic, nicId);
             nic.setMacAddress(mac);
+            nic.setUuid("nic-" + nicId);
             nic.setVfPoolId(vfPoolId);
             return nic;
         }

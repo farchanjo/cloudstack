@@ -89,6 +89,13 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         return new ExactVfTopology(pfName, vfId);
     }
 
+    /** Clear one exact VF while the caller owns its lifecycle lock. */
+    public static void clearVfIdentityLocked(final String pciAddress) {
+        final ExactVfTopology topology = requireExactVfTopology(pciAddress, null, null);
+        Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0",
+                topology.pfName(), topology.vfId()));
+    }
+
     @Override
     public void configure(Map<String, Object> params) throws ConfigurationException {
         super.configure(params);
@@ -104,7 +111,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 "VfPassthroughVifDriver invoked without vfPciAddress on NicTO; check VfPoolManager allocation");
         }
         java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
-        lifecycleLock.lock();
+        final boolean lockOwned = lifecycleLock.isHeldByCurrentThread();
+        if (!lockOwned) {
+            lifecycleLock.lock();
+        }
 
         String pfName = nic.getVfPfName();
         Integer vlanTag = extractVlanTag(nic);
@@ -173,7 +183,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             drainRollback(rollback, "VfPassthroughVifDriver.plug");
             throw ex;
         } finally {
-            lifecycleLock.unlock();
+            if (!lockOwned) {
+                lifecycleLock.unlock();
+            }
         }
     }
 

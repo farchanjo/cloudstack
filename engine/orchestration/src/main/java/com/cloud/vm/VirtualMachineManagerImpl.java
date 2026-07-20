@@ -164,6 +164,10 @@ import com.cloud.agent.api.VmDiskStatsEntry;
 import com.cloud.agent.api.VmNetworkStatsEntry;
 import com.cloud.agent.api.VmStatsEntry;
 import com.cloud.agent.api.routing.NetworkElementCommand;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationAnswer;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationCommand;
+import com.cloud.agent.api.routing.MigrationIdentityActionAnswer;
+import com.cloud.agent.api.routing.MigrationIdentityActionCommand;
 import com.cloud.agent.api.to.DataTO;
 import com.cloud.agent.api.to.DiskTO;
 import com.cloud.agent.api.to.DpdkTO;
@@ -237,6 +241,7 @@ import com.cloud.network.dao.NetworkDetailsDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.router.VirtualRouter;
 import com.cloud.network.router.VfPoolManager;
+import com.cloud.network.router.dao.SriovVfPoolDao;
 import com.cloud.network.security.SecurityGroupManager;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
@@ -296,6 +301,7 @@ import com.cloud.utils.db.Transaction;
 import com.cloud.utils.db.TransactionCallback;
 import com.cloud.utils.db.TransactionCallbackWithException;
 import com.cloud.utils.db.TransactionCallbackWithExceptionNoReturn;
+import com.cloud.utils.db.TransactionCallbackNoReturn;
 import com.cloud.utils.db.TransactionLegacy;
 import com.cloud.utils.db.TransactionStatus;
 import com.cloud.utils.exception.CloudRuntimeException;
@@ -316,6 +322,26 @@ import com.cloud.vm.snapshot.dao.VMSnapshotDao;
 import com.google.gson.Gson;
 
 public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMachineManager, VmWorkJobHandler, Listener, Configurable {
+    private static final long MIGRATION_RECOVERY_LEASE_SECONDS = 900L;
+
+    static final class MigrationAdmissionContext {
+        private final String workId;
+        private final long generation;
+        private final long owner;
+        private final String token;
+        private final long version;
+
+        MigrationAdmissionContext(final String workId, final long generation, final long owner,
+                final String token, final long version) {
+            this.workId = workId; this.generation = generation; this.owner = owner;
+            this.token = token; this.version = version;
+        }
+        String workId() { return workId; }
+        long generation() { return generation; }
+        long owner() { return owner; }
+        String token() { return token; }
+        long version() { return version; }
+    }
 
     public static final String VM_WORK_JOB_HANDLER = VirtualMachineManagerImpl.class.getSimpleName();
 
@@ -349,6 +375,11 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     private VMTemplateZoneDao templateZoneDao;
     @Inject
     private ItWorkDao _workDao;
+    @Inject
+    private MigrationNicDao _migrationNicDao;
+    private final MigrationRecoveryPendingRegistry migrationRecoveryPending = new MigrationRecoveryPendingRegistry();
+    @Inject
+    private SriovVfPoolDao _vfPoolDao;
     @Inject
     private UserVmDao _userVmDao;
     @Inject
@@ -697,6 +728,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         if (isVmDestroyed(vm)) {
             return;
         }
+        if (_workDao.findNonterminalColdMigrationForVm(vm.getId()) != null) {
+            throw new CloudRuntimeException("Deferring expunge while migration recovery is unresolved for "
+                    + vm.getUuid());
+        }
 
         if (HypervisorType.External.equals(vm.getHypervisorType())) {
             UserVmVO userVM = _userVmDao.findById(vm.getId());
@@ -897,8 +932,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Override
     public boolean start() {
         vmIdsInProgressCache = new SingleCache<>(10, vmWorkJobDao::listVmIdsWithPendingJob);
+        migrationRecoveryPending.rebuild(_workDao.listNonterminalColdMigrations(), _migrationNicDao);
+        recoverPendingColdMigrations();
+        migrationRecoveryPending.clearTerminal(_workDao.listNonterminalColdMigrations(), _migrationNicDao);
         _executor.scheduleAtFixedRate(new CleanupTask(), 5, VmJobStateReportInterval.value(), TimeUnit.SECONDS);
         _executor.scheduleAtFixedRate(new TransitionTask(),  VmOpCleanupInterval.value(), VmOpCleanupInterval.value(), TimeUnit.SECONDS);
+        _executor.scheduleAtFixedRate(this::recoverPendingColdMigrations, 10,
+                VmOpCleanupInterval.value(), TimeUnit.SECONDS);
         cancelWorkItems(_nodeId);
 
         volumeMgr.cleanupStorageJobs();
@@ -1076,7 +1116,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         Step previousStep = null;
         if (work != null) {
             previousStep = work.getStep();
-            _workDao.updateStep(work, step);
+            updateWorkStep(work, previousStep, step);
         }
         boolean result = false;
         try {
@@ -1084,9 +1124,21 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             return result;
         } finally {
             if (!result && work != null) {
-                _workDao.updateStep(work, previousStep);
+                updateWorkStep(work, step, previousStep);
             }
         }
+    }
+
+    private void updateWorkStep(final ItWorkVO work, final Step expectedStep, final Step nextStep) {
+        if (isMigrationRecoveryWork(work)) {
+            if (!_workDao.updateMigrationStepLeased(work, expectedStep, nextStep, _nodeId,
+                    work.getMigrationRecoveryLeaseToken(), work.getMigrationRecoveryLeaseVersion())) {
+                migrationRecoveryPending.enqueue(work, _migrationNicDao);
+                throw new CloudRuntimeException("migration work step CAS was rejected");
+            }
+            return;
+        }
+        _workDao.updateStep(work, nextStep);
     }
 
     protected boolean areAffinityGroupsAssociated(final VirtualMachineProfile vmProfile) {
@@ -1105,6 +1157,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Override
     public void advanceStart(final String vmUuid, final Map<VirtualMachineProfile.Param, Object> params, final DeploymentPlan planToDeploy, final DeploymentPlanner planner)
             throws InsufficientCapacityException, ConcurrentOperationException, ResourceUnavailableException {
+        rejectNonterminalMigrationRecovery(vmUuid);
 
         final AsyncJobExecutionContext jobContext = AsyncJobExecutionContext.getCurrentExecutionContext();
         if (jobContext.isJobDispatchedBy(VmWorkConstants.VM_WORK_JOB_DISPATCHER)) {
@@ -1352,12 +1405,23 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     public void orchestrateStart(final String vmUuid, final Map<VirtualMachineProfile.Param, Object> params, final DeploymentPlan planToDeploy, final DeploymentPlanner planner)
             throws InsufficientCapacityException, ConcurrentOperationException, ResourceUnavailableException {
 
+        orchestrateStart(vmUuid, params, planToDeploy, planner, null);
+    }
+
+    private void orchestrateStart(final String vmUuid, final Map<VirtualMachineProfile.Param, Object> params,
+            final DeploymentPlan planToDeploy, final DeploymentPlanner planner,
+            final MigrationAdmissionContext admissionContext)
+            throws InsufficientCapacityException, ConcurrentOperationException, ResourceUnavailableException {
+
         logger.debug(() -> LogUtils.logGsonWithoutException("Trying to start VM [%s] using plan [%s] and planner [%s].", vmUuid, planToDeploy, planner));
         final CallContext cctxt = CallContext.current();
         final Account account = cctxt.getCallingAccount();
         final User caller = cctxt.getCallingUser();
 
         VMInstanceVO vm = _vmDao.findByUuid(vmUuid);
+        if (!isExactMigrationAdmission(vm, admissionContext)) {
+            rejectNonterminalMigrationRecovery(vm);
+        }
 
         final boolean firstStart = vm.getUpdated() == 0;
 
@@ -2126,6 +2190,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
     @Override
     public void stop(final String vmUuid) throws ResourceUnavailableException {
+        rejectNonterminalMigrationRecovery(vmUuid);
         try {
             advanceStop(vmUuid, false);
         } catch (final OperationTimedoutException e) {
@@ -2138,8 +2203,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
     @Override
     public void stopForced(String vmUuid) throws ResourceUnavailableException {
+        rejectNonterminalMigrationRecovery(vmUuid);
         try {
-            advanceStop(vmUuid, true);
+            advanceStop(_vmDao.findByUuid(vmUuid), true, null);
         } catch (final OperationTimedoutException e) {
             throw new AgentUnavailableException(String.format("Unable to stop vm [%s] because the operation to stop timed out", vmUuid), e.getAgentId(), e);
         } catch (final ConcurrentOperationException e) {
@@ -2572,6 +2638,12 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
     private void advanceStop(final VMInstanceVO vm, final boolean cleanUpEvenIfUnableToStop) throws AgentUnavailableException, OperationTimedoutException,
     ConcurrentOperationException {
+        advanceStop(vm, cleanUpEvenIfUnableToStop, null);
+    }
+
+    private void advanceStop(final VMInstanceVO vm, final boolean cleanUpEvenIfUnableToStop,
+            final ItWorkVO migrationWork) throws AgentUnavailableException, OperationTimedoutException,
+            ConcurrentOperationException {
         final State state = vm.getState();
         if (state == State.Stopped) {
             logger.debug("VM is already stopped: {}", vm);
@@ -2583,7 +2655,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             return;
         }
 
-        final ItWorkVO work = _workDao.findByOutstandingWork(vm.getId(), vm.getState());
+        final ItWorkVO work = migrationWork == null ? _workDao.findByOutstandingWork(vm.getId(), vm.getState())
+                : migrationWork;
         if (work != null) {
             logger.debug("Found an outstanding work item for this vm {} with state: {}, work id: {}", vm, vm.getState(), work.getId());
         }
@@ -2593,16 +2666,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 logger.debug("HostId is null but this is not a forced stop, cannot stop vm {} with state: {}", vm, vm.getState());
                 throw new CloudRuntimeException("Unable to stop " + vm);
             }
+            if (work != null) {
+                logger.debug("Updating work item to Done, id: {}", work.getId());
+                updateWorkStep(work, work.getStep(), Step.Done);
+            }
             try {
                 stateTransitTo(vm, Event.AgentReportStopped, null, null);
             } catch (final NoTransitionException e) {
                 logger.warn(e.getMessage());
-            }
-
-            if (work != null) {
-                logger.debug("Updating work item to Done, id: {}", work.getId());
-                work.setStep(Step.Done);
-                _workDao.update(work.getId(), work);
             }
             return;
         } else {
@@ -2665,7 +2736,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         boolean stopped = false;
         Answer answer = null;
         try {
-            answer = _agentMgr.send(vm.getHostId(), stop);
+            answer = migrationWork == null ? _agentMgr.send(vm.getHostId(), stop)
+                    : sendMigrationAgentRpc(migrationWork, vm.getHostId(), stop, migrationWork.getMigrationPhase());
             if (answer != null) {
                 if (answer instanceof StopAnswer) {
                     final StopAnswer stopAns = (StopAnswer)answer;
@@ -2727,13 +2799,15 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
         logger.debug("{} is stopped on the host.  Proceeding to release resource held.", vm);
 
+        if (work != null && isMigrationRecoveryWork(work)) {
+            updateWorkStep(work, work.getStep(), Step.Done);
+        }
         releaseVmResources(profile, cleanUpEvenIfUnableToStop);
 
         try {
-            if (work != null) {
+            if (work != null && !isMigrationRecoveryWork(work)) {
                 logger.debug("Updating the outstanding work item to Done, id: {}", work.getId());
-                work.setStep(Step.Done);
-                _workDao.update(work.getId(), work);
+                updateWorkStep(work, work.getStep(), Step.Done);
             }
 
             boolean result = Transaction.execute(new TransactionCallbackWithException<Boolean, NoTransitionException>() {
@@ -2795,6 +2869,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
     @Override
     public void destroy(final String vmUuid, final boolean expunge) throws AgentUnavailableException, OperationTimedoutException, ConcurrentOperationException {
+        rejectNonterminalMigrationRecovery(vmUuid);
         VMInstanceVO vm = _vmDao.findByUuid(vmUuid);
         if (vm == null || vm.getState() == State.Destroyed || vm.getState() == State.Expunging || vm.getRemoved() != null) {
             logger.debug("Unable to find vm or vm is destroyed: {}", vm);
@@ -2857,7 +2932,27 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     }
 
     protected boolean checkVmOnHost(final VirtualMachine vm, final long hostId) throws AgentUnavailableException, OperationTimedoutException {
-        final Answer answer = _agentMgr.send(hostId, new CheckVirtualMachineCommand(vm.getInstanceName()));
+        return checkVmOnHostLegacy(vm, hostId);
+    }
+
+    private boolean checkVmOnHostLegacy(final VirtualMachine vm, final long hostId)
+            throws AgentUnavailableException, OperationTimedoutException {
+        return checkVmOnHostInternal(vm, hostId, null);
+    }
+
+    private boolean checkVmOnHostLeased(final VirtualMachine vm, final long hostId, final ItWorkVO work)
+            throws AgentUnavailableException, OperationTimedoutException {
+        if (work == null) {
+            throw new CloudRuntimeException("leased VM check requires work");
+        }
+        return checkVmOnHostInternal(vm, hostId, work);
+    }
+
+    private boolean checkVmOnHostInternal(final VirtualMachine vm, final long hostId, final ItWorkVO work)
+            throws AgentUnavailableException, OperationTimedoutException {
+        final Answer answer = work == null ? _agentMgr.send(hostId, new CheckVirtualMachineCommand(vm.getInstanceName()))
+                : sendMigrationAgentRpc(work, hostId, new CheckVirtualMachineCommand(vm.getInstanceName()),
+                work.getMigrationPhase());
         if (answer == null || !answer.getResult()) {
             return false;
         }
@@ -2873,7 +2968,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             List<VMSnapshotVO> vmSnapshots = _vmSnapshotDao.findByVm(vm.getId());
             RestoreVMSnapshotCommand command = _vmSnapshotMgr.createRestoreCommand(userVm, vmSnapshots);
             if (command != null) {
-                RestoreVMSnapshotAnswer restoreVMSnapshotAnswer = (RestoreVMSnapshotAnswer) _agentMgr.send(hostId, command);
+                RestoreVMSnapshotAnswer restoreVMSnapshotAnswer = (RestoreVMSnapshotAnswer) (work == null
+                        ? _agentMgr.send(hostId, command)
+                        : sendMigrationAgentRpc(work, hostId, command, work.getMigrationPhase()));
                 if (restoreVMSnapshotAnswer == null || !restoreVMSnapshotAnswer.getResult()) {
                     logger.warn("Unable to restore the Instance Snapshot from image file after live migration of Instance with vmsnapshots: {}", restoreVMSnapshotAnswer == null ? "null answer" : restoreVMSnapshotAnswer.getDetails());
                 }
@@ -3171,6 +3268,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Override
     public void migrate(final String vmUuid, final long srcHostId, final DeployDestination dest)
             throws ResourceUnavailableException, ConcurrentOperationException {
+        rejectNonterminalMigrationRecovery(vmUuid);
+        ensureHostMigrationReady(srcHostId);
+        ensureHostMigrationReady(dest.getHost().getId());
 
         final AsyncJobExecutionContext jobContext = AsyncJobExecutionContext.getCurrentExecutionContext();
         if (jobContext.isJobDispatchedBy(VmWorkConstants.VM_WORK_JOB_DISPATCHER)) {
@@ -3250,26 +3350,44 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         final VirtualMachineProfile profile = migrationProfile(vm, dest.getHost());
         profile.setHost(dest.getHost());
 
+        final MigrationCapability capability = migrationVfPreflight.capability(profile);
+        if (!capability.isAllowed()) {
+            throw new CloudRuntimeException(capability.rejectionReason());
+        }
+        if (capability.coldOnly()) {
+            migrationVfPreflight.verify(profile, dest.getHost(), MigrationVfPreflight.MigrationMode.COLD);
+            coldRelocateAccelerated(vm, vmSrc, dest, srcHostId);
+            return;
+        }
+
         migrationVfPreflight.verify(profile, dest.getHost());
+        final ItWorkVO work = persistMigrationWorkAndNicCheckpoints(vm, dstHostId, srcHostId, profile,
+                ItWorkVO.MigrationMode.ORDINARY, null);
+        claimMigrationLeaseOrThrow(work);
+        requireMigrationLease(work);
+        installMigrationFence(work, srcHostId, profile, true);
         _networkMgr.prepareNicForMigration(profile, dest);
         volumeMgr.prepareForMigration(profile, dest);
+        requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED);
         profile.setConfigDriveLabel(VmConfigDriveLabel.value());
         updateOverCommitRatioForVmProfile(profile, dest.getHost().getClusterId());
 
         final VirtualMachineTO to = toVmTO(profile);
         final PrepareForMigrationCommand pfmc = new PrepareForMigrationCommand(to);
+        pfmc.setMigrationWorkId(work.getId());
+        pfmc.setMigrationGeneration(work.getMigrationGeneration());
+        pfmc.setMigrationLeaseToken(work.getMigrationRecoveryLeaseToken());
+        pfmc.setMigrationLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+        pfmc.setMigrationLeaseExpiry(work.getMigrationRecoveryLeaseExpiresAt());
+        pfmc.setMigrationIdentities(buildPrepareMigrationIdentities(work, profile));
         setVmNetworkDetails(vm, to);
-
-        ItWorkVO work = new ItWorkVO(UUID.randomUUID().toString(), _nodeId, State.Migrating, vm.getType(), vm.getId());
-        work.setStep(Step.Prepare);
-        work.setResourceType(ItWorkVO.ResourceType.Host);
-        work.setResourceId(dstHostId);
-        work = _workDao.persist(work);
 
         Answer pfma = null;
         boolean prepareCleanupAuthorized = true;
         try {
-            pfma = _agentMgr.send(dstHostId, pfmc);
+            requireMigrationLease(work);
+            pfma = sendMigrationAgentRpc(work, dstHostId, pfmc,
+                    ItWorkVO.MigrationPhase.PREPARING_DESTINATION);
             if (pfma == null || !pfma.getResult()) {
                 final String details = pfma != null ? pfma.getDetails() : "null answer returned";
                 final String msg = "Unable to prepare for migration due to " + details;
@@ -3278,29 +3396,67 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 throw new AgentUnavailableException(msg, dstHostId);
             }
             logger.debug("Successfully prepared destination host {} for migration of VM {} ", dstHostId, vm.getInstanceName());
-        } catch (final OperationTimedoutException e1) {
-            prepareCleanupAuthorized = false;
-            throw new AgentUnavailableException("Operation timed out", dstHostId);
+            if (!(pfma instanceof PrepareForMigrationAnswer)) {
+                throw new CloudRuntimeException("destination prepare answer lacks authoritative NIC identities");
+            }
+            final PrepareForMigrationAnswer prepared = (PrepareForMigrationAnswer) pfma;
+            persistDestinationNicObservations(work, prepared, profile);
+            requireMigrationLease(work);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.DESTINATION_DATAPLANE_PROVEN);
         } finally {
             if (pfma == null) {
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, prepareCleanupAuthorized,
-                        "migration-prepare", work.getId());
-                volumeMgr.release(vm.getId(), dstHostId);
-                work.setStep(Step.Done);
-                _workDao.update(work.getId(), work);
+                try {
+                    executeLeasedRollbackStep(work, "rollback phase", () -> {
+                        if (!advanceMigrationPhase(work, ItWorkVO.MigrationPhase.ROLLING_BACK)) {
+                            throw new CloudRuntimeException("unable to persist rollback phase");
+                        }
+                    });
+                    executeLeasedRollbackStep(work, "network ownership rollback",
+                            () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                    final boolean prepareCleanup = prepareCleanupAuthorized;
+                    executeLeasedRollbackStep(work, "VF ownership rollback",
+                            () -> rollbackVfReservationsStrict(vm.getId(), dstHostId, prepareCleanup,
+                                    "migration-prepare", work.getId()));
+                    executeLeasedRollbackStep(work, "destination volume release",
+                            () -> volumeMgr.release(vm.getId(), dstHostId));
+                    if (prepareCleanupAuthorized) {
+                        executeLeasedRollbackStep(work, "migration terminalization",
+                                () -> terminalizeMigrationWork(work));
+                        executeLeasedRollbackStep(work, "work completion", () -> {
+                            work.setStep(Step.Done);
+                            if (!_workDao.updateMigrationWorkLeased(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                                    work.getMigrationRecoveryLeaseVersion())) {
+                                throw new CloudRuntimeException("unable to persist completed migration work");
+                            }
+                        });
+                        executeLeasedRollbackStep(work, "lease release", () -> {
+                            if (!_workDao.releaseMigrationLease(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                                    work.getMigrationRecoveryLeaseVersion())) {
+                                throw new CloudRuntimeException("unable to release migration lease");
+                            }
+                        });
+                    }
+                } catch (CloudRuntimeException rollbackFailure) {
+                    migrationRecoveryPending.enqueue(work, _migrationNicDao);
+                    logger.warn("Migration prepare rollback stopped; recovery remains nonterminal for {}", work.getId(),
+                            rollbackFailure);
+                }
             }
         }
 
         vm.setLastHostId(srcHostId);
         _vmDao.resetVmPowerStateTracking(vm.getId());
         try {
+            requireMigrationLease(work);
             if (vm.getHostId() == null || vm.getHostId() != srcHostId || !changeState(vm, Event.MigrationRequested, dstHostId, work, Step.Migrating)) {
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
-                        "migration-state-change", work.getId());
+                executeLeasedRollbackStep(work, "network ownership rollback after state change",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                executeLeasedRollbackStep(work, "VF ownership rollback after state change",
+                        () -> rollbackVfReservationsStrict(vm.getId(), dstHostId, true,
+                                "migration-state-change", work.getId()));
                 if (vm != null) {
-                    volumeMgr.release(vm.getId(), dstHostId);
+                    executeLeasedRollbackStep(work, "destination volume release after state change",
+                            () -> volumeMgr.release(vm.getId(), dstHostId));
                 }
 
                 String msg = "Migration cancelled because state has changed: " + vm;
@@ -3308,29 +3464,29 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 throw new ConcurrentOperationException(msg);
             }
         } catch (final NoTransitionException e1) {
-            _networkMgr.rollbackNicForMigration(vmSrc, profile);
-            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
-                    "migration-state-transition", work.getId());
-            volumeMgr.release(vm.getId(), dstHostId);
+            executeLeasedRollbackStep(work, "network ownership rollback after transition failure",
+                    () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+            executeLeasedRollbackStep(work, "VF ownership rollback after transition failure",
+                    () -> rollbackVfReservationsStrict(vm.getId(), dstHostId, true,
+                            "migration-state-transition", work.getId()));
+            executeLeasedRollbackStep(work, "destination volume release after transition failure",
+                    () -> volumeMgr.release(vm.getId(), dstHostId));
             String msg = String.format("Migration cancelled for VM %s due to state transition failure: %s",
                     vm.getInstanceName(), e1.getMessage());
             logger.warn(msg, e1);
             throw new ConcurrentOperationException("Migration cancelled because " + e1.getMessage());
         } catch (final CloudRuntimeException e2) {
-            _networkMgr.rollbackNicForMigration(vmSrc, profile);
-            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
-                    "migration-runtime-failure", work.getId());
-            volumeMgr.release(vm.getId(), dstHostId);
+            executeLeasedRollbackStep(work, "network ownership rollback after runtime failure",
+                    () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+            executeLeasedRollbackStep(work, "VF ownership rollback after runtime failure",
+                    () -> rollbackVfReservationsStrict(vm.getId(), dstHostId, true,
+                            "migration-runtime-failure", work.getId()));
+            executeLeasedRollbackStep(work, "destination volume release after runtime failure",
+                    () -> volumeMgr.release(vm.getId(), dstHostId));
             String msg = String.format("Migration cancelled for VM %s due to runtime exception: %s",
                     vm.getInstanceName(), e2.getMessage());
             logger.error(msg, e2);
-            work.setStep(Step.Done);
-            _workDao.update(work.getId(), work);
-            try {
-                stateTransitTo(vm, Event.OperationFailed, srcHostId);
-            } catch (final NoTransitionException e3) {
-                logger.warn(e3.getMessage());
-            }
+            executeLeasedRollbackStep(work, "source failure state", () -> stateTransitTo(vm, Event.OperationFailed, srcHostId));
             throw new CloudRuntimeException("Migration cancelled because " + e2.getMessage());
         }
 
@@ -3340,45 +3496,24 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         boolean destinationAuthoritativelyVerified = false;
         Map<String, DpdkTO> dpdkInterfaceMapping = new HashMap<>();
         try {
+            requireMigrationLease(work);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.TRANSFERRING);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.STARTING_DESTINATION);
             final MigrateCommand mc = buildMigrateCommand(vm, to, dest, pfma, dpdkInterfaceMapping);
 
-            try {
-                final Answer ma = _agentMgr.send(vm.getLastHostId(), mc);
-                if (ma == null || !ma.getResult()) {
-                    final String details = ma != null ? ma.getDetails() : "null answer returned";
-                    String msg = String.format("Migration command failed for VM %s on source host id=%s to destination host %s: %s",
-                            vm.getInstanceName(), vm.getLastHostId(), dstHostId, details);
-                    logger.error(msg);
-                    throw new CloudRuntimeException(details);
-                }
-                logger.info("Migration command successful for VM {}", vm.getInstanceName());
-            } catch (final OperationTimedoutException e) {
-                migrationCommandTimedOut = true;
-                migrationCleanupAuthorized = false;
-                boolean success = false;
-                if (HypervisorType.KVM.equals(vm.getHypervisorType())) {
-                    try {
-                        final Answer answer = _agentMgr.send(vm.getHostId(), new CheckVirtualMachineCommand(vm.getInstanceName()));
-                        if (answer != null && answer.getResult() && answer instanceof CheckVirtualMachineAnswer) {
-                            final CheckVirtualMachineAnswer vmAnswer = (CheckVirtualMachineAnswer) answer;
-                            if (VirtualMachine.PowerState.PowerOn.equals(vmAnswer.getState())) {
-                                logger.info(String.format("Vm %s is found on destination host %s. Migration is successful", vm, vm.getHostId()));
-                                success = true;
-                            }
-                        }
-                    } catch (Exception ex) {
-                        logger.error(String.format("Failed to get state of VM %s on destination host %s: %s", vm, vm.getHostId(), ex.getMessage()));
-                    }
-                }
-                if (!success) {
-                    if (e.isActive()) {
-                        logger.warn("Active migration command so scheduling a restart for {}", vm, e);
-                        _haMgr.scheduleRestart(vm, true);
-
-                        throw new AgentUnavailableException("Operation timed out on migrating " + vm, dstHostId);
-                    }
-                }
+            requireMigrationLease(work);
+            final Answer ma = sendMigrationAgentRpc(work, vm.getLastHostId(), mc,
+                    ItWorkVO.MigrationPhase.STARTING_DESTINATION);
+            if (ma == null || !ma.getResult()) {
+                final String details = ma != null ? ma.getDetails() : "null answer returned";
+                String msg = String.format("Migration command failed for VM %s on source host id=%s to destination host %s: %s",
+                        vm.getInstanceName(), vm.getLastHostId(), dstHostId, details);
+                logger.error(msg);
+                throw new CloudRuntimeException(details);
             }
+            logger.info("Migration command successful for VM {}", vm.getInstanceName());
+            requireMigrationLease(work);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.GUEST_TRANSFERRED_OR_STARTED);
 
             try {
                 if (!changeState(vm, VirtualMachine.Event.OperationSucceeded, dstHostId, work, Step.Started)) {
@@ -3389,13 +3524,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             }
 
             try {
-                if (!checkVmOnHost(vm, dstHostId)) {
+                if (!checkVmOnHostLeased(vm, dstHostId, work)) {
                     logger.error("Migration verification failed for VM {} : VM not found on destination host {} ", vm.getInstanceName(), dstHostId);
-                    try {
-                        _agentMgr.send(srcHostId, new Commands(cleanup(vm, dpdkInterfaceMapping)), null);
-                    } catch (final AgentUnavailableException e) {
-                        logger.error("AgentUnavailableException while cleanup on source host: {}", fromHost, e);
-                    }
+                    sendMigrationAgentRpc(work, srcHostId, cleanup(vm, dpdkInterfaceMapping),
+                            work.getMigrationPhase());
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("Unable to complete migration for " + vm);
                 }
@@ -3404,13 +3536,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 destinationAuthoritativelyVerified = false;
                 logger.warn("Error while checking the vm {} on host {}", vm, dest.getHost(), e);
             }
-            if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
+            if (!dispatchPostMigrateOvnStampLeased(vm, to, dstHostId, work)) {
                 throw new CloudRuntimeException("Destination OVN post-migration stamp failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId, dstHostId)) {
+            if (!verifySourceBindingDownLeased(vm, to, srcHostId, dstHostId, work)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after cutover");
             }
             try {
+                requireMigrationLease(work);
                 requireVfOwnershipManager(profile);
                 _networkMgr.commitNicForMigration(vmSrc, profile);
                 finalizeVfOwnershipAfterMigration(vm.getId(), srcHostId, dstHostId,
@@ -3419,54 +3552,94 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 throw new CloudRuntimeException("Migration ownership commit failed for " + vm.getInstanceName(), e);
             }
             migrated = true;
+            requireMigrationLease(work);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED);
+            requireMigrationLease(work);
+            requireMigrationCheckpoint(work, ItWorkVO.MigrationPhase.SOURCE_CLEANUP);
         } finally {
             if (!migrated) {
                 logger.info("Migration was unsuccessful. Cleaning up: {}", vm);
                 if (hasVdpaNic(to)) {
                     try {
-                        final Answer stopAnswer = _agentMgr.send(dstHostId,
-                                new StopCommand(vm.getInstanceName(), false, true));
-                        if (stopAnswer == null || !stopAnswer.getResult()) {
-                            logger.error("Unable to stop failed vDPA destination {}: {}",
-                                    dstHostId, stopAnswer == null ? "null answer" : stopAnswer.getDetails());
-                        }
+                        executeLeasedRollbackStep(work, "failed vDPA destination stop", () -> {
+                            final Answer stopAnswer = sendMigrationAgentRpc(work, dstHostId,
+                                    new StopCommand(vm.getInstanceName(), false, true), work.getMigrationPhase());
+                            if (stopAnswer == null || !stopAnswer.getResult()) {
+                                throw new CloudRuntimeException("failed vDPA destination stop was not acknowledged");
+                            }
+                        });
                     } catch (Exception e) {
                         logger.error("Unable to stop failed vDPA destination {}; leaving VM stopped", dstHostId, e);
+                        throw e instanceof CloudRuntimeException ? (CloudRuntimeException) e
+                                : new CloudRuntimeException("failed vDPA destination stop failed", e);
                     }
                 }
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, migrationCleanupAuthorized,
-                        "migration", work.getId());
-                volumeMgr.release(vm.getId(), dstHostId);
-                // deallocate GPU devices for the VM on the destination host
-                gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), dstHostId);
+                executeLeasedRollbackStep(work, "network ownership rollback",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                final boolean migrationCleanup = migrationCleanupAuthorized;
+                executeLeasedRollbackStep(work, "VF ownership rollback",
+                    () -> rollbackVfReservationsStrict(vm.getId(), dstHostId, migrationCleanup,
+                                "migration", work.getId()));
+                executeLeasedRollbackStep(work, "destination volume release",
+                        () -> volumeMgr.release(vm.getId(), dstHostId));
+                executeLeasedRollbackStep(work, "destination GPU release",
+                        () -> gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), dstHostId));
 
-                _alertMgr.sendAlert(alertType, fromHost.getDataCenterId(), fromHost.getPodId(),
-                        "Unable to migrate vm " + vm.getInstanceName() + " from host " + fromHost.getName() + " in zone " + dest.getDataCenter().getName() + " and pod " +
-                                dest.getPod().getName(), "Migrate Command failed.  Please check logs.");
-                try {
-                    _agentMgr.send(dstHostId, new Commands(cleanup(vm, dpdkInterfaceMapping)), null);
-                } catch (final AgentUnavailableException ae) {
-                    logger.warn("Destination host {} unavailable for cleanup after failed migration of VM {}", dstHostId, vm.getInstanceName(), ae);
-                }
-                _networkMgr.setHypervisorHostname(profile, dest, false);
-                try {
-                    stateTransitTo(vm, Event.OperationFailed, srcHostId);
-                } catch (final NoTransitionException e) {
-                    logger.warn(e.getMessage());
-                }
+                final AlertManager.AlertType failureAlertType = alertType;
+                final Host failureFromHost = fromHost;
+                final DeployDestination failureDestination = dest;
+                executeLeasedRollbackStep(work, "migration failure alert", () -> _alertMgr.sendAlert(failureAlertType,
+                        failureFromHost.getDataCenterId(), failureFromHost.getPodId(),
+                        "Unable to migrate vm " + vm.getInstanceName() + " from host " + failureFromHost.getName() + " in zone " + failureDestination.getDataCenter().getName() + " and pod " +
+                                failureDestination.getPod().getName(), "Migrate Command failed.  Please check logs."));
+                executeLeasedRollbackStep(work, "destination cleanup RPC",
+                         () -> sendMigrationAgentRpc(work, dstHostId, cleanup(vm, dpdkInterfaceMapping),
+                                work.getMigrationPhase()));
+                executeLeasedRollbackStep(work, "destination hostname rollback",
+                        () -> _networkMgr.setHypervisorHostname(profile, dest, false));
+                executeLeasedRollbackStep(work, "source VM state rollback",
+                        () -> stateTransitTo(vm, Event.OperationFailed, srcHostId));
             } else {
                 logger.info("Migration completed successfully for VM %s" + vm);
-                volumeMgr.release(vm.getId(), srcHostId);
-                // deallocate GPU devices for the VM on the src host after migration is complete
-                gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), srcHostId);
-                _networkMgr.setHypervisorHostname(profile, dest, true);
-                recreateCheckpointsKvmOnVmAfterMigration(vm, dstHostId);
-                updateVmPod(vm, dstHostId);
             }
 
-            work.setStep(Step.Done);
-            _workDao.update(work.getId(), work);
+            if (migrated) {
+                executeLeasedRollbackStep(work, "source post-migration cleanup RPC",
+                        () -> sendMigrationAgentRpc(work, srcHostId,
+                                cleanup(vm, dpdkInterfaceMapping), work.getMigrationPhase()));
+                executeLeasedRollbackStep(work, "source volume release",
+                        () -> volumeMgr.release(vm.getId(), srcHostId));
+                executeLeasedRollbackStep(work, "source GPU release",
+                        () -> gpuService.deallocateGpuDevicesForVmOnHost(vm.getId(), srcHostId));
+                executeLeasedRollbackStep(work, "destination hostname restore",
+                        () -> _networkMgr.setHypervisorHostname(profile, dest, true));
+                executeLeasedRollbackStep(work, "KVM checkpoint recreation",
+                        () -> recreateCheckpointsKvmOnVmAfterMigration(vm, dstHostId, work));
+                executeLeasedRollbackStep(work, "VM pod restoration",
+                        () -> updateVmPod(vm, dstHostId));
+                executeLeasedRollbackStep(work, "fresh migration postconditions", () -> {
+                    if (!checkVmOnHostLeased(vm, dstHostId, work)
+                            || !verifySourceBindingDownLeased(vm, to, srcHostId, dstHostId, work)) {
+                        throw new CloudRuntimeException("migration postconditions were not proven after cleanup");
+                    }
+                });
+                executeLeasedRollbackStep(work, "migration terminalization", () -> terminalizeMigrationWork(work));
+            }
+            if (migrated) {
+                executeLeasedRollbackStep(work, "work completion", () -> {
+                    work.setStep(Step.Done);
+                    if (!_workDao.updateMigrationWorkLeased(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                            work.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to persist migration work completion");
+                    }
+                });
+                executeLeasedRollbackStep(work, "lease release", () -> {
+                    if (!_workDao.releaseMigrationLease(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                            work.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to release migration lease");
+                    }
+                });
+            }
         }
     }
 
@@ -3484,13 +3657,34 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
      * <p>No-op for non-KVM hypervisors.
      */
     protected boolean dispatchPostMigrateOvnStamp(final VMInstanceVO vm, final VirtualMachineTO to, final long destHostId) {
+        return dispatchPostMigrateOvnStampLegacy(vm, to, destHostId);
+    }
+
+    private boolean dispatchPostMigrateOvnStampLegacy(final VMInstanceVO vm, final VirtualMachineTO to,
+            final long destHostId) {
+        return dispatchPostMigrateOvnStampInternal(vm, to, destHostId, null);
+    }
+
+    private boolean dispatchPostMigrateOvnStampLeased(final VMInstanceVO vm, final VirtualMachineTO to,
+            final long destHostId, final ItWorkVO work) {
+        if (work == null) {
+            throw new CloudRuntimeException("leased migration dispatch requires work");
+        }
+        return dispatchPostMigrateOvnStampInternal(vm, to, destHostId, work);
+    }
+
+    private boolean dispatchPostMigrateOvnStampInternal(final VMInstanceVO vm, final VirtualMachineTO to,
+            final long destHostId, final ItWorkVO work) {
         if (!HypervisorType.KVM.equals(vm.getHypervisorType())) {
             return true;
         }
         final PostMigrateOvnStampCommand cmd = new PostMigrateOvnStampCommand(vm.getInstanceName(), to.getNics());
         final boolean vdpa = to.getNics() != null && java.util.Arrays.stream(to.getNics()).anyMatch(NicTO::isUseVdpa);
         try {
-            final Answer answer = vdpa ? _agentMgr.send(destHostId, cmd) : _agentMgr.easySend(destHostId, cmd);
+            final Answer answer = work == null
+                    ? vdpa ? _agentMgr.send(destHostId, cmd) : _agentMgr.easySend(destHostId, cmd)
+                    : sendMigrationAgentRpc(work, destHostId, cmd,
+                            ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED);
             if (answer == null || !answer.getResult()) {
                 final String detail = answer != null ? answer.getDetails() : "null answer";
                 logger.warn("PostMigrateOvnStamp failed for VM {} on dest host {}: {}",
@@ -3501,9 +3695,12 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 if (!vdpa) {
                     return true;
                 }
-                final Answer verification = _agentMgr.send(destHostId,
-                        new VerifyDestinationDataplaneCommand(vm.getInstanceName(), to.getNics(),
-                                migrationVfPreflight.expectedChassis(_hostDao.findById(destHostId))));
+                final VerifyDestinationDataplaneCommand verifyCommand = new VerifyDestinationDataplaneCommand(
+                        vm.getInstanceName(), to.getNics(),
+                        migrationVfPreflight.expectedChassis(_hostDao.findById(destHostId)));
+                final Answer verification = work == null ? _agentMgr.send(destHostId, verifyCommand)
+                        : sendMigrationAgentRpc(work, destHostId, verifyCommand,
+                        ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED);
                 if (!(verification instanceof VerifyDestinationDataplaneAnswer)
                         || !verification.getResult()) {
                     logger.error("Destination vDPA dataplane verification failed for VM {} on host {}: {}",
@@ -3525,8 +3722,16 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 && java.util.Arrays.stream(to.getNics()).anyMatch(NicTO::isUseVdpa);
     }
 
-    private boolean verifySourceBindingDown(final VMInstanceVO vm, final VirtualMachineTO to,
-            final long sourceHostId, final long destinationHostId) {
+    private boolean verifySourceBindingDownLeased(final VMInstanceVO vm, final VirtualMachineTO to,
+            final long sourceHostId, final long destinationHostId, final ItWorkVO work) {
+        if (work == null) {
+            throw new CloudRuntimeException("leased source-binding verification requires work");
+        }
+        return verifySourceBindingDownInternal(vm, to, sourceHostId, destinationHostId, work);
+    }
+
+    private boolean verifySourceBindingDownInternal(final VMInstanceVO vm, final VirtualMachineTO to,
+            final long sourceHostId, final long destinationHostId, final ItWorkVO work) {
         if (!hasVdpaNic(to)) {
             return true;
         }
@@ -3537,10 +3742,13 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 .map(uuid -> "lsp-" + uuid)
                 .toArray(String[]::new);
         try {
-            final Answer answer = _agentMgr.send(sourceHostId,
-                    new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
-                            migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId)),
-                            migrationVfPreflight.expectedChassis(_hostDao.findById(destinationHostId))));
+            final VerifySourceBindingDownCommand verifyCommand = new VerifySourceBindingDownCommand(
+                    vm.getInstanceName(), lsps,
+                    migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId)),
+                    migrationVfPreflight.expectedChassis(_hostDao.findById(destinationHostId)));
+            final Answer answer = work == null ? _agentMgr.send(sourceHostId, verifyCommand)
+                    : sendMigrationAgentRpc(work, sourceHostId, verifyCommand,
+                    ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED);
             return answer instanceof VerifySourceBindingDownAnswer && answer.getResult();
         } catch (Exception e) {
             logger.error("Source vDPA binding proof failed for VM {} after cutover", vm.getInstanceName(), e);
@@ -3848,6 +4056,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Override
     public void migrateWithStorage(final String vmUuid, final long srcHostId, final long destHostId, final Map<Long, Long> volumeToPool)
             throws ResourceUnavailableException, ConcurrentOperationException {
+        rejectNonterminalMigrationRecovery(vmUuid);
+        ensureHostMigrationReady(srcHostId);
+        ensureHostMigrationReady(destHostId);
 
         final AsyncJobExecutionContext jobContext = AsyncJobExecutionContext.getCurrentExecutionContext();
         if (jobContext.isJobDispatchedBy(VmWorkConstants.VM_WORK_JOB_DISPATCHER)) {
@@ -3911,16 +4122,14 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
 
         migrationVfPreflight.verify(profile, destination.getHost());
+        ItWorkVO work = persistMigrationWorkAndNicCheckpoints(vm, destHostId, srcHostId, profile,
+                ItWorkVO.MigrationMode.ORDINARY, null);
+        claimMigrationLeaseOrThrow(work);
+        installMigrationFence(work, srcHostId, profile, true);
         _networkMgr.prepareNicForMigration(profile, destination);
         volumeMgr.prepareForMigration(profile, destination);
         final HypervisorGuru hvGuru = _hvGuruMgr.getGuru(vm.getHypervisorType());
         final VirtualMachineTO to = hvGuru.implement(profile);
-
-        ItWorkVO work = new ItWorkVO(UUID.randomUUID().toString(), _nodeId, State.Migrating, vm.getType(), vm.getId());
-        work.setStep(Step.Prepare);
-        work.setResourceType(ItWorkVO.ResourceType.Host);
-        work.setResourceId(destHostId);
-        work = _workDao.persist(work);
 
         vm.setLastHostId(srcHostId);
         vm.setPodIdToDeployIn(destHost.getPodId());
@@ -3953,13 +4162,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                     profile.setConfigDriveIsoFile(isoFile);
 
                     AttachOrDettachConfigDriveCommand dettachCommand = new AttachOrDettachConfigDriveCommand(vm.getInstanceName(), vmData, VmConfigDriveLabel.value(), false);
-                    try {
-                        _agentMgr.send(srcHost.getId(), dettachCommand);
-                        logger.debug("Deleted config drive ISO for  vm {} in host {}", vm.getInstanceName(), srcHost);
-                    } catch (OperationTimedoutException e) {
-                        logger.error("TIme out occurred while exeuting command AttachOrDettachConfigDrive {}", e.getMessage(), e);
-
-                    }
+                    sendMigrationAgentRpc(work, srcHost.getId(), dettachCommand, work.getMigrationPhase());
+                    logger.debug("Deleted config drive ISO for  vm {} in host {}", vm.getInstanceName(), srcHost);
                 }
             }
 
@@ -3968,13 +4172,9 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             moveVmOutofMigratingStateOnSuccess(vm, destHost.getId(), work);
 
             try {
-                if (!checkVmOnHost(vm, destHostId)) {
+                if (!checkVmOnHostLeased(vm, destHostId, work)) {
                     logger.error("Vm not found on destination host. Unable to complete migration for {}", vm);
-                    try {
-                        _agentMgr.send(srcHostId, new Commands(cleanup(vm.getInstanceName())), null);
-                    } catch (final AgentUnavailableException e) {
-                        logger.error("AgentUnavailableException while cleanup on source host: {}", srcHost, e);
-                    }
+                    sendMigrationAgentRpc(work, srcHostId, cleanup(vm.getInstanceName()), null);
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("VM not found on destination host. Unable to complete migration for " + vm);
                 }
@@ -3984,10 +4184,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 storageDestinationVerified = false;
                 logger.error("Error while checking the vm {} is on host {}", vm, destHost, e);
             }
-            if (!dispatchPostMigrateOvnStamp(vm, to, destHostId)) {
+            if (!dispatchPostMigrateOvnStampLeased(vm, to, destHostId, work)) {
                 throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId, destHostId)) {
+            if (!verifySourceBindingDownLeased(vm, to, srcHostId, destHostId, work)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after storage cutover");
             }
             requireVfOwnershipManager(profile);
@@ -3999,40 +4199,66 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!migrated) {
                 logger.info("Migration was unsuccessful.  Cleaning up: {}", vm);
                 if (hasVdpaNic(to)) {
-                    try {
-                        _agentMgr.send(destHostId, new StopCommand(vm.getInstanceName(), false, true));
-                    } catch (Exception e) {
-                        logger.error("Unable to stop failed storage-migration vDPA destination {}; VM remains stopped",
-                                destHostId, e);
-                    }
+                    executeLeasedRollbackStep(work, "failed storage-migration vDPA stop", () -> {
+                        final Answer answer = sendMigrationAgentRpc(work, destHostId,
+                                new StopCommand(vm.getInstanceName(), false, true), work.getMigrationPhase());
+                        if (answer == null || !answer.getResult()) {
+                            throw new CloudRuntimeException("failed storage-migration vDPA stop was not acknowledged");
+                        }
+                    });
                 }
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                volumeMgr.release(vm.getId(), destHostId);
+                executeLeasedRollbackStep(work, "storage network ownership rollback",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                executeLeasedRollbackStep(work, "storage destination volume release",
+                        () -> volumeMgr.release(vm.getId(), destHostId));
 
-                _alertMgr.sendAlert(alertType, srcHost.getDataCenterId(), srcHost.getPodId(),
-                        "Unable to migrate vm " + vm.getInstanceName() + " from host " + srcHost.getName() + " in zone " + dc.getName() + " and pod " + dc.getName(),
-                        "Migrate Command failed.  Please check logs.");
+                final AlertManager.AlertType storageFailureAlertType = alertType;
+                final Host storageSourceHost = srcHost;
+                final DataCenter storageDataCenter = dc;
+                executeLeasedRollbackStep(work, "storage migration failure alert", () -> _alertMgr.sendAlert(storageFailureAlertType, storageSourceHost.getDataCenterId(), storageSourceHost.getPodId(),
+                        "Unable to migrate vm " + vm.getInstanceName() + " from host " + storageSourceHost.getName() + " in zone " + storageDataCenter.getName() + " and pod " + storageDataCenter.getName(),
+                        "Migrate Command failed.  Please check logs."));
                 try {
-                    _agentMgr.send(destHostId, new Commands(cleanup(vm.getInstanceName())), null);
-                    vm.setPodIdToDeployIn(srcHost.getPodId());
-                    stateTransitTo(vm, Event.OperationFailed, srcHostId);
-                } catch (final AgentUnavailableException e) {
+                    executeLeasedRollbackStep(work, "storage destination cleanup RPC", () -> sendMigrationAgentRpc(work, destHostId,
+                            cleanup(vm.getInstanceName()), work.getMigrationPhase()));
+                    executeLeasedRollbackStep(work, "storage source pod restoration",
+                            () -> vm.setPodIdToDeployIn(srcHost.getPodId()));
+                    executeLeasedRollbackStep(work, "storage source VM state rollback",
+                            () -> stateTransitTo(vm, Event.OperationFailed, srcHostId));
+                } catch (final CloudRuntimeException e) {
                     storageCleanupAuthorized = false;
-                    logger.warn("Looks like the destination Host is unavailable for cleanup.", e);
-                } catch (final NoTransitionException e) {
-                    logger.error("Error while transitioning vm from migrating to running state.", e);
+                    throw e;
                 }
-                rollbackVfReservationsBestEffort(vm.getId(), destHostId, storageCleanupAuthorized,
-                        "storage-migration", work.getId());
-                _networkMgr.setHypervisorHostname(profile, destination, false);
+                final boolean storageCleanup = storageCleanupAuthorized;
+                executeLeasedRollbackStep(work, "storage VF ownership rollback",
+                        () -> rollbackVfReservationsStrict(vm.getId(), destHostId, storageCleanup,
+                                "storage-migration", work.getId()));
+                executeLeasedRollbackStep(work, "storage destination hostname rollback",
+                        () -> _networkMgr.setHypervisorHostname(profile, destination, false));
             } else {
-                volumeMgr.release(vm.getId(), srcHostId);
-                _networkMgr.setHypervisorHostname(profile, destination, true);
-                endSnapshotChainForVolumes(volumeToPoolMap, vm.getHypervisorType());
+                executeLeasedRollbackStep(work, "storage source volume release",
+                        () -> volumeMgr.release(vm.getId(), srcHostId));
+                executeLeasedRollbackStep(work, "storage destination hostname restore",
+                        () -> _networkMgr.setHypervisorHostname(profile, destination, true));
+                executeLeasedRollbackStep(work, "storage snapshot chain completion",
+                        () -> endSnapshotChainForVolumes(volumeToPoolMap, vm.getHypervisorType()));
             }
 
-            work.setStep(Step.Done);
-            _workDao.update(work.getId(), work);
+            if (migrated) {
+                executeLeasedRollbackStep(work, "storage work completion", () -> {
+                    work.setStep(Step.Done);
+                    if (!_workDao.updateMigrationWorkLeased(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                            work.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to persist storage migration work completion");
+                    }
+                });
+                executeLeasedRollbackStep(work, "storage lease release", () -> {
+                    if (!_workDao.releaseMigrationLease(work, _nodeId, work.getMigrationRecoveryLeaseToken(),
+                            work.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to release storage migration lease");
+                    }
+                });
+            }
         }
     }
 
@@ -4045,6 +4271,11 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     }
 
     protected void recreateCheckpointsKvmOnVmAfterMigration(VMInstanceVO vm, long hostId) {
+        recreateCheckpointsKvmOnVmAfterMigration(vm, hostId, null);
+    }
+
+    private void recreateCheckpointsKvmOnVmAfterMigration(final VMInstanceVO vm, final long hostId,
+            final ItWorkVO work) {
         if (!HypervisorType.KVM.equals(vm.getHypervisorType())) {
             logger.debug("Will not recreate checkpoint on VM as it is not running on KVM, thus it is not needed.");
             return;
@@ -4061,7 +4292,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         Answer answer = null;
         try {
             logger.debug(String.format("Recreating the volume checkpoints with URLs [%s] of volumes [%s] on %s as part of the migration process.", volumes.stream().map(VolumeObjectTO::getCheckpointPaths).collect(Collectors.toList()), volumes, vm));
-            answer = _agentMgr.send(hostId, recreateCheckpointsCommand);
+            answer = work == null ? _agentMgr.send(hostId, recreateCheckpointsCommand)
+                    : sendMigrationAgentRpc(work, hostId, recreateCheckpointsCommand, work.getMigrationPhase());
         } catch (AgentUnavailableException | OperationTimedoutException e) {
             logger.error(String.format("Exception while sending command to host [%s] to recreate checkpoints with URLs [%s] of volumes [%s] on %s due to: [%s].", hostId, volumes.stream().map(VolumeObjectTO::getCheckpointPaths).collect(Collectors.toList()), volumes, vm, e.getMessage()), e);
             throw new CloudRuntimeException(e);
@@ -4128,9 +4360,16 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                                     work.setStep(Step.Done);
                                     _workDao.update(work.getId(), work);
                                 } else if (work.getType() == State.Migrating) {
-                                    _haMgr.scheduleMigration(vm);
-                                    work.setStep(Step.Done);
-                                    _workDao.update(work.getId(), work);
+                                    if (work.getMigrationPhase() != null
+                                            && work.getMigrationPhase() != ItWorkVO.MigrationPhase.DONE) {
+                                        // A management restart is not evidence that either
+                                        // side was cleaned. Preserve the fenced checkpoint.
+                                        logger.warn("Preserved interrupted cold migration {} for VM {} "
+                                                + "for authoritative recovery observation", work.getId(), vm.getUuid());
+                                    } else {
+                                        _haMgr.scheduleMigration(vm);
+                                        updateWorkStep(work, work.getStep(), Step.Done);
+                                    }
                                 }
                             }
                         } catch (final Exception e) {
@@ -4235,10 +4474,6 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 logger.warn("Unable to migrate {} to {} due to [{}]", vm.toString(), dest.getHost().toString(), e.getMessage(), e);
             }
 
-            if (migrationVfPreflight.requiresColdVfMigration(profile)) {
-                coldRelocateVdpa(vm, profile, dest, srcHostId);
-                return;
-            }
             try {
                 advanceStop(vmUuid, true);
                 throw new CloudRuntimeException("Unable to migrate " + vm);
@@ -4249,10 +4484,32 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
     }
 
-    private void coldRelocateVdpa(final VMInstanceVO vm, final VirtualMachineProfile sourceProfile,
+    private void coldRelocateAccelerated(final VMInstanceVO vm, final VirtualMachineProfile sourceProfile,
             final DeployDestination destination, final long sourceHostId) {
+        ensureHostMigrationReady(sourceHostId);
+        ensureHostMigrationReady(destination.getHost().getId());
         final String vmUuid = vm.getUuid();
-        final String workId = UUID.randomUUID().toString();
+        validateColdMigrationIdentityInputs(sourceProfile);
+        final ItWorkVO persistedWork;
+        final GlobalLock checkpointLock = GlobalLock.getInternLock("vdpa.migration.vm." + vm.getId());
+        boolean checkpointLocked = false;
+        try {
+            if (!checkpointLock.lock(3)) {
+                throw new CloudRuntimeException("unable to lock VM for cold migration checkpoint creation");
+            }
+            checkpointLocked = true;
+            final String workId = UUID.randomUUID().toString();
+            persistedWork = persistMigrationWorkAndNicCheckpointsLocked(vm, destination.getHost().getId(),
+                    sourceHostId, sourceProfile, ItWorkVO.MigrationMode.ACCELERATED_COLD,
+                    new ProposedMigrationIdentity(workId, 0L, List.of()));
+        } finally {
+            if (checkpointLocked) {
+                checkpointLock.unlock();
+            }
+            checkpointLock.releaseRef();
+        }
+        final String workId = persistedWork.getId();
+        claimMigrationLeaseOrThrow(persistedWork);
         final String[] lsps = sourceProfile.getNics().stream()
                 .map(NicProfile::getUuid)
                 .filter(java.util.Objects::nonNull)
@@ -4263,13 +4520,29 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         boolean destinationStopped = true;
         boolean ownershipRestored = false;
         boolean cleanupSucceeded = false;
+        boolean sourceManifestAcknowledged = false;
+        boolean sourceManifestInstalled = false;
+        boolean destinationManifestInstalled = false;
         try {
             migrationVfPreflight.verify(sourceProfile, destination.getHost(), MigrationVfPreflight.MigrationMode.COLD);
-            advanceStop(vmUuid, true);
-            final Answer bindingDown = _agentMgr.send(sourceHostId,
+            if (!advanceMigrationPhase(persistedWork, ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED)) {
+                throw new CloudRuntimeException("stale cold migration checkpoint before destination allocation");
+            }
+            installColdSourceManifestRpc(persistedWork, sourceHostId, sourceProfile);
+            sourceManifestAcknowledged = true;
+            executeLeasedRollbackStep(persistedWork, "cold source manifest checkpoint", () -> {
+                if (!advanceMigrationPhase(persistedWork, ItWorkVO.MigrationPhase.SOURCE_MANIFEST_INSTALLED)) {
+                    throw new CloudRuntimeException("unable to persist cold source manifest checkpoint");
+                }
+            });
+            sourceManifestInstalled = true;
+            advanceStop(_vmDao.findByUuid(vmUuid), true, persistedWork);
+            requireMigrationLease(persistedWork);
+            final Answer bindingDown = sendMigrationAgentRpc(persistedWork, sourceHostId,
                     new VerifySourceBindingDownCommand(vm.getInstanceName(), lsps,
                             migrationVfPreflight.expectedChassis(_hostDao.findById(sourceHostId)),
-                            migrationVfPreflight.expectedChassis(destination.getHost())));
+                            migrationVfPreflight.expectedChassis(destination.getHost())),
+                    ItWorkVO.MigrationPhase.SOURCE_MANIFEST_INSTALLED);
             if (!(bindingDown instanceof VerifySourceBindingDownAnswer) || !bindingDown.getResult()) {
                 throw new CloudRuntimeException("source vDPA binding-down proof failed; refusing cold relocation");
             }
@@ -4278,58 +4551,170 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             final DataCenterDeployment startPlan = new DataCenterDeployment(
                     destination.getDataCenter().getId(), destination.getPod().getId(),
                     destination.getCluster().getId(), destination.getHost().getId(), null, null);
-            orchestrateStart(vmUuid, java.util.Map.of(), startPlan, null);
+            requireMigrationLease(persistedWork);
+            orchestrateStart(vmUuid, java.util.Map.of(), startPlan, null,
+                    new MigrationAdmissionContext(persistedWork.getId(), persistedWork.getMigrationGeneration(),
+                            persistedWork.getMigrationRecoveryLeaseOwner(), persistedWork.getMigrationRecoveryLeaseToken(),
+                            persistedWork.getMigrationRecoveryLeaseVersion()));
+            requireMigrationLease(persistedWork);
 
             final VMInstanceVO startedVm = _vmDao.findByUuid(vmUuid);
             destinationProfile = migrationProfile(startedVm, destination.getHost());
+            stampDestinationNicIdentities(persistedWork, destinationProfile);
+            for (final NicProfile nic : destinationProfile.getNics()) {
+                if (!"VIRTIO_OVN".equals(migrationNicKind(nic))) {
+                    snapshotVfIdentity(workId, persistedWork.getMigrationGeneration(), nic.getId(),
+                            destination.getHost().getId(), false);
+                }
+            }
+            final ObserveVdpaMigrationAnswer destinationObservation = observeMigrationHost(persistedWork,
+                    destination.getHost().getId(), destinationObservationCommand(persistedWork, destinationProfile));
+            if (destinationObservation == null || !destinationObservation.isObservationAvailable()
+                    || destinationObservation.getNicObservations().size() != destinationProfile.getNics().size()
+                    || destinationObservation.getNicObservations().stream()
+                    .anyMatch(observation -> !observation.isExact())) {
+                throw new CloudRuntimeException("destination cold-prepare identity observation unavailable");
+            }
+            persistDestinationNicObservations(persistedWork,
+                    destinationObservation.getNicObservations().stream()
+                            .collect(Collectors.toMap(ObserveVdpaMigrationAnswer.NicObservation::getNicId,
+                                    observation -> observation)), destinationProfile);
+            for (final NicProfile nic : destinationProfile.getNics()) {
+                snapshotVfIdentity(workId, persistedWork.getMigrationGeneration(), nic.getId(),
+                        destination.getHost().getId(), false);
+                final MigrationNicVO checkpoint = _migrationNicDao.listByWorkAndGeneration(workId,
+                        persistedWork.getMigrationGeneration()).stream().filter(row -> row.getNicId() == nic.getId())
+                        .findFirst().orElse(null);
+                if (checkpoint != null && !"VIRTIO_OVN".equals(checkpoint.getNicKind())) {
+                    requireAcceleratedIdentity(workId, persistedWork.getMigrationGeneration(), nic.getId(), false);
+                }
+            }
+            requireMigrationLease(persistedWork);
+            if (!advanceMigrationPhase(persistedWork, ItWorkVO.MigrationPhase.DESTINATION_DATAPLANE_PROVEN)) {
+                throw new CloudRuntimeException("stale cold migration checkpoint before guest transfer");
+            }
+            requireMigrationCheckpoint(persistedWork, ItWorkVO.MigrationPhase.TRANSFERRING);
+            requireMigrationCheckpoint(persistedWork, ItWorkVO.MigrationPhase.STARTING_DESTINATION);
             final VirtualMachineTO destinationTo = toVmTO(destinationProfile);
-            if (!dispatchPostMigrateOvnStamp(startedVm, destinationTo, destination.getHost().getId())) {
+            if (!dispatchPostMigrateOvnStampLeased(startedVm, destinationTo, destination.getHost().getId(), persistedWork)) {
                 throw new CloudRuntimeException("destination vDPA stamp/dataplane proof failed; refusing cold relocation");
+            }
+            final MigrationIdentityActionCommand destinationFence = new MigrationIdentityActionCommand(
+                    startedVm.getInstanceName(), vmUuid, workId, persistedWork.getMigrationGeneration(),
+                    persistedWork.getMigrationPhase().name(),
+                    MigrationIdentityActionCommand.Action.INSTALL_DESTINATION_FENCE,
+                    _migrationNicDao.listByWorkAndGeneration(workId, persistedWork.getMigrationGeneration()).stream()
+                            .map(row -> identityFor(row, false)).toList(), persistedWork.getMigrationRecoveryLeaseToken());
+            destinationFence.setRecoveryLeaseVersion(persistedWork.getMigrationRecoveryLeaseVersion());
+            destinationFence.setRecoveryLeaseExpiresAt(persistedWork.getMigrationRecoveryLeaseExpiresAt());
+            final Answer fenceAnswer = sendMigrationAgentRpc(persistedWork, destination.getHost().getId(),
+                    destinationFence, persistedWork.getMigrationPhase());
+            if (!(fenceAnswer instanceof MigrationIdentityActionAnswer) || !fenceAnswer.getResult()) {
+                throw new CloudRuntimeException("immediate destination fence was not acknowledged");
+            }
+            destinationManifestInstalled = true;
+            requireMigrationLease(persistedWork);
+            if (!advanceMigrationPhase(persistedWork, ItWorkVO.MigrationPhase.GUEST_TRANSFERRED_OR_STARTED)) {
+                throw new CloudRuntimeException("stale cold migration checkpoint before ownership commit");
             }
             requireVfOwnershipManager(destinationProfile);
             _networkMgr.commitNicForMigration(sourceProfile, destinationProfile);
             finalizeVfOwnershipAfterMigration(startedVm.getId(), sourceHostId, destination.getHost().getId(),
                     true, true, "cold-migration", workId);
+            requireMigrationCheckpoint(persistedWork, ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED);
+            if (!sourceManifestInstalled || !destinationManifestInstalled) {
+                throw new CloudRuntimeException("cold migration manifests were not durably installed");
+            }
+            executeLeasedRollbackStep(persistedWork, "accelerated migration terminalization",
+                    () -> completeMigrationTerminalization(persistedWork));
+            executeLeasedRollbackStep(persistedWork, "accelerated work completion", () -> {
+                persistedWork.setStep(Step.Done);
+                if (!_workDao.updateMigrationWorkLeased(persistedWork, _nodeId,
+                        persistedWork.getMigrationRecoveryLeaseToken(), persistedWork.getMigrationRecoveryLeaseVersion())) {
+                    throw new CloudRuntimeException("unable to persist accelerated migration completion");
+                }
+            });
+            executeLeasedRollbackStep(persistedWork, "accelerated lease release", () -> {
+                if (!_workDao.releaseMigrationLease(persistedWork, _nodeId,
+                        persistedWork.getMigrationRecoveryLeaseToken(), persistedWork.getMigrationRecoveryLeaseVersion())) {
+                    throw new CloudRuntimeException("unable to release accelerated migration lease");
+                }
+            });
         } catch (Exception e) {
             logger.error("Cold vDPA relocation failed for VM {}; beginning authoritative rollback", vmUuid, e);
             final List<Throwable> rollbackFailures = new ArrayList<>();
             try {
-                final VMInstanceVO currentVm = _vmDao.findByUuid(vmUuid);
-                if (currentVm != null && java.util.Objects.equals(destination.getHost().getId(), currentVm.getHostId())) {
-                    advanceStop(vmUuid, true);
+                executeLeasedRollbackStep(persistedWork, "cold rollback phase", () -> {
+                    if (!advanceMigrationPhase(persistedWork, ItWorkVO.MigrationPhase.ROLLING_BACK)) {
+                        throw new CloudRuntimeException("unable to persist cold rollback phase");
+                    }
+                });
+                final List<MigrationNicVO> rollbackNics = _migrationNicDao.listByWorkAndGeneration(workId,
+                        persistedWork.getMigrationGeneration());
+                if (sourceManifestAcknowledged) {
+                    executeLeasedRollbackStep(persistedWork, "cold source manifest rollback",
+                            () -> {
+                                if (!clearMigrationFence(persistedWork, sourceHostId, rollbackNics, true)) {
+                                    throw new CloudRuntimeException("cold source manifest rollback was not acknowledged");
+                                }
+                            });
                 }
-            } catch (Exception cleanupError) {
-                destinationStopped = false;
-                rollbackFailures.add(cleanupError);
-                logger.error("Cold vDPA destination stop failed for VM {}; recovery evidence retained", vmUuid, cleanupError);
-            }
-            if (destinationProfile != null) {
-                try {
-                    _networkMgr.rollbackNicForMigration(sourceProfile, destinationProfile);
-                } catch (RuntimeException rollbackError) {
-                    rollbackFailures.add(rollbackError);
+                if (destinationManifestInstalled) {
+                    executeLeasedRollbackStep(persistedWork, "cold destination manifest rollback",
+                            () -> {
+                                if (!clearMigrationFence(persistedWork, destination.getHost().getId(), rollbackNics, false)) {
+                                    throw new CloudRuntimeException("cold destination manifest rollback was not acknowledged");
+                                }
+                            });
                 }
-            }
-            try {
-                rollbackVfReservationsStrict(vm.getId(), destination.getHost().getId(), true,
-                        "cold-migration", workId);
-            } catch (RuntimeException rollbackError) {
-                rollbackFailures.add(rollbackError);
-            }
-            try {
-                stateTransitTo(vm, VirtualMachine.Event.OperationFailed, sourceHostId);
+                executeLeasedRollbackStep(persistedWork, "cold destination stop", () -> {
+                    final VMInstanceVO currentVm = _vmDao.findByUuid(vmUuid);
+                    if (currentVm != null && java.util.Objects.equals(destination.getHost().getId(), currentVm.getHostId())) {
+                        advanceStop(currentVm, true, persistedWork);
+                    }
+                });
+                final VirtualMachineProfile rollbackDestinationProfile = destinationProfile;
+                if (rollbackDestinationProfile != null) {
+                    executeLeasedRollbackStep(persistedWork, "cold network ownership rollback",
+                            () -> _networkMgr.rollbackNicForMigration(sourceProfile, rollbackDestinationProfile));
+                }
+                executeLeasedRollbackStep(persistedWork, "cold VF ownership rollback",
+                        () -> rollbackVfReservationsStrict(vm.getId(), destination.getHost().getId(), true,
+                                "cold-migration", workId));
+                executeLeasedRollbackStep(persistedWork, "cold source VM state rollback",
+                        () -> stateTransitTo(vm, VirtualMachine.Event.OperationFailed, sourceHostId));
                 ownershipRestored = true;
-            } catch (NoTransitionException stateError) {
-                rollbackFailures.add(stateError);
-                logger.error("Unable to restore source ownership state for VM {}; leaving stopped", vmUuid, stateError);
+                executeLeasedRollbackStep(persistedWork, "cold VM host restoration", () -> {
+                    vm.setHostId(sourceHostId);
+                    vm.setLastHostId(sourceHostId);
+                });
+            } catch (Exception rollbackError) {
+                rollbackFailures.add(rollbackError);
+                destinationStopped = false;
+                migrationRecoveryPending.enqueue(persistedWork, _migrationNicDao);
             }
-            vm.setHostId(sourceHostId);
-            vm.setLastHostId(sourceHostId);
             cleanupSucceeded = rollbackFailures.isEmpty();
+            if (cleanupSucceeded) {
+                try {
+                    executeLeasedRollbackStep(persistedWork, "cold migration terminalization",
+                            () -> terminalizeMigrationWork(persistedWork));
+                    executeLeasedRollbackStep(persistedWork, "cold work completion", () -> {
+                        persistedWork.setStep(Step.Done);
+                        if (!_workDao.updateMigrationWorkLeased(persistedWork, _nodeId,
+                                persistedWork.getMigrationRecoveryLeaseToken(), persistedWork.getMigrationRecoveryLeaseVersion())) {
+                            throw new CloudRuntimeException("unable to persist cold migration completion");
+                        }
+                    });
+                } catch (RuntimeException terminalizationError) {
+                    cleanupSucceeded = false;
+                    rollbackFailures.add(terminalizationError);
+                    migrationRecoveryPending.enqueue(persistedWork, _migrationNicDao);
+                }
+            }
             rollbackFailures.forEach(e::addSuppressed);
             if (shouldScheduleColdRollbackRestart(destinationStopped, ownershipRestored,
                     sourceBindingProof, cleanupSucceeded)) {
-                _haMgr.scheduleRestart(vm, true);
+                executeLeasedRollbackStep(persistedWork, "cold rollback restart", () -> _haMgr.scheduleRestart(vm, true));
             } else {
                 logger.error("Cold vDPA rollback for VM {} is recovery-required; restart is suppressed "
                         + "(destinationStopped={}, ownershipRestored={}, sourceBindingProof={}, cleanupSucceeded={})",
@@ -4340,9 +4725,1108 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         }
     }
 
+    private ProposedMigrationIdentity observeSourceBeforeColdCheckpoint(final VMInstanceVO vm,
+            final VirtualMachineProfile profile, final long sourceHostId, final String workId,
+            final long generation) {
+        final VirtualMachineTO source = toVmTO(profile);
+        final List<NicVO> dbNics = _nicsDao.listByVmId(vm.getId());
+        final Map<String, NicVO> dbByUuid = dbNics.stream().collect(Collectors.toMap(NicVO::getUuid,
+                nic -> nic, (left, right) -> { throw new CloudRuntimeException("duplicate NIC UUID"); }));
+        if (dbByUuid.size() != dbNics.size() || source.getNics() == null
+                || source.getNics().length != dbNics.size()) {
+            throw new CloudRuntimeException("source NIC inventory is not one-to-one");
+        }
+        final List<ObserveVdpaMigrationCommand.NicIdentity> identities = new ArrayList<>();
+        for (final NicTO nic : source.getNics()) {
+            final NicVO dbNic = dbByUuid.get(nic.getUuid());
+            if (dbNic == null) {
+                throw new CloudRuntimeException("source observation returned an unexpected NIC UUID");
+            }
+            final NicProfile nicProfile = profile.getNics().stream()
+                    .filter(candidate -> dbNic.getId() == candidate.getId()).findFirst().orElse(null);
+            final String kind = migrationNicKind(nicProfile);
+            final com.cloud.network.router.SriovVfPoolVO reservation = "VIRTIO_OVN".equals(kind) ? null
+                    : _vfPoolDao.listByNicId(dbNic.getId()).stream()
+                    .filter(row -> row.getHostId() == sourceHostId && row.getAllocatedToNicId() != null
+                            && row.getAllocatedToNicId() == dbNic.getId()
+                            && row.getStateEnum() != com.cloud.network.router.SriovVfPoolVO.State.FREE)
+                    .findFirst().orElse(null);
+            final String bdf = reservation == null ? nic.getVfPciAddress() : reservation.getPciAddress();
+            final String pf = reservation == null ? nic.getVfPfName() : reservation.getPfName();
+            final String representor = reservation == null ? nic.getVfRepName() : reservation.getRepresentorName();
+            final String vdpaName = reservation == null ? null : reservation.getVdpaName();
+            final String vdpaDevice = reservation == null ? nic.getVdpaDevice() : reservation.getVdpaDevice();
+            final ObserveVdpaMigrationCommand.NicIdentity identity = new ObserveVdpaMigrationCommand.NicIdentity(dbNic.getId(),
+                    nic.getOvnLspName(), kind, bdf, vdpaName, vdpaDevice, nic.getMac(),
+                    nic.getVfVlan() == null ? null : String.valueOf(nic.getVfVlan()), null, representor,
+                    null, null, null, null, nic.getOvnLspName(), null);
+            identity.setExpectedNicUuid(dbNic.getUuid());
+            identity.setExpectedPf(pf);
+            if (!"VIRTIO_OVN".equals(kind) && reservation == null) {
+                throw new CloudRuntimeException("source VF-pool reservation is unavailable for NIC " + dbNic.getUuid());
+            }
+            identities.add(identity);
+        }
+        final Answer answer;
+        try {
+            final ObserveVdpaMigrationCommand command = new ObserveVdpaMigrationCommand(vm.getInstanceName(),
+                    workId, generation, identities);
+            command.setTopologyDiscovery(true);
+            answer = _agentMgr.send(sourceHostId, command);
+        } catch (AgentUnavailableException | OperationTimedoutException e) {
+            throw new CloudRuntimeException("authoritative source observation RPC failed before checkpoint persistence", e);
+        }
+        if (!(answer instanceof ObserveVdpaMigrationAnswer)
+                || !((ObserveVdpaMigrationAnswer) answer).isObservationAvailable()
+                || ((ObserveVdpaMigrationAnswer) answer).getNicObservations().size() != identities.size()
+                || ((ObserveVdpaMigrationAnswer) answer).getNicObservations().stream().map(ObserveVdpaMigrationAnswer.NicObservation::getNicId)
+                .collect(Collectors.toSet()).size() != identities.size()
+                || ((ObserveVdpaMigrationAnswer) answer).getNicObservations().stream().map(ObserveVdpaMigrationAnswer.NicObservation::getNicId)
+                .anyMatch(id -> identities.stream().noneMatch(identity -> identity.getNicId() == id))
+                || ((ObserveVdpaMigrationAnswer) answer).getNicObservations().stream().anyMatch(observation -> !observation.isAvailable()
+                || observation.getMac() == null)) {
+            throw new CloudRuntimeException("authoritative source observation unavailable before checkpoint persistence");
+        }
+        final ObserveVdpaMigrationAnswer observed = (ObserveVdpaMigrationAnswer) answer;
+        observed.getNicObservations().forEach(observation -> validateDiscoveredSourceIdentity(identities, observation));
+        return new ProposedMigrationIdentity(workId, generation, observed.getNicObservations());
+    }
+
+    static void validateDiscoveredSourceIdentity(
+            final List<ObserveVdpaMigrationCommand.NicIdentity> identities,
+            final ObserveVdpaMigrationAnswer.NicObservation observation) {
+        final ObserveVdpaMigrationCommand.NicIdentity expected = identities.stream()
+                .filter(identity -> identity.getNicId() == observation.getNicId()).findFirst().orElseThrow(() ->
+                        new CloudRuntimeException("unexpected source observation NIC"));
+        if ("VIRTIO_OVN".equals(expected.getNicKind())) {
+            if (!observation.isExact() || observation.getNicUuid() == null || observation.getMac() == null
+                    || !expected.getExpectedNicUuid().equals(observation.getNicUuid())
+                    || !expected.getExpectedMac().equalsIgnoreCase(observation.getMac())) {
+                throw new CloudRuntimeException("source VIRTIO observation was incomplete or mismatched");
+            }
+            return;
+        }
+        if (!observation.isExact() || observation.getNicUuid() == null || observation.getMac() == null
+                || !expected.getExpectedNicUuid().equals(observation.getNicUuid())
+                || !expected.getExpectedMac().equalsIgnoreCase(observation.getMac())
+                || !expected.getExpectedBdf().equalsIgnoreCase(observation.getActualBdf())
+                || !expected.getExpectedPf().equals(observation.getPf())
+                || !discoveredVlanMatches(expected.getExpectedVlan(), observation.getVlan())
+                || !expected.getExpectedRepresentor().equals(observation.getRepresentor())
+                || observation.getVfId() == null || observation.getVfDriver() == null
+                || observation.getRepresentorPhysPortName() == null || observation.getRepresentorBdf() == null
+                || ("VDPA".equals(expected.getNicKind()) && (!expected.getExpectedVdpaName().equals(
+                        observation.getActualVdpaName()) || !expected.getExpectedVdpaDevice().equals(
+                        observation.getActualVdpaDevice())))) {
+            throw new CloudRuntimeException("source topology discovery was incomplete or mismatched");
+        }
+    }
+
+    private static boolean discoveredVlanMatches(final String expectedVlan, final String observedVlan) {
+        return expectedVlan == null ? observedVlan == null || "0".equals(observedVlan)
+                : expectedVlan.equals(observedVlan);
+    }
+
+    private static final class ProposedMigrationIdentity {
+        private final String workId;
+        private final long generation;
+        private final List<ObserveVdpaMigrationAnswer.NicObservation> observations;
+        ProposedMigrationIdentity(final String workId, final long generation,
+                final List<ObserveVdpaMigrationAnswer.NicObservation> observations) {
+            this.workId = workId; this.generation = generation; this.observations = observations;
+        }
+        String workId() { return workId; }
+        long generation() { return generation; }
+        List<ObserveVdpaMigrationAnswer.NicObservation> observations() { return observations; }
+    }
+
+    private void validateColdMigrationIdentityInputs(final VirtualMachineProfile profile) {
+        final VirtualMachineTO sourceTo = toVmTO(profile);
+        for (final NicProfile nic : profile.getNics()) {
+            if (nic.getUuid() == null || nic.getUuid().isBlank()) {
+                throw new CloudRuntimeException("accelerated migration requires NIC UUID before persistence");
+            }
+            final String kind = migrationNicKind(nic);
+            if (!Set.of("VIRTIO_OVN", "VF_PASSTHROUGH", "VDPA").contains(kind)) {
+                throw new CloudRuntimeException("unsupported NIC kind in accelerated migration");
+            }
+        }
+        if (sourceTo.getNics() == null || sourceTo.getNics().length != profile.getNics().size()) {
+            throw new CloudRuntimeException("authoritative source NIC identity is incomplete");
+        }
+        for (final NicTO nic : sourceTo.getNics()) {
+            if (nic.getUuid() == null || nic.getMac() == null) {
+                throw new CloudRuntimeException("authoritative source NIC identity is incomplete");
+            }
+            if (!"VIRTIO_OVN".equals(migrationNicKind(profile.getNics().stream()
+                    .filter(candidate -> nic.getUuid().equals(candidate.getUuid())).findFirst().orElse(null)))
+                    && (nic.getVfPciAddress() == null || nic.getVfPfName() == null || nic.getVfRepName() == null)) {
+                throw new CloudRuntimeException("authoritative source accelerated NIC identity is incomplete");
+            }
+        }
+    }
+
+    private ItWorkVO persistMigrationWorkAndNicCheckpoints(final VMInstanceVO vm, final long destinationHostId,
+            final long sourceHostId, final VirtualMachineProfile profile, final ItWorkVO.MigrationMode mode,
+            final ProposedMigrationIdentity proposed) {
+        final GlobalLock lock = GlobalLock.getInternLock("vdpa.migration.vm." + vm.getId());
+        boolean locked = false;
+        try {
+            if (!lock.lock(3)) {
+                throw new CloudRuntimeException("unable to lock VM for migration checkpoint creation");
+            }
+            locked = true;
+            return persistMigrationWorkAndNicCheckpointsLocked(vm, destinationHostId, sourceHostId, profile, mode,
+                    proposed);
+        } finally {
+            if (locked) {
+                lock.unlock();
+            }
+            lock.releaseRef();
+        }
+    }
+
+    private ItWorkVO persistMigrationWorkAndNicCheckpointsLocked(final VMInstanceVO vm,
+            final long destinationHostId, final long sourceHostId, final VirtualMachineProfile profile,
+            final ItWorkVO.MigrationMode mode, final ProposedMigrationIdentity proposed) {
+        final ItWorkVO existing = _workDao.findNonterminalColdMigrationForVm(vm.getId());
+        if (existing != null) {
+            throw new CloudRuntimeException("migration recovery already exists for VM " + vm.getUuid());
+        }
+        final String workId = proposed == null ? UUID.randomUUID().toString() : proposed.workId();
+        return Transaction.execute(new TransactionCallback<>() {
+            @Override
+            public ItWorkVO doInTransaction(final TransactionStatus status) {
+                _vmDao.lockRow(vm.getId(), true);
+                final long lockedGeneration = proposed != null && proposed.generation() > 0
+                        ? proposed.generation() : _workDao.nextColdMigrationGeneration(vm.getId());
+                final ProposedMigrationIdentity observed = proposed != null && proposed.generation() > 0
+                        ? proposed : shouldObserveSourceBeforeCheckpoint(mode)
+                        ? observeSourceBeforeColdCheckpoint(vm, profile, sourceHostId, workId, lockedGeneration)
+                        : null;
+                final ItWorkVO work = new ItWorkVO(workId, _nodeId, State.Migrating, vm.getType(), vm.getId());
+                work.setResourceType(ItWorkVO.ResourceType.Host);
+                work.setMigrationGeneration(lockedGeneration);
+                work.setMigrationMode(mode);
+                work.setMigrationRecoveryLeaseToken(null);
+                work.setMigrationVmUuid(vm.getUuid());
+                work.setMigrationSourceHostId(sourceHostId);
+                work.setMigrationDestinationHostId(destinationHostId);
+                work.setMigrationPhase(ItWorkVO.MigrationPhase.PREPARING_DESTINATION);
+                final ItWorkVO persisted = _workDao.persist(work);
+                for (final NicProfile nic : profile.getNics()) {
+                    if (nic.getUuid() == null || nic.getUuid().isBlank()) {
+                        throw new CloudRuntimeException("NIC UUID is required before migration checkpoint persistence");
+                    }
+                    final String kind = mode == ItWorkVO.MigrationMode.ACCELERATED_COLD
+                            ? migrationNicKind(nic) : "VIRTIO_OVN";
+                    persistMigrationNicCheckpoint(persisted, vm, nic, kind, sourceHostId, destinationHostId);
+                    if (observed != null && !"VIRTIO_OVN".equals(kind)) {
+                        snapshotVfIdentity(persisted.getId(), lockedGeneration, nic.getId(), sourceHostId, true);
+                    }
+                }
+                if (observed != null) {
+                    stampSourceNicIdentities(persisted, profile, observed.observations());
+                }
+                return persisted;
+            }
+        });
+    }
+
+    private void persistMigrationNicCheckpoint(final ItWorkVO work, final VMInstanceVO vm,
+            final NicProfile nic, final String kind, final Long sourceHostId, final Long destinationHostId) {
+        final MigrationNicVO checkpoint = new MigrationNicVO(work.getId(), work.getMigrationGeneration(), vm.getId(),
+                vm.getUuid(), nic.getId(), nic.getUuid(), kind, "lsp-" + nic.getUuid());
+        checkpoint.setMacAddress(nic.getMacAddress());
+        checkpoint.setSourceHostId(sourceHostId);
+        checkpoint.setDestinationHostId(destinationHostId);
+        checkpoint.setIdentityAvailability("VIRTIO_OVN".equals(kind) ? "AVAILABLE" : "UNAVAILABLE");
+        _migrationNicDao.persist(checkpoint);
+    }
+
+    private void requireMigrationCheckpoint(final ItWorkVO work, final ItWorkVO.MigrationPhase phase) {
+        requireMigrationLease(work);
+        if (phase == ItWorkVO.MigrationPhase.DONE) {
+            terminalizeMigrationWork(work);
+            return;
+        }
+        if (!advanceMigrationPhase(work, phase)) {
+            throw new CloudRuntimeException("unable to persist fenced cold migration checkpoint " + phase);
+        }
+    }
+
+    private boolean terminalizeMigrationWork(final ItWorkVO work) {
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.SOURCE_CLEANUP
+                && !advanceMigrationPhase(work, ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN)) {
+            throw new CloudRuntimeException("unable to prove migration postconditions");
+        }
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN
+                && !advanceMigrationPhase(work, ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING)) {
+            throw new CloudRuntimeException("unable to persist migration fence cleanup phase");
+        }
+        if (work.getMigrationPhase() != ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING) {
+            throw new CloudRuntimeException("unable to terminalize migration work");
+        }
+        final List<MigrationNicVO> children = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration());
+        if (!children.isEmpty()) {
+            if (!clearMigrationFence(work, work.getMigrationSourceHostId(), children, true)
+                    || !clearMigrationFence(work, work.getMigrationDestinationHostId(), children, false)) {
+                throw new CloudRuntimeException("migration recovery fence cleanup was not acknowledged");
+            }
+        }
+        final Boolean terminalized = Transaction.execute((TransactionCallback<Boolean>) status -> {
+            if (!_workDao.terminalizeMigration(work.getId(), work.getMigrationGeneration(), _nodeId,
+                    work.getMigrationRecoveryLeaseToken(), work.getMigrationRecoveryLeaseVersion())
+                    || _migrationNicDao.markTerminalByWorkAndGeneration(work.getId(), work.getMigrationGeneration())
+                    != children.size()) {
+                throw new CloudRuntimeException("migration terminalization CAS or child update failed");
+            }
+            return true;
+        });
+        if (!Boolean.TRUE.equals(terminalized)) {
+            throw new CloudRuntimeException("migration terminalization transaction was not committed");
+        }
+        return true;
+    }
+
+    private void installMigrationFence(final ItWorkVO work, final long hostId,
+            final VirtualMachineProfile profile, final boolean source) {
+        final List<MigrationNicVO> rows = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration());
+        if (rows.size() != profile.getNics().size()) {
+            throw new CloudRuntimeException("migration fence identity cardinality is incomplete");
+        }
+        final MigrationIdentityActionCommand command = new MigrationIdentityActionCommand(
+                work.getMigrationVmUuid(), work.getMigrationVmUuid(), work.getId(), work.getMigrationGeneration(),
+                work.getMigrationPhase().name(), MigrationIdentityActionCommand.Action.INSTALL_DESTINATION_FENCE,
+                rows.stream().map(row -> identityFor(row, source)).toList(), work.getMigrationRecoveryLeaseToken());
+        command.setRecoveryLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+        command.setRecoveryLeaseExpiresAt(work.getMigrationRecoveryLeaseExpiresAt());
+        final Answer answer = sendMigrationAgentRpc(work, hostId, command, work.getMigrationPhase());
+        if (!(answer instanceof MigrationIdentityActionAnswer)
+                || !((MigrationIdentityActionAnswer) answer).getResult()) {
+            throw new CloudRuntimeException("exact migration fence installation was not acknowledged");
+        }
+    }
+
+    void installColdSourceManifestRpc(final ItWorkVO work, final long sourceHostId,
+            final VirtualMachineProfile sourceProfile) {
+        executeLeasedRollbackStep(work, "cold source manifest installation",
+                () -> installMigrationFence(work, sourceHostId, sourceProfile, true));
+    }
+
+    private boolean advanceMigrationPhase(final ItWorkVO work, final ItWorkVO.MigrationPhase nextPhase) {
+        return advanceMigrationPhase(work, work.getMigrationPhase(), nextPhase);
+    }
+
+    private boolean advanceMigrationPhase(final ItWorkVO work, final ItWorkVO.MigrationPhase expectedPhase,
+            final ItWorkVO.MigrationPhase nextPhase) {
+        if (work == null || expectedPhase == null || work.getMigrationRecoveryLeaseOwner() == null
+                || work.getMigrationRecoveryLeaseToken() == null || work.getMigrationRecoveryLeaseExpiresAt() == null) {
+            return false;
+        }
+        return _workDao.advanceMigrationPhase(work.getId(), work.getMigrationGeneration(), expectedPhase,
+                work.getMigrationRecoveryLeaseOwner(), work.getMigrationRecoveryLeaseToken(),
+                work.getMigrationRecoveryLeaseVersion(), work.getMigrationRecoveryLeaseExpiresAt(), nextPhase);
+    }
+
+    private void snapshotVfIdentity(final String workId, final long generation, final long nicId,
+            final long hostId, final boolean source) {
+        final List<com.cloud.network.router.SriovVfPoolVO> rows = _vfPoolDao.listByNicId(nicId);
+        final MigrationNicVO checkpoint = _migrationNicDao.listByWorkAndGeneration(workId, generation).stream()
+                .filter(row -> row.getNicId() == nicId).findFirst().orElse(null);
+        if (checkpoint == null || rows.isEmpty()) {
+            return;
+        }
+        rows.stream().filter(row -> row.getHostId() == hostId
+                && row.getAllocatedToNicId() != null && row.getAllocatedToNicId() == nicId
+                && row.getStateEnum() != com.cloud.network.router.SriovVfPoolVO.State.FREE).findFirst().ifPresent(row -> {
+            if (source) {
+                checkpoint.setSourceVfPoolId(row.getId());
+                checkpoint.setSourceBdf(row.getPciAddress());
+                checkpoint.setSourceVdpaName(row.getVdpaName());
+                checkpoint.setSourceVdpaDevice(row.getVdpaDevice());
+            } else {
+                checkpoint.setDestinationVfPoolId(row.getId());
+                checkpoint.setDestinationBdf(row.getPciAddress());
+                checkpoint.setDestinationVdpaName(row.getVdpaName());
+                checkpoint.setDestinationVdpaDevice(row.getVdpaDevice());
+            }
+            _migrationNicDao.update(checkpoint.getId(), checkpoint);
+        });
+    }
+
+    private void requireAcceleratedIdentity(final String workId, final long generation, final long nicId,
+            final boolean source) {
+        final MigrationNicVO checkpoint = _migrationNicDao.listByWorkAndGeneration(workId, generation).stream()
+                .filter(row -> row.getNicId() == nicId).findFirst().orElseThrow(() ->
+                        new CloudRuntimeException("missing migration NIC checkpoint for NIC " + nicId));
+        final boolean present = (source ? checkpoint.getSourceVfPoolId() != null && checkpoint.getSourceBdf() != null
+                && checkpoint.getSourcePf() != null && checkpoint.getSourceRepresentor() != null
+                : checkpoint.getDestinationVfPoolId() != null && checkpoint.getDestinationBdf() != null
+                && checkpoint.getDestinationPf() != null && checkpoint.getDestinationRepresentor() != null);
+        if (!present) {
+            throw new CloudRuntimeException("exact VF/BDF reservation identity unavailable for NIC " + nicId);
+        }
+        checkpoint.setIdentityAvailability("AVAILABLE");
+        _migrationNicDao.update(checkpoint.getId(), checkpoint);
+    }
+
+    private void stampSourceNicIdentities(final ItWorkVO work, final VirtualMachineProfile profile,
+            final List<ObserveVdpaMigrationAnswer.NicObservation> observations) {
+        final VirtualMachineTO sourceTo = toVmTO(profile);
+        if (sourceTo.getNics() == null) {
+            return;
+        }
+        final Map<String, NicVO> dbByUuid = _nicsDao.listByVmId(work.getInstanceId()).stream()
+                .collect(Collectors.toMap(NicVO::getUuid, nic -> nic));
+        for (int index = 0; index < sourceTo.getNics().length; index++) {
+            final NicTO sourceNic = sourceTo.getNics()[index];
+            final NicVO dbNic = dbByUuid.get(sourceNic.getUuid());
+            final ObserveVdpaMigrationAnswer.NicObservation observed = observations.stream()
+                    .filter(candidate -> dbNic != null && candidate.getNicId() == dbNic.getId()
+                            && dbNic.getUuid().equals(candidate.getNicUuid()))
+                    .findFirst().orElseThrow(() -> new CloudRuntimeException(
+                            "source observation omitted NIC " + sourceNic.getUuid()));
+            _migrationNicDao.listByWorkAndGeneration(work.getId(), work.getMigrationGeneration()).stream()
+                    .filter(row -> sourceNic.getUuid() != null && sourceNic.getUuid().equals(row.getNicUuid()))
+                    .findFirst().ifPresent(row -> {
+                        row.setSourceBdf(sourceNic.getVfPciAddress());
+                        row.setSourcePf(sourceNic.getVfPfName());
+                        row.setSourceRepresentor(sourceNic.getVfRepName());
+                        row.setSourceVdpaDevice(sourceNic.getVdpaDevice());
+                        row.setSourceVdpaName(sourceNic.isUseVdpa()
+                                ? "vdpa-" + sourceNic.getMac().replace(":", "").toLowerCase() : null);
+                        row.setSourceBdf(observed.getActualBdf());
+                        row.setSourceVdpaName(observed.getActualVdpaName());
+                        row.setSourceVdpaDevice(observed.getActualVdpaDevice());
+                        row.setSourceRepresentor(observed.getRepresentor());
+                        row.setSourceRepresentorPhysPort(observed.getRepresentorPhysPortName());
+                        row.setSourceRepresentorBdf(observed.getRepresentorBdf());
+                        row.setSourceDriver(observed.getVfDriver());
+                        row.setSourcePf(observed.getPf());
+                        row.setSourceVfId(observed.getVfId());
+                        row.setMacAddress(observed.getMac());
+                        row.setVlan(observed.getVlan());
+                        row.setSourceOvsBridge(observed.getOvsBridge());
+                        row.setSourceOvsPort(observed.getOvsPort());
+                        row.setSourceOvsInterface(observed.getOvsInterface());
+                        row.setSourceOvsExternalIds(observed.getOvsExternalIds());
+                        row.setSourceOvsBridgeUuid(observed.getOvsBridgeUuid());
+                        row.setSourceOvsPortUuid(observed.getOvsPortUuid());
+                        row.setSourceOvsInterfaceUuid(observed.getOvsInterfaceUuid());
+                        row.setOvnPortBinding(observed.getOvnMetadata());
+                        row.setLibvirtAlias(observed.getLibvirtAlias());
+                        row.setLibvirtTarget(observed.getLibvirtTarget());
+                        row.setLibvirtSource(observed.getLibvirtSource());
+                        row.setLibvirtType(observed.getLibvirtType());
+                        row.setLibvirtModel(observed.getLibvirtModel());
+                        row.setTcExpectation(observed.getTcIdentity());
+                        row.setFdbExpectation(observed.getFdbIdentity());
+                        _migrationNicDao.update(row.getId(), row);
+                    });
+        }
+    }
+
+    private void stampDestinationNicIdentities(final ItWorkVO work, final VirtualMachineProfile profile) {
+        final VirtualMachineTO destinationTo = toVmTO(profile);
+        if (destinationTo.getNics() == null) {
+            return;
+        }
+        for (final NicTO destinationNic : destinationTo.getNics()) {
+            _migrationNicDao.listByWorkAndGeneration(work.getId(), work.getMigrationGeneration()).stream()
+                    .filter(row -> destinationNic.getUuid() != null && destinationNic.getUuid().equals(row.getNicUuid()))
+                    .findFirst().ifPresent(row -> {
+                        row.setDestinationBdf(destinationNic.getVfPciAddress());
+                        row.setDestinationPf(destinationNic.getVfPfName());
+                        row.setDestinationRepresentor(destinationNic.getVfRepName());
+                        row.setDestinationVdpaDevice(destinationNic.getVdpaDevice());
+                        row.setDestinationVdpaName(destinationNic.isUseVdpa()
+                                ? "vdpa-" + destinationNic.getMac().replace(":", "").toLowerCase() : null);
+                        _migrationNicDao.update(row.getId(), row);
+                    });
+        }
+    }
+
+    private void persistDestinationNicObservations(final ItWorkVO work, final PrepareForMigrationAnswer answer,
+            final VirtualMachineProfile profile) {
+        persistDestinationNicObservations(work, answer.getNicObservations(), profile);
+    }
+
+    private void persistDestinationNicObservations(final ItWorkVO work,
+            final Map<Long, ObserveVdpaMigrationAnswer.NicObservation> observations,
+            final VirtualMachineProfile profile) {
+        if (observations.size() != profile.getNics().size()
+                || observations.values().stream().anyMatch(observation -> !observation.isExact()
+                || observation.getNicUuid() == null)
+                || profile.getNics().stream().anyMatch(nic -> {
+                    final ObserveVdpaMigrationAnswer.NicObservation observation = observations.get(nic.getId());
+                    return observation == null || !nic.getUuid().equals(observation.getNicUuid());
+                })) {
+            throw new CloudRuntimeException("destination NIC identity is unavailable or not exact");
+        }
+        Transaction.execute(new TransactionCallbackNoReturn() {
+            @Override
+            public void doInTransactionWithoutResult(final TransactionStatus status) {
+                final List<MigrationNicVO> rows = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                        work.getMigrationGeneration());
+                for (final NicProfile nic : profile.getNics()) {
+                    final MigrationNicVO row = rows.stream().filter(candidate -> candidate.getNicId() == nic.getId())
+                            .findFirst().orElseThrow(() -> new CloudRuntimeException("missing NIC checkpoint"));
+                    final ObserveVdpaMigrationAnswer.NicObservation observed = observations.get(nic.getId());
+                    if (observed == null || !observed.isExact() || observed.getOvsBridgeUuid() == null
+                            || observed.getOvsPortUuid() == null || observed.getOvsInterfaceUuid() == null
+                            || !nic.getUuid().equals(row.getNicUuid())
+                            || !nic.getUuid().equals(observed.getNicUuid())
+                            || observed.getLspId() == null || !observed.getLspId().equals(row.getLspId())
+                            || (row.getDestinationBdf() != null && !row.getDestinationBdf().equalsIgnoreCase(observed.getActualBdf()))
+                            || (row.getMacAddress() != null && !row.getMacAddress().equalsIgnoreCase(observed.getMac()))) {
+                        throw new CloudRuntimeException("destination NIC identity mismatches reservation");
+                    }
+                    row.setDestinationBdf(observed.getActualBdf());
+                    row.setDestinationVdpaName(observed.getActualVdpaName());
+                    row.setDestinationVdpaDevice(observed.getActualVdpaDevice());
+                    row.setDestinationDriver(observed.getVfDriver());
+                    row.setDestinationPf(observed.getPf());
+                    row.setDestinationVfId(observed.getVfId());
+                    row.setDestinationRepresentor(observed.getRepresentor());
+                    row.setDestinationRepresentorPhysPort(observed.getRepresentorPhysPortName());
+                    row.setDestinationRepresentorBdf(observed.getRepresentorBdf());
+                    row.setMacAddress(observed.getMac());
+                    row.setVlan(observed.getVlan());
+                    row.setDestinationOvsBridge(observed.getOvsBridge());
+                    row.setDestinationOvsPort(observed.getOvsPort());
+                    row.setDestinationOvsInterface(observed.getOvsInterface());
+                    row.setDestinationOvsExternalIds(observed.getOvsExternalIds());
+                    row.setDestinationOvsBridgeUuid(observed.getOvsBridgeUuid());
+                    row.setDestinationOvsPortUuid(observed.getOvsPortUuid());
+                    row.setDestinationOvsInterfaceUuid(observed.getOvsInterfaceUuid());
+                    row.setOvnPortBinding(observed.getOvnMetadata());
+                    row.setLibvirtAlias(observed.getLibvirtAlias());
+                    row.setLibvirtTarget(observed.getLibvirtTarget());
+                    row.setLibvirtSource(observed.getLibvirtSource());
+                    row.setLibvirtType(observed.getLibvirtType());
+                    row.setLibvirtModel(observed.getLibvirtModel());
+                    row.setTcExpectation(observed.getTcIdentity());
+                    row.setFdbExpectation(observed.getFdbIdentity());
+                    row.setIdentityAvailability("AVAILABLE");
+                    _migrationNicDao.update(row.getId(), row);
+                }
+            }
+        });
+    }
+
+    private ObserveVdpaMigrationCommand destinationObservationCommand(final ItWorkVO work,
+            final VirtualMachineProfile profile) {
+        final List<MigrationNicVO> rows = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration());
+        final Map<String, MigrationNicVO> byUuid = rows.stream().collect(Collectors.toMap(
+                MigrationNicVO::getNicUuid, row -> row, (left, right) -> {
+                    throw new CloudRuntimeException("duplicate migration NIC checkpoint UUID");
+                }));
+        final List<ObserveVdpaMigrationCommand.NicIdentity> identities = profile.getNics().stream().map(nic -> {
+            final MigrationNicVO row = byUuid.get(nic.getUuid());
+            if (row == null || row.getNicId() != nic.getId()) {
+                throw new CloudRuntimeException("destination observation NIC identity is not persisted");
+            }
+            return identityFor(row, false);
+        }).toList();
+        if (identities.size() != rows.size()) {
+            throw new CloudRuntimeException("destination observation contains unexpected NIC checkpoint");
+        }
+        return new ObserveVdpaMigrationCommand(toVmTO(profile).getName(), work.getId(),
+                work.getMigrationGeneration(), identities);
+    }
+
+    private String migrationNicKind(final NicProfile nic) {
+        if (nic == null) {
+            return null;
+        }
+        if (migrationVfPreflight.isVdpaNic(nic)) {
+            return "VDPA";
+        }
+        return nic.isUseHwOffload() ? "VF_PASSTHROUGH" : "VIRTIO_OVN";
+    }
+
+    private List<ObserveVdpaMigrationCommand.NicIdentity> buildPrepareMigrationIdentities(
+            final ItWorkVO work, final VirtualMachineProfile profile) {
+        final Map<String, MigrationNicVO> rows = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration()).stream().collect(Collectors.toMap(MigrationNicVO::getNicUuid,
+                        row -> row, (left, right) -> { throw new CloudRuntimeException("duplicate checkpoint NIC UUID"); }));
+        final List<ObserveVdpaMigrationCommand.NicIdentity> result = new ArrayList<>();
+        for (final NicProfile nic : profile.getNics()) {
+            final MigrationNicVO row = rows.get(nic.getUuid());
+            if (row == null || row.getNicId() != nic.getId()) {
+                throw new CloudRuntimeException("checkpoint NIC UUID/ID mapping is not exact");
+            }
+            result.add(identityFor(row, false));
+        }
+        if (result.size() != rows.size()) {
+            throw new CloudRuntimeException("checkpoint contains unexpected NIC rows");
+        }
+        return result;
+    }
+
+    private void recoverPendingColdMigrations() {
+        recoverPendingColdMigrations(null);
+    }
+
+    private void recoverPendingColdMigrations(final Long hostId) {
+        for (final ItWorkVO work : _workDao.listNonterminalColdMigrations()) {
+            if (hostId != null && !hostId.equals(work.getMigrationSourceHostId())
+                    && !hostId.equals(work.getMigrationDestinationHostId())) {
+                continue;
+            }
+            final GlobalLock lock = GlobalLock.getInternLock("vdpa.migration.vm." + work.getInstanceId());
+            boolean locked = false;
+            try {
+                if (!lock.lock(0)) {
+                    continue;
+                }
+                locked = true;
+                recoverColdMigration(work);
+            } catch (RuntimeException e) {
+                logger.warn("Cold migration recovery observation failed for work {}: {}",
+                        work.getId(), e.getMessage());
+            } finally {
+                if (locked) {
+                    lock.unlock();
+                }
+                lock.releaseRef();
+            }
+        }
+        migrationRecoveryPending.clearTerminal(_workDao.listNonterminalColdMigrations(), _migrationNicDao);
+    }
+
+    private void recoverColdMigration(final ItWorkVO initialWork) {
+        ItWorkVO work = initialWork;
+        final long now = System.currentTimeMillis() / 1000L;
+        final String leaseToken;
+        ItWorkDao.MigrationLeaseClaim takeoverClaim = null;
+        boolean takeover = false;
+        if (Long.valueOf(_nodeId).equals(work.getMigrationRecoveryLeaseOwner())
+                && work.getMigrationRecoveryLeaseExpiresAt() != null
+                && work.getMigrationRecoveryLeaseExpiresAt() > now
+                && work.getMigrationRecoveryLeaseToken() != null) {
+            leaseToken = work.getMigrationRecoveryLeaseToken();
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+        } else {
+            takeover = work.getMigrationRecoveryLeaseOwner() != null && work.getMigrationRecoveryLeaseExpiresAt() != null
+                    && work.getMigrationRecoveryLeaseExpiresAt() <= now;
+            leaseToken = UUID.randomUUID().toString();
+            if (takeover) {
+                takeoverClaim = _workDao.takeOverExpiredMigrationLease(work.getId(), work.getMigrationGeneration(),
+                        _nodeId, leaseToken, now, now + MIGRATION_RECOVERY_LEASE_SECONDS).orElse(null);
+                if (takeoverClaim == null) {
+                    return;
+                }
+                final ItWorkVO reloaded = _workDao.findById(work.getId());
+                if (reloaded == null || !Long.valueOf(takeoverClaim.newOwner()).equals(
+                        reloaded.getMigrationRecoveryLeaseOwner())
+                        || !takeoverClaim.newToken().equals(reloaded.getMigrationRecoveryLeaseToken())
+                        || takeoverClaim.newVersion() != reloaded.getMigrationRecoveryLeaseVersion()
+                        || takeoverClaim.newExpiry() != reloaded.getMigrationRecoveryLeaseExpiresAt()) {
+                    return;
+                }
+                work = reloaded;
+            } else if (!_workDao.claimMigrationLease(work, _nodeId, leaseToken, null, null, null, now,
+                    now + MIGRATION_RECOVERY_LEASE_SECONDS)) {
+                return;
+            }
+        }
+        final ItWorkVO leasedWork = work;
+        final List<MigrationNicVO> nics = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration());
+        if (nics.isEmpty() || work.getMigrationSourceHostId() == null
+                || work.getMigrationDestinationHostId() == null) {
+            return;
+        }
+        final ObserveVdpaMigrationCommand sourceCommand = new ObserveVdpaMigrationCommand(work.getMigrationVmUuid(),
+                work.getId(), work.getMigrationGeneration(), nics.stream()
+                        .map(nic -> identityFor(nic, true)).toList());
+        final ObserveVdpaMigrationCommand destinationCommand = new ObserveVdpaMigrationCommand(work.getMigrationVmUuid(),
+                work.getId(), work.getMigrationGeneration(), nics.stream()
+                        .map(nic -> identityFor(nic, false)).toList());
+        if (!renewMigrationLease(work, leaseToken)) {
+            return;
+        }
+        final ObserveVdpaMigrationAnswer source = observeMigrationHost(work, work.getMigrationSourceHostId(), sourceCommand);
+        if (!renewMigrationLease(work, leaseToken)) {
+            return;
+        }
+        final ObserveVdpaMigrationAnswer destination = observeMigrationHost(work, work.getMigrationDestinationHostId(), destinationCommand);
+        if (!renewMigrationLease(work, leaseToken)) {
+            return;
+        }
+        if (source == null || destination == null || !source.isObservationAvailable()
+                || !destination.isObservationAvailable()
+                || source.getNicObservations().size() != nics.size()
+                || destination.getNicObservations().size() != nics.size()
+                || !work.getId().equals(source.getObservedWorkId())
+                || !work.getId().equals(destination.getObservedWorkId())
+                || work.getMigrationGeneration() != source.getObservedGeneration()
+                || work.getMigrationGeneration() != destination.getObservedGeneration()) {
+            return;
+        }
+        final Map<String, ObserveVdpaMigrationAnswer.NicObservation> sourceByIdentity = indexObservations(source,
+                nics);
+        final Map<String, ObserveVdpaMigrationAnswer.NicObservation> destinationByIdentity = indexObservations(
+                destination, nics);
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED) {
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.SOURCE_CLEANUP);
+            return;
+        }
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.SOURCE_CLEANUP) {
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN);
+            return;
+        }
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN) {
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING);
+            return;
+        }
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING) {
+            if (!clearMigrationFence(work, work.getMigrationSourceHostId(), nics, true)
+                    || !clearMigrationFence(work, work.getMigrationDestinationHostId(), nics, false)) {
+                return;
+            }
+            final Boolean terminalized = Transaction.execute((TransactionCallback<Boolean>) status -> {
+                if (!_workDao.terminalizeMigration(leasedWork.getId(), leasedWork.getMigrationGeneration(), _nodeId,
+                        leaseToken, leasedWork.getMigrationRecoveryLeaseVersion())) {
+                    return false;
+                }
+                final int children = _migrationNicDao.markTerminalByWorkAndGeneration(leasedWork.getId(),
+                        leasedWork.getMigrationGeneration());
+                if (children != nics.size()) {
+                    throw new CloudRuntimeException("migration child terminalization count mismatch");
+                }
+                return true;
+            });
+            if (!Boolean.TRUE.equals(terminalized)) {
+                migrationRecoveryPending.enqueue(work, _migrationNicDao);
+            }
+            return;
+        }
+        if (takeover) {
+            final MigrationIdentityActionCommand adopt = new MigrationIdentityActionCommand(work.getMigrationVmUuid(),
+                    work.getMigrationVmUuid(), work.getId(), work.getMigrationGeneration(),
+                    work.getMigrationPhase().name(), MigrationIdentityActionCommand.Action.ADOPT_RECOVERY_FENCE,
+                    nics.stream().map(nic -> identityFor(nic, false)).toList(), leaseToken);
+            adopt.setOldFenceToken(takeoverClaim.oldToken());
+            adopt.setOldFenceVersion(takeoverClaim.oldVersion());
+            adopt.setRecoveryLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+            adopt.setRecoveryLeaseExpiresAt(work.getMigrationRecoveryLeaseExpiresAt() == null ? 0L
+                    : work.getMigrationRecoveryLeaseExpiresAt());
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+            final Answer adoption = sendMigrationAgentRpc(work, work.getMigrationDestinationHostId(), adopt,
+                    work.getMigrationPhase());
+            if (!renewMigrationLease(work, leaseToken)
+                    || !(adoption instanceof MigrationIdentityActionAnswer)
+                    || !((MigrationIdentityActionAnswer) adoption).getResult()) {
+                return;
+            }
+            final MigrationIdentityActionCommand sourceAdopt = new MigrationIdentityActionCommand(work.getMigrationVmUuid(),
+                    work.getMigrationVmUuid(), work.getId(), work.getMigrationGeneration(),
+                    work.getMigrationPhase().name(), MigrationIdentityActionCommand.Action.ADOPT_RECOVERY_FENCE,
+                    nics.stream().map(nic -> identityFor(nic, true)).toList(), leaseToken);
+            sourceAdopt.setOldFenceToken(takeoverClaim.oldToken());
+            sourceAdopt.setOldFenceVersion(takeoverClaim.oldVersion());
+            sourceAdopt.setRecoveryLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+            sourceAdopt.setRecoveryLeaseExpiresAt(work.getMigrationRecoveryLeaseExpiresAt() == null ? 0L
+                    : work.getMigrationRecoveryLeaseExpiresAt());
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+            final Answer sourceAdoption = sendMigrationAgentRpc(work, work.getMigrationSourceHostId(), sourceAdopt,
+                    work.getMigrationPhase());
+            if (!renewMigrationLease(work, leaseToken)
+                    || !(sourceAdoption instanceof MigrationIdentityActionAnswer)
+                    || !((MigrationIdentityActionAnswer) sourceAdoption).getResult()) {
+                return;
+            }
+        }
+        final List<VdpaMigrationRecovery.NicObservation> observations = new ArrayList<>();
+        for (final MigrationNicVO nic : nics) {
+            final String key = observationKey(nic.getNicId(), nic.getNicUuid());
+            final ObserveVdpaMigrationAnswer.NicObservation sourceNic = sourceByIdentity.get(key);
+            final ObserveVdpaMigrationAnswer.NicObservation destinationNic = destinationByIdentity.get(key);
+            observations.add(new VdpaMigrationRecovery.NicObservation(nic.getNicId(),
+                    sourceNic.isExact(), destinationNic.isExact(),
+                    isRunning(destinationNic.getDomainState()),
+                    leasedWork.getMigrationPhase() == ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED));
+        }
+        final VdpaMigrationRecovery.Action action = VdpaMigrationRecovery.decide(work,
+                new VdpaMigrationRecovery.Observation(true, true, observations));
+        if (action == VdpaMigrationRecovery.Action.MANUAL_INTERVENTION) {
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.MANUAL_INTERVENTION);
+            return;
+        }
+        final MigrationIdentityActionCommand.Action agentAction;
+        switch (action) {
+            case CLEAN_DESTINATION_PREP:
+                agentAction = MigrationIdentityActionCommand.Action.CLEAN_DESTINATION_PREP;
+                break;
+            case FINISH_DESTINATION_COMMIT:
+                agentAction = MigrationIdentityActionCommand.Action.VERIFY_AND_RESTAMP;
+                break;
+            case RESTORE_SOURCE:
+                agentAction = MigrationIdentityActionCommand.Action.RESTORE_SOURCE;
+                break;
+            case FINISH_SOURCE_CLEANUP:
+                agentAction = MigrationIdentityActionCommand.Action.CLEAN_SOURCE_AFTER_COMMIT;
+                break;
+            case MANUAL_INTERVENTION:
+            default:
+                throw new IllegalStateException("unreachable recovery action");
+        }
+        if (action == VdpaMigrationRecovery.Action.RESTORE_SOURCE
+                && work.getMigrationPhase() != ItWorkVO.MigrationPhase.ROLLING_BACK) {
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+            if (!advanceMigrationPhase(work, ItWorkVO.MigrationPhase.ROLLING_BACK)) {
+                advanceMigrationPhase(work, ItWorkVO.MigrationPhase.MANUAL_INTERVENTION);
+                return;
+            }
+        }
+        final Long hostId = action == VdpaMigrationRecovery.Action.RESTORE_SOURCE
+                || action == VdpaMigrationRecovery.Action.FINISH_SOURCE_CLEANUP
+                ? work.getMigrationSourceHostId() : work.getMigrationDestinationHostId();
+        final MigrationIdentityActionCommand command = new MigrationIdentityActionCommand(work.getMigrationVmUuid(),
+                work.getMigrationVmUuid(), work.getId(), work.getMigrationGeneration(),
+                work.getMigrationPhase().name(), agentAction, nics.stream()
+                        .map(nic -> identityFor(nic, hostId.equals(leasedWork.getMigrationSourceHostId()))).toList(),
+                work.getMigrationRecoveryLeaseToken());
+        command.setRecoveryLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+        command.setRecoveryLeaseExpiresAt(work.getMigrationRecoveryLeaseExpiresAt() == null ? 0L
+                : work.getMigrationRecoveryLeaseExpiresAt());
+        final Answer actionAnswer;
+        try {
+            actionAnswer = sendMigrationAgentRpc(work, hostId, command, work.getMigrationPhase());
+        } catch (CloudRuntimeException e) {
+            return;
+        }
+        if (!(actionAnswer instanceof MigrationIdentityActionAnswer)
+                || (!((MigrationIdentityActionAnswer) actionAnswer).getResult()
+                && ((MigrationIdentityActionAnswer) actionAnswer).getStatus()
+                != MigrationIdentityActionAnswer.Status.DATAPLANE_RESTORED_DOMAIN_START_REQUIRED)) {
+            if (!renewMigrationLease(work, leaseToken)) {
+                return;
+            }
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.MANUAL_INTERVENTION);
+            return;
+        }
+        if (!renewMigrationLease(work, leaseToken)) {
+            return;
+        }
+        final ItWorkVO.MigrationPhase next;
+        switch (action) {
+            case CLEAN_DESTINATION_PREP:
+                next = ItWorkVO.MigrationPhase.ROLLING_BACK;
+                break;
+            case FINISH_DESTINATION_COMMIT:
+                next = ItWorkVO.MigrationPhase.OWNERSHIP_COMMITTED;
+                break;
+            case RESTORE_SOURCE:
+                next = ItWorkVO.MigrationPhase.SOURCE_CLEANUP;
+                break;
+            case FINISH_SOURCE_CLEANUP:
+                next = ItWorkVO.MigrationPhase.SOURCE_CLEANUP;
+                break;
+            case MANUAL_INTERVENTION:
+            default:
+                next = ItWorkVO.MigrationPhase.MANUAL_INTERVENTION;
+                break;
+        }
+        if (!advanceMigrationPhase(work, next)) {
+            advanceMigrationPhase(work, ItWorkVO.MigrationPhase.MANUAL_INTERVENTION);
+        } else if (action == VdpaMigrationRecovery.Action.FINISH_SOURCE_CLEANUP) {
+            if (!advanceMigrationPhase(work, ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN)) {
+                advanceMigrationPhase(work, ItWorkVO.MigrationPhase.MANUAL_INTERVENTION);
+            }
+        }
+        if (work.getMigrationPhase() == ItWorkVO.MigrationPhase.DONE) {
+            _workDao.releaseMigrationLease(work, _nodeId, leaseToken, work.getMigrationRecoveryLeaseVersion());
+        }
+    }
+
+    private boolean clearMigrationFence(final ItWorkVO work, final Long hostId,
+            final List<MigrationNicVO> nics, final boolean source) {
+        final MigrationIdentityActionCommand command = new MigrationIdentityActionCommand(
+                work.getMigrationVmUuid(), work.getMigrationVmUuid(), work.getId(), work.getMigrationGeneration(),
+                work.getMigrationPhase().name(), MigrationIdentityActionCommand.Action.CLEAN_RECOVERY_FENCE,
+                nics.stream().map(nic -> identityFor(nic, source)).toList(), work.getMigrationRecoveryLeaseToken());
+        command.setRecoveryLeaseVersion(work.getMigrationRecoveryLeaseVersion());
+        command.setRecoveryLeaseExpiresAt(work.getMigrationRecoveryLeaseExpiresAt() == null ? 0L
+                : work.getMigrationRecoveryLeaseExpiresAt());
+        final Answer answer = sendMigrationAgentRpc(work, hostId, command, work.getMigrationPhase());
+        if (!isAcceptedRecoveryFenceCleanupAnswer(answer, nics.size())) {
+            return false;
+        }
+        return renewMigrationLease(work, work.getMigrationRecoveryLeaseToken());
+    }
+
+    boolean isAcceptedRecoveryFenceCleanupAnswer(final Answer answer, final int expectedNicCount) {
+        return answer instanceof MigrationIdentityActionAnswer
+                && ((MigrationIdentityActionAnswer) answer).getResult()
+                && ((MigrationIdentityActionAnswer) answer).isPostconditionProven()
+                && (((MigrationIdentityActionAnswer) answer).getStatus() == MigrationIdentityActionAnswer.Status.SUCCESS
+                || ((MigrationIdentityActionAnswer) answer).getStatus() == MigrationIdentityActionAnswer.Status.ALREADY_SATISFIED)
+                && ((MigrationIdentityActionAnswer) answer).getObservations() != null
+                && ((MigrationIdentityActionAnswer) answer).getObservations().size() == expectedNicCount
+                && ((MigrationIdentityActionAnswer) answer).getObservations().stream().allMatch(observation -> observation.isExact()
+                || "ABSENT".equals(observation.getDomainState()));
+    }
+
+    private boolean completeMigrationTerminalization(final ItWorkVO work) {
+        if (!advanceMigrationPhase(work, ItWorkVO.MigrationPhase.SOURCE_CLEANUP)
+                || !advanceMigrationPhase(work, ItWorkVO.MigrationPhase.POSTCONDITIONS_PROVEN)
+                || !advanceMigrationPhase(work, ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING)) {
+            throw new CloudRuntimeException("unable to establish terminalization checkpoint");
+        }
+        final List<MigrationNicVO> nics = _migrationNicDao.listByWorkAndGeneration(work.getId(),
+                work.getMigrationGeneration());
+        if (!clearMigrationFence(work, work.getMigrationSourceHostId(), nics, true)
+                || !clearMigrationFence(work, work.getMigrationDestinationHostId(), nics, false)) {
+            throw new CloudRuntimeException("migration fence cleanup was not acknowledged");
+        }
+        final Boolean terminalized = Transaction.execute((TransactionCallback<Boolean>) status -> {
+            if (!_workDao.terminalizeMigration(work.getId(), work.getMigrationGeneration(), _nodeId,
+                    work.getMigrationRecoveryLeaseToken(), work.getMigrationRecoveryLeaseVersion())
+                    || _migrationNicDao.markTerminalByWorkAndGeneration(work.getId(), work.getMigrationGeneration())
+                    != nics.size()) {
+                throw new CloudRuntimeException("migration terminalization CAS or child update failed");
+            }
+            return true;
+        });
+        if (!Boolean.TRUE.equals(terminalized)) {
+            throw new CloudRuntimeException("migration terminalization transaction was not committed");
+        }
+        return true;
+    }
+
+    private static Map<String, ObserveVdpaMigrationAnswer.NicObservation> indexObservations(
+            final ObserveVdpaMigrationAnswer answer, final List<MigrationNicVO> checkpoints) {
+        final Map<String, ObserveVdpaMigrationAnswer.NicObservation> indexed = new HashMap<>();
+        for (final ObserveVdpaMigrationAnswer.NicObservation observation : answer.getNicObservations()) {
+            if (observation.getNicUuid() == null || observation.getNicId() <= 0
+                    || indexed.putIfAbsent(observationKey(observation.getNicId(), observation.getNicUuid()),
+                    observation) != null) {
+                throw new CloudRuntimeException("duplicate migration observation identity");
+            }
+        }
+        if (indexed.size() != checkpoints.size() || checkpoints.stream().anyMatch(checkpoint ->
+                !indexed.containsKey(observationKey(checkpoint.getNicId(), checkpoint.getNicUuid())))) {
+            throw new CloudRuntimeException("migration observations are missing or unexpected");
+        }
+        return indexed;
+    }
+
+    private static String observationKey(final long nicId, final String nicUuid) {
+        return nicId + "\u0000" + nicUuid;
+    }
+
+    private boolean renewMigrationLease(final ItWorkVO work, final String token) {
+        final long now = System.currentTimeMillis() / 1000L;
+        return _workDao.renewMigrationLease(work, _nodeId, token, work.getMigrationRecoveryLeaseVersion(),
+                now, now + MIGRATION_RECOVERY_LEASE_SECONDS);
+    }
+
+    private void claimMigrationLeaseOrThrow(final ItWorkVO work) {
+        final long now = System.currentTimeMillis() / 1000L;
+        final String token = UUID.randomUUID().toString();
+        if (!_workDao.claimMigrationLease(work, _nodeId, token, null, null, null, now,
+                now + MIGRATION_RECOVERY_LEASE_SECONDS)) {
+            throw new CloudRuntimeException("unable to claim migration recovery lease");
+        }
+    }
+
+    private void requireMigrationLease(final ItWorkVO work) {
+        if (!renewAndValidateMigrationLease(work)) {
+            throw new CloudRuntimeException("migration recovery lease was lost; refusing further mutation");
+        }
+    }
+
+    @FunctionalInterface
+    interface LeasedRollbackAction {
+        void execute() throws Exception;
+    }
+
+    /**
+     * Execute exactly one rollback mutation under the migration lease.  A
+     * rollback is deliberately fail-closed: after either fence fails, no
+     * subsequent cleanup, state, or terminalization mutation is permitted.
+     */
+    void executeLeasedRollbackStep(final ItWorkVO work, final String description,
+            final LeasedRollbackAction action) {
+        try {
+            if (!renewAndValidateMigrationLease(work)) {
+                throw new CloudRuntimeException("migration rollback lease lost before " + description);
+            }
+            action.execute();
+            if (!description.endsWith("lease release") && !renewAndValidateMigrationLease(work)) {
+                throw new CloudRuntimeException("migration rollback lease lost after " + description);
+            }
+        } catch (Exception e) {
+            migrationRecoveryPending.enqueue(work, _migrationNicDao);
+            if (e instanceof CloudRuntimeException) {
+                throw (CloudRuntimeException) e;
+            }
+            throw new CloudRuntimeException("migration rollback step failed: " + description, e);
+        }
+    }
+
+    private boolean renewAndValidateMigrationLease(final ItWorkVO work) {
+        if (work == null || work.getMigrationRecoveryLeaseOwner() == null
+                || !Long.valueOf(_nodeId).equals(work.getMigrationRecoveryLeaseOwner())
+                || work.getMigrationRecoveryLeaseToken() == null
+                || work.getMigrationRecoveryLeaseVersion() <= 0
+                || work.getMigrationRecoveryLeaseExpiresAt() == null) {
+            return false;
+        }
+        final String token = work.getMigrationRecoveryLeaseToken();
+        final long version = work.getMigrationRecoveryLeaseVersion();
+        final long now = System.currentTimeMillis() / 1000L;
+        if (work.getMigrationRecoveryLeaseExpiresAt() <= now
+                || !renewMigrationLease(work, token)) {
+            return false;
+        }
+        return Long.valueOf(_nodeId).equals(work.getMigrationRecoveryLeaseOwner())
+                && token.equals(work.getMigrationRecoveryLeaseToken())
+                && version == work.getMigrationRecoveryLeaseVersion()
+                && work.getMigrationRecoveryLeaseExpiresAt() > now;
+    }
+
+    /**
+     * The only permitted dispatch boundary for a migration-owned agent action.
+     * There is deliberately no best-effort mode: losing ownership before or
+     * after the RPC leaves the durable checkpoint for recovery and prevents a
+     * stale manager from issuing another side effect.
+     */
+    private Answer sendMigrationAgentRpc(final ItWorkVO work, final Long hostId,
+            final Command command, final ItWorkVO.MigrationPhase expectedPhase) {
+        if (work == null || hostId == null || command == null
+                || (expectedPhase != null && work.getMigrationPhase() != expectedPhase)) {
+            throw new CloudRuntimeException("migration RPC rejected by checkpoint fence");
+        }
+        if (migrationRecoveryPending.isHostPendingForOtherWork(hostId, work.getId())) {
+            throw new CloudRuntimeException("migration host is pending recovery for another work");
+        }
+        requireMigrationLease(work);
+        final Answer answer;
+        try {
+            answer = _agentMgr.send(hostId, command);
+        } catch (Exception e) {
+            throw new CloudRuntimeException("migration RPC failed; recovery is required", e);
+        }
+        requireMigrationLease(work);
+        return answer;
+    }
+
+    private void rejectNonterminalMigrationRecovery(final VMInstanceVO vm) {
+        if (vm != null && (_workDao.findNonterminalColdMigrationForVm(vm.getId()) != null
+                || migrationRecoveryPending.isPending(vm.getId()))) {
+            throw new CloudRuntimeException("VM has nonterminal migration recovery evidence; admission is blocked");
+        }
+    }
+
+    private void rejectNonterminalMigrationRecovery(final String vmUuid) {
+        rejectNonterminalMigrationRecovery(vmUuid == null ? null : _vmDao.findByUuid(vmUuid));
+    }
+
+    private boolean isExactMigrationAdmission(final VMInstanceVO vm,
+            final MigrationAdmissionContext admissionContext) {
+        if (vm == null || admissionContext == null || admissionContext.workId() == null
+                || admissionContext.token() == null) {
+            return false;
+        }
+        final List<ItWorkVO> conflicts = _workDao.listNonterminalColdMigrations().stream()
+                .filter(work -> work.getInstanceId() == vm.getId()).toList();
+        if (conflicts.size() != 1 || !admissionContext.workId().equals(conflicts.get(0).getId())) {
+            return false;
+        }
+        final ItWorkVO work = _workDao.findById(admissionContext.workId());
+        final long now = System.currentTimeMillis() / 1000L;
+        return work != null && work.getMigrationGeneration() == admissionContext.generation()
+                && Long.valueOf(admissionContext.owner()).equals(work.getMigrationRecoveryLeaseOwner())
+                && admissionContext.token().equals(work.getMigrationRecoveryLeaseToken())
+                && work.getMigrationRecoveryLeaseVersion() == admissionContext.version()
+                && work.getMigrationRecoveryLeaseExpiresAt() != null
+                && work.getMigrationRecoveryLeaseExpiresAt() > now
+                && renewMigrationLease(work, admissionContext.token());
+    }
+
+    private boolean isMigrationRecoveryWork(final ItWorkVO work) {
+        return work != null && work.getMigrationPhase() != null
+                && work.getMigrationRecoveryLeaseToken() != null;
+    }
+
+    private void ensureHostMigrationReady(final long hostId) {
+        if (migrationRecoveryPending.isHostPending(hostId)) {
+            throw new CloudRuntimeException("host has pending migration recovery: " + hostId);
+        }
+    }
+
+    private static ObserveVdpaMigrationCommand.NicIdentity identityFor(final MigrationNicVO nic,
+            final boolean source) {
+        final ObserveVdpaMigrationCommand.NicIdentity identity = new ObserveVdpaMigrationCommand.NicIdentity(
+                nic.getNicId(), nic.getLspId(), nic.getNicKind(),
+                source ? nic.getSourceBdf() : nic.getDestinationBdf(),
+                source ? nic.getSourceVdpaName() : nic.getDestinationVdpaName(),
+                source ? nic.getSourceVdpaDevice() : nic.getDestinationVdpaDevice(), nic.getMacAddress(),
+                nic.getVlan(), source ? nic.getSourceDriver() : nic.getDestinationDriver(),
+                source ? nic.getSourceRepresentor() : nic.getDestinationRepresentor(),
+                source ? nic.getSourceOvsBridge() : nic.getDestinationOvsBridge(),
+                source ? nic.getSourceOvsPort() : nic.getDestinationOvsPort(),
+                source ? nic.getSourceOvsInterface() : nic.getDestinationOvsInterface(),
+                source ? nic.getSourceOvsExternalIds() : nic.getDestinationOvsExternalIds(),
+                nic.getLspId(), nic.getOvnChassis());
+        identity.setExpectedNicUuid(nic.getNicUuid());
+        identity.setExpectedVfRowId(source ? nic.getSourceVfPoolId() : nic.getDestinationVfPoolId());
+        identity.setExpectedPf(source ? nic.getSourcePf() : nic.getDestinationPf());
+        identity.setExpectedOvsBridgeUuid(source ? nic.getSourceOvsBridgeUuid() : nic.getDestinationOvsBridgeUuid());
+        identity.setExpectedOvsPortUuid(source ? nic.getSourceOvsPortUuid() : nic.getDestinationOvsPortUuid());
+        identity.setExpectedOvsInterfaceUuid(source ? nic.getSourceOvsInterfaceUuid() : nic.getDestinationOvsInterfaceUuid());
+        identity.setExpectedRepresentorPhysPortName(source ? nic.getSourceRepresentorPhysPort()
+                : nic.getDestinationRepresentorPhysPort());
+        identity.setExpectedRepresentorBdf(source ? nic.getSourceRepresentorBdf()
+                : nic.getDestinationRepresentorBdf());
+        identity.setExpectedMigrationWorkId(nic.getWorkId());
+        identity.setExpectedMigrationGeneration(nic.getGeneration());
+        identity.setExpectedLibvirtAlias(nic.getLibvirtAlias());
+        identity.setExpectedLibvirtTarget(nic.getLibvirtTarget());
+        identity.setExpectedLibvirtSource(nic.getLibvirtSource());
+        identity.setExpectedLibvirtType(nic.getLibvirtType());
+        identity.setExpectedLibvirtModel(nic.getLibvirtModel());
+        identity.setExpectedVfPoolId(source ? nic.getSourceVfPoolId() : nic.getDestinationVfPoolId());
+        return identity;
+    }
+
+    private ObserveVdpaMigrationAnswer observeMigrationHost(final ItWorkVO work, final Long hostId,
+            final ObserveVdpaMigrationCommand command) {
+        final Answer answer = sendMigrationAgentRpc(work, hostId, command, work.getMigrationPhase());
+        return answer instanceof ObserveVdpaMigrationAnswer ? (ObserveVdpaMigrationAnswer) answer : null;
+    }
+
+    private static boolean isRunning(final String state) {
+        return state != null && !state.isBlank() && !state.toLowerCase().contains("shut off")
+                && !state.toLowerCase().contains("inactive");
+    }
+
     static boolean shouldScheduleColdRollbackRestart(final boolean destinationStopped,
             final boolean ownershipRestored, final boolean sourceBindingProof, final boolean cleanupSucceeded) {
         return destinationStopped && ownershipRestored && sourceBindingProof && cleanupSucceeded;
+    }
+
+    static boolean shouldObserveSourceBeforeCheckpoint(final ItWorkVO.MigrationMode mode) {
+        return mode == ItWorkVO.MigrationMode.ACCELERATED_COLD;
     }
 
     private VirtualMachineProfile migrationProfile(final VMInstanceVO vm, final Host host) {
@@ -4435,6 +5919,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
     @Override
     public void advanceReboot(final String vmUuid, final Map<VirtualMachineProfile.Param, Object> params)
             throws InsufficientCapacityException, ConcurrentOperationException, ResourceUnavailableException {
+        rejectNonterminalMigrationRecovery(vmUuid);
 
         final AsyncJobExecutionContext jobContext = AsyncJobExecutionContext.getCurrentExecutionContext();
         if ( jobContext.isJobDispatchedBy(VmWorkConstants.VM_WORK_JOB_DISPATCHER)) {
@@ -4765,6 +6250,8 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
     @Override
     public void processConnect(final Host agent, final StartupCommand cmd, final boolean forRebalance) throws ConnectionException {
+        migrationRecoveryPending.rebuild(_workDao.listNonterminalColdMigrations(), _migrationNicDao);
+        recoverPendingColdMigrations(agent.getId());
         if (!(cmd instanceof StartupRoutingCommand)) {
             return;
         }
@@ -5278,6 +6765,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             throws ResourceUnavailableException, ConcurrentOperationException {
 
         VMInstanceVO vm = _vmDao.findByUuid(vmUuid);
+        rejectNonterminalMigrationRecovery(vm);
         logger.info("Migrating {} to {}", vm, dest);
 
         vm.getServiceOfferingId();
@@ -5343,43 +6831,50 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         work.setResourceType(ItWorkVO.ResourceType.Host);
         work.setResourceId(dstHostId);
         work = _workDao.persist(work);
+        claimMigrationLeaseOrThrow(work);
+        final ItWorkVO leasedWork = work;
+        final long migrationVmId = vm.getId();
+        final String migrationVmName = vm.getInstanceName();
+        final VMInstanceVO rollbackVm = vm;
 
         Answer pfma = null;
         boolean prepareCleanupAuthorized = true;
         try {
-            pfma = _agentMgr.send(dstHostId, pfmc);
+            pfma = sendMigrationAgentRpc(work, dstHostId, pfmc, null);
             if (pfma == null || !pfma.getResult()) {
                 final String details = pfma != null ? pfma.getDetails() : "null answer returned";
                 pfma = null;
                 throw new AgentUnavailableException(String.format("Unable to prepare for migration to destination host [%s] due to [%s].", dest.getHost(), details), dstHostId);
             }
-        } catch (final OperationTimedoutException e1) {
-            prepareCleanupAuthorized = false;
-            throw new AgentUnavailableException("Operation timed out", dstHostId);
         } finally {
             if (pfma == null) {
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, prepareCleanupAuthorized,
-                        "scale-migration-prepare", work.getId());
-                work.setStep(Step.Done);
-                _workDao.update(work.getId(), work);
+                final boolean cleanupAuthorized = prepareCleanupAuthorized;
+                executeLeasedRollbackStep(leasedWork, "scale network ownership rollback",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                executeLeasedRollbackStep(leasedWork, "scale VF ownership rollback",
+                        () -> rollbackVfReservationsStrict(migrationVmId, dstHostId, cleanupAuthorized,
+                                "scale-migration-prepare", leasedWork.getId()));
             }
         }
 
         vm.setLastHostId(srcHostId);
         try {
             if (vm.getHostId() == null || vm.getHostId() != srcHostId || !changeState(vm, Event.MigrationRequested, dstHostId, work, Step.Migrating)) {
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
-                        "scale-migration-state-change", work.getId());
+                executeLeasedRollbackStep(leasedWork, "scale network rollback after state change",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+                executeLeasedRollbackStep(leasedWork, "scale VF rollback after state change",
+                        () -> rollbackVfReservationsStrict(migrationVmId, dstHostId, true,
+                                "scale-migration-state-change", leasedWork.getId()));
                 String message = String.format("Migration of %s cancelled because state has changed.", vm.toString());
                 logger.warn(message);
                 throw new ConcurrentOperationException(message);
             }
         } catch (final NoTransitionException e1) {
-            _networkMgr.rollbackNicForMigration(vmSrc, profile);
-            rollbackVfReservationsBestEffort(vm.getId(), dstHostId, true,
-                    "scale-migration-state-transition", work.getId());
+            executeLeasedRollbackStep(leasedWork, "scale network rollback after transition failure",
+                    () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
+            executeLeasedRollbackStep(leasedWork, "scale VF rollback after transition failure",
+                    () -> rollbackVfReservationsStrict(migrationVmId, dstHostId, true,
+                            "scale-migration-state-transition", leasedWork.getId()));
             String message = String.format("Migration of %s cancelled due to [%s].", vm.toString(), e1.getMessage());
             logger.error(message, e1);
             throw new ConcurrentOperationException(message);
@@ -5391,22 +6886,12 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         try {
             final MigrateCommand mc = buildMigrateCommand(vm, to, dest, pfma, null);
 
-            try {
-                final Answer ma = _agentMgr.send(vm.getLastHostId(), mc);
-                if (ma == null || !ma.getResult()) {
-                    String msg = String.format("Unable to migrate %s due to [%s].", vm.toString(), ma != null ? ma.getDetails() : "null answer returned");
-                    logger.error(msg);
-                    throw new CloudRuntimeException(msg);
-                }
-            } catch (final OperationTimedoutException e) {
-                scaleCleanupAuthorized = false;
-                if (e.isActive()) {
-                    logger.warn("Active migration command so scheduling a restart for {}", vm, e);
-                    _haMgr.scheduleRestart(vm, true);
-                }
-                throw new AgentUnavailableException("Operation timed out on migrating " + vm, dstHostId, e);
+            final Answer ma = sendMigrationAgentRpc(work, vm.getLastHostId(), mc, null);
+            if (ma == null || !ma.getResult()) {
+                String msg = String.format("Unable to migrate %s due to [%s].", vm.toString(), ma != null ? ma.getDetails() : "null answer returned");
+                logger.error(msg);
+                throw new CloudRuntimeException(msg);
             }
-
             try {
                 final long newServiceOfferingId = vm.getServiceOfferingId();
                 vm.setServiceOfferingId(oldSvcOfferingId);
@@ -5419,13 +6904,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             }
 
             try {
-                if (!checkVmOnHost(vm, dstHostId)) {
+                if (!checkVmOnHostLeased(vm, dstHostId, work)) {
                     logger.error("Unable to complete migration for {}", vm);
-                    try {
-                        _agentMgr.send(srcHostId, new Commands(cleanup(vm.getInstanceName())), null);
-                    } catch (final AgentUnavailableException e) {
-                        logger.error("Unable to cleanup source host [{}] due to [{}].", fromHost, e.getMessage(), e);
-                    }
+                    sendMigrationAgentRpc(work, srcHostId, cleanup(vm.getInstanceName()),
+                            work.getMigrationPhase());
                     cleanup(vmGuru, new VirtualMachineProfileImpl(vm), work, Event.AgentReportStopped, true);
                     throw new CloudRuntimeException("Unable to complete migration for " + vm);
                 }
@@ -5436,10 +6918,10 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
                 logger.debug("Error while checking the {} on {}", vm, dstHost, e);
             }
 
-            if (!dispatchPostMigrateOvnStamp(vm, to, dstHostId)) {
+            if (!dispatchPostMigrateOvnStampLeased(vm, to, dstHostId, work)) {
                 throw new CloudRuntimeException("Destination OVN post-migration verification failed for " + vm.getInstanceName());
             }
-            if (!verifySourceBindingDown(vm, to, srcHostId, dstHostId)) {
+            if (!verifySourceBindingDownLeased(vm, to, srcHostId, dstHostId, work)) {
                 throw new CloudRuntimeException("source vDPA binding remained active after scale cutover");
             }
             requireVfOwnershipManager(profile);
@@ -5452,42 +6934,59 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
             if (!migrated) {
                 logger.info("Migration was unsuccessful.  Cleaning up: {}", vm);
                 if (hasVdpaNic(to)) {
-                    try {
-                        _agentMgr.send(dstHostId, new StopCommand(vm.getInstanceName(), false, true));
-                    } catch (Exception e) {
-                        logger.error("Unable to stop failed scale-migration vDPA destination {}; VM remains stopped",
-                                dstHostId, e);
-                    }
+                    final StopCommand failedDestinationStop = new StopCommand(migrationVmName, false, true);
+                    executeLeasedRollbackStep(leasedWork, "scale failed vDPA destination stop", () -> {
+                        final Answer answer = sendMigrationAgentRpc(leasedWork, dstHostId, failedDestinationStop, null);
+                        if (answer == null || !answer.getResult()) {
+                            throw new CloudRuntimeException("scale failed vDPA stop was not acknowledged");
+                        }
+                    });
                 }
-                _networkMgr.rollbackNicForMigration(vmSrc, profile);
+                executeLeasedRollbackStep(leasedWork, "scale network ownership rollback",
+                        () -> _networkMgr.rollbackNicForMigration(vmSrc, profile));
 
                 String alertSubject = String.format("Unable to migrate %s from %s in Zone [%s] and Pod [%s].",
                         vm.getInstanceName(), fromHost, dest.getDataCenter().getName(), dest.getPod().getName());
                 String alertBody = "Migrate Command failed. Please check logs.";
-                _alertMgr.sendAlert(alertType, fromHost.getDataCenterId(), fromHost.getPodId(), alertSubject, alertBody);
-                try {
-                    _agentMgr.send(dstHostId, new Commands(cleanup(vm.getInstanceName())), null);
-                } catch (final AgentUnavailableException ae) {
-                    scaleCleanupAuthorized = false;
-                    logger.info("Looks like the destination Host is unavailable for cleanup");
-                }
-                rollbackVfReservationsBestEffort(vm.getId(), dstHostId, scaleCleanupAuthorized,
-                        "scale-migration", work.getId());
-                _networkMgr.setHypervisorHostname(profile, dest, false);
-                try {
-                    stateTransitTo(vm, Event.OperationFailed, srcHostId);
-                } catch (final NoTransitionException e) {
-                    logger.warn(e.getMessage(), e);
-                }
+                final AlertManager.AlertType scaleFailureAlertType = alertType;
+                final Host scaleSourceHost = fromHost;
+                executeLeasedRollbackStep(leasedWork, "scale migration failure alert",
+                        () -> _alertMgr.sendAlert(scaleFailureAlertType, scaleSourceHost.getDataCenterId(),
+                                scaleSourceHost.getPodId(), alertSubject, alertBody));
+                executeLeasedRollbackStep(leasedWork, "scale destination cleanup RPC",
+                        () -> sendMigrationAgentRpc(leasedWork, dstHostId, cleanup(migrationVmName), null));
+                final boolean scaleCleanup = scaleCleanupAuthorized;
+                executeLeasedRollbackStep(leasedWork, "scale VF ownership rollback",
+                        () -> rollbackVfReservationsStrict(migrationVmId, dstHostId, scaleCleanup,
+                                "scale-migration", leasedWork.getId()));
+                executeLeasedRollbackStep(leasedWork, "scale destination hostname rollback",
+                        () -> _networkMgr.setHypervisorHostname(profile, dest, false));
+                executeLeasedRollbackStep(leasedWork, "scale source VM state rollback",
+                        () -> stateTransitTo(rollbackVm, Event.OperationFailed, srcHostId));
             } else {
-                _networkMgr.setHypervisorHostname(profile, dest, true);
-
-                updateVmPod(vm, dstHostId);
+                final VMInstanceVO restoredVm = rollbackVm;
+                executeLeasedRollbackStep(leasedWork, "scale destination hostname restore",
+                        () -> _networkMgr.setHypervisorHostname(profile, dest, true));
+                executeLeasedRollbackStep(leasedWork, "scale VM pod restoration",
+                        () -> updateVmPod(restoredVm, dstHostId));
 
             }
 
-            work.setStep(Step.Done);
-            _workDao.update(work.getId(), work);
+            if (migrated) {
+                executeLeasedRollbackStep(leasedWork, "scale work completion", () -> {
+                    leasedWork.setStep(Step.Done);
+                    if (!_workDao.updateMigrationWorkLeased(leasedWork, _nodeId,
+                            leasedWork.getMigrationRecoveryLeaseToken(), leasedWork.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to persist scale migration completion");
+                    }
+                });
+                executeLeasedRollbackStep(leasedWork, "scale lease release", () -> {
+                    if (!_workDao.releaseMigrationLease(leasedWork, _nodeId,
+                            leasedWork.getMigrationRecoveryLeaseToken(), leasedWork.getMigrationRecoveryLeaseVersion())) {
+                        throw new CloudRuntimeException("unable to release scale migration lease");
+                    }
+                });
+            }
         }
     }
 
@@ -5497,6 +6996,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         boolean result = true;
 
         final VMInstanceVO router = _vmDao.findById(vm.getId());
+        rejectNonterminalMigrationRecovery(router);
         if (router.getState() == State.Running) {
             try {
                 final ReplugNicCommand replugNicCmd = new ReplugNicCommand(nic, vm.getName(), vm.getType(), vm.getDetails());
@@ -5526,6 +7026,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
         boolean result = true;
 
         final VMInstanceVO router = _vmDao.findById(vm.getId());
+        rejectNonterminalMigrationRecovery(router);
         if (router.getState() == State.Running) {
             try {
                 NetworkDetailVO pvlanTypeDetail = networkDetailsDao.findDetail(network.getId(), ApiConstants.ISOLATED_PVLAN_TYPE);
@@ -5563,6 +7064,7 @@ public class VirtualMachineManagerImpl extends ManagerBase implements VirtualMac
 
         boolean result = true;
         final VMInstanceVO router = _vmDao.findById(vm.getId());
+        rejectNonterminalMigrationRecovery(router);
 
         if (router.getState() == State.Running) {
             UserVmVO userVm = _userVmDao.findById(vm.getId());

@@ -35,6 +35,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
@@ -89,10 +90,13 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.Spy;
 import org.mockito.junit.MockitoJUnitRunner;
-import org.mockito.stubbing.Answer;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import com.cloud.agent.AgentManager;
+import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.routing.MigrationIdentityActionAnswer;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationAnswer;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationCommand;
 import com.cloud.agent.api.Command;
 import com.cloud.agent.api.PrepareExternalProvisioningAnswer;
 import com.cloud.agent.api.RebootCommand;
@@ -165,6 +169,7 @@ import com.cloud.utils.db.EntityManager;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.fsm.StateMachine2;
 import com.cloud.vm.VirtualMachine.State;
+import com.cloud.vm.ItWorkVO.Step;
 import com.cloud.vm.dao.NicDao;
 import com.cloud.vm.dao.UserVmDao;
 import com.cloud.vm.dao.VMInstanceDetailsDao;
@@ -180,6 +185,320 @@ public class VirtualMachineManagerImplTest {
         assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, false, true));
         assertFalse(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, true, false));
         assertTrue(VirtualMachineManagerImpl.shouldScheduleColdRollbackRestart(true, true, true, true));
+    }
+
+    @Test
+    public void ordinaryMigrationDoesNotObserveSourceBeforeCheckpoint() {
+        assertFalse(VirtualMachineManagerImpl.shouldObserveSourceBeforeCheckpoint(ItWorkVO.MigrationMode.ORDINARY));
+    }
+
+    @Test
+    public void acceleratedColdMigrationObservesSourceBeforeCheckpoint() {
+        assertTrue(VirtualMachineManagerImpl.shouldObserveSourceBeforeCheckpoint(
+                ItWorkVO.MigrationMode.ACCELERATED_COLD));
+    }
+
+    @Test
+    public void completeDiscoveredAcceleratedIdentityIsAccepted() {
+        final ObserveVdpaMigrationCommand.NicIdentity expected = new ObserveVdpaMigrationCommand.NicIdentity(
+                1L, "lsp-1", "VF_PASSTHROUGH", "0000:01:00.2", null, null,
+                "02:00:00:00:00:01", "100", null, "rep0", null, null, null, null, null, null);
+        expected.setExpectedNicUuid("nic-1");
+        expected.setExpectedPf("pf0");
+        final ObserveVdpaMigrationAnswer.NicObservation observed = new ObserveVdpaMigrationAnswer.NicObservation(
+                1L, "lsp-1", "0000:01:00.2", null, null, "running", "vfio-pci",
+                "02:00:00:00:00:01", "100", "rep0", null, true, true);
+        observed.setNicUuid("nic-1");
+        observed.setPf("pf0");
+        observed.setVfId(2);
+        observed.setRepresentorPhysPortName("pf0vf2");
+        observed.setRepresentorBdf("0000:01:00.2");
+
+        VirtualMachineManagerImpl.validateDiscoveredSourceIdentity(List.of(expected), observed);
+    }
+
+    @Test
+    public void completeDiscoveredVdpaIdentityUsesManagementBdf() {
+        final ObserveVdpaMigrationCommand.NicIdentity expected = new ObserveVdpaMigrationCommand.NicIdentity(
+                1L, "lsp-1", "VDPA", "0000:01:00.2", "vdpa0", "/dev/vhost-vdpa-0",
+                "02:00:00:00:00:01", null, null, "rep0", null, null, null, null, null, null);
+        expected.setExpectedNicUuid("nic-1");
+        expected.setExpectedPf("pf0");
+        final ObserveVdpaMigrationAnswer.NicObservation observed = new ObserveVdpaMigrationAnswer.NicObservation(
+                1L, "lsp-1", "0000:01:00.2", "vdpa0", "/dev/vhost-vdpa-0", "running", "mlx5_core",
+                "02:00:00:00:00:01", "0", "rep0", null, true, true);
+        observed.setNicUuid("nic-1");
+        observed.setPf("pf0");
+        observed.setVfId(2);
+        observed.setRepresentorPhysPortName("pf0vf2");
+        observed.setRepresentorBdf("0000:01:00.0");
+
+        VirtualMachineManagerImpl.validateDiscoveredSourceIdentity(List.of(expected), observed);
+    }
+
+    @Test
+    public void migrationRpcRenewsBeforeAndAfterSendBeforeCheckpointCas()
+            throws AgentUnavailableException, OperationTimedoutException {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.TRANSFERRING);
+        final Command command = mock(Command.class);
+        final Answer answer = mock(Answer.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+        when(agentManagerMock.send(eq(22L), eq(command))).thenReturn(answer);
+        when(_workDao.advanceMigrationPhase("migration-work", 3L, ItWorkVO.MigrationPhase.TRANSFERRING,
+                1L, "lease-token", 4L, Long.MAX_VALUE, ItWorkVO.MigrationPhase.STARTING_DESTINATION)).thenReturn(true);
+
+        assertEquals(answer, ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "sendMigrationAgentRpc", work, 22L, command, ItWorkVO.MigrationPhase.TRANSFERRING));
+        _workDao.advanceMigrationPhase("migration-work", 3L, ItWorkVO.MigrationPhase.TRANSFERRING,
+                1L, "lease-token", 4L, Long.MAX_VALUE, ItWorkVO.MigrationPhase.STARTING_DESTINATION);
+
+        final InOrder order = Mockito.inOrder(_workDao, agentManagerMock);
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+        order.verify(agentManagerMock).send(22L, command);
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+        order.verify(_workDao).advanceMigrationPhase("migration-work", 3L, ItWorkVO.MigrationPhase.TRANSFERRING,
+                1L, "lease-token", 4L, Long.MAX_VALUE, ItWorkVO.MigrationPhase.STARTING_DESTINATION);
+    }
+
+    @Test
+    public void migrationRpcStopsAtEveryFenceFailureAndKeepsWorkNonterminal()
+            throws AgentUnavailableException, OperationTimedoutException {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.TRANSFERRING);
+        final Command command = mock(Command.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(false);
+
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "sendMigrationAgentRpc", work, 22L, command, ItWorkVO.MigrationPhase.TRANSFERRING));
+        verify(agentManagerMock, never()).send(anyLong(), any(Command.class));
+        assertFalse(work.getMigrationPhase() == ItWorkVO.MigrationPhase.DONE);
+
+        Mockito.reset(_workDao, agentManagerMock);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true, false);
+        when(agentManagerMock.send(eq(22L), eq(command))).thenReturn(mock(Answer.class));
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "sendMigrationAgentRpc", work, 22L, command, ItWorkVO.MigrationPhase.TRANSFERRING));
+        assertFalse(work.getMigrationPhase() == ItWorkVO.MigrationPhase.DONE);
+
+        Mockito.reset(_workDao, agentManagerMock);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+        doThrow(new RuntimeException("send failed")).when(agentManagerMock).send(eq(22L), eq(command));
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "sendMigrationAgentRpc", work, 22L, command, ItWorkVO.MigrationPhase.TRANSFERRING));
+        verify(_workDao, times(1)).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    public void migrationRpcRejectsStalePhaseBeforeAnySideEffect() {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED);
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "sendMigrationAgentRpc", work, 22L, mock(Command.class), ItWorkVO.MigrationPhase.TRANSFERRING));
+        verifyNoInteractions(_workDao, agentManagerMock);
+    }
+
+    @Test
+    public void leasedOvnAndSourceBindingBoundariesRejectMissingWork() {
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "dispatchPostMigrateOvnStampLeased", mock(VMInstanceVO.class), mock(VirtualMachineTO.class),
+                22L, null));
+        assertThrows(CloudRuntimeException.class, () -> ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl,
+                "verifySourceBindingDownLeased", mock(VMInstanceVO.class), mock(VirtualMachineTO.class),
+                11L, 22L, null));
+    }
+
+    @Test
+    public void rollbackStepRenewsBeforeAndAfterExternalMutation() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.ROLLING_BACK);
+        final VirtualMachineManagerImpl.LeasedRollbackAction action = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "network rollback", action);
+
+        final InOrder order = Mockito.inOrder(_workDao, action);
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+        order.verify(action).execute();
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    public void rollbackStepStopsBeforeMutationWhenLeaseIsLost() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.ROLLING_BACK);
+        final VirtualMachineManagerImpl.LeasedRollbackAction action = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(false);
+
+        assertThrows(CloudRuntimeException.class,
+                () -> virtualMachineManagerImpl.executeLeasedRollbackStep(work, "storage rollback", action));
+        verifyNoInteractions(action);
+        verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    public void rollbackStepStopsChainWhenLeaseIsLostAfterMutation() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.ROLLING_BACK);
+        final VirtualMachineManagerImpl.LeasedRollbackAction action = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true, false);
+
+        assertThrows(CloudRuntimeException.class,
+                () -> virtualMachineManagerImpl.executeLeasedRollbackStep(work, "accelerated VF rollback", action));
+        final InOrder order = Mockito.inOrder(_workDao, action);
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+        order.verify(action).execute();
+        order.verify(_workDao).renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    public void sameWorkColdAdmissionRequiresExactCurrentLeaseTuple() {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        when(vm.getId()).thenReturn(10L);
+        when(_workDao.listNonterminalColdMigrations()).thenReturn(List.of(work));
+        when(_workDao.findById(work.getId())).thenReturn(work);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+        final VirtualMachineManagerImpl.MigrationAdmissionContext context =
+                new VirtualMachineManagerImpl.MigrationAdmissionContext(work.getId(), work.getMigrationGeneration(),
+                        work.getMigrationRecoveryLeaseOwner(), work.getMigrationRecoveryLeaseToken(),
+                        work.getMigrationRecoveryLeaseVersion());
+
+        assertTrue(ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl, "isExactMigrationAdmission", vm, context));
+
+        final VirtualMachineManagerImpl.MigrationAdmissionContext stale =
+                new VirtualMachineManagerImpl.MigrationAdmissionContext(work.getId(), work.getMigrationGeneration(),
+                        work.getMigrationRecoveryLeaseOwner(), work.getMigrationRecoveryLeaseToken(),
+                        work.getMigrationRecoveryLeaseVersion() + 1);
+        assertFalse(ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl, "isExactMigrationAdmission", vm, stale));
+    }
+
+    @Test
+    public void sameWorkColdAdmissionRejectsDifferentAndMultipleNonterminalWorks() {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED);
+        final ItWorkVO differentWork = new ItWorkVO("different-work", 1L, State.Migrating,
+                VirtualMachine.Type.User, 10L);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        when(vm.getId()).thenReturn(10L);
+        when(_workDao.listNonterminalColdMigrations()).thenReturn(List.of(work, differentWork));
+        final VirtualMachineManagerImpl.MigrationAdmissionContext context =
+                new VirtualMachineManagerImpl.MigrationAdmissionContext(work.getId(), work.getMigrationGeneration(),
+                        work.getMigrationRecoveryLeaseOwner(), work.getMigrationRecoveryLeaseToken(),
+                        work.getMigrationRecoveryLeaseVersion());
+
+        assertFalse(ReflectionTestUtils.invokeMethod(virtualMachineManagerImpl, "isExactMigrationAdmission", vm, context));
+    }
+
+    @Test
+    public void ordinaryCleanupPrecedesTerminalizationAndStopsOnCleanupFailure() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.SOURCE_CLEANUP);
+        final VirtualMachineManagerImpl.LeasedRollbackAction cleanup = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        final VirtualMachineManagerImpl.LeasedRollbackAction terminalization = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "source cleanup", cleanup);
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "migration terminalization", terminalization);
+
+        final InOrder order = Mockito.inOrder(cleanup, terminalization);
+        order.verify(cleanup).execute();
+        order.verify(terminalization).execute();
+
+        Mockito.reset(cleanup, terminalization);
+        doThrow(new CloudRuntimeException("cleanup failed")).when(cleanup).execute();
+        assertThrows(CloudRuntimeException.class,
+                () -> virtualMachineManagerImpl.executeLeasedRollbackStep(work, "source cleanup", cleanup));
+        verifyNoInteractions(terminalization);
+    }
+
+    @Test
+    public void migrationStepCasRejectsStaleWorkBeforeStateMutation() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.ROLLING_BACK);
+        work.setStep(Step.Prepare);
+        final VMInstanceVO vm = mock(VMInstanceVO.class);
+        when(_workDao.updateMigrationStepLeased(work, Step.Prepare, Step.Starting, 1L,
+                work.getMigrationRecoveryLeaseToken(), work.getMigrationRecoveryLeaseVersion())).thenReturn(false);
+
+        assertThrows(CloudRuntimeException.class,
+                () -> virtualMachineManagerImpl.changeState(vm, VirtualMachine.Event.StartRequested, 22L,
+                        work, Step.Starting));
+        verifyNoInteractions(_stateMachine);
+    }
+
+    @Test
+    public void coldManifestStepsAreOrderedAndPartialFailureStopsDestinationInstall() throws Exception {
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.DESTINATION_ALLOCATED);
+        final VirtualMachineManagerImpl.LeasedRollbackAction sourceInstall = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        final VirtualMachineManagerImpl.LeasedRollbackAction sourceStop = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        final VirtualMachineManagerImpl.LeasedRollbackAction destinationInstall = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "cold source manifest installation", sourceInstall);
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "cold source stop", sourceStop);
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "cold destination manifest installation", destinationInstall);
+        final InOrder order = Mockito.inOrder(sourceInstall, sourceStop, destinationInstall);
+        order.verify(sourceInstall).execute();
+        order.verify(sourceStop).execute();
+        order.verify(destinationInstall).execute();
+
+        Mockito.reset(sourceInstall, destinationInstall);
+        doThrow(new CloudRuntimeException("source manifest failed")).when(sourceInstall).execute();
+        assertThrows(CloudRuntimeException.class,
+                () -> virtualMachineManagerImpl.executeLeasedRollbackStep(work,
+                        "cold source manifest installation", sourceInstall));
+        verifyNoInteractions(destinationInstall);
+    }
+
+    @Test
+    public void recoveryFenceCleanupAcceptsRetryAlreadySatisfiedAndOrdersHosts() throws Exception {
+        final MigrationIdentityActionAnswer sourceSuccess = mock(MigrationIdentityActionAnswer.class);
+        final MigrationIdentityActionAnswer destinationFailure = mock(MigrationIdentityActionAnswer.class);
+        final MigrationIdentityActionAnswer sourceAlreadyClean = mock(MigrationIdentityActionAnswer.class);
+        final MigrationIdentityActionAnswer destinationSuccess = mock(MigrationIdentityActionAnswer.class);
+        when(sourceSuccess.getResult()).thenReturn(true);
+        when(sourceSuccess.isPostconditionProven()).thenReturn(true);
+        when(sourceSuccess.getStatus()).thenReturn(MigrationIdentityActionAnswer.Status.SUCCESS);
+        when(sourceSuccess.getObservations()).thenReturn(List.of());
+        when(destinationFailure.getResult()).thenReturn(false);
+        when(sourceAlreadyClean.getResult()).thenReturn(true);
+        when(sourceAlreadyClean.isPostconditionProven()).thenReturn(true);
+        when(sourceAlreadyClean.getStatus()).thenReturn(MigrationIdentityActionAnswer.Status.ALREADY_SATISFIED);
+        when(sourceAlreadyClean.getObservations()).thenReturn(List.of());
+        when(destinationSuccess.getResult()).thenReturn(true);
+        when(destinationSuccess.isPostconditionProven()).thenReturn(true);
+        when(destinationSuccess.getStatus()).thenReturn(MigrationIdentityActionAnswer.Status.SUCCESS);
+        when(destinationSuccess.getObservations()).thenReturn(List.of());
+
+        assertTrue(virtualMachineManagerImpl.isAcceptedRecoveryFenceCleanupAnswer(sourceSuccess, 0));
+        assertFalse(virtualMachineManagerImpl.isAcceptedRecoveryFenceCleanupAnswer(destinationFailure, 0));
+        assertTrue(virtualMachineManagerImpl.isAcceptedRecoveryFenceCleanupAnswer(sourceAlreadyClean, 0));
+        assertTrue(virtualMachineManagerImpl.isAcceptedRecoveryFenceCleanupAnswer(destinationSuccess, 0));
+
+        final VirtualMachineManagerImpl.LeasedRollbackAction sourceCleanup = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        final VirtualMachineManagerImpl.LeasedRollbackAction destinationCleanup = mock(VirtualMachineManagerImpl.LeasedRollbackAction.class);
+        when(_workDao.renewMigrationLease(any(ItWorkVO.class), anyLong(), anyString(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(true);
+        final ItWorkVO work = migrationWork(ItWorkVO.MigrationPhase.FENCE_CLEANUP_PENDING);
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "source recovery fence cleanup", sourceCleanup);
+        virtualMachineManagerImpl.executeLeasedRollbackStep(work, "destination recovery fence cleanup", destinationCleanup);
+        final InOrder order = Mockito.inOrder(sourceCleanup, destinationCleanup);
+        order.verify(sourceCleanup).execute();
+        order.verify(destinationCleanup).execute();
+    }
+
+    private static ItWorkVO migrationWork(final ItWorkVO.MigrationPhase phase) {
+        final ItWorkVO work = new ItWorkVO("migration-work", 1L, State.Migrating,
+                VirtualMachine.Type.User, 10L);
+        work.setMigrationGeneration(3L);
+        work.setMigrationPhase(phase);
+        work.setMigrationRecoveryLeaseToken("lease-token");
+        work.setMigrationRecoveryLeaseOwner(1L);
+        work.setMigrationRecoveryLeaseVersion(4L);
+        work.setMigrationRecoveryLeaseExpiresAt(Long.MAX_VALUE);
+        return work;
     }
 
     @Spy
@@ -308,6 +627,9 @@ public class VirtualMachineManagerImplTest {
     @Before
     public void setup() {
         ReflectionTestUtils.getField(VirtualMachineManager.VmMetadataManufacturer, "s_depot");
+        // The unit-test manager has no management-server lifecycle injection.  Keep
+        // the fixture's lease owner aligned with the manager used by the guard.
+        ReflectionTestUtils.setField(virtualMachineManagerImpl, "_nodeId", 1L);
         virtualMachineManagerImpl.setHostAllocators(new ArrayList<>());
 
         when(vmInstanceMock.getName()).thenReturn(vmName);
@@ -551,7 +873,7 @@ public class VirtualMachineManagerImplTest {
         Mockito.doReturn(true).when(storagePoolVoMock).isManaged();
         // return any storage type except powerflex/scaleio
         List<Storage.StoragePoolType> values = Arrays.asList(Storage.StoragePoolType.values());
-        when(storagePoolVoMock.getPoolType()).thenAnswer((Answer<Storage.StoragePoolType>) invocation -> {
+        when(storagePoolVoMock.getPoolType()).thenAnswer((org.mockito.stubbing.Answer<Storage.StoragePoolType>) invocation -> {
             List<Storage.StoragePoolType> filteredValues = values.stream().filter(v -> v != Storage.StoragePoolType.PowerFlex).collect(Collectors.toList());
             int randomIndex = new Random().nextInt(filteredValues.size());
             return filteredValues.get(randomIndex); });
@@ -567,7 +889,7 @@ public class VirtualMachineManagerImplTest {
         Mockito.doReturn(true).when(storagePoolVoMock).isManaged();
         // return any storage type except powerflex/scaleio
         List<Storage.StoragePoolType> values = Arrays.asList(Storage.StoragePoolType.values());
-        when(storagePoolVoMock.getPoolType()).thenAnswer((Answer<Storage.StoragePoolType>) invocation -> {
+        when(storagePoolVoMock.getPoolType()).thenAnswer((org.mockito.stubbing.Answer<Storage.StoragePoolType>) invocation -> {
             List<Storage.StoragePoolType> filteredValues = values.stream().filter(v -> v != Storage.StoragePoolType.PowerFlex).collect(Collectors.toList());
             int randomIndex = new Random().nextInt(filteredValues.size());
             return filteredValues.get(randomIndex); });
@@ -1760,7 +2082,7 @@ public class VirtualMachineManagerImplTest {
         com.cloud.hypervisor.HypervisorGuru guru = Mockito.mock(com.cloud.hypervisor.HypervisorGuru.class);
         when(_hvGuruMgr.getGuru(HypervisorType.KVM)).thenReturn(guru);
         VirtualMachineTO vmTO = new VirtualMachineTO() {};
-        when(guru.implement(any(VirtualMachineProfile.class))).thenAnswer((Answer<VirtualMachineTO>) invocation -> {
+        when(guru.implement(any(VirtualMachineProfile.class))).thenAnswer((org.mockito.stubbing.Answer<VirtualMachineTO>) invocation -> {
             VirtualMachineProfile profile = invocation.getArgument(0);
             assertEquals("BIOS", profile.getParameter(VirtualMachineProfile.Param.BootType));
             return vmTO;

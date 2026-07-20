@@ -115,6 +115,17 @@ public class MigrationVfPreflightTest {
     }
 
     @Test
+    public void rejectsAcceleratedCapabilityBeforePersistenceIdentityIsCreated() {
+        final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
+        final NicProfile nic = mock(NicProfile.class);
+        when(profile.getNics()).thenReturn(java.util.List.of(nic));
+        when(nic.isUseHwOffload()).thenReturn(true);
+        when(nic.getUuid()).thenReturn(null);
+        final MigrationCapability capability = preflight.capability(profile);
+        assertTrue(!capability.isAllowed());
+    }
+
+    @Test
     public void rejectsHostdevForLiveMigration() {
         final VirtualMachineProfile profile = mock(VirtualMachineProfile.class);
         final VirtualMachine vm = mock(VirtualMachine.class);

@@ -36,6 +36,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class VfHostLifecycleLock {
 
     private static final ConcurrentMap<String, ReentrantLock> LOCKS = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<String, ReentrantLock> MANIFEST_LOCKS = new ConcurrentHashMap<>();
 
     private VfHostLifecycleLock() {
     }
@@ -46,5 +47,16 @@ public final class VfHostLifecycleLock {
             throw new IllegalArgumentException("VF lifecycle requires a canonical PCI BDF");
         }
         return LOCKS.computeIfAbsent(bdf.trim().toLowerCase(java.util.Locale.ROOT), ignored -> new ReentrantLock());
+    }
+
+    public static boolean isHeldByCurrentThread(final String bdf) {
+        return forBdf(bdf).isHeldByCurrentThread();
+    }
+
+    public static ReentrantLock forManifest(final String key) {
+        if (key == null || key.isBlank()) {
+            throw new IllegalArgumentException("migration manifest lock requires an identity");
+        }
+        return MANIFEST_LOCKS.computeIfAbsent(key, ignored -> new ReentrantLock());
     }
 }

@@ -20,10 +20,19 @@
 package com.cloud.agent.api;
 
 import com.cloud.agent.api.to.VirtualMachineTO;
+import com.cloud.agent.api.routing.ObserveVdpaMigrationCommand;
+import java.util.ArrayList;
+import java.util.List;
 
 public class PrepareForMigrationCommand extends Command {
     private VirtualMachineTO vm;
     private boolean rollback;
+    private String migrationWorkId;
+    private long migrationGeneration;
+    private String migrationLeaseToken;
+    private long migrationLeaseVersion;
+    private long migrationLeaseExpiry;
+    private List<ObserveVdpaMigrationCommand.NicIdentity> migrationIdentities = new ArrayList<>();
 
     protected PrepareForMigrationCommand() {
     }
@@ -42,6 +51,21 @@ public class PrepareForMigrationCommand extends Command {
 
     public boolean isRollback() {
         return rollback;
+    }
+
+    public String getMigrationWorkId() { return migrationWorkId; }
+    public void setMigrationWorkId(final String value) { migrationWorkId = value; }
+    public long getMigrationGeneration() { return migrationGeneration; }
+    public void setMigrationGeneration(final long value) { migrationGeneration = value; }
+    public String getMigrationLeaseToken() { return migrationLeaseToken; }
+    public void setMigrationLeaseToken(final String value) { migrationLeaseToken = value; }
+    public long getMigrationLeaseVersion() { return migrationLeaseVersion; }
+    public void setMigrationLeaseVersion(final long value) { migrationLeaseVersion = value; }
+    public long getMigrationLeaseExpiry() { return migrationLeaseExpiry; }
+    public void setMigrationLeaseExpiry(final long value) { migrationLeaseExpiry = value; }
+    public List<ObserveVdpaMigrationCommand.NicIdentity> getMigrationIdentities() { return migrationIdentities; }
+    public void setMigrationIdentities(final List<ObserveVdpaMigrationCommand.NicIdentity> value) {
+        migrationIdentities = value == null ? new ArrayList<>() : new ArrayList<>(value);
     }
 
     @Override

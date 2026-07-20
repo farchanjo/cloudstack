@@ -118,6 +118,7 @@ public class MigrationVfPreflight {
     private final ConcurrentMap<Long, ReentrantLock> clusterLocks = new ConcurrentHashMap<>();
     private OvnChassisLookup chassisLookup;
     private MigrationAuthoritativeGuard authoritativeGuard;
+    private ItWorkDao workDao;
 
     @Inject
     public MigrationVfPreflight(final VfPoolManager vfPoolManager,
@@ -144,6 +145,11 @@ public class MigrationVfPreflight {
         this.authoritativeGuard = authoritativeGuard;
     }
 
+    @Autowired(required = false)
+    public void setWorkDao(final ItWorkDao workDao) {
+        this.workDao = workDao;
+    }
+
     public void verify(final VirtualMachineProfile profile, final Host destination) {
         verify(profile, destination, MigrationMode.LIVE);
     }
@@ -155,6 +161,22 @@ public class MigrationVfPreflight {
     public boolean requiresColdVfMigration(final VirtualMachineProfile profile) {
         return requiresVdpa(profile) || (profile.getNics() != null
                 && profile.getNics().stream().anyMatch(NicProfile::isUseHwOffload));
+    }
+
+    public MigrationCapability capability(final VirtualMachineProfile profile) {
+        boolean vdpa = false;
+        boolean vf = false;
+        for (final NicProfile nic : profile.getNics()) {
+            vdpa |= isVdpaNic(nic);
+            vf |= nic.isUseHwOffload() && !isVdpaNic(nic);
+            if ((isVdpaNic(nic) || nic.isUseHwOffload())
+                    && (nic.getUuid() == null || nic.getUuid().isBlank())) {
+                return new MigrationCapability(true, vdpa, vf,
+                        "accelerated migration requires every NIC UUID before persistence");
+            }
+        }
+        return vdpa || vf ? new MigrationCapability(true, vdpa, vf, null)
+                : MigrationCapability.ordinary();
     }
 
     public int requiredVdpaVfs(final VirtualMachineProfile profile) {
@@ -204,6 +226,9 @@ public class MigrationVfPreflight {
 
     private void verifyInternal(final VirtualMachineProfile profile, final Host destination,
             final MigrationMode mode) {
+        if (workDao != null && workDao.findNonterminalColdMigrationForVm(profile.getId()) != null) {
+            throw new CloudRuntimeException("VM has unresolved cold VF/vDPA migration recovery; refusing admission");
+        }
         validateNicInventory(profile);
         validateHostdev(profile, mode);
         final int required = countVdpaNics(profile);
@@ -285,15 +310,15 @@ public class MigrationVfPreflight {
             return;
         }
         for (final NicProfile nic : profile.getNics()) {
-            if (!nic.isUseHwOffload()) {
+            if (!nic.isUseHwOffload() && !isVdpaNic(nic)) {
                 continue;
             }
             final NetworkVO network = networkDao.findById(nic.getNetworkId());
             final NetworkOfferingVO offering = network == null ? null
                     : networkOfferingDao.findById(network.getNetworkOfferingId());
-            if (offering == null || !offering.isVdpaEnabled()) {
+            if (offering == null || !offering.isVdpaEnabled() || nic.isUseHwOffload()) {
                 throw new CloudRuntimeException(String.format(
-                        "VM %s NIC %s uses SR-IOV hostdev passthrough; live migration is not supported",
+                        "VM %s NIC %s uses VF/vDPA hardware; live migration is not supported",
                         profile.getVirtualMachine().getUuid(), nic.getUuid()));
             }
         }
