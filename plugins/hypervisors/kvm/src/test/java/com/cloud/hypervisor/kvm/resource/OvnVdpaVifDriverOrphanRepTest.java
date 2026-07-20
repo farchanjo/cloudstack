@@ -51,13 +51,18 @@ public class OvnVdpaVifDriverOrphanRepTest {
         final LibvirtVMDef.InterfaceDef iface = new LibvirtVMDef.InterfaceDef();
         iface.defVdpaNet("/dev/vhost-vdpa-3", "fa:16:3e:00:02:10", 4);
 
-        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p1vf6");
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa"), anyInt()))
                     .thenReturn("{\"dev\":{}}");
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), anyString()))
+                    .thenReturn("lsp-race");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()))
+                    .thenReturn(true);
 
             driver.unplug(iface, true);
 
