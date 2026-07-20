@@ -945,25 +945,57 @@ public class OvnVifDriver extends VifDriverBase {
                         callerLabel, repName);
                 continue;
             }
-            freeRepresentorAndClearVfIdentity(log, callerLabel, repName, ifaceId, vfPci);
+            freeRepresentorAndClearVfIdentityBestEffort(log, callerLabel, repName, ifaceId, vfPci);
             log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
                     callerLabel, repName, integrationBridge, mac);
         }
     }
 
     /**
-     * Best-effort VF identity clear (MAC zero + VLAN 0) on the parent PF of a
-     * representor that was just removed from the bridge, derived solely from
-     * the representor's own netdev name — the PCI-scoped lookup path is
-     * exactly what was unavailable when {@link #clearOrphanRepsByAttachedMac}
-     * fired. Any resolution miss (missing/unexpected {@code phys_port_name},
-     * PF netdev not found) is logged at DEBUG and silently skipped; the rep
-     * removal already performed by the caller is the load-bearing half of
-     * this cleanup and must not be undone by a failure here.
+     * Strict orphan cleanup: resolve and validate the PF/VF target before the
+     * OVS CAS, then require the identity clear to execute successfully.
      */
     private static boolean freeRepresentorAndClearVfIdentity(final Logger log, final String callerLabel,
                                                               final String repName, final String ifaceId,
                                                               final String vfPci) {
+        if (StringUtils.isBlank(vfPci)) {
+            log.warn("{}: VF BDF is unknown; refusing strict orphan cleanup for {}", callerLabel, repName);
+            return false;
+        }
+        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
+        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
+        if (StringUtils.isBlank(pfName) || vfId == null) {
+            log.warn("{}: missing exact PF/VF target for strict orphan cleanup rep={} pci={} pf={} vf={}",
+                    callerLabel, repName, vfPci, pfName, vfId);
+            return false;
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+        lock.lock();
+        try {
+            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
+                    repName, ifaceId)) {
+                log.warn("{}: OVS representor CAS failed; VF identity remains untouched for {}",
+                        callerLabel, repName);
+                return false;
+            }
+            try {
+                clearVfIdentityForBdfStrict(log, callerLabel, pfName, vfId, repName);
+                return true;
+            } catch (RuntimeException re) {
+                log.warn("{}: partial orphan cleanup rep={} pci={}: OVS CAS succeeded but VF identity clear failed: {}",
+                        callerLabel, repName, vfPci, re.getMessage());
+                return false;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean freeRepresentorAndClearVfIdentityBestEffort(final Logger log,
+                                                                         final String callerLabel,
+                                                                         final String repName,
+                                                                         final String ifaceId,
+                                                                         final String vfPci) {
         if (StringUtils.isBlank(vfPci)) {
             log.warn("{}: VF BDF is unknown; refusing attached-MAC cleanup for {}", callerLabel, repName);
             return false;
@@ -973,7 +1005,8 @@ public class OvnVifDriver extends VifDriverBase {
         try {
             if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
                     repName, ifaceId)) {
-                log.warn("{}: OVS representor CAS failed; refusing VF identity clear for {}", callerLabel, repName);
+                log.warn("{}: OVS representor CAS failed for attached-MAC cleanup of {}",
+                        callerLabel, repName);
                 return false;
             }
             clearVfIdentityForBdfBestEffort(log, callerLabel, vfPci, repName);
@@ -983,8 +1016,16 @@ public class OvnVifDriver extends VifDriverBase {
         }
     }
 
+    private static void clearVfIdentityForBdfStrict(final Logger log, final String callerLabel,
+                                                    final String pfName, final int vfId,
+                                                    final String repName) {
+        Script.runSimpleBashScript(String.format(
+                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
+        log.info("{}: cleared VF identity pf={} vf={} (derived from rep={})", callerLabel, pfName, vfId, repName);
+    }
+
     private static void clearVfIdentityForBdfBestEffort(final Logger log, final String callerLabel,
-                                                        final String vfPci, final String repName) {
+                                                         final String vfPci, final String repName) {
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
         if (pfName == null || vfId == null) {

@@ -175,7 +175,8 @@ public class OvnVifDriverFreeStaleRepTest {
     public void freeStaleCasFailureDeletesVdpaButDoesNotClearVfOrIncrementFreed() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
              MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
-             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
                     .thenReturn("rep0\n");
             driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
@@ -188,6 +189,7 @@ public class OvnVifDriverFreeStaleRepTest {
             driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenReturn(Collections.emptySet());
             driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
                     .thenReturn("aa:bb:cc:dd:ee:ff");
+            stubVfIdentity(vfMock);
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
                     .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}",
                             "{\"dev\":{}}");
@@ -209,7 +211,8 @@ public class OvnVifDriverFreeStaleRepTest {
     public void freeStaleVdpaDeletionFailureLeavesOvsAndVfUntouched() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
              MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
-             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
                     .thenReturn("rep0\n");
             driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
@@ -222,6 +225,7 @@ public class OvnVifDriverFreeStaleRepTest {
             driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenReturn(Collections.emptySet());
             driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
                     .thenReturn("aa:bb:cc:dd:ee:ff");
+            stubVfIdentity(vfMock);
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
                     .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev del")))
@@ -240,7 +244,8 @@ public class OvnVifDriverFreeStaleRepTest {
     public void freeStaleVdpaVerificationFailureLeavesOvsAndVfUntouched() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
              MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
-             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
                     .thenReturn("rep0\n");
             driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
@@ -253,6 +258,7 @@ public class OvnVifDriverFreeStaleRepTest {
             driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenReturn(Collections.emptySet());
             driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
                     .thenReturn("aa:bb:cc:dd:ee:ff");
+            stubVfIdentity(vfMock);
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
                     .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}",
                             "{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}");
@@ -264,6 +270,49 @@ public class OvnVifDriverFreeStaleRepTest {
             assertEquals(0, result.freed);
             casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")), never());
+        }
+    }
+
+    @Test
+    public void freeStaleMissingPfTargetLeavesOvsAndVfUntouched() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
+            stubOrphanCandidate(scriptMock, driverMock, casMock);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.3")).thenReturn(null);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.3")).thenReturn(3);
+
+            final OvnVifDriver.FreeStaleOvsResult result =
+                    OvnVifDriver.freeStaleFreeVfRepresentors(LOG, "test", false);
+
+            assertEquals(0, result.freed);
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")), never());
+        }
+    }
+
+    @Test
+    public void freeStaleIdentityClearFailureDoesNotReportSuccess() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
+            stubOrphanCandidate(scriptMock, driverMock, casMock);
+            stubVfIdentity(vfMock);
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-1");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-1")))
+                    .thenReturn(true);
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("ip link set")))
+                    .thenThrow(new IllegalStateException("identity clear failed"));
+
+            final OvnVifDriver.FreeStaleOvsResult result =
+                    OvnVifDriver.freeStaleFreeVfRepresentors(LOG, "test", false);
+
+            assertEquals(0, result.freed);
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-1")));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")));
         }
     }
 
@@ -344,5 +393,31 @@ public class OvnVifDriverFreeStaleRepTest {
 
             scriptMock.verify(() -> Script.executeCommandForExitValue(any(String[].class)), never());
         }
+    }
+
+    private static void stubOrphanCandidate(final MockedStatic<Script> scriptMock,
+                                            final MockedStatic<OvnVifDriver> driverMock,
+                                            final MockedStatic<OvsRepresentorCas> casMock) {
+        scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
+                .thenReturn("rep0\n");
+        driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
+        driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                .thenReturn("0000:01:00.3");
+        driverMock.when(() -> OvnVifDriver.readPciDriver("0000:01:00.3"))
+                .thenReturn("mlx5_core");
+        driverMock.when(() -> OvnVifDriver.listVdpaMgmtPciAddresses(LOG))
+                .thenReturn(Collections.emptySet());
+        driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenReturn(Collections.emptySet());
+        driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
+                .thenReturn("aa:bb:cc:dd:ee:ff");
+        casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                .thenReturn("lsp-1");
+    }
+
+    private static void stubVfIdentity(final MockedStatic<VfPassthroughVifDriver> vfMock) {
+        vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.3"))
+                .thenReturn("pf0");
+        vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.3"))
+                .thenReturn(3);
     }
 }
