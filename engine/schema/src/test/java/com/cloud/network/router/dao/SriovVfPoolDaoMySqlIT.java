@@ -188,6 +188,7 @@ public class SriovVfPoolDaoMySqlIT {
         assertTrue(dao.releaseExact(1001L, 100L));
         assertEquals(1000L, longValue("SELECT vf_pool_id FROM nics WHERE id=100"));
         assertFalse(dao.releaseExact(1001L, 100L));
+        assertTrue(dao.markSuspect(1000L, 100L));
         assertTrue(dao.releaseExact(1000L, 100L));
         final NicVO observed = nicDao.findById(100L);
         assertNotNull(observed);
