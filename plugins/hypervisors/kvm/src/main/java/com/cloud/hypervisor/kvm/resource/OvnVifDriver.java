@@ -888,10 +888,10 @@ public class OvnVifDriver extends VifDriverBase {
      * each class); that stamp lives in OVSDB, not on the netdev, so it
      * survives the MAC zeroing and is used here as the fallback lookup key.
      *
-     * <p>For every representor OVS returns, {@link #freeRepresentorOnOvs}
-     * clears external_ids and removes the port (bridge-agnostic). A
-     * best-effort attempt is also made to clear the VF identity (MAC + VLAN)
-     * on the parent PF — see {@link #clearVfIdentityForRepBestEffort}.
+     * <p>For every representor OVS returns, the strict orphan cleanup resolves
+     * and validates the PF/VF target under the BDF lock, removes the port with
+     * the OVS CAS, and clears the VF identity. A failed identity clear is
+     * reported as partial cleanup; it is never reported as a freed orphan.
      * Idempotent — safe when no representor carries the given
      * {@code attached-mac}.
      *
@@ -904,10 +904,10 @@ public class OvnVifDriver extends VifDriverBase {
      *                          longer scopes del-port to a single bridge.
      * @param mac the guest MAC stamped as {@code attached-mac} at plug time.
      */
-    static void clearOrphanRepsByAttachedMac(final Logger log, final String callerLabel,
-                                              final String integrationBridge, final String mac) {
+    static boolean clearOrphanRepsByAttachedMac(final Logger log, final String callerLabel,
+                                                 final String integrationBridge, final String mac) {
         if (StringUtils.isBlank(mac)) {
-            return;
+            return true;
         }
         final String findCmd = String.format(
             "ovs-vsctl --no-headings --columns=name find Interface external_ids:attached-mac=%s 2>/dev/null",
@@ -922,11 +922,12 @@ public class OvnVifDriver extends VifDriverBase {
                 log.debug("{}: attached-mac find failed for mac={}: {}",
                         callerLabel, mac, re.getMessage());
             }
-            return;
+            return false;
         }
         if (StringUtils.isBlank(found)) {
-            return;
+            return true;
         }
+        boolean allClean = true;
         for (final String raw : found.split("\\R")) {
             final String repName = raw.trim().replaceAll("^\"|\"$", "");
             if (StringUtils.isBlank(repName)) {
@@ -936,6 +937,7 @@ public class OvnVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(vfPci)) {
                 log.warn("{}: attached-mac fallback found rep={} without authoritative BDF; refusing cleanup",
                         callerLabel, repName);
+                allClean = false;
                 continue;
             }
             final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
@@ -943,12 +945,19 @@ public class OvnVifDriver extends VifDriverBase {
             if (StringUtils.isBlank(ifaceId)) {
                 log.warn("{}: attached-mac fallback found rep={} without iface-id; refusing cleanup",
                         callerLabel, repName);
+                allClean = false;
                 continue;
             }
-            freeRepresentorAndClearVfIdentityBestEffort(log, callerLabel, repName, ifaceId, vfPci);
-            log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
-                    callerLabel, repName, integrationBridge, mac);
+            if (freeRepresentorAndClearVfIdentity(log, callerLabel, repName, ifaceId, vfPci)) {
+                log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
+                        callerLabel, repName, integrationBridge, mac);
+            } else {
+                log.warn("{}: attached-mac fallback failed to fully clean orphan rep={} (bridge hint={}, mac={})",
+                        callerLabel, repName, integrationBridge, mac);
+                allClean = false;
+            }
         }
+        return allClean;
     }
 
     /**
@@ -962,16 +971,16 @@ public class OvnVifDriver extends VifDriverBase {
             log.warn("{}: VF BDF is unknown; refusing strict orphan cleanup for {}", callerLabel, repName);
             return false;
         }
-        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
-        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
-        if (StringUtils.isBlank(pfName) || vfId == null) {
-            log.warn("{}: missing exact PF/VF target for strict orphan cleanup rep={} pci={} pf={} vf={}",
-                    callerLabel, repName, vfPci, pfName, vfId);
-            return false;
-        }
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
         lock.lock();
         try {
+            final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
+            final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
+            if (StringUtils.isBlank(pfName) || vfId == null) {
+                log.warn("{}: missing exact PF/VF target for strict orphan cleanup rep={} pci={} pf={} vf={}",
+                        callerLabel, repName, vfPci, pfName, vfId);
+                return false;
+            }
             if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
                     repName, ifaceId)) {
                 log.warn("{}: OVS representor CAS failed; VF identity remains untouched for {}",
@@ -991,31 +1000,6 @@ public class OvnVifDriver extends VifDriverBase {
         }
     }
 
-    private static boolean freeRepresentorAndClearVfIdentityBestEffort(final Logger log,
-                                                                         final String callerLabel,
-                                                                         final String repName,
-                                                                         final String ifaceId,
-                                                                         final String vfPci) {
-        if (StringUtils.isBlank(vfPci)) {
-            log.warn("{}: VF BDF is unknown; refusing attached-MAC cleanup for {}", callerLabel, repName);
-            return false;
-        }
-        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
-        lock.lock();
-        try {
-            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
-                    repName, ifaceId)) {
-                log.warn("{}: OVS representor CAS failed for attached-MAC cleanup of {}",
-                        callerLabel, repName);
-                return false;
-            }
-            clearVfIdentityForBdfBestEffort(log, callerLabel, vfPci, repName);
-            return true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
     private static void clearVfIdentityForBdfStrict(final Logger log, final String callerLabel,
                                                     final String pfName, final int vfId,
                                                     final String repName) {
@@ -1024,17 +1008,4 @@ public class OvnVifDriver extends VifDriverBase {
         log.info("{}: cleared VF identity pf={} vf={} (derived from rep={})", callerLabel, pfName, vfId, repName);
     }
 
-    private static void clearVfIdentityForBdfBestEffort(final Logger log, final String callerLabel,
-                                                         final String vfPci, final String repName) {
-        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
-        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
-        if (pfName == null || vfId == null) {
-            log.debug("{}: no exact parent PF/VF found for rep={} pci={}; skipping PF-side clear",
-                    callerLabel, repName, vfPci);
-            return;
-        }
-        Script.runSimpleBashScript(String.format(
-            "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-        log.info("{}: cleared VF identity pf={} vf={} (derived from rep={})", callerLabel, pfName, vfId, repName);
-    }
 }

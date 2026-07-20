@@ -30,6 +30,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.times;
 
 import java.util.Collections;
 import java.util.List;
@@ -383,15 +384,97 @@ public class OvnVifDriverFreeStaleRepTest {
      */
     @Test
     public void clearOrphanRepsByAttachedMac_freesAllFoundReps() {
-        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
             scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
                             contains("find Interface external_ids:attached-mac"), anyInt()))
                     .thenReturn("dx6p0vf4\ndx6p1vf6\n");
             scriptMock.when(() -> Script.runSimpleBashScript(anyString())).thenReturn("");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p1vf6"))
+                    .thenReturn("0000:01:00.6");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p0vf4")))
+                    .thenReturn("lsp-4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p1vf6")))
+                    .thenReturn("lsp-6");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")))
+                    .thenReturn(true);
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p1vf6"), eq("lsp-6")))
+                    .thenReturn(true);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.4"))
+                    .thenReturn("pf4");
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.4"))
+                    .thenReturn(4);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.6"))
+                    .thenReturn("pf6");
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.6"))
+                    .thenReturn(6);
 
-            OvnVifDriver.clearOrphanRepsByAttachedMac(LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff");
+            assertTrue(OvnVifDriver.clearOrphanRepsByAttachedMac(
+                    LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff"));
 
-            scriptMock.verify(() -> Script.executeCommandForExitValue(any(String[].class)), never());
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")));
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p1vf6"), eq("lsp-6")));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")), times(2));
+        }
+    }
+
+    @Test
+    public void clearOrphanRepsByAttachedMac_missingPfFailsClosed() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
+                    .thenReturn("dx6p0vf4\n");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p0vf4")))
+                    .thenReturn("lsp-4");
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.4"))
+                    .thenReturn(null);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.4"))
+                    .thenReturn(4);
+
+            assertFalse(OvnVifDriver.clearOrphanRepsByAttachedMac(
+                    LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff"));
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")), never());
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")), never());
+        }
+    }
+
+    @Test
+    public void clearOrphanRepsByAttachedMac_identityFailureReportsPartialCleanup() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
+                    .thenReturn("dx6p0vf4\n");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p0vf4")))
+                    .thenReturn("lsp-4");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")))
+                    .thenReturn(true);
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf("0000:01:00.4"))
+                    .thenReturn("pf4");
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci("0000:01:00.4"))
+                    .thenReturn(4);
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("ip link set")))
+                    .thenThrow(new IllegalStateException("identity clear failed"));
+
+            assertFalse(OvnVifDriver.clearOrphanRepsByAttachedMac(
+                    LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff"));
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")));
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")));
         }
     }
 
