@@ -144,7 +144,8 @@ public class VdpaVifDriver extends VifDriverBase {
                 final String repNameFinal = repName;
                 rollback.push(() -> {
                     Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
-                    OvnVifDriver.freeRepresentorOnOvs(logger, "VdpaVifDriver.plug-rollback", repNameFinal);
+                    OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.plug-rollback",
+                            repNameFinal, pciAddress);
                 });
             }
 
@@ -229,7 +230,7 @@ public class VdpaVifDriver extends VifDriverBase {
             String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
-                OvnVifDriver.freeRepresentorOnOvs(logger, "VdpaVifDriver.unplug", repName);
+                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.unplug", repName, pciAddress);
                 logger.info("vDPA unplug: removed rep {} from OVS and cleared TC", repName);
             }
             String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);

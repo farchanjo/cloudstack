@@ -107,6 +107,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         // the Geneve VNI in its pipeline instead. Pass null to skip the
         // PF-side VLAN config and avoid "Operation not supported".
         final Deque<Runnable> rollback = new ArrayDeque<>();
+        final String preLockRepName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+        if (preLockRepName != null) {
+            clearOrphanRepsForLspName(nic.getOvnLspName(), preLockRepName);
+        }
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
@@ -131,10 +135,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                     "OvnVfPassthroughVifDriver: representor not found for VF %s; is mlx5 in switchdev mode?",
                     pciAddress));
             }
-            attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin());
+            attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin(), pciAddress);
             final String repFinal = repName;
-            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(logger,
-                    "OvnVfPassthroughVifDriver.rollback", repFinal, nic.getOvnLspName()));
+            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvsLocked(logger,
+                    "OvnVfPassthroughVifDriver.rollback", repFinal, pciAddress, nic.getOvnLspName()));
 
             final InterfaceDef intf = new InterfaceDef();
             // xmlVlanTag=0 → no <vlan> element in domain XML; OVN handles
@@ -168,7 +172,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             try {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.unplug", repName);
+                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVfPassthroughVifDriver.unplug",
+                        repName, pciAddress);
             } else {
                 logger.warn("OvnVfPassthroughVifDriver.unplug: exact representor not found for pci={} mac={}; skipping OVS cleanup",
                         pciAddress, mac);
@@ -273,15 +278,27 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      * which pushes one of the two reps out of the OVN dataplane.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
-                                          final Boolean hairpin) {
-        clearOrphanRepsForLspName(lspName, repName);
+                                           final Boolean hairpin) {
+        attachRepresentorToBrInt(repName, lspName, mac, hairpin, null);
+    }
+
+    private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
+                                          final Boolean hairpin, final String bdf) {
+        if (StringUtils.isBlank(bdf)) {
+            clearOrphanRepsForLspName(lspName, repName);
+        }
         // DEF-1: pre-clear any stale external_ids on this specific representor
         // before stamping the new iface-id. clearOrphanRepsForLspName only
         // removes reps carrying the same lspName; if this rep was previously
         // used by a different VM it may still hold an old iface-id that would
         // create a duplicate-iface-id conflict in ovn-controller.
-        OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVfPassthroughVifDriver.attach",
-                repName, lspName);
+        if (StringUtils.isBlank(bdf)) {
+            OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVfPassthroughVifDriver.attach",
+                    repName, lspName);
+        } else {
+            OvnVifDriver.prepareRepresentorForAttachLocked(logger, "OvnVfPassthroughVifDriver.attach",
+                    repName, bdf, lspName);
+        }
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(

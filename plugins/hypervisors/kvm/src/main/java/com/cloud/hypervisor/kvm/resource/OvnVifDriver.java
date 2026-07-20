@@ -319,7 +319,7 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-        if (!removeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId)) {
+        if (!freeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId)) {
             log.warn("{}: OVS representor CAS failed; refusing mutation for {}", callerLabel, repName);
             return;
         }
@@ -348,7 +348,7 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-            return removeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId);
+            return freeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId);
         } finally {
             lock.unlock();
         }
@@ -372,6 +372,25 @@ public class OvnVifDriver extends VifDriverBase {
         }
         return OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
                 currentIfaceId);
+    }
+
+    /** Executes representor CAS while the caller already owns the BDF lock. */
+    static boolean freeRepresentorOnOvsLocked(final Logger log, final String callerLabel,
+                                              final String repName, final String expectedBdf,
+                                              final String expectedIfaceId) {
+        return removeRepresentorOnOvsLocked(log, callerLabel, repName, expectedBdf, expectedIfaceId);
+    }
+
+    /** Reads the candidate iface-id and executes representor CAS under the held BDF lock. */
+    static boolean freeRepresentorOnOvsLocked(final Logger log, final String callerLabel,
+                                              final String repName, final String expectedBdf) {
+        final String expectedIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(expectedIfaceId)) {
+            log.warn("{}: representor iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
+            return false;
+        }
+        return freeRepresentorOnOvsLocked(log, callerLabel, repName, expectedBdf, expectedIfaceId);
     }
 
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
@@ -409,6 +428,25 @@ public class OvnVifDriver extends VifDriverBase {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Prepare a representor when the caller already owns the BDF lifecycle lock. */
+    static void prepareRepresentorForAttachLocked(final Logger log, final String callerLabel,
+                                                  final String repName, final String expectedBdf,
+                                                  final String expectedIfaceId) {
+        if (StringUtils.isBlank(repName) || StringUtils.isBlank(expectedBdf)
+                || StringUtils.isBlank(expectedIfaceId)) {
+            throw new CloudRuntimeException("representor attach requires an exact BDF and iface-id");
+        }
+        final String current = OvsRepresentorCas.readIfaceIdStrict(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(current) || expectedIfaceId.equals(current)) {
+            return;
+        }
+        if (!freeRepresentorOnOvsLocked(log, callerLabel, repName, expectedBdf, current)) {
+            throw new CloudRuntimeException("stale representor CAS failed for " + repName);
+        }
+        log.info("{}: removed stale representor identity rep={} iface-id={}", callerLabel, repName, current);
     }
 
     /** Matches {@code <mac address='..'/>} / {@code ".." } in virsh dumpxml. */

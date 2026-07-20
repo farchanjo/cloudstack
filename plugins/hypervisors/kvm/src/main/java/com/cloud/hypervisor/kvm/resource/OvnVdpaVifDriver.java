@@ -101,6 +101,10 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final int maxVqs = nic.getVdpaMaxVqs() != null ? nic.getVdpaMaxVqs() : 33;
 
         final Deque<Runnable> rollback = new ArrayDeque<>();
+        final String preLockRepName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+        if (preLockRepName != null) {
+            clearOrphanRepsForLspName(nic.getOvnLspName(), preLockRepName);
+        }
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
@@ -155,10 +159,10 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             // Cache rep name on the NicTO so applyOvnPostPlugTunables can
             // retrieve it without re-deriving from PCI after VM start.
             nic.setVfRepName(repName);
-            attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin());
+            attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin(), pciAddress);
             final String repFinal = repName;
-            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvs(
-                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal, nic.getOvnLspName()));
+            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvsLocked(
+                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal, pciAddress, nic.getOvnLspName()));
 
             // (4) Domain XML <interface type='vdpa'>. queues defaults to
             //     max_vqs / 2 (TX+RX pair count); operator can override
@@ -275,7 +279,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         //     the vhost device resolves to one exact vDPA management BDF.
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.unplug", repName);
+                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.unplug", repName, pciAddress);
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
@@ -356,12 +360,24 @@ public class OvnVdpaVifDriver extends VifDriverBase {
      * the caller so the post-start hook can retrieve it without a PCI scan.
      */
     private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
-                                           final Boolean hairpin) {
-        clearOrphanRepsForLspName(lspName, repName);
+                                            final Boolean hairpin) {
+        attachRepresentorToBrInt(repName, lspName, mac, hairpin, null);
+    }
+
+    private void attachRepresentorToBrInt(final String repName, final String lspName, final String mac,
+                                           final Boolean hairpin, final String bdf) {
+        if (StringUtils.isBlank(bdf)) {
+            clearOrphanRepsForLspName(lspName, repName);
+        }
         // DEF-1: a representor can retain an iface-id from a previous VM even
         // when that stale value does not match the current LSP. Clear the
         // complete external_ids map before stamping the new identity.
-        OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVdpaVifDriver.attach", repName, lspName);
+        if (StringUtils.isBlank(bdf)) {
+            OvnVifDriver.prepareRepresentorForAttach(logger, "OvnVdpaVifDriver.attach", repName, lspName);
+        } else {
+            OvnVifDriver.prepareRepresentorForAttachLocked(logger, "OvnVdpaVifDriver.attach", repName,
+                    bdf, lspName);
+        }
         Script.runSimpleBashScript(String.format(
             "ovs-vsctl --may-exist add-port %s %s", integrationBridge, repName));
         Script.runSimpleBashScript(String.format(
@@ -435,21 +451,25 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         RuntimeException cleanupFailure = null;
         final String vdpaName = VdpaVifDriver.buildVdpaName(nic);
         logger.info("OvnVdpaVifDriver.releaseVdpaOnRollback: releasing vdpa={} mac={}", vdpaName, nic.getMac());
-        try {
-            Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
-        } catch (RuntimeException e) {
-            cleanupFailure = e;
-        }
-
         final String pciAddress = nic.getVfPciAddress();
         if (StringUtils.isNotBlank(pciAddress)) {
+            final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
+            lifecycleLock.lock();
             try {
-                removeRepresentorAndClearVf(pciAddress, "lsp-" + nic.getUuid());
+                Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
+                if (!OvnVifDriver.isVdpaDeviceAbsentStrict(vdpaName, pciAddress)) {
+                    throw new CloudRuntimeException("vDPA inventory still contains " + vdpaName
+                            + " on " + pciAddress);
+                }
+                removeRepresentorAndClearVfLocked(pciAddress, "lsp-" + nic.getUuid());
             } catch (RuntimeException e) {
                 cleanupFailure = appendCleanupFailure(cleanupFailure, e);
+            } finally {
+                lifecycleLock.unlock();
             }
         } else {
             try {
+                Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
                 removeDestinationOwnedRepresentor(nic);
             } catch (RuntimeException e) {
                 cleanupFailure = appendCleanupFailure(cleanupFailure, e);
@@ -493,17 +513,17 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         return primary;
     }
 
-    private void removeRepresentorAndClearVf(final String pciAddress, final String expectedIfaceId) {
+    private void removeRepresentorAndClearVfLocked(final String pciAddress, final String expectedIfaceId) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback", repName,
-                    expectedIfaceId);
+            OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback",
+                    repName, pciAddress, expectedIfaceId);
         }
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
         if (pfName != null && vfId != null) {
             Script.runSimpleBashScript(String.format(
-                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
+                    "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
         }
     }
 
