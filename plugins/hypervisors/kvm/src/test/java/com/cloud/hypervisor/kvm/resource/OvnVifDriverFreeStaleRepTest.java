@@ -542,6 +542,44 @@ public class OvnVifDriverFreeStaleRepTest {
     }
 
     @Test
+    public void clearOrphanRepsByAttachedMac_bdfChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
+                    .thenReturn("dx6p0vf4\n");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4", "0000:01:00.5");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p0vf4")))
+                    .thenReturn("lsp-4");
+
+            assertFalse(OvnVifDriver.clearOrphanRepsByAttachedMac(
+                    LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff"));
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), never());
+        }
+    }
+
+    @Test
+    public void clearOrphanRepsByAttachedMac_ifaceIdChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(
+                            contains("find Interface external_ids:attached-mac"), anyInt()))
+                    .thenReturn("dx6p0vf4\n");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("dx6p0vf4")))
+                    .thenReturn("lsp-old", "lsp-new");
+
+            assertFalse(OvnVifDriver.clearOrphanRepsByAttachedMac(
+                    LOG, "test", "br-overlay", "aa:bb:cc:dd:ee:ff"));
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), never());
+        }
+    }
+
+    @Test
     public void clearOrphanRepsByAttachedMac_identityFailureReportsPartialCleanup() {
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
              MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);

@@ -521,7 +521,7 @@ public class OvnVifDriver extends VifDriverBase {
             if (hasVdpa) {
                 deleteVdpaDevsForPciStrictLocked(log, callerLabel, vfPci, inventory);
             }
-            if (freeRepresentorAndClearVfIdentityLocked(log, callerLabel, iface, ifaceId, vfPci)) {
+            if (freeRepresentorAndClearVfIdentityLocked(log, callerLabel, iface, vfPci, ifaceId)) {
                 recordFreed(result, iface);
             }
             return;
@@ -970,7 +970,7 @@ public class OvnVifDriver extends VifDriverBase {
                 allClean = false;
                 continue;
             }
-            if (freeRepresentorAndClearVfIdentity(log, callerLabel, repName, ifaceId, vfPci)) {
+            if (freeRepresentorAndClearVfIdentity(log, callerLabel, repName, vfPci, ifaceId)) {
                 log.info("{}: attached-mac fallback freed orphan rep={} (bridge hint={}, mac={})",
                         callerLabel, repName, integrationBridge, mac);
             } else {
@@ -987,24 +987,39 @@ public class OvnVifDriver extends VifDriverBase {
      * OVS CAS, then require the identity clear to execute successfully.
      */
     private static boolean freeRepresentorAndClearVfIdentity(final Logger log, final String callerLabel,
-                                                              final String repName, final String ifaceId,
-                                                              final String vfPci) {
-        if (StringUtils.isBlank(vfPci)) {
+                                                               final String repName, final String expectedBdf,
+                                                               final String expectedIfaceId) {
+        if (StringUtils.isBlank(expectedBdf)) {
             log.warn("{}: VF BDF is unknown; refusing strict orphan cleanup for {}", callerLabel, repName);
             return false;
         }
-        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(expectedBdf);
         lock.lock();
         try {
-            return freeRepresentorAndClearVfIdentityLocked(log, callerLabel, repName, ifaceId, vfPci);
+            return freeRepresentorAndClearVfIdentityLocked(
+                    log, callerLabel, repName, expectedBdf, expectedIfaceId);
         } finally {
             lock.unlock();
         }
     }
 
     private static boolean freeRepresentorAndClearVfIdentityLocked(final Logger log, final String callerLabel,
-                                                                    final String repName, final String ifaceId,
-                                                                    final String vfPci) {
+                                                                    final String repName, final String expectedBdf,
+                                                                    final String expectedIfaceId) {
+        final String currentBdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(currentBdf) || !expectedBdf.equalsIgnoreCase(currentBdf)) {
+            log.warn("{}: representor BDF changed while waiting for cleanup rep={} expected={} current={}",
+                    callerLabel, repName, expectedBdf, currentBdf);
+            return false;
+        }
+        final String currentIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(currentIfaceId) || !currentIfaceId.equals(expectedIfaceId)) {
+            log.warn("{}: representor iface-id changed while waiting for cleanup rep={} expected={} current={}",
+                    callerLabel, repName, expectedIfaceId, currentIfaceId);
+            return false;
+        }
+        final String vfPci = currentBdf;
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
         if (StringUtils.isBlank(pfName) || vfId == null) {
@@ -1013,7 +1028,7 @@ public class OvnVifDriver extends VifDriverBase {
             return false;
         }
         if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
-                repName, ifaceId)) {
+                repName, currentIfaceId)) {
             log.warn("{}: OVS representor CAS failed; VF identity remains untouched for {}",
                     callerLabel, repName);
             return false;
