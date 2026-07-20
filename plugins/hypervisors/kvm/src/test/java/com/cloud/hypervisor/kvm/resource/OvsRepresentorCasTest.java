@@ -101,6 +101,7 @@ public class OvsRepresentorCasTest {
         final Deque<String> responses = discoveryResponses("lsp-1");
         responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"new-iface\"],\"name\":\"rep0\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-1\"]]]}]}]");
         responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"rep0\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]");
+        responses.add("[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"name\":\"br-int\",\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]");
         assertFalse(OvsRepresentorCas.remove(executorWithValidMutation(responses),
                 "unix:/var/run/openvswitch/db.sock", "rep0", "lsp-1"));
     }

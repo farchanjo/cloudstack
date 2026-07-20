@@ -118,6 +118,56 @@ public class OvnVifDriverFreeStaleRepTest {
         }
     }
 
+    @Test(expected = IllegalArgumentException.class)
+    public void strictVdpaInventory_rejectsMalformedJson() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenReturn("not-json");
+            OvnVifDriver.listVdpaDevicesStrict();
+        }
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void strictVdpaInventory_propagatesUnavailableCli() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenThrow(new IllegalStateException("vdpa unavailable"));
+            OvnVifDriver.listVdpaDevicesStrict();
+        }
+    }
+
+    @Test
+    public void strictVdpaDelete_requiresFreshInventoryPostcondition() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}",
+                            "{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}");
+            OvnVifDriver.deleteVdpaDevsForPciStrict(LOG, "test", "0000:01:00.3");
+        } catch (RuntimeException expected) {
+            return;
+        }
+        throw new AssertionError("surviving vDPA device must fail strict cleanup");
+    }
+
+    @Test
+    public void strictVdpaDelete_abortsOnPartialMultiDeviceFailure() {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenReturn("{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"},"
+                            + "\"vdpa-r2\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev del vdpa-r1")))
+                    .thenReturn("");
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev del vdpa-r2")))
+                    .thenThrow(new IllegalStateException("delete failed"));
+            try {
+                OvnVifDriver.deleteVdpaDevsForPciStrict(LOG, "test", "0000:01:00.3");
+            } catch (IllegalStateException expected) {
+                return;
+            }
+        }
+        throw new AssertionError("partial vDPA deletion must fail");
+    }
+
     /**
      * End-to-end freeStale with mocked ovs + no real sysfs representors:
      * candidate list comes from ovs-vsctl, but isVfRepresentor returns false

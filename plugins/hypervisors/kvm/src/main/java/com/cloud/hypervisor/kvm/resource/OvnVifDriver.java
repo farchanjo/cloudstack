@@ -492,9 +492,11 @@ public class OvnVifDriver extends VifDriverBase {
                         log.warn("{}: orphan rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
                         continue;
                     }
-                    freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci);
+                    if (!freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci)) {
+                        continue;
+                    }
                     if (hasVdpa) {
-                        deleteVdpaDevsForPciBestEffort(log, callerLabel, vfPci);
+                        deleteVdpaDevsForPciStrict(log, callerLabel, vfPci);
                     }
                     result.freed++;
                     if (result.freedNames.size() < 64) {
@@ -523,7 +525,9 @@ public class OvnVifDriver extends VifDriverBase {
                 continue;
             }
             try {
-                freeRepresentorOnOvs(log, callerLabel, iface);
+                if (!freeRepresentorOnOvsChecked(log, callerLabel, iface)) {
+                    continue;
+                }
                 result.freed++;
                 if (result.freedNames.size() < 64) {
                     result.freedNames.add(iface);
@@ -623,86 +627,40 @@ public class OvnVifDriver extends VifDriverBase {
         return mac.toLowerCase();
     }
 
-    /**
-     * Best-effort {@code vdpa dev del} for every vDPA device whose mgmtdev is
-     * {@code vfPci}.
-     */
-    static void deleteVdpaDevsForPciBestEffort(final Logger log, final String callerLabel,
-                                               final String vfPci) {
+    /** Strictly delete every vDPA device whose management BDF is {@code vfPci}. */
+    static void deleteVdpaDevsForPciStrict(final Logger log, final String callerLabel,
+                                           final String vfPci) {
         if (StringUtils.isBlank(vfPci)) {
             return;
         }
-        for (final String name : listVdpaNamesForPci(vfPci)) {
-            try {
-                Script.runSimpleBashScript("vdpa dev del " + name + " 2>/dev/null");
-                if (log != null) {
-                    log.info("{}: deleted leftover vdpa {} for pci={}", callerLabel, name, vfPci);
-                }
-            } catch (RuntimeException re) {
-                if (log != null) {
-                    log.warn("{}: vdpa dev del {} for pci={} failed: {}",
-                            callerLabel, name, vfPci, re.getMessage());
-                }
+        final Map<String, VdpaPoolReconciler.VdpaSf> inventory = listVdpaDevicesStrict();
+        final Set<String> names = new HashSet<>();
+        for (final VdpaPoolReconciler.VdpaSf device : inventory.values()) {
+            if (vfPci.equalsIgnoreCase(device.getMgmtdevPci())) {
+                names.add(device.getName());
             }
+        }
+        for (final String name : names) {
+            Script.runSimpleBashScript("vdpa dev del " + name + " 2>/dev/null");
+            if (log != null) {
+                log.info("{}: deleted leftover vdpa {} for pci={}", callerLabel, name, vfPci);
+            }
+        }
+        final Map<String, VdpaPoolReconciler.VdpaSf> remaining = listVdpaDevicesStrict();
+        for (final String name : names) {
+            if (remaining.containsKey(name)) {
+                throw new CloudRuntimeException("vDPA device remained after deletion: " + name);
+            }
+        }
+        if (remaining.values().stream().anyMatch(device -> vfPci.equalsIgnoreCase(device.getMgmtdevPci()))) {
+            throw new CloudRuntimeException("vDPA management BDF remained after deletion: " + vfPci);
         }
     }
 
-    /**
-     * vDPA device names whose mgmtdev parent PCI is {@code vfPci}. Prefer sysfs
-     * (no PATH / multi-line issues); fall back to multi-line {@code vdpa dev show}.
-     */
-    static Set<String> listVdpaNamesForPci(final String vfPci) {
-        final Set<String> names = new HashSet<>();
-        if (StringUtils.isBlank(vfPci)) {
-            return names;
-        }
-        final String want = vfPci.toLowerCase();
-        final File bus = new File("/sys/bus/vdpa/devices");
-        final File[] entries = bus.listFiles();
-        if (entries != null) {
-            for (final File entry : entries) {
-                try {
-                    final File real = entry.getCanonicalFile();
-                    final File parent = real.getParentFile();
-                    if (parent != null && want.equals(parent.getName().toLowerCase())) {
-                        names.add(entry.getName());
-                    }
-                } catch (IOException ignored) {
-                    // skip unreadable entry
-                }
-            }
-        }
-        if (!names.isEmpty()) {
-            return names;
-        }
-        try {
-            final String raw = Script.runSimpleBashScriptWithFullResult("vdpa dev show 2>/dev/null", 5);
-            if (StringUtils.isBlank(raw)) {
-                return names;
-            }
-            for (final String line : raw.split("\\R")) {
-                final int idx = line.indexOf("mgmtdev pci/");
-                if (idx < 0) {
-                    continue;
-                }
-                String rest = line.substring(idx + "mgmtdev pci/".length()).trim();
-                final int sp = rest.indexOf(' ');
-                if (sp > 0) {
-                    rest = rest.substring(0, sp);
-                }
-                if (!want.equals(rest.toLowerCase())) {
-                    continue;
-                }
-                final int colon = line.indexOf(':');
-                final String name = colon > 0 ? line.substring(0, colon).trim() : null;
-                if (StringUtils.isNotBlank(name)) {
-                    names.add(name);
-                }
-            }
-        } catch (RuntimeException ignored) {
-            // CLI unavailable — empty set is fine (best-effort)
-        }
-        return names;
+    static Map<String, VdpaPoolReconciler.VdpaSf> listVdpaDevicesStrict() {
+        final String raw = Script.runSimpleBashScriptWithFullResult(
+                "/usr/sbin/vdpa dev show -j 2>/dev/null", 5);
+        return VdpaPoolReconciler.parseHostSfs(raw);
     }
 
     /**
@@ -815,8 +773,9 @@ public class OvnVifDriver extends VifDriverBase {
      */
     static Set<String> listVdpaMgmtPciAddresses(final Logger log) {
         final Set<String> out = new HashSet<>();
-        out.addAll(listVdpaMgmtPciFromSysfs());
-        out.addAll(listVdpaMgmtPciFromCli(log));
+        for (final VdpaPoolReconciler.VdpaSf device : listVdpaDevicesStrict().values()) {
+            out.add(device.getMgmtdevPci().toLowerCase());
+        }
         return out;
     }
 
@@ -1002,12 +961,12 @@ public class OvnVifDriver extends VifDriverBase {
      * removal already performed by the caller is the load-bearing half of
      * this cleanup and must not be undone by a failure here.
      */
-    private static void freeRepresentorAndClearVfIdentity(final Logger log, final String callerLabel,
-                                                           final String repName, final String ifaceId,
-                                                           final String vfPci) {
+    private static boolean freeRepresentorAndClearVfIdentity(final Logger log, final String callerLabel,
+                                                              final String repName, final String ifaceId,
+                                                              final String vfPci) {
         if (StringUtils.isBlank(vfPci)) {
             log.warn("{}: VF BDF is unknown; refusing attached-MAC cleanup for {}", callerLabel, repName);
-            return;
+            return false;
         }
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
         lock.lock();
@@ -1015,9 +974,10 @@ public class OvnVifDriver extends VifDriverBase {
             if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
                     repName, ifaceId)) {
                 log.warn("{}: OVS representor CAS failed; refusing VF identity clear for {}", callerLabel, repName);
-                return;
+                return false;
             }
             clearVfIdentityForBdfBestEffort(log, callerLabel, vfPci, repName);
+            return true;
         } finally {
             lock.unlock();
         }
