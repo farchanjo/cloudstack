@@ -112,8 +112,6 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         try {
             final VfPassthroughVifDriver.ExactVfTopology topology =
                     VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
-            pfName = topology.pfName();
-            vfId = topology.vfId();
             // (1) PF-side VF identity: MAC + trust + spoofchk, NO VLAN.
             //     Switchdev mlx5 rejects PF-side VLAN; OVN owns segmentation.
             configureVfOnPfNoVlan(topology.pfName(), topology.vfId(), mac);
@@ -121,7 +119,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             // link state / max_tx_rate / min_tx_rate / qos). On switchdev
             // most kernels reject vlan/qos here; the helper logs and
             // continues, so plug never aborts on operator typos.
-            OvnNicTunableApplier.applyVfTunables(nic, pfName, vfId);
+            OvnNicTunableApplier.applyVfTunables(nic, topology.pfName(), topology.vfId());
             final String pfFinal = pfName;
             final Integer vfIdFinal = vfId;
             rollback.push(() -> {
