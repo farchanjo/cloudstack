@@ -367,7 +367,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             if (!destinationOwned || !inactive) {
                 throw new CloudRuntimeException("refusing to remove representor with unproven ownership: " + name);
             }
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVfPassthroughVifDriver.orphan", name);
+            if (!OvnVifDriver.freeDestinationOwnedRepresentor(logger,
+                    "OvnVfPassthroughVifDriver.orphan", name, lspName)) {
+                throw new CloudRuntimeException("orphan ownership changed before locked CAS: " + name);
+            }
             logger.info("OvnVfPassthroughVifDriver: cleared orphan rep={} carrying stale iface-id={} (kept rep={})",
                     name, lspName, keepRepName);
         }

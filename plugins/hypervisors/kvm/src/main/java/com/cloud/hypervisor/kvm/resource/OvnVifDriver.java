@@ -393,6 +393,35 @@ public class OvnVifDriver extends VifDriverBase {
         return freeRepresentorOnOvsLocked(log, callerLabel, repName, expectedBdf, expectedIfaceId);
     }
 
+    /**
+     * Removes an orphan only when destination ownership is still authoritative
+     * immediately before the BDF-fenced CAS.
+     */
+    static boolean freeDestinationOwnedRepresentor(final Logger log, final String callerLabel,
+                                                   final String repName, final String expectedIfaceId) {
+        final String bdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(bdf)) {
+            return false;
+        }
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        lock.lock();
+        try {
+            final String ids = Script.runSimpleBashScript(String.format(
+                    "ovs-vsctl get Interface %s external_ids 2>/dev/null", repName));
+            final boolean destinationOwned = ids.contains("migration-owner=destination")
+                    || ids.contains("migration-owner=\"destination\"");
+            final boolean inactive = ids.contains("iface-status=inactive")
+                    || ids.contains("iface-status=\"inactive\"");
+            if (!destinationOwned || !inactive) {
+                log.warn("{}: ownership changed before locked orphan CAS rep={}", callerLabel, repName);
+                return false;
+            }
+            return freeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
         try {
             final String output = Script.executeCommand(argv);

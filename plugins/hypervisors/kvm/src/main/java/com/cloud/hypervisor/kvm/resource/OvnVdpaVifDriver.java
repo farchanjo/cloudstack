@@ -425,7 +425,10 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                         "duplicate active/source representor claim cannot be proven orphaned: rep=%s iface-id=%s target=%s",
                         name, lspName, keepRepName));
             }
-            OvnVifDriver.freeRepresentorOnOvs(logger, "OvnVdpaVifDriver.orphan", name, lspName);
+            if (!OvnVifDriver.freeDestinationOwnedRepresentor(logger,
+                    "OvnVdpaVifDriver.orphan", name, lspName)) {
+                throw new CloudRuntimeException("orphan ownership changed before locked CAS: " + name);
+            }
             logger.warn("Removed provably orphaned inactive destination representor {} for LSP {}", name, lspName);
         }
     }
