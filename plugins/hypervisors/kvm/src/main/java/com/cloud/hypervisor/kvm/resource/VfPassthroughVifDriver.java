@@ -39,6 +39,7 @@ import com.cloud.agent.properties.AgentProperties;
 import com.cloud.agent.properties.AgentPropertiesFileHandler;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.network.Networks;
+import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.script.Script;
 
 /**
@@ -113,8 +114,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
                 final String repNameFinal = repName;
                 rollback.push(() -> {
                     Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
-            OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VfPassthroughVifDriver.plug.rollback",
-                    repNameFinal, pciAddress);
+                    if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger,
+                            "VfPassthroughVifDriver.plug.rollback", repNameFinal, pciAddress)) {
+                        throw new CloudRuntimeException("representor CAS failed for " + repNameFinal);
+                    }
                 });
                 // Register the tier / VM in DvrManager so OpenFlow cross-tier
                 // shortcut + ACL flows get installed on br-bond. Runs right after
@@ -191,7 +194,10 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
             Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
-            OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VfPassthroughVifDriver.unplug", repName, pciAddress);
+            if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VfPassthroughVifDriver.unplug",
+                    repName, pciAddress)) {
+                throw new CloudRuntimeException("representor CAS failed for " + repName);
+            }
             logger.info("VF unplug: removed rep {} from OVS and cleared TC", repName);
         }
         // Clear the static FDB pin OF rule installed at plug time. Match by

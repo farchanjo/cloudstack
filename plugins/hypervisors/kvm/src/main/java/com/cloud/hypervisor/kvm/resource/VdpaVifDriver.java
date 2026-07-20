@@ -33,6 +33,7 @@ import org.libvirt.LibvirtException;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.exception.InternalErrorException;
 import com.cloud.network.Networks;
+import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.script.Script;
 import com.cloud.hypervisor.kvm.resource.hwoffload.VdpaPoolReconciler;
 import com.google.gson.JsonArray;
@@ -144,8 +145,10 @@ public class VdpaVifDriver extends VifDriverBase {
                 final String repNameFinal = repName;
                 rollback.push(() -> {
                     Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repNameFinal));
-                    OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.plug-rollback",
-                            repNameFinal, pciAddress);
+                    if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.plug-rollback",
+                            repNameFinal, pciAddress)) {
+                        throw new CloudRuntimeException("representor CAS failed for " + repNameFinal);
+                    }
                 });
             }
 
@@ -230,7 +233,9 @@ public class VdpaVifDriver extends VifDriverBase {
             String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
-                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.unplug", repName, pciAddress);
+                if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "VdpaVifDriver.unplug", repName, pciAddress)) {
+                    throw new CloudRuntimeException("representor CAS failed for " + repName);
+                }
                 logger.info("vDPA unplug: removed rep {} from OVS and cleared TC", repName);
             }
             String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);

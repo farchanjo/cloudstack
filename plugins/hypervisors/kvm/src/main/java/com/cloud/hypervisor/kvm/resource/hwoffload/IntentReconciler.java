@@ -411,28 +411,31 @@ public class IntentReconciler {
         // stale tag state. Since removeIntent has authoritative knowledge of every VF
         // PCI this VR ever used (persisted in the intent JSON), mirror the del-port
         // here so cleanup is tied to VR lifecycle rather than libvirt domain state.
-        detachRepresentorFromBridge(guestRep);
+        requireRepresentorDetached(guestRep);
         if (prev.additionalGuestVfPcis != null) {
             for (String extraPci : prev.additionalGuestVfPcis) {
-                detachRepresentorFromBridge(repMapper.getRepresentor(extraPci));
+                requireRepresentorDetached(repMapper.getRepresentor(extraPci));
             }
         }
-        detachRepresentorFromBridge(publicRep);
+        requireRepresentorDetached(publicRep);
         LOGGER.info("Removed intent for VR {} (cleared guestRep={} publicRep={})",
             vrId, guestRep, publicRep);
     }
 
     /** Remove a VF representor through the shared iface-id fenced CAS helper. */
-    private void detachRepresentorFromBridge(String repName) {
+    private void requireRepresentorDetached(String repName) {
         if (repName == null || repName.isEmpty()) {
             return;
         }
         try {
-            com.cloud.hypervisor.kvm.resource.OvnVifDriver.freeRepresentorOnOvs(
-                    LOGGER, "IntentReconciler.removeIntent", repName);
+            if (!com.cloud.hypervisor.kvm.resource.OvnVifDriver.freeRepresentorOnOvs(
+                    LOGGER, "IntentReconciler.removeIntent", repName)) {
+                throw new IllegalStateException("representor CAS returned false");
+            }
             LOGGER.debug("Detached VF representor {} from br-bond", repName);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to detach rep {} from br-bond: {}", repName, e.getMessage());
+            throw e;
         }
     }
 

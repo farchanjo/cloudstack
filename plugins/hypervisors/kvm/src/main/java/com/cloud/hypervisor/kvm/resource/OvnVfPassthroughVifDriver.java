@@ -137,8 +137,12 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             }
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), nic.getMac(), nic.getOvsHairpin(), pciAddress);
             final String repFinal = repName;
-            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvsLocked(logger,
-                    "OvnVfPassthroughVifDriver.rollback", repFinal, pciAddress, nic.getOvnLspName()));
+            rollback.push(() -> {
+                if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger,
+                        "OvnVfPassthroughVifDriver.rollback", repFinal, pciAddress, nic.getOvnLspName())) {
+                    throw new CloudRuntimeException("representor CAS failed for " + repFinal);
+                }
+            });
 
             final InterfaceDef intf = new InterfaceDef();
             // xmlVlanTag=0 → no <vlan> element in domain XML; OVN handles
@@ -172,8 +176,10 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             try {
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVfPassthroughVifDriver.unplug",
-                        repName, pciAddress);
+                if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVfPassthroughVifDriver.unplug",
+                        repName, pciAddress)) {
+                    throw new CloudRuntimeException("representor CAS failed for " + repName);
+                }
             } else {
                 logger.warn("OvnVfPassthroughVifDriver.unplug: exact representor not found for pci={} mac={}; skipping OVS cleanup",
                         pciAddress, mac);

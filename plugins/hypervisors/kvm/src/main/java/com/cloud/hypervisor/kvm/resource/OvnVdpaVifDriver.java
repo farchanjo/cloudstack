@@ -161,8 +161,12 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             nic.setVfRepName(repName);
             attachRepresentorToBrInt(repName, nic.getOvnLspName(), mac, nic.getOvsHairpin(), pciAddress);
             final String repFinal = repName;
-            rollback.push(() -> OvnVifDriver.freeRepresentorOnOvsLocked(
-                    logger, "OvnVdpaVifDriver.plug-rollback", repFinal, pciAddress, nic.getOvnLspName()));
+            rollback.push(() -> {
+                if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.plug-rollback",
+                        repFinal, pciAddress, nic.getOvnLspName())) {
+                    throw new CloudRuntimeException("representor CAS failed for " + repFinal);
+                }
+            });
 
             // (4) Domain XML <interface type='vdpa'>. queues defaults to
             //     max_vqs / 2 (TX+RX pair count); operator can override
@@ -277,9 +281,12 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         //     so a wrong integration-bridge name cannot leave a live OVN binding
         //     after destroy/expunge (Chaos B). Cleanup is fail-closed unless
         //     the vhost device resolves to one exact vDPA management BDF.
-        final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
+            final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
-                OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.unplug", repName, pciAddress);
+                if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.unplug",
+                        repName, pciAddress)) {
+                    throw new CloudRuntimeException("representor CAS failed for " + repName);
+                }
             }
             final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
             final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
@@ -490,8 +497,10 @@ public class OvnVdpaVifDriver extends VifDriverBase {
     private void removeRepresentorAndClearVfLocked(final String pciAddress, final String expectedIfaceId) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
-            OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback",
-                    repName, pciAddress, expectedIfaceId);
+            if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback",
+                    repName, pciAddress, expectedIfaceId)) {
+                throw new CloudRuntimeException("representor CAS failed for " + repName);
+            }
         }
         final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
         final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);

@@ -291,39 +291,40 @@ public class OvnVifDriver extends VifDriverBase {
      * <p>Public so {@code HostVfPurgeOrphans} / startup residual reconcile can
      * share the exact unplug free path.
      */
-    public static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName) {
+    public static boolean freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName) {
         if (StringUtils.isBlank(repName)) {
-            return;
+            return true;
         }
         final String expectedIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
                 "unix:/var/run/openvswitch/db.sock", repName);
         if (StringUtils.isBlank(expectedIfaceId)) {
             log.warn("{}: representor iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
-            return;
+            return false;
         }
-        freeRepresentorOnOvs(log, callerLabel, repName, expectedIfaceId);
+        return freeRepresentorOnOvs(log, callerLabel, repName, expectedIfaceId);
     }
 
     /** Remove a representor only when the caller supplies its exact iface-id. */
-    public static void freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName,
-                                            final String expectedIfaceId) {
+    public static boolean freeRepresentorOnOvs(final Logger log, final String callerLabel, final String repName,
+                                               final String expectedIfaceId) {
         if (StringUtils.isBlank(repName) || StringUtils.isBlank(expectedIfaceId)) {
             log.warn("{}: representor or iface-id is unknown; refusing cleanup for {}", callerLabel, repName);
-            return;
+            return false;
         }
         final String bdf = resolveVfPciFromRepresentor(repName);
         if (StringUtils.isBlank(bdf)) {
             log.warn("{}: representor BDF is unknown; refusing unfenced CAS for {}", callerLabel, repName);
-            return;
+            return false;
         }
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
         if (!freeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId)) {
             log.warn("{}: OVS representor CAS failed; refusing mutation for {}", callerLabel, repName);
-            return;
+            return false;
         }
         log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
+        return true;
         } finally {
             lock.unlock();
         }
