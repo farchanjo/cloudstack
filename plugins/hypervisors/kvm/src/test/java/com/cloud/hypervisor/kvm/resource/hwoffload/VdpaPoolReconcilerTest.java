@@ -22,6 +22,7 @@ package com.cloud.hypervisor.kvm.resource.hwoffload;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -75,10 +76,20 @@ public class VdpaPoolReconcilerTest {
     }
 
     @Test
-    public void parseHostSfsHandlesEmptyJson() {
-        assertTrue(VdpaPoolReconciler.parseHostSfs("").isEmpty());
-        assertTrue(VdpaPoolReconciler.parseHostSfs(null).isEmpty());
-        assertTrue(VdpaPoolReconciler.parseHostSfs("{}").isEmpty());
+    public void parseHostSfsRejectsUnavailableOutput() {
+        assertUnavailable(null);
+        assertUnavailable("");
+        assertUnavailable("  \n  ");
+    }
+
+    @Test
+    public void parseHostSfsAcceptsValidEmptyInventory() {
+        assertTrue(VdpaPoolReconciler.parseHostSfs("{\"dev\":{}}").isEmpty());
+    }
+
+    @Test
+    public void parseHostSfsRejectsArraySchema() {
+        assertUnavailable("[]");
     }
 
     @Test
@@ -93,6 +104,15 @@ public class VdpaPoolReconcilerTest {
         assertEquals("0000:01:00.3", sf.getMgmtdevPci());
         assertEquals("aa:bb:cc:dd:ee:01", sf.getMac());
         assertEquals(Integer.valueOf(33), sf.getMaxVqs());
+    }
+
+    private static void assertUnavailable(final String json) {
+        try {
+            VdpaPoolReconciler.parseHostSfs(json);
+            fail("vDPA inventory must fail closed: " + json);
+        } catch (IllegalArgumentException expected) {
+            // Expected for unavailable or unsupported inventory output.
+        }
     }
 
     @Test
