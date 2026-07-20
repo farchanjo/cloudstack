@@ -114,15 +114,16 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
-            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
-            configureVfOnPfNoVlan(pfName, vfId, nic.getMac());
+            final VfPassthroughVifDriver.ExactVfTopology topology =
+                    VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
+            configureVfOnPfNoVlan(topology.pfName(), topology.vfId(), nic.getMac());
             // Apply operator-resolved VF tunables (trust / spoofchk /
             // link state / max/min tx_rate / qos) on top of the bare
             // configureVfOnPfNoVlan baseline. Tunables that are null on
             // NicTO are skipped — preserving the historical defaults.
-            OvnNicTunableApplier.applyVfTunables(nic, pfName, vfId);
-            final String pfFinal = pfName;
-            final Integer vfIdFinal = vfId;
+            OvnNicTunableApplier.applyVfTunables(nic, topology.pfName(), topology.vfId());
+            final String pfFinal = topology.pfName();
+            final Integer vfIdFinal = topology.vfId();
             rollback.push(() -> {
                 if (pfFinal != null && vfIdFinal != null) {
                     Script.runSimpleBashScript(String.format(
@@ -175,7 +176,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
             lifecycleLock.lock();
             try {
-            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
+            final VfPassthroughVifDriver.ExactVfTopology topology =
+                    VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVfPassthroughVifDriver.unplug",
@@ -186,12 +188,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
                 logger.warn("OvnVfPassthroughVifDriver.unplug: exact representor not found for pci={} mac={}; skipping OVS cleanup",
                         pciAddress, mac);
             }
-            final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-            final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
-            if (pfName != null && vfId != null) {
-                Script.runSimpleBashScript(String.format(
-                    "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-            }
+            Script.runSimpleBashScript(String.format(
+                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", topology.pfName(), topology.vfId()));
             } finally {
                 lifecycleLock.unlock();
             }

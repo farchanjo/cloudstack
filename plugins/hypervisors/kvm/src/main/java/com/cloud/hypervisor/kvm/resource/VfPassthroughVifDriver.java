@@ -58,7 +58,10 @@ import com.cloud.utils.script.Script;
  */
 public class VfPassthroughVifDriver extends VifDriverBase {
 
-    static void requireExactVfTopology(final String pciAddress, final String expectedPf, final Integer expectedVfId) {
+    record ExactVfTopology(String pfName, int vfId) { }
+
+    static ExactVfTopology requireExactVfTopology(final String pciAddress, final String expectedPf,
+                                                  final Integer expectedVfId) {
         final String pfName = lookupPfFromVf(pciAddress);
         final Integer vfId = lookupVfIdFromPci(pciAddress);
         if (StringUtils.isBlank(pfName) || vfId == null
@@ -67,6 +70,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             throw new CloudRuntimeException("exact PF/VF topology unavailable or changed for " + pciAddress
                     + ": pf=" + pfName + " vf=" + vfId);
         }
+        return new ExactVfTopology(pfName, vfId);
     }
 
     @Override
@@ -95,7 +99,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         // cause and the VR isn't left straddling a partial plug.
         Deque<Runnable> rollback = new ArrayDeque<>();
         try {
-            requireExactVfTopology(pciAddress, pfName, null);
+            final ExactVfTopology topology = requireExactVfTopology(pciAddress, pfName, null);
             // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
             // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
             // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
@@ -108,9 +112,9 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             String repName = lookupRepresentor(pciAddress);
             boolean switchdev = repName != null;
             Integer pfVlanTag = switchdev ? null : vlanTag;
-            configureVfOnPf(pfName, pciAddress, nic.getMac(), pfVlanTag);
-            final String pfNameFinal = pfName != null ? pfName : lookupPfFromVf(pciAddress);
-            final Integer vfIdFinal = lookupVfIdFromPci(pciAddress);
+            configureVfOnPf(topology.pfName(), topology.vfId(), nic.getMac(), pfVlanTag);
+            final String pfNameFinal = topology.pfName();
+            final Integer vfIdFinal = topology.vfId();
             rollback.push(() -> {
                 if (pfNameFinal != null && vfIdFinal != null) {
                     Script.runSimpleBashScript(String.format(
@@ -199,7 +203,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
-        requireExactVfTopology(pciAddress, null, null);
+        final ExactVfTopology topology = requireExactVfTopology(pciAddress, null, null);
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
             Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
@@ -215,11 +219,8 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         removeLocalVmFdbRuleByMac(mac);
         // Notify DvrManager so it reaps the VM entry + shortcut flows.
         notifyDvrUnregister(mac);
-        String pfName = lookupPfFromVf(pciAddress);
-        Integer vfId = lookupVfIdFromPci(pciAddress);
-        if (pfName != null && vfId != null) {
-            Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-        }
+        Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0",
+                topology.pfName(), topology.vfId()));
         // VF representor has been detached from br-bond; the split-horizon
         // group for its tag still contains the now-freed ofport. Rebuild all
         // tracked groups so their buckets match the live port set.
@@ -410,14 +411,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
      * disable spoof check (so guest can use unicast/broadcast MACs and VRRP virtual MACs),
      * set VLAN tag on the PF if applicable.
      */
-    private void configureVfOnPf(String pfName, String pciAddress, String macAddr, Integer vlanTag) {
-        if (StringUtils.isBlank(pfName)) {
-            pfName = lookupPfFromVf(pciAddress);
-        }
-        Integer vfId = lookupVfIdFromPci(pciAddress);
-        if (pfName == null || vfId == null) {
-            throw new CloudRuntimeException(String.format("Cannot configure VF on PF: pf=%s pci=%s", pfName, pciAddress));
-        }
+    private void configureVfOnPf(final String pfName, final int vfId, final String macAddr, final Integer vlanTag) {
         if (StringUtils.isNotBlank(macAddr)) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac %s", pfName, vfId, macAddr));
         }

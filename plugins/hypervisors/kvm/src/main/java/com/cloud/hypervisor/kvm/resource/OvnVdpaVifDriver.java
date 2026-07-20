@@ -110,10 +110,13 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
-            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
+            final VfPassthroughVifDriver.ExactVfTopology topology =
+                    VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
+            pfName = topology.pfName();
+            vfId = topology.vfId();
             // (1) PF-side VF identity: MAC + trust + spoofchk, NO VLAN.
             //     Switchdev mlx5 rejects PF-side VLAN; OVN owns segmentation.
-            configureVfOnPfNoVlan(pfName, vfId, mac);
+            configureVfOnPfNoVlan(topology.pfName(), topology.vfId(), mac);
             // Apply operator-resolved VF tunables (trust / spoofchk /
             // link state / max_tx_rate / min_tx_rate / qos). On switchdev
             // most kernels reject vlan/qos here; the helper logs and
@@ -269,7 +272,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
-        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
+        final VfPassthroughVifDriver.ExactVfTopology topology =
+                VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
         if (StringUtils.isNotBlank(vdpaName)) {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("OvnVdpaVifDriver.unplug: deleted vdpa dev {}", vdpaName);
@@ -292,12 +296,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                     throw new CloudRuntimeException("representor CAS failed for " + repName);
                 }
             }
-            final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-            final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
-            if (pfName != null && vfId != null) {
-                Script.runSimpleBashScript(String.format(
-                    "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-            }
+            Script.runSimpleBashScript(String.format(
+                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", topology.pfName(), topology.vfId()));
         } finally {
             lifecycleLock.unlock();
         }
@@ -470,13 +470,14 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
             lifecycleLock.lock();
             try {
-                VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
+                final VfPassthroughVifDriver.ExactVfTopology topology =
+                        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
                 Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
                 if (!OvnVifDriver.isVdpaDeviceAbsentStrict(vdpaName, pciAddress)) {
                     throw new CloudRuntimeException("vDPA inventory still contains " + vdpaName
                             + " on " + pciAddress);
                 }
-                removeRepresentorAndClearVfLocked(pciAddress, "lsp-" + nic.getUuid());
+                removeRepresentorAndClearVfLocked(pciAddress, "lsp-" + nic.getUuid(), topology);
             } catch (RuntimeException e) {
                 cleanupFailure = appendCleanupFailure(cleanupFailure, e);
             } finally {
@@ -499,8 +500,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         return primary;
     }
 
-    private void removeRepresentorAndClearVfLocked(final String pciAddress, final String expectedIfaceId) {
-        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
+    private void removeRepresentorAndClearVfLocked(final String pciAddress, final String expectedIfaceId,
+                                                   final VfPassthroughVifDriver.ExactVfTopology topology) {
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
             if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback",
@@ -508,12 +509,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
                 throw new CloudRuntimeException("representor CAS failed for " + repName);
             }
         }
-        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
-        if (pfName != null && vfId != null) {
-            Script.runSimpleBashScript(String.format(
-                    "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-        }
+        Script.runSimpleBashScript(String.format(
+                "ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", topology.pfName(), topology.vfId()));
     }
 
     private void drainRollback(final Deque<Runnable> rollback) {

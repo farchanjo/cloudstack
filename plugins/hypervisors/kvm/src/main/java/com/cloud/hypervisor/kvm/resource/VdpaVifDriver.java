@@ -104,13 +104,14 @@ public class VdpaVifDriver extends VifDriverBase {
         Deque<Runnable> rollback = new ArrayDeque<>();
         try {
             String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
-            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, null);
+            final VfPassthroughVifDriver.ExactVfTopology topology =
+                    VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, null);
+            pfName = topology.pfName();
             boolean switchdev = repName != null;
             Integer pfVlanTag = switchdev ? null : vlanTag;
-            configureVfOnPf(pfName, pciAddress, mac, pfVlanTag);
-            final String pfNameFinal = pfName != null
-                    ? pfName : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-            final Integer vfIdFinal = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
+            configureVfOnPf(topology.pfName(), topology.vfId(), mac, pfVlanTag);
+            final String pfNameFinal = topology.pfName();
+            final Integer vfIdFinal = topology.vfId();
             rollback.push(() -> {
                 if (pfNameFinal != null && vfIdFinal != null) {
                     Script.runSimpleBashScript(String.format(
@@ -220,7 +221,8 @@ public class VdpaVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
-            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
+            final VfPassthroughVifDriver.ExactVfTopology topology =
+                    VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             if (VdpaPoolReconciler.parseHostSfs(
                     Script.runSimpleBashScript("vdpa dev show -j 2>/dev/null", 5000)).containsKey(vdpaName)) {
@@ -240,11 +242,8 @@ public class VdpaVifDriver extends VifDriverBase {
                 }
                 logger.info("vDPA unplug: removed rep {} from OVS and cleared TC", repName);
             }
-            String pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-            Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
-            if (pfName != null && vfId != null) {
-                Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0", pfName, vfId));
-            }
+            Script.runSimpleBashScript(String.format("ip link set %s vf %d mac 00:00:00:00:00:00 vlan 0",
+                    topology.pfName(), topology.vfId()));
         } finally {
             lifecycleLock.unlock();
         }
@@ -493,14 +492,7 @@ public class VdpaVifDriver extends VifDriverBase {
      * Kept inline here so vDPA does not depend on the passthrough driver's
      * private method visibility.
      */
-    private void configureVfOnPf(String pfName, String pciAddress, String macAddr, Integer vlanTag) {
-        if (StringUtils.isBlank(pfName)) {
-            pfName = VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-        }
-        Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
-        if (pfName == null || vfId == null) {
-            throw new CloudRuntimeException(String.format("Cannot configure VF on PF: pf=%s pci=%s", pfName, pciAddress));
-        }
+    private void configureVfOnPf(final String pfName, final int vfId, final String macAddr, final Integer vlanTag) {
         if (StringUtils.isNotBlank(macAddr)) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac %s", pfName, vfId, macAddr));
         }
