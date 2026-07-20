@@ -114,8 +114,6 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
             return new HostVfPurgeOrphansAnswer(cmd, true, "no explicit target PCI BDFs; no-op");
         }
 
-        final VdpaInventory vdpa = inventoryVdpa();
-        final DomainInventory domains = inventoryDomains(vdpa);
         final List<TargetResult> results = new ArrayList<>();
         int processed = 0;
         for (final String bdf : targets) {
@@ -127,6 +125,8 @@ public class LibvirtHostVfPurgeOrphansCommandWrapper extends
                 final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(bdf);
                 lifecycleLock.lock();
                 try {
+                    final VdpaInventory vdpa = inventoryVdpa();
+                    final DomainInventory domains = inventoryDomains(vdpa);
                     results.add(processTarget(cmd, bdf, vdpa, domains));
                 } finally {
                     lifecycleLock.unlock();
