@@ -114,6 +114,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
+            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
             configureVfOnPfNoVlan(pfName, vfId, nic.getMac());
             // Apply operator-resolved VF tunables (trust / spoofchk /
             // link state / max/min tx_rate / qos) on top of the bare
@@ -174,6 +175,7 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
             final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
             lifecycleLock.lock();
             try {
+            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
             final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
             if (repName != null) {
                 if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVfPassthroughVifDriver.unplug",
@@ -233,8 +235,8 @@ public class OvnVfPassthroughVifDriver extends VifDriverBase {
      */
     private void configureVfOnPfNoVlan(final String pfName, final Integer vfId, final String macAddr) {
         if (pfName == null || vfId == null) {
-            logger.warn("OvnVfPassthroughVifDriver: cannot configure VF on PF: pf={} vfId={}", pfName, vfId);
-            return;
+            throw new CloudRuntimeException("OvnVfPassthroughVifDriver: exact PF/VF topology unavailable: pf="
+                    + pfName + " vfId=" + vfId);
         }
         if (StringUtils.isNotBlank(macAddr)) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac %s", pfName, vfId, macAddr));

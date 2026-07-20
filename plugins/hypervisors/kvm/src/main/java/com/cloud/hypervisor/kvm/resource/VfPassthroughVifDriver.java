@@ -58,6 +58,17 @@ import com.cloud.utils.script.Script;
  */
 public class VfPassthroughVifDriver extends VifDriverBase {
 
+    static void requireExactVfTopology(final String pciAddress, final String expectedPf, final Integer expectedVfId) {
+        final String pfName = lookupPfFromVf(pciAddress);
+        final Integer vfId = lookupVfIdFromPci(pciAddress);
+        if (StringUtils.isBlank(pfName) || vfId == null
+                || (StringUtils.isNotBlank(expectedPf) && !expectedPf.equals(pfName))
+                || (expectedVfId != null && !expectedVfId.equals(vfId))) {
+            throw new CloudRuntimeException("exact PF/VF topology unavailable or changed for " + pciAddress
+                    + ": pf=" + pfName + " vf=" + vfId);
+        }
+    }
+
     @Override
     public void configure(Map<String, Object> params) throws ConfigurationException {
         super.configure(params);
@@ -84,6 +95,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         // cause and the VR isn't left straddling a partial plug.
         Deque<Runnable> rollback = new ArrayDeque<>();
         try {
+            requireExactVfTopology(pciAddress, pfName, null);
             // In switchdev mode (lookupRepresentor returns the rep), the PF/e-switch
             // does NOT accept legacy `ip link set vf vlan N` — VLAN tagging is owned
             // by OVS at the rep boundary (we set `tag=N` on the rep port). Pushing
@@ -182,15 +194,12 @@ public class VfPassthroughVifDriver extends VifDriverBase {
             }
         }
         if (StringUtils.isBlank(pciAddress)) {
-            logger.info("VfPassthroughVifDriver.unplug: no pciAddress, skipping");
-            // Still notify DvrManager by MAC so state/flows are reaped even
-            // when we cannot find the physical VF.
-            notifyDvrUnregister(mac);
-            return;
+            throw new CloudRuntimeException("VfPassthroughVifDriver.unplug: exact VF BDF unavailable for " + mac);
         }
         java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
+        requireExactVfTopology(pciAddress, null, null);
         String repName = lookupRepresentor(pciAddress);
         if (repName != null) {
             Script.runSimpleBashScript(String.format("tc qdisc del dev %s clsact 2>/dev/null", repName));
@@ -407,8 +416,7 @@ public class VfPassthroughVifDriver extends VifDriverBase {
         }
         Integer vfId = lookupVfIdFromPci(pciAddress);
         if (pfName == null || vfId == null) {
-            logger.warn(String.format("Cannot configure VF on PF: pf=%s pci=%s", pfName, pciAddress));
-            return;
+            throw new CloudRuntimeException(String.format("Cannot configure VF on PF: pf=%s pci=%s", pfName, pciAddress));
         }
         if (StringUtils.isNotBlank(macAddr)) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac %s", pfName, vfId, macAddr));

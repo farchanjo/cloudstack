@@ -90,14 +90,16 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(mac)) {
             throw new InternalErrorException("OvnVdpaVifDriver requires a MAC on the NicTO");
         }
+        final String candidatePf = StringUtils.isNotBlank(nic.getVfPfName())
+                ? nic.getVfPfName() : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
+        final Integer candidateVfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
+        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, candidatePf, candidateVfId);
         // Stamp the bridge-wide tc-policy on the first OVN-aware plug per
         // JVM (idempotent latch).
         OvnNicTunableApplier.applyTcPolicyOnce(nic.getOvsTcPolicy());
 
-        final String pfName = StringUtils.isNotBlank(nic.getVfPfName())
-                ? nic.getVfPfName()
-                : VfPassthroughVifDriver.lookupPfFromVf(pciAddress);
-        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(pciAddress);
+        final String pfName = candidatePf;
+        final Integer vfId = candidateVfId;
         final int maxVqs = nic.getVdpaMaxVqs() != null ? nic.getVdpaMaxVqs() : 33;
 
         final Deque<Runnable> rollback = new ArrayDeque<>();
@@ -108,6 +110,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
+            VfPassthroughVifDriver.requireExactVfTopology(pciAddress, pfName, vfId);
             // (1) PF-side VF identity: MAC + trust + spoofchk, NO VLAN.
             //     Switchdev mlx5 rejects PF-side VLAN; OVN owns segmentation.
             configureVfOnPfNoVlan(pfName, vfId, mac);
@@ -266,6 +269,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
         lifecycleLock.lock();
         try {
+        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
         if (StringUtils.isNotBlank(vdpaName)) {
             Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
             logger.info("OvnVdpaVifDriver.unplug: deleted vdpa dev {}", vdpaName);
@@ -327,8 +331,8 @@ public class OvnVdpaVifDriver extends VifDriverBase {
     /** MAC + trust + spoofchk on the VF; never set VLAN (OVN handles it). */
     private void configureVfOnPfNoVlan(final String pfName, final Integer vfId, final String macAddr) {
         if (pfName == null || vfId == null) {
-            logger.warn("OvnVdpaVifDriver: cannot configure VF on PF: pf={} vfId={}", pfName, vfId);
-            return;
+            throw new CloudRuntimeException("OvnVdpaVifDriver: exact PF/VF topology unavailable: pf="
+                    + pfName + " vfId=" + vfId);
         }
         if (StringUtils.isNotBlank(macAddr)) {
             Script.runSimpleBashScript(String.format("ip link set %s vf %d mac %s", pfName, vfId, macAddr));
@@ -466,6 +470,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
             final java.util.concurrent.locks.ReentrantLock lifecycleLock = VfHostLifecycleLock.forBdf(pciAddress);
             lifecycleLock.lock();
             try {
+                VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
                 Script.runSimpleBashScript(String.format("vdpa dev del %s 2>/dev/null", vdpaName));
                 if (!OvnVifDriver.isVdpaDeviceAbsentStrict(vdpaName, pciAddress)) {
                     throw new CloudRuntimeException("vDPA inventory still contains " + vdpaName
@@ -495,6 +500,7 @@ public class OvnVdpaVifDriver extends VifDriverBase {
     }
 
     private void removeRepresentorAndClearVfLocked(final String pciAddress, final String expectedIfaceId) {
+        VfPassthroughVifDriver.requireExactVfTopology(pciAddress, null, null);
         final String repName = VfPassthroughVifDriver.lookupRepresentor(pciAddress);
         if (repName != null) {
             if (!OvnVifDriver.freeRepresentorOnOvsLocked(logger, "OvnVdpaVifDriver.releaseVdpaOnRollback",
