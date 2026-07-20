@@ -32,6 +32,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.times;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -317,6 +318,98 @@ public class OvnVifDriverFreeStaleRepTest {
         }
     }
 
+    @Test
+    public void freeStaleHoldsBdfLockThroughVdpaCasAndIdentityClear() {
+        final String bdf = "0000:01:00.3";
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        final List<String> order = new ArrayList<>();
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class);
+             MockedStatic<VfPassthroughVifDriver> vfMock = mockStatic(VfPassthroughVifDriver.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
+                    .thenReturn("rep0\n");
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenAnswer(invocation -> {
+                        assertTrue(lock.isHeldByCurrentThread());
+                        order.add("inventory");
+                        return order.size() == 1
+                                ? "{\"dev\":{\"vdpa-r1\":{\"mgmtdev\":\"pci/0000:01:00.3\"}}}"
+                                : "{\"dev\":{}}";
+                    });
+            driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn(bdf);
+            driverMock.when(() -> OvnVifDriver.readPciDriver(bdf)).thenReturn("mlx5_core");
+            driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenReturn(Collections.emptySet());
+            driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
+                    .thenReturn("aa:bb:cc:dd:ee:ff");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-1");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-1")))
+                    .thenAnswer(invocation -> {
+                        assertTrue(lock.isHeldByCurrentThread());
+                        order.add("cas");
+                        return true;
+                    });
+            vfMock.when(() -> VfPassthroughVifDriver.lookupPfFromVf(bdf)).thenReturn("pf0");
+            vfMock.when(() -> VfPassthroughVifDriver.lookupVfIdFromPci(bdf)).thenReturn(3);
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("vdpa dev del")))
+                    .thenAnswer(invocation -> {
+                        assertTrue(lock.isHeldByCurrentThread());
+                        order.add("delete");
+                        return "";
+                    });
+            scriptMock.when(() -> Script.runSimpleBashScript(contains("ip link set")))
+                    .thenAnswer(invocation -> {
+                        assertTrue(lock.isHeldByCurrentThread());
+                        order.add("identity");
+                        return "";
+                    });
+
+            final OvnVifDriver.FreeStaleOvsResult result =
+                    OvnVifDriver.freeStaleFreeVfRepresentors(LOG, "test", false);
+
+            assertEquals(1, result.freed);
+            assertEquals(List.of("inventory", "delete", "inventory", "cas", "identity"), order);
+        }
+    }
+
+    @Test
+    public void freeStaleOwnershipAppearingDuringLockedRevalidationPreventsMutation() {
+        final String bdf = "0000:01:00.3";
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
+                    .thenReturn("rep0\n");
+            scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                    .thenAnswer(invocation -> {
+                        assertTrue(lock.isHeldByCurrentThread());
+                        return "{\"dev\":{}}";
+                    });
+            driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn(bdf);
+            driverMock.when(() -> OvnVifDriver.readPciDriver(bdf)).thenReturn("mlx5_core");
+            driverMock.when(OvnVifDriver::collectLiveDomainMacs).thenAnswer(invocation -> {
+                assertTrue(lock.isHeldByCurrentThread());
+                return Collections.singleton("aa:bb:cc:dd:ee:ff");
+            });
+            driverMock.when(() -> OvnVifDriver.readAttachedMac("rep0"))
+                    .thenReturn("aa:bb:cc:dd:ee:ff");
+
+            final OvnVifDriver.FreeStaleOvsResult result =
+                    OvnVifDriver.freeStaleFreeVfRepresentors(LOG, "test", false);
+
+            assertEquals(0, result.freed);
+            assertEquals(1, result.skippedAllocated);
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), never());
+            scriptMock.verify(() -> Script.runSimpleBashScript(contains("vdpa dev del")), never());
+        }
+    }
+
     /**
      * End-to-end freeStale with mocked ovs + no real sysfs representors:
      * candidate list comes from ovs-vsctl, but isVfRepresentor returns false
@@ -483,6 +576,8 @@ public class OvnVifDriverFreeStaleRepTest {
                                             final MockedStatic<OvsRepresentorCas> casMock) {
         scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("find Interface"), anyInt()))
                 .thenReturn("rep0\n");
+        scriptMock.when(() -> Script.runSimpleBashScriptWithFullResult(contains("vdpa dev show -j"), anyInt()))
+                .thenReturn("{\"dev\":{}}");
         driverMock.when(() -> OvnVifDriver.isVfRepresentor("rep0")).thenReturn(true);
         driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
                 .thenReturn("0000:01:00.3");

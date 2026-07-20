@@ -349,6 +349,14 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
+            return freeRepresentorOnOvsCheckedLocked(log, callerLabel, repName, expectedIfaceId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean freeRepresentorOnOvsCheckedLocked(final Logger log, final String callerLabel,
+                                                               final String repName, final String expectedIfaceId) {
         if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
                 expectedIfaceId)) {
             log.warn("{}: failed to free OVS representor {} by CAS", callerLabel, repName);
@@ -356,9 +364,6 @@ public class OvnVifDriver extends VifDriverBase {
         }
         log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
         return true;
-        } finally {
-            lock.unlock();
-        }
     }
 
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
@@ -442,16 +447,6 @@ public class OvnVifDriver extends VifDriverBase {
             return result;
         }
 
-        // null = inventory incomplete (virsh failed) → refuse free-by-MAC so we
-        // never del-port a live guest's rep because of a partial domain list.
-        final Set<String> liveMacs = collectLiveDomainMacs();
-        final Set<String> vdpaPci = listVdpaMgmtPciAddresses(log);
-        if (log != null && log.isDebugEnabled()) {
-            log.debug("{}: live domain MACs known={} size={} ({})",
-                    callerLabel, liveMacs != null, liveMacs == null ? -1 : liveMacs.size(), liveMacs);
-            log.debug("{}: vDPA mgmtdev PCI set size={} ({})", callerLabel, vdpaPci.size(), vdpaPci);
-        }
-
         for (final String iface : candidates) {
             if (!isVfRepresentor(iface)) {
                 result.skippedNonRep++;
@@ -463,77 +458,14 @@ public class OvnVifDriver extends VifDriverBase {
                 result.skippedUnresolved++;
                 continue;
             }
-            final String driver = readPciDriver(vfPci);
-            // lower-case: sysfs + parseVdpaDevShowPci normalize; virtfn can vary
-            final boolean hasVdpa = vdpaPci.contains(vfPci.toLowerCase());
-            final String attachedMac = readAttachedMac(iface);
-
-            // Primary path: MAC ownership from running domains. Domain-dead
-            // leftovers keep vfio/vDPA on the PCI BDF — still free them.
-            // Only when live inventory is complete (non-null).
-            if (StringUtils.isNotBlank(attachedMac) && liveMacs != null) {
-                if (liveMacs.contains(attachedMac)) {
-                    result.skippedAllocated++;
-                    log.debug("{}: keep rep={} mac={} pci={} (live domain owns MAC)",
-                            callerLabel, iface, attachedMac, vfPci);
-                    continue;
-                }
-                if (dryRun) {
-                    result.freed++;
-                    if (result.freedNames.size() < 64) {
-                        result.freedNames.add(iface);
-                    }
-                    continue;
-                }
-                try {
-                    final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
-                            "unix:/var/run/openvswitch/db.sock", iface);
-                    if (StringUtils.isBlank(ifaceId)) {
-                        log.warn("{}: orphan rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
-                        continue;
-                    }
-                    if (hasVdpa) {
-                        deleteVdpaDevsForPciStrict(log, callerLabel, vfPci);
-                    }
-                    if (!freeRepresentorAndClearVfIdentity(log, callerLabel, iface, ifaceId, vfPci)) {
-                        continue;
-                    }
-                    result.freed++;
-                    if (result.freedNames.size() < 64) {
-                        result.freedNames.add(iface);
-                    }
-                } catch (RuntimeException re) {
-                    log.warn("{}: failed to free orphan rep={} mac={}: {}",
-                            callerLabel, iface, attachedMac, re.getMessage());
-                }
-                continue;
-            }
-
-            // No attached-mac stamp, or live-domain inventory unknown: only free
-            // when the VF is kernel-FREE (legacy safe path — never free vfio/vDPA).
-            if (!isSafeToFreeStaleRep(driver, hasVdpa)) {
-                result.skippedAllocated++;
-                log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} mac={} liveKnown={} (ALLOCATED/unknown)",
-                        callerLabel, iface, vfPci, driver, hasVdpa, attachedMac, liveMacs != null);
-                continue;
-            }
-            if (dryRun) {
-                result.freed++;
-                if (result.freedNames.size() < 64) {
-                    result.freedNames.add(iface);
-                }
-                continue;
-            }
+            final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+            lock.lock();
             try {
-                if (!freeRepresentorOnOvsChecked(log, callerLabel, iface)) {
-                    continue;
-                }
-                result.freed++;
-                if (result.freedNames.size() < 64) {
-                    result.freedNames.add(iface);
-                }
+                processStaleRepresentorLocked(log, callerLabel, iface, vfPci, dryRun, result);
             } catch (RuntimeException re) {
-                log.warn("{}: failed to free stale FREE rep={}: {}", callerLabel, iface, re.getMessage());
+                log.warn("{}: failed to free stale representor {}: {}", callerLabel, iface, re.getMessage());
+            } finally {
+                lock.unlock();
             }
         }
         log.info("{}: freeStaleFreeVfRepresentors scanned={} freed={} skippedNonRep={} "
@@ -541,6 +473,79 @@ public class OvnVifDriver extends VifDriverBase {
                 callerLabel, result.scanned, result.freed, result.skippedNonRep,
                 result.skippedAllocated, result.skippedUnresolved, dryRun);
         return result;
+    }
+
+    private static void processStaleRepresentorLocked(final Logger log, final String callerLabel,
+                                                       final String iface, final String initialBdf,
+                                                       final boolean dryRun, final FreeStaleOvsResult result) {
+        if (!isVfRepresentor(iface)) {
+            result.skippedNonRep++;
+            return;
+        }
+        final String vfPci = resolveVfPciFromRepresentor(iface);
+        if (StringUtils.isBlank(vfPci) || !initialBdf.equalsIgnoreCase(vfPci)) {
+            result.skippedUnresolved++;
+            log.warn("{}: representor BDF changed or became unavailable for {}; refusing cleanup",
+                    callerLabel, iface);
+            return;
+        }
+        final String driver = readPciDriver(vfPci);
+        final Map<String, VdpaPoolReconciler.VdpaSf> inventory = listVdpaDevicesStrict();
+        final boolean hasVdpa = inventory.values().stream()
+                .anyMatch(device -> vfPci.equalsIgnoreCase(device.getMgmtdevPci()));
+        final Set<String> liveMacs = collectLiveDomainMacs();
+        final String attachedMac = readAttachedMac(iface);
+        if (StringUtils.isNotBlank(attachedMac) && liveMacs != null) {
+            if (liveMacs.contains(attachedMac)) {
+                result.skippedAllocated++;
+                log.debug("{}: keep rep={} mac={} pci={} (live domain owns MAC)",
+                        callerLabel, iface, attachedMac, vfPci);
+                return;
+            }
+            if (dryRun) {
+                recordFreed(result, iface);
+                return;
+            }
+            final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                    "unix:/var/run/openvswitch/db.sock", iface);
+            if (StringUtils.isBlank(ifaceId)) {
+                log.warn("{}: orphan rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
+                return;
+            }
+            if (hasVdpa) {
+                deleteVdpaDevsForPciStrictLocked(log, callerLabel, vfPci, inventory);
+            }
+            if (freeRepresentorAndClearVfIdentityLocked(log, callerLabel, iface, ifaceId, vfPci)) {
+                recordFreed(result, iface);
+            }
+            return;
+        }
+        if (!isSafeToFreeStaleRep(driver, hasVdpa)) {
+            result.skippedAllocated++;
+            log.debug("{}: keep rep={} pci={} driver={} hasVdpa={} mac={} liveKnown={} (ALLOCATED/unknown)",
+                    callerLabel, iface, vfPci, driver, hasVdpa, attachedMac, liveMacs != null);
+            return;
+        }
+        if (dryRun) {
+            recordFreed(result, iface);
+            return;
+        }
+        final String ifaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", iface);
+        if (StringUtils.isBlank(ifaceId)) {
+            log.warn("{}: stale rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
+            return;
+        }
+        if (freeRepresentorOnOvsCheckedLocked(log, callerLabel, iface, ifaceId)) {
+            recordFreed(result, iface);
+        }
+    }
+
+    private static void recordFreed(final FreeStaleOvsResult result, final String iface) {
+        result.freed++;
+        if (result.freedNames.size() < 64) {
+            result.freedNames.add(iface);
+        }
     }
 
     /**
@@ -633,7 +638,18 @@ public class OvnVifDriver extends VifDriverBase {
         if (StringUtils.isBlank(vfPci)) {
             return;
         }
-        final Map<String, VdpaPoolReconciler.VdpaSf> inventory = listVdpaDevicesStrict();
+        final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
+        lock.lock();
+        try {
+            deleteVdpaDevsForPciStrictLocked(log, callerLabel, vfPci, listVdpaDevicesStrict());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static void deleteVdpaDevsForPciStrictLocked(final Logger log, final String callerLabel,
+                                                         final String vfPci,
+                                                         final Map<String, VdpaPoolReconciler.VdpaSf> inventory) {
         final Set<String> names = new HashSet<>();
         for (final VdpaPoolReconciler.VdpaSf device : inventory.values()) {
             if (vfPci.equalsIgnoreCase(device.getMgmtdevPci())) {
@@ -974,29 +990,35 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(vfPci);
         lock.lock();
         try {
-            final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
-            final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
-            if (StringUtils.isBlank(pfName) || vfId == null) {
-                log.warn("{}: missing exact PF/VF target for strict orphan cleanup rep={} pci={} pf={} vf={}",
-                        callerLabel, repName, vfPci, pfName, vfId);
-                return false;
-            }
-            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
-                    repName, ifaceId)) {
-                log.warn("{}: OVS representor CAS failed; VF identity remains untouched for {}",
-                        callerLabel, repName);
-                return false;
-            }
-            try {
-                clearVfIdentityForBdfStrict(log, callerLabel, pfName, vfId, repName);
-                return true;
-            } catch (RuntimeException re) {
-                log.warn("{}: partial orphan cleanup rep={} pci={}: OVS CAS succeeded but VF identity clear failed: {}",
-                        callerLabel, repName, vfPci, re.getMessage());
-                return false;
-            }
+            return freeRepresentorAndClearVfIdentityLocked(log, callerLabel, repName, ifaceId, vfPci);
         } finally {
             lock.unlock();
+        }
+    }
+
+    private static boolean freeRepresentorAndClearVfIdentityLocked(final Logger log, final String callerLabel,
+                                                                    final String repName, final String ifaceId,
+                                                                    final String vfPci) {
+        final String pfName = VfPassthroughVifDriver.lookupPfFromVf(vfPci);
+        final Integer vfId = VfPassthroughVifDriver.lookupVfIdFromPci(vfPci);
+        if (StringUtils.isBlank(pfName) || vfId == null) {
+            log.warn("{}: missing exact PF/VF target for strict orphan cleanup rep={} pci={} pf={} vf={}",
+                    callerLabel, repName, vfPci, pfName, vfId);
+            return false;
+        }
+        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
+                repName, ifaceId)) {
+            log.warn("{}: OVS representor CAS failed; VF identity remains untouched for {}",
+                    callerLabel, repName);
+            return false;
+        }
+        try {
+            clearVfIdentityForBdfStrict(log, callerLabel, pfName, vfId, repName);
+            return true;
+        } catch (RuntimeException re) {
+            log.warn("{}: partial orphan cleanup rep={} pci={}: OVS CAS succeeded but VF identity clear failed: {}",
+                    callerLabel, repName, vfPci, re.getMessage());
+            return false;
         }
     }
 
