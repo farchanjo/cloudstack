@@ -88,7 +88,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
                     .thenReturn("{migration-owner=destination, iface-status=inactive}");
             scriptMock.when(() -> Script.executeCommand(any(String[].class)))
                     .thenReturn(
-                            
+
                                     "[{\"rows\":[{\"_uuid\":[\"uuid\",\"iface-1\"],\"name\":\"dx6p0vf4\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-99640d2f\"]]]}]}]",
                             "[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"dx6p0vf4\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]",
                             "[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]",
