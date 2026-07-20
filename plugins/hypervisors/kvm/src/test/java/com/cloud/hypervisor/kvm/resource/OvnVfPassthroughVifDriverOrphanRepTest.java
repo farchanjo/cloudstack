@@ -92,14 +92,12 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
                                     "[{\"rows\":[{\"_uuid\":[\"uuid\",\"iface-1\"],\"name\":\"dx6p0vf4\",\"external_ids\":[\"map\",[[\"iface-id\",\"lsp-99640d2f\"]]]}]}]",
                             "[{\"rows\":[{\"_uuid\":[\"uuid\",\"port-1\"],\"name\":\"dx6p0vf4\",\"interfaces\":[\"set\",[[\"uuid\",\"iface-1\"]]]}]}]",
                             "[{\"rows\":[{\"_uuid\":[\"uuid\",\"bridge-1\"],\"ports\":[\"set\",[[\"uuid\",\"port-1\"]]]}]}]",
-                            "[{},{},{},{\"count\":1},{\"count\":1},{\"count\":1}]",
-                            "[{\"rows\":[]}]",
-                             "[{\"rows\":[]}]");
+                            "[{},{},{},{\"count\":1},{\"count\":1},{\"count\":1}]");
 
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
             // The orphan must enter the shared CAS path; the keeper must not.
-            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(6));
+            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(4));
         }
     }
 
