@@ -319,8 +319,7 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
-                expectedIfaceId)) {
+        if (!removeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId)) {
             log.warn("{}: OVS representor CAS failed; refusing mutation for {}", callerLabel, repName);
             return;
         }
@@ -349,21 +348,30 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-            return freeRepresentorOnOvsCheckedLocked(log, callerLabel, repName, expectedIfaceId);
+            return removeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, expectedIfaceId);
         } finally {
             lock.unlock();
         }
     }
 
-    private static boolean freeRepresentorOnOvsCheckedLocked(final Logger log, final String callerLabel,
-                                                               final String repName, final String expectedIfaceId) {
-        if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
-                expectedIfaceId)) {
-            log.warn("{}: failed to free OVS representor {} by CAS", callerLabel, repName);
+    private static boolean removeRepresentorOnOvsLocked(final Logger log, final String callerLabel,
+                                                        final String repName, final String expectedBdf,
+                                                        final String expectedIfaceId) {
+        final String currentBdf = resolveVfPciFromRepresentor(repName);
+        if (StringUtils.isBlank(currentBdf) || !expectedBdf.equalsIgnoreCase(currentBdf)) {
+            log.warn("{}: representor BDF changed while waiting for CAS rep={} expected={} current={}",
+                    callerLabel, repName, expectedBdf, currentBdf);
             return false;
         }
-        log.info("{}: freed OVS representor {} by UUID-bound CAS", callerLabel, repName);
-        return true;
+        final String currentIfaceId = OvsRepresentorCas.readIfaceId(OvnVifDriver::runOvsdb,
+                "unix:/var/run/openvswitch/db.sock", repName);
+        if (StringUtils.isBlank(currentIfaceId) || !currentIfaceId.equals(expectedIfaceId)) {
+            log.warn("{}: representor iface-id changed while waiting for CAS rep={} expected={} current={}",
+                    callerLabel, repName, expectedIfaceId, currentIfaceId);
+            return false;
+        }
+        return OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock", repName,
+                currentIfaceId);
     }
 
     private static OvsRepresentorCas.Result runOvsdb(final String... argv) {
@@ -394,8 +402,7 @@ public class OvnVifDriver extends VifDriverBase {
         final java.util.concurrent.locks.ReentrantLock lock = VfHostLifecycleLock.forBdf(bdf);
         lock.lock();
         try {
-            if (!OvsRepresentorCas.remove(OvnVifDriver::runOvsdb, "unix:/var/run/openvswitch/db.sock",
-                    repName, current)) {
+            if (!removeRepresentorOnOvsLocked(log, callerLabel, repName, bdf, current)) {
                 throw new CloudRuntimeException("stale representor CAS failed for " + repName);
             }
             log.info("{}: removed stale representor identity rep={} iface-id={}", callerLabel, repName, current);
@@ -542,7 +549,7 @@ public class OvnVifDriver extends VifDriverBase {
             log.warn("{}: stale rep={} has no exact iface-id; refusing cleanup", callerLabel, iface);
             return;
         }
-        if (freeRepresentorOnOvsCheckedLocked(log, callerLabel, iface, ifaceId)) {
+        if (removeRepresentorOnOvsLocked(log, callerLabel, iface, vfPci, ifaceId)) {
             recordFreed(result, iface);
         }
     }
