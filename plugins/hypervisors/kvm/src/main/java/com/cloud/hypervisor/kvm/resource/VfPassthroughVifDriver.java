@@ -58,7 +58,23 @@ import com.cloud.utils.script.Script;
  */
 public class VfPassthroughVifDriver extends VifDriverBase {
 
-    record ExactVfTopology(String pfName, int vfId) { }
+    static final class ExactVfTopology {
+        private final String pfName;
+        private final int vfId;
+
+        ExactVfTopology(final String pfName, final int vfId) {
+            this.pfName = pfName;
+            this.vfId = vfId;
+        }
+
+        String pfName() {
+            return pfName;
+        }
+
+        int vfId() {
+            return vfId;
+        }
+    }
 
     static ExactVfTopology requireExactVfTopology(final String pciAddress, final String expectedPf,
                                                   final Integer expectedVfId) {
