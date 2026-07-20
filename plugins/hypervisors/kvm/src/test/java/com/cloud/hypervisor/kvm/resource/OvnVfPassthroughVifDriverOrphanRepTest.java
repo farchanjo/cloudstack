@@ -81,7 +81,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
         final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
-             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS)) {
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
             driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
                     .thenReturn("0000:01:00.4");
             // Simulate ovs-vsctl find returning two reps on separate lines.
@@ -90,6 +91,10 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
 
             scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
                     .thenReturn("{migration-owner=destination, iface-status=inactive}");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), anyString()))
+                    .thenReturn("lsp-99640d2f");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()))
+                    .thenReturn(true);
             scriptMock.when(() -> Script.executeCommand(any(String[].class)))
                     .thenReturn(
 
@@ -101,7 +106,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
             invokeClearOrphans(driver, "lsp-99640d2f", "dx6p1vf6");
 
             // The orphan must enter the shared CAS path; the keeper must not.
-            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(4));
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), times(1));
         }
     }
 
@@ -132,12 +137,7 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
     public void clearOrphanRepsForLspName_skipsWhenNoMatch() throws Exception {
         final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
 
-        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
-             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS)) {
-            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p1vf6"))
-                    .thenReturn("0000:01:00.5");
-            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
-                    .thenReturn("0000:01:00.4");
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
             scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface")))
                     .thenReturn("");
 
@@ -161,7 +161,8 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
         final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
 
         try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
-             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS)) {
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
             driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p1vf6"))
                     .thenReturn("0000:01:00.5");
             driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
@@ -173,11 +174,14 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
                     .thenReturn("");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("get Interface")))
                     .thenReturn("{migration-owner=destination, iface-status=inactive}");
-
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), anyString()))
+                    .thenReturn("lsp-b3f77bd2");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()))
+                    .thenReturn(true);
             driver.cleanupStaleRepsByLspName("lsp-b3f77bd2");
 
             // Both reps must enter the CAS path — keepRepName=null means keep nothing.
-            scriptMock.verify(() -> Script.executeCommand(any(String[].class)), times(2));
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), times(2));
         }
     }
 
