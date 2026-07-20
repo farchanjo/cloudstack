@@ -160,7 +160,12 @@ public class OvnVfPassthroughVifDriverOrphanRepTest {
     public void cleanupStaleRepsByLspName_clearsAll() throws Exception {
         final OvnVfPassthroughVifDriver driver = new OvnVfPassthroughVifDriver();
 
-        try (MockedStatic<Script> scriptMock = mockStatic(Script.class)) {
+        try (MockedStatic<Script> scriptMock = mockStatic(Script.class);
+             MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS)) {
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p1vf6"))
+                    .thenReturn("0000:01:00.5");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("dx6p0vf4"))
+                    .thenReturn("0000:01:00.4");
             scriptMock.when(() -> Script.runSimpleBashScript(contains("find Interface")))
                     .thenReturn("dx6p1vf6\ndx6p0vf4");
 
