@@ -22,6 +22,7 @@ package com.cloud.hypervisor.kvm.resource;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -43,6 +44,7 @@ import org.junit.Test;
 import org.mockito.MockedStatic;
 
 import com.cloud.utils.script.Script;
+import com.cloud.utils.exception.CloudRuntimeException;
 
 /**
  * Residual Chaos-B heal: FREE VF representors that still carry
@@ -606,6 +608,112 @@ public class OvnVifDriverFreeStaleRepTest {
 
             casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("dx6p0vf4"), eq("lsp-4")));
             scriptMock.verify(() -> Script.runSimpleBashScript(contains("ip link set")));
+        }
+    }
+
+    @Test
+    public void freeRepresentorOnOvs_bdfChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4", "0000:01:00.5");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-4");
+
+            OvnVifDriver.freeRepresentorOnOvs(LOG, "test", "rep0");
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
+        }
+    }
+
+    @Test
+    public void freeRepresentorOnOvs_ifaceChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-old", "lsp-new");
+
+            OvnVifDriver.freeRepresentorOnOvs(LOG, "test", "rep0");
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
+        }
+    }
+
+    @Test
+    public void freeRepresentorOnOvs_stableIdentityUsesExactCas() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-4");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-4")))
+                    .thenReturn(true);
+
+            OvnVifDriver.freeRepresentorOnOvs(LOG, "test", "rep0");
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-4")));
+        }
+    }
+
+    @Test
+    public void prepareRepresentorForAttach_bdfChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            casMock.when(() -> OvsRepresentorCas.readIfaceIdStrict(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-old");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4", "0000:01:00.5");
+
+            try {
+                OvnVifDriver.prepareRepresentorForAttach(LOG, "test", "rep0", "lsp-new");
+                fail("BDF change must abort stale representor CAS");
+            } catch (CloudRuntimeException expected) {
+                // Expected.
+            }
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
+        }
+    }
+
+    @Test
+    public void prepareRepresentorForAttach_ifaceChangesAfterLockSelectionFailsClosed() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            casMock.when(() -> OvsRepresentorCas.readIfaceIdStrict(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-old");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-new");
+
+            try {
+                OvnVifDriver.prepareRepresentorForAttach(LOG, "test", "rep0", "lsp-new");
+                fail("iface-id change must abort stale representor CAS");
+            } catch (CloudRuntimeException expected) {
+                // Expected.
+            }
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), anyString()), never());
+        }
+    }
+
+    @Test
+    public void prepareRepresentorForAttach_stableIdentityUsesExactCas() {
+        try (MockedStatic<OvnVifDriver> driverMock = mockStatic(OvnVifDriver.class, CALLS_REAL_METHODS);
+             MockedStatic<OvsRepresentorCas> casMock = mockStatic(OvsRepresentorCas.class)) {
+            casMock.when(() -> OvsRepresentorCas.readIfaceIdStrict(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-old");
+            driverMock.when(() -> OvnVifDriver.resolveVfPciFromRepresentor("rep0"))
+                    .thenReturn("0000:01:00.4");
+            casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), eq("rep0")))
+                    .thenReturn("lsp-old");
+            casMock.when(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-old")))
+                    .thenReturn(true);
+
+            OvnVifDriver.prepareRepresentorForAttach(LOG, "test", "rep0", "lsp-new");
+
+            casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), eq("rep0"), eq("lsp-old")));
         }
     }
 
