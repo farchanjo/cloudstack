@@ -58,6 +58,9 @@ public class OvnDestinationOrphanOwnershipRaceTest {
                     .thenReturn(candidateIds, currentIds);
             casMock.when(() -> OvsRepresentorCas.readIfaceId(any(), anyString(), anyString())).thenReturn(LSP);
 
+            // Candidate ownership is observed before lock selection; the helper
+            // must repeat this read after acquiring the BDF lock.
+            Script.runSimpleBashScript("ovs-vsctl get Interface " + REP + " external_ids");
             assertFalse(OvnVifDriver.freeDestinationOwnedRepresentor(
                     org.apache.logging.log4j.LogManager.getLogger(getClass()), "race", REP, LSP));
             casMock.verify(() -> OvsRepresentorCas.remove(any(), anyString(), anyString(), anyString()), never());
